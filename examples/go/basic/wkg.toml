@@ -1,0 +1,2 @@
+[overrides]
+"terminal-games:app" = { path = "../../../wit" }

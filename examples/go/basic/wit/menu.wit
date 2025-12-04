@@ -1,0 +1,5 @@
+package menu:app;
+
+world app {
+  include terminal-games:app/app@0.1.0;
+}
