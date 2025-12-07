@@ -1687,6 +1687,7 @@ dependencies = [
 name = "terminal-games"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crossterm",
  "tokio",
  "wasmtime",

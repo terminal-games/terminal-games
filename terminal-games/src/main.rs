@@ -1,149 +1,151 @@
-use std::io::Write;
-
-use wasmtime::component::{Component, HasData, Linker, ResourceTable, bindgen};
-use wasmtime::*;
-use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
-
-bindgen!({
-    world: "app",
-    path: "../wit",
-    imports: {
-        default: async | trappable
-    },
-    exports: {
-        default: async | trappable
-    }
-});
+use anyhow::Result;
+use tokio::io::AsyncWriteExt;
+use wasmtime::{Caller, Config, Engine, Extern, Linker, Module, Store};
+use wasmtime_wasi::{I32Exit, ResourceTable, WasiCtx, p1::WasiP1Ctx};
 
 pub struct ComponentRunStates {
-    // These two are required basically as a standard way to enable the impl of IoView and
-    // WasiView.
-    // impl of WasiView is required by [`wasmtime_wasi::p2::add_to_linker_sync`]
-    pub wasi_ctx: WasiCtx,
+    pub wasi_ctx: WasiP1Ctx,
     pub resource_table: ResourceTable,
-    // You can add other custom host states if needed
-    limits: MyLimiter,
-}
-
-impl WasiView for ComponentRunStates {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi_ctx,
-            table: &mut self.resource_table,
-        }
-    }
-}
-
-struct MyLimiter;
-
-impl ResourceLimiter for MyLimiter {
-    fn memory_growing(
-        &mut self,
-        current: usize,
-        desired: usize,
-        maximum: Option<usize>,
-    ) -> Result<bool> {
-        let mut log = std::fs::OpenOptions::new()
-            .append(true)
-            .open("log.txt")
-            .unwrap();
-        writeln!(
-            &mut log,
-            "memory growing current={} desired={} maximum={:?}",
-            current, desired, maximum
-        )?;
-        return Ok(true);
-    }
-
-    fn table_growing(
-        &mut self,
-        current: usize,
-        desired: usize,
-        maximum: Option<usize>,
-    ) -> Result<bool> {
-        let mut log = std::fs::OpenOptions::new()
-            .append(true)
-            .open("log.txt")
-            .unwrap();
-        writeln!(
-            &mut log,
-            "table growing current={} desired={} maximum={:?}",
-            current, desired, maximum
-        )?;
-        return Ok(true);
-    }
-}
-
-struct TerminalData;
-
-impl HasData for TerminalData {
-    type Data<'a> = &'a mut ComponentRunStates;
-}
-
-impl terminal_games::app::terminal::Host for ComponentRunStates {
-    async fn size(&mut self) -> wasmtime::Result<terminal_games::app::terminal::Dimensions> {
-        let (width, height) = crossterm::terminal::size()?;
-        Ok(terminal_games::app::terminal::Dimensions { width, height })
-    }
+    streams: Vec<tokio::net::TcpStream>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    crossterm::terminal::enable_raw_mode()?;
-
     let mut config = Config::new();
     config.async_support(true);
-    config.epoch_interruption(true);
+    // config.strategy(wasmtime::Strategy::Winch);
     let engine = Engine::new(&config)?;
-    let mut linker = Linker::new(&engine);
 
-    let engine_weak = engine.weak();
-    tokio::task::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            if let Some(engine) = engine_weak.upgrade() {
-                engine.increment_epoch();
-            } else {
-                return;
+    let mut linker: Linker<ComponentRunStates> = Linker::new(&engine);
+    wasmtime_wasi::p1::add_to_linker_async(&mut linker, |t| &mut t.wasi_ctx)?;
+
+    let wasi_ctx = WasiCtx::builder().inherit_stdio().build_p1();
+    let state = ComponentRunStates {
+        wasi_ctx: wasi_ctx,
+        resource_table: ResourceTable::new(),
+        streams: Vec::default(),
+    };
+
+    let mut store = Store::new(&engine, state);
+    linker.func_wrap("terminal_games", "triple", |x: i32| x * 3)?;
+    linker.func_wrap_async(
+        "terminal_games",
+        "dial",
+        |mut caller: Caller<'_, ComponentRunStates>, (address_ptr, address_len): (i32, u32)| {
+            Box::new(async move {
+                let mut buf = [0u8; 64];
+                if address_len >= buf.len() as u32 {
+                    anyhow::bail!("dial address too long")
+                }
+                let len = address_len as usize;
+                let offset = address_ptr as usize;
+
+                let Some(Extern::Memory(mem)) = caller.get_export("memory") else {
+                    anyhow::bail!("failed to find host memory");
+                };
+
+                if let Err(_) = mem.read(&mut caller, offset, &mut buf[..len]) {
+                    anyhow::bail!("failed to write to host memory");
+                }
+                let address = String::from_utf8_lossy(&buf[..len]);
+                println!("dial {:?}", address);
+
+                // let mut x = Box::pin(tokio::net::TcpStream::connect(address.as_ref()));
+                // let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                let stream = match tokio::net::TcpStream::connect(address.as_ref()).await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        return {
+                            println!("tokio tcpstream connect {}", err);
+                            Ok(-1)
+                        };
+                    }
+                };
+                caller.data_mut().streams.push(stream);
+
+                Ok(0)
+            })
+        },
+    )?;
+    linker.func_wrap_async(
+        "terminal_games",
+        "dial_write",
+        |mut caller: Caller<'_, ComponentRunStates>,
+         (conn_id, address_ptr, address_len): (i32, i32, u32)| {
+            Box::new(async move {
+                println!("writing {} {}", conn_id, address_len);
+                let mut buf = [0u8; 4 * 1024];
+                if address_len >= buf.len() as u32 {
+                    anyhow::bail!("dial address too long")
+                }
+                let len = address_len as usize;
+                let offset = address_ptr as usize;
+
+                let Some(Extern::Memory(mem)) = caller.get_export("memory") else {
+                    anyhow::bail!("failed to find host memory");
+                };
+
+                if let Err(_) = mem.read(&mut caller, offset, &mut buf[..len]) {
+                    anyhow::bail!("failed to write to host memory");
+                }
+
+                let Some(stream) = caller.data_mut().streams.get_mut(0) else {
+                    anyhow::bail!("failed to write to host memory");
+                };
+
+                match stream.write(&buf[..len]).await {
+                    Ok(n) => Ok(n as i32),
+                    Err(_) => anyhow::bail!("failed to write"),
+                }
+            })
+        },
+    )?;
+
+    linker.func_wrap(
+        "terminal_games",
+        "dial_read",
+        |mut caller: Caller<'_, ComponentRunStates>, conn_id: i32, ptr: i32, len: u32| {
+            let Some(stream) = caller.data_mut().streams.get_mut(0) else {
+                anyhow::bail!("failed to write to host memory");
+            };
+            // let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            // let poll_result = stream.poll_read_ready(&mut cx);
+            // println!("Read poll {:?}", poll_result);
+
+            let mut buf = [0u8; 4 * 1024];
+            let len = std::cmp::min(buf.len(), len as usize);
+            let n = match stream.try_read(&mut buf[..len]) {
+                Ok(n) => n,
+                Err(_) => return Ok(0),
+            };
+
+            let Some(Extern::Memory(mem)) = caller.get_export("memory") else {
+                anyhow::bail!("failed to find host memory");
+            };
+            let offset = ptr as u32 as usize;
+            if let Err(_) = mem.write(&mut caller, offset, &buf[..n]) {
+                anyhow::bail!("failed to write to host memory");
+            }
+            Ok(n as i32)
+        },
+    )?;
+
+    let module = Module::from_file(&engine, "examples/go/net/main.wasm")?;
+    let func = linker
+        .module_async(&mut store, "", &module)
+        .await?
+        .get_default(&mut store, "")?
+        .typed::<(), ()>(&store)?;
+
+    println!("calling");
+    match func.call_async(&mut store, ()).await {
+        Ok(()) => {}
+        Err(err) => {
+            if let Ok(err) = err.downcast::<I32Exit>() {
+                std::process::exit(err.0)
             }
         }
-    });
-
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-    terminal_games::app::terminal::add_to_linker::<_, TerminalData>(&mut linker, |s| s)?;
-
-    let wasi = WasiCtx::builder()
-        .inherit_stdin()
-        .inherit_stdout()
-        .inherit_stderr()
-        .inherit_args()
-        .build();
-
-    let args: Vec<String> = std::env::args().collect();
-    let path = &args[1];
-    _ = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open("log.txt");
-    let component = Component::from_file(&engine, path)?;
-
-    let state = ComponentRunStates {
-        wasi_ctx: wasi,
-        resource_table: ResourceTable::new(),
-        limits: MyLimiter,
-    };
-    let mut store = Store::new(&engine, state);
-    store.limiter(|state| &mut state.limits);
-    store.epoch_deadline_callback(|_| Ok(UpdateDeadline::Yield(1)));
-
-    let plugin = App::instantiate_async(&mut store, &component, &linker).await?;
-    let program_result = plugin.wasi_cli_run().call_run(&mut store).await?;
-
-    if program_result.is_err() {
-        std::process::exit(1)
     }
-
-    crossterm::terminal::disable_raw_mode()?;
 
     Ok(())
 }
