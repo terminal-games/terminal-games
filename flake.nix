@@ -18,21 +18,6 @@
           overlays = [(import rust-overlay)];
         };
 
-        wit-bindgen-go = pkgs.buildGoModule rec {
-          pname = "wit-bindgen-go";
-          version = "0.7.0";
-          subPackages = [ "cmd/wit-bindgen-go" ];
-          src = pkgs.fetchFromGitHub {
-            owner = "bytecodealliance";
-            repo = "go-modules";
-            rev = "v${version}";
-            sha256 = "sha256-bzsB0EsDNk6x1xroIQqbUy7L97JbEJHo7wASnl35X+0=";
-          };
-          vendorHash = "sha256-R4BdPlcaQBhH3cpLq//aeS3F2Qe4Z/TV/TALs6OSnAQ=";
-
-          GOWORK = "off";
-        };
-
         rust-toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
       in rec {
         devShells.default = pkgs.mkShell {
@@ -42,13 +27,12 @@
             go
             gopls
             go-tools
-            tinygo
             wasm-tools
-            wit-bindgen-go
-            wkg
             go-task
             flyctl
           ];
+          GOOS = "wasip1";
+          GOARCH = "wasm";
         };
       }
     );

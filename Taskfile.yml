@@ -1,16 +1,13 @@
 version: "3"
 
 tasks:
-  bindgen:
+  example-kitchen-sink:
+    dir: examples/kitchen-sink
     cmds:
-      - wkg wit fetch
-      - wit-bindgen-go generate --world app --out internal/gen ./terminal-games:app@0.1.0.wasm
-  example-go-basic-fetch:
-    dir: examples/go/basic
+      - GOOS=wasip1 GOARCH=wasm go build -o main.wasm .
+      - cargo run --release -- main.wasm
+  example-net:
+    dir: examples/net
     cmds:
-      - wkg wit fetch
-  example-go-basic-run:
-    dir: examples/go/basic
-    cmds:
-      - tinygo build -no-debug -target target.json -o main.wasm
-      - cargo run -p terminal-games ./main.wasm
+      - GOOS=wasip1 GOARCH=wasm go build -o main.wasm .
+      - cargo run --release -- main.wasm
