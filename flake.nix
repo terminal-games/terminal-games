@@ -24,6 +24,7 @@
           name = "terminal-games";
           packages = with pkgs; [
             rust-toolchain
+            mold
             go
             gopls
             go-tools
