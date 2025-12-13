@@ -12,6 +12,24 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::{ComponentRunStates, MyLimiter};
 
+fn create_status_bar(width: u32, height: u32) -> Vec<u8> {
+    let mut bar = Vec::new();
+    bar.extend_from_slice(b"\x1b[s");
+
+    bar.extend_from_slice(format!("\x1b[{};1H", height).as_bytes());
+    bar.extend_from_slice(b"\x1b[48;5;4m");
+    bar.extend_from_slice(b"\x1b[38;5;15m");
+
+    let text = "terminal-games";
+    let padding = width.saturating_sub(text.len() as u32);
+    bar.extend_from_slice(text.as_bytes());
+    bar.extend(std::iter::repeat(b' ').take(padding as usize));
+
+    bar.extend_from_slice(b"\x1b[0m");
+    bar.extend_from_slice(b"\x1b[u");
+    bar
+}
+
 pub struct App {
     input_channel: tokio::sync::mpsc::Sender<Vec<u8>>,
     output_receiver: Option<UnboundedReceiver<Vec<u8>>>,
@@ -28,6 +46,8 @@ pub(crate) struct AppServer {
 
 impl AppServer {
     pub async fn new() -> anyhow::Result<Self> {
+        tracing::info!("Initializing runtime");
+
         let mut config = wasmtime::Config::new();
         config.async_support(true);
         config.epoch_interruption(true);
@@ -73,10 +93,7 @@ impl AppServer {
                     let stream = match tokio::net::TcpStream::connect(address.as_ref()).await {
                         Ok(stream) => stream,
                         Err(_) => {
-                            return {
-                                // println!("tokio tcpstream connect {}", err);
-                                Ok(-1)
-                            };
+                            return Ok(-1);
                         }
                     };
                     caller.data_mut().streams.push(stream);
@@ -178,6 +195,7 @@ impl AppServer {
                         anyhow::bail!("failed to find host memory");
                     };
                     let (width, height) = *caller.data().dimensions.lock().await;
+                    let effective_height = if height > 0 { height - 1 } else { 0 };
 
                     let width_offset = width_ptr as u32 as usize;
                     if let Err(_) = mem.write(&mut caller, width_offset, &width.to_le_bytes()) {
@@ -185,7 +203,9 @@ impl AppServer {
                     }
 
                     let height_offset = height_ptr as u32 as usize;
-                    if let Err(_) = mem.write(&mut caller, height_offset, &height.to_le_bytes()) {
+                    if let Err(_) =
+                        mem.write(&mut caller, height_offset, &effective_height.to_le_bytes())
+                    {
                         anyhow::bail!("failed to write to host memory");
                     }
 
@@ -194,7 +214,9 @@ impl AppServer {
             },
         )?;
 
-        let module = wasmtime::Module::from_file(&engine, "examples/kitchen-sink/main.wasm")?;
+        let path = "examples/kitchen-sink/main.wasm";
+        tracing::info!(path, "Compiling");
+        let module = wasmtime::Module::from_file(&engine, path)?;
 
         Ok(Self {
             id: 0,
@@ -216,6 +238,7 @@ impl AppServer {
             ..Default::default()
         };
 
+        tracing::info!("Running SSH server");
         self.run_on_address(Arc::new(config), ("0.0.0.0", 2222))
             .await?;
         Ok(())
@@ -279,7 +302,7 @@ impl Server for AppServer {
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> App {
         self.id += 1;
         let id = self.id;
-        println!("new client {}", id);
+        tracing::info!(id, "new client");
 
         let (output_sender, output_receiver) = unbounded_channel::<Vec<u8>>();
 
@@ -343,13 +366,22 @@ impl Handler for App {
         if let Some(mut output_receiver) = self.output_receiver.take() {
             let handle = session.handle();
             let channel_id = channel.id();
+            let dimensions = self.dimensions.clone();
 
             tokio::spawn(async move {
                 while let Some(data) = output_receiver.recv().await {
-                    let result = handle.data(channel_id, data.into()).await;
-                    if result.is_err() {
-                        eprintln!("Failed to send output data: {result:?}");
+                    if handle.data(channel_id, data.into()).await.is_err() {
+                        eprintln!("Failed to send output data");
                         break;
+                    }
+
+                    let (width, height) = *dimensions.lock().await;
+                    if width > 0 && height > 0 {
+                        let bar = create_status_bar(width, height);
+                        if handle.data(channel_id, bar.into()).await.is_err() {
+                            eprintln!("Failed to send status bar");
+                            break;
+                        }
                     }
                 }
             });

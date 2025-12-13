@@ -103,10 +103,11 @@ func (m model) View() string {
 		hoverString = "[hello there]"
 	}
 	markedZone := zone.Mark("myId", hoverString)
-	return zone.Scan(m.mainStyle.Render(fmt.Sprintf(
+	content := m.mainStyle.Render(fmt.Sprintf(
 		"Hi. Last char: %v. Size: %vx%v Mouse: %v %v %v This program will exit in %d seconds...\n\n%v",
 		m.lastChar, m.w, m.h, m.x, m.y, markedZone, m.timeLeft, m.httpStyle.Render(m.httpBody),
-	)))
+	))
+	return zone.Scan(lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, content))
 }
 
 func tick() tea.Cmd {
