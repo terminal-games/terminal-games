@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -8,22 +9,55 @@ use russh::server::*;
 use russh::{Channel, ChannelId, Pty};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use unicode_width::UnicodeWidthStr;
+use yansi::Paint;
+use yansi::hyperlink::HyperlinkExt;
 
 use crate::{ComponentRunStates, MyLimiter};
 
-fn create_status_bar(width: u32, height: u32) -> Vec<u8> {
+fn terminal_width(str: &str) -> usize {
+    strip_ansi_escapes::strip_str(str).width()
+}
+
+fn create_status_bar(
+    width: u32,
+    height: u32,
+    tickers: Vec<String>,
+    session_start_time: std::time::Instant,
+) -> Vec<u8> {
     let mut bar = Vec::new();
     bar.extend_from_slice(b"\x1b[s");
 
     bar.extend_from_slice(format!("\x1b[{};1H", height).as_bytes());
-    bar.extend_from_slice(b"\x1b[48;5;4m");
-    bar.extend_from_slice(b"\x1b[38;5;15m");
 
-    let text = "terminal-games";
-    let padding = width.saturating_sub(text.len() as u32);
-    bar.extend_from_slice(text.as_bytes());
-    bar.extend(std::iter::repeat(b' ').take(padding as usize));
+    let active_tab = " menu ".bold().black().on_green();
+    let username = " mbund ".white().on_fixed(237);
+    let left = active_tab.to_string() + &username.to_string();
+
+    let ssh_callout = " ssh terminal-games.fly.dev ".bold().black().on_green();
+    let ticker_index =
+        ((std::time::Instant::now() - session_start_time).as_secs() / 10) as usize % tickers.len();
+    let ticker = format!(
+        " {} {}{}{} ",
+        tickers[ticker_index],
+        "•".repeat(ticker_index).fixed(241),
+        "•".fixed(249),
+        "•"
+            .repeat(tickers.len().saturating_sub(ticker_index + 1))
+            .fixed(241),
+    )
+    .on_fixed(237)
+    .wrap()
+    .to_string();
+    let right = ticker + &ssh_callout.to_string();
+
+    let padding = " "
+        .repeat((width as usize).saturating_sub(terminal_width(&left) + terminal_width(&right)))
+        .on_fixed(236)
+        .to_string();
+
+    bar.extend_from_slice((left + &padding + &right).as_bytes());
 
     bar.extend_from_slice(b"\x1b[0m");
     bar.extend_from_slice(b"\x1b[u");
@@ -31,16 +65,22 @@ fn create_status_bar(width: u32, height: u32) -> Vec<u8> {
 }
 
 pub struct App {
-    input_channel: tokio::sync::mpsc::Sender<Vec<u8>>,
-    output_receiver: Option<UnboundedReceiver<Vec<u8>>>,
+    linker: Arc<Mutex<wasmtime::Linker<ComponentRunStates>>>,
+    modules: Arc<Mutex<HashMap<String, wasmtime::Module>>>,
+    engine: wasmtime::Engine,
+    input_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    input_receiver: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     dimensions: Arc<Mutex<(u32, u32)>>,
+    username: Option<String>,
+    term: Option<String>,
+    args_sender: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
+    args_receiver: Option<tokio::sync::oneshot::Receiver<Vec<u8>>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct AppServer {
-    id: usize,
     engine: wasmtime::Engine,
-    module: wasmtime::Module,
+    modules: Arc<Mutex<HashMap<String, wasmtime::Module>>>,
     linker: Arc<Mutex<wasmtime::Linker<ComponentRunStates>>>,
 }
 
@@ -168,7 +208,7 @@ impl AppServer {
             "terminal_games",
             "terminal_read",
             move |mut caller: wasmtime::Caller<'_, ComponentRunStates>, ptr: i32, _len: u32| {
-                match caller.data_mut().input_channel.try_recv() {
+                match caller.data_mut().input_receiver.try_recv() {
                     Ok(buf) => {
                         let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory")
                         else {
@@ -214,14 +254,21 @@ impl AppServer {
             },
         )?;
 
+        let mut modules = std::collections::HashMap::new();
+
         let path = "examples/kitchen-sink/main.wasm";
         tracing::info!(path, "Compiling");
         let module = wasmtime::Module::from_file(&engine, path)?;
+        modules.insert("kitchen-sink".to_string(), module);
+
+        let path = "examples/net/main.wasm";
+        tracing::info!(path, "Compiling");
+        let module = wasmtime::Module::from_file(&engine, path)?;
+        modules.insert("net".to_string(), module);
 
         Ok(Self {
-            id: 0,
             engine,
-            module,
+            modules: Arc::new(Mutex::new(modules)),
             linker: Arc::new(Mutex::new(linker)),
         })
     }
@@ -300,57 +347,22 @@ impl wasmtime_wasi::cli::IsTerminal for MyStdoutStream {
 impl Server for AppServer {
     type Handler = App;
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> App {
-        self.id += 1;
-        let id = self.id;
-        tracing::info!(id, "new client");
-
-        let (output_sender, output_receiver) = unbounded_channel::<Vec<u8>>();
-
-        let wasi_ctx = wasmtime_wasi::WasiCtx::builder()
-            .stdout(MyStdoutStream {
-                sender: output_sender,
-            })
-            .build_p1();
-
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-
         let dimensions = Arc::new(Mutex::new((0, 0)));
 
-        let state = ComponentRunStates {
-            wasi_ctx: wasi_ctx,
-            resource_table: wasmtime_wasi::ResourceTable::new(),
-            streams: Vec::default(),
-            input_channel: rx,
-            limits: MyLimiter::default(),
-            dimensions: dimensions.clone(),
-        };
-
-        let mut store = wasmtime::Store::new(&self.engine, state);
-        store.limiter(|state| &mut state.limits);
-        store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Yield(1)));
-
-        let linker = self.linker.clone();
-        let module = self.module.clone();
-        tokio::task::spawn(async move {
-            let func = {
-                let linker = linker.lock().await;
-                let instance = linker.instantiate_async(&mut store, &module).await.unwrap();
-                let func = instance
-                    .get_typed_func::<(), ()>(&mut store, "_start")
-                    .unwrap();
-                func
-            };
-
-            match func.call_async(&mut store, ()).await {
-                Ok(()) => {}
-                Err(err) => if let Ok(_err) = err.downcast::<wasmtime_wasi::I32Exit>() {},
-            }
-        });
+        let (input_sender, input_receiver) = tokio::sync::mpsc::channel(1);
+        let (args_sender, args_receiver) = tokio::sync::oneshot::channel();
 
         App {
-            input_channel: tx,
-            output_receiver: Some(output_receiver),
+            linker: self.linker.clone(),
+            modules: self.modules.clone(),
+            engine: self.engine.clone(),
+            input_sender,
+            input_receiver: Some(input_receiver),
             dimensions,
+            args_sender: Some(args_sender),
+            args_receiver: Some(args_receiver),
+            term: None,
+            username: None,
         }
     }
 }
@@ -363,34 +375,128 @@ impl Handler for App {
         channel: Channel<Msg>,
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        if let Some(mut output_receiver) = self.output_receiver.take() {
-            let handle = session.handle();
-            let channel_id = channel.id();
-            let dimensions = self.dimensions.clone();
+        let handle1 = session.handle();
+        let handle2 = session.handle();
+        let channel_id = channel.id();
+        let dimensions = self.dimensions.clone();
+        let engine = self.engine.clone();
+        let modules = self.modules.clone();
+        let linker = self.linker.clone();
 
-            tokio::spawn(async move {
+        // safety: nothing else takes these
+        let input_receiver = self.input_receiver.take().unwrap();
+        let mut args_receiver = self.args_receiver.take().unwrap();
+
+        tokio::task::spawn(async move {
+            // Wait for a pty request (and maybe also an exec)
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+            let (output_sender, mut output_receiver) = unbounded_channel::<Vec<u8>>();
+
+            let wasi_ctx = wasmtime_wasi::WasiCtx::builder()
+                .stdout(MyStdoutStream {
+                    sender: output_sender,
+                })
+                .build_p1();
+
+            let state = ComponentRunStates {
+                wasi_ctx: wasi_ctx,
+                resource_table: wasmtime_wasi::ResourceTable::new(),
+                streams: Vec::default(),
+                input_receiver,
+                limits: MyLimiter::default(),
+                dimensions: dimensions.clone(),
+            };
+
+            let mut store = wasmtime::Store::new(&engine, state);
+            store.limiter(|state| &mut state.limits);
+            store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Yield(1)));
+
+            let module = {
+                let modules = modules.lock().await;
+                let args = match args_receiver.try_recv() {
+                    Ok(args) => String::from_utf8_lossy(&args).to_string(),
+                    _ => "kitchen-sink".to_string(),
+                };
+                match modules.get(&args) {
+                    None => {
+                        let _ = handle1
+                            .disconnect(
+                                russh::Disconnect::ByApplication,
+                                "Game not found".to_string(),
+                                "en-US".to_string(),
+                            )
+                            .await;
+                        return;
+                    }
+                    Some(module) => module.clone(),
+                }
+            };
+
+            let session_start_time = std::time::Instant::now();
+
+            tokio::task::spawn(async move {
+                let func = {
+                    let linker = linker.lock().await;
+                    let instance = linker.instantiate_async(&mut store, &module).await.unwrap();
+                    let func = instance
+                        .get_typed_func::<(), ()>(&mut store, "_start")
+                        .unwrap();
+                    func
+                };
+
+                match func.call_async(&mut store, ()).await {
+                    Ok(()) => {}
+                    Err(err) => if let Ok(_err) = err.downcast::<wasmtime_wasi::I32Exit>() {},
+                }
+
+                let _ = handle1
+                    .disconnect(
+                        russh::Disconnect::ByApplication,
+                        "Thanks for playing!".to_string(),
+                        "en-US".to_string(),
+                    )
+                    .await;
+            });
+
+            tokio::task::spawn(async move {
                 while let Some(data) = output_receiver.recv().await {
-                    if handle.data(channel_id, data.into()).await.is_err() {
-                        eprintln!("Failed to send output data");
+                    if handle2.data(channel_id, data.into()).await.is_err() {
+                        tracing::error!("Failed to send output data");
                         break;
                     }
 
                     let (width, height) = *dimensions.lock().await;
                     if width > 0 && height > 0 {
-                        let bar = create_status_bar(width, height);
-                        if handle.data(channel_id, bar.into()).await.is_err() {
-                            eprintln!("Failed to send status bar");
+                        let bar = create_status_bar(
+                            width,
+                            height,
+                            vec![
+                                "Check out the new Terminal Miner v0.1".to_string(),
+                                format!("Link test {}", "example.com".link("https://example.com"))
+                                    .to_string(),
+                            ],
+                            session_start_time,
+                        );
+                        if handle2.data(channel_id, bar.into()).await.is_err() {
+                            tracing::error!("Failed to send status bar");
                             break;
                         }
                     }
                 }
             });
-        }
+        });
+
+        tracing::info!(
+            remote_sshid = String::from_utf8_lossy(session.remote_sshid()).as_ref(),
+            "open_session"
+        );
 
         Ok(true)
     }
 
-    async fn auth_publickey(&mut self, _: &str, _: &PublicKey) -> Result<Auth, Self::Error> {
+    async fn auth_publickey(&mut self, user: &str, _: &PublicKey) -> Result<Auth, Self::Error> {
+        self.username = Some(user.to_string());
         Ok(Auth::Accept)
     }
 
@@ -400,29 +506,42 @@ impl Handler for App {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.input_channel.send(data.to_vec()).await?;
+        self.input_sender.send(data.to_vec()).await?;
 
         Ok(())
     }
 
     async fn window_change_request(
         &mut self,
-        _: ChannelId,
+        channel: ChannelId,
         col_width: u32,
         row_height: u32,
         _: u32,
         _: u32,
-        _: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
         *self.dimensions.lock().await = (col_width, row_height);
+        session.channel_success(channel)?;
+        Ok(())
+    }
 
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(args_sender) = self.args_sender.take() {
+            args_sender.send(data.to_vec()).unwrap();
+        }
+        session.channel_success(channel)?;
         Ok(())
     }
 
     async fn pty_request(
         &mut self,
         channel: ChannelId,
-        _: &str,
+        term: &str,
         col_width: u32,
         row_height: u32,
         _: u32,
@@ -431,9 +550,8 @@ impl Handler for App {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         *self.dimensions.lock().await = (col_width, row_height);
-
+        self.term = Some(term.to_string());
         session.channel_success(channel)?;
-
         Ok(())
     }
 }

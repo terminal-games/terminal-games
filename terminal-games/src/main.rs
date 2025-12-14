@@ -10,7 +10,7 @@ pub struct ComponentRunStates {
     pub wasi_ctx: WasiP1Ctx,
     pub resource_table: ResourceTable,
     streams: Vec<tokio::net::TcpStream>,
-    input_channel: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    input_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
     limits: MyLimiter,
     dimensions: Arc<Mutex<(u32, u32)>>,
 }
