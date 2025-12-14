@@ -4,7 +4,7 @@
 
 mod ssh;
 
-use std::{io::Write, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::sync::Mutex;
@@ -36,19 +36,11 @@ impl wasmtime::ResourceLimiter for MyLimiter {
         desired: usize,
         maximum: Option<usize>,
     ) -> Result<bool> {
-        let mut log = std::fs::OpenOptions::new()
-            .append(true)
-            .open("log.txt")
-            .unwrap();
-        writeln!(
-            &mut log,
-            "memory growing current={} desired={} maximum={:?}",
-            current, desired, maximum
-        )?;
+        tracing::trace!(current, desired, maximum, "memory growing");
         self.total -= current;
         self.total += desired;
         if self.total >= 32 * 1024 * 1024 {
-            writeln!(&mut log, "rejected memory grow total={}", self.total)?;
+            tracing::trace!(total = self.total, "rejected memory grow");
             return Ok(false);
         }
 
@@ -61,15 +53,7 @@ impl wasmtime::ResourceLimiter for MyLimiter {
         desired: usize,
         maximum: Option<usize>,
     ) -> Result<bool> {
-        let mut log = std::fs::OpenOptions::new()
-            .append(true)
-            .open("log.txt")
-            .unwrap();
-        writeln!(
-            &mut log,
-            "table growing current={} desired={} maximum={:?}",
-            current, desired, maximum
-        )?;
+        tracing::trace!(current, desired, maximum, "table growing");
         return Ok(true);
     }
 }
