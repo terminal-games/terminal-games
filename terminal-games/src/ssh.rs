@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use rand_core::OsRng;
@@ -23,6 +23,7 @@ fn terminal_width(str: &str) -> usize {
 fn create_status_bar(
     width: u32,
     height: u32,
+    username: &str,
     tickers: Vec<String>,
     session_start_time: std::time::Instant,
 ) -> Vec<u8> {
@@ -32,8 +33,8 @@ fn create_status_bar(
     bar.extend_from_slice(format!("\x1b[{};1H", height).as_bytes());
 
     let active_tab = " menu ".bold().black().on_green();
-    let username = " mbund ".white().on_fixed(237);
-    let left = active_tab.to_string() + &username.to_string();
+    let username = format!(" {} ", username).white().on_fixed(237).to_string();
+    let left = active_tab.to_string() + &username;
 
     let ssh_callout = " ssh terminal-games.fly.dev ".bold().black().on_green();
     let ticker_index =
@@ -71,7 +72,7 @@ pub struct App {
     input_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     input_receiver: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     dimensions: Arc<Mutex<(u32, u32)>>,
-    username: Option<String>,
+    username: Arc<OnceLock<String>>,
     term: Option<String>,
     args_sender: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
     args_receiver: Option<tokio::sync::oneshot::Receiver<Vec<u8>>>,
@@ -362,7 +363,7 @@ impl Server for AppServer {
             args_sender: Some(args_sender),
             args_receiver: Some(args_receiver),
             term: None,
-            username: None,
+            username: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -382,6 +383,7 @@ impl Handler for App {
         let engine = self.engine.clone();
         let modules = self.modules.clone();
         let linker = self.linker.clone();
+        let username = self.username.clone();
 
         // safety: nothing else takes these
         let input_receiver = self.input_receiver.take().unwrap();
@@ -468,9 +470,11 @@ impl Handler for App {
 
                     let (width, height) = *dimensions.lock().await;
                     if width > 0 && height > 0 {
+                        let username = username.get().map_or("", |v| v);
                         let bar = create_status_bar(
                             width,
                             height,
+                            username,
                             vec![
                                 "Check out the new Terminal Miner v0.1".to_string(),
                                 format!("Link test {}", "example.com".link("https://example.com"))
@@ -496,7 +500,7 @@ impl Handler for App {
     }
 
     async fn auth_publickey(&mut self, user: &str, _: &PublicKey) -> Result<Auth, Self::Error> {
-        self.username = Some(user.to_string());
+        let _ = self.username.set(user.to_string());
         Ok(Auth::Accept)
     }
 
