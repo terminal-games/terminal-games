@@ -1,13 +1,8 @@
 version: "3"
 
 tasks:
-  example-kitchen-sink:
-    dir: examples/kitchen-sink
+  dev:
     cmds:
-      - GOOS=wasip1 GOARCH=wasm go build -o main.wasm .
-      - cargo run --release -- main.wasm
-  example-net:
-    dir: examples/net
-    cmds:
-      - GOOS=wasip1 GOARCH=wasm go build -o main.wasm .
-      - cargo run --release -- main.wasm
+      - GOOS=wasip1 GOARCH=wasm go build -o ./examples/kitchen-sink/main.wasm ./examples/kitchen-sink
+      - GOOS=wasip1 GOARCH=wasm go build -o ./examples/net/main.wasm ./examples/net
+      - mold -run cargo run --release

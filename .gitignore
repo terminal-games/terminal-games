@@ -1,4 +1,3 @@
 target/
 *.wasm
-deps/
 log.txt
