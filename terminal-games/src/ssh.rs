@@ -69,10 +69,91 @@ fn create_status_bar(
     bar
 }
 
+struct ModuleCacheEntry {
+    module: wasmtime::Module,
+    ref_count: usize,
+}
+
+struct ModuleCache {
+    cache: HashMap<String, ModuleCacheEntry>,
+    engine: wasmtime::Engine,
+    db: libsql::Connection,
+}
+
+impl ModuleCache {
+    fn new(engine: wasmtime::Engine, db: libsql::Connection) -> Self {
+        Self {
+            cache: HashMap::new(),
+            engine,
+            db,
+        }
+    }
+
+    async fn get_module(&mut self, shortname: &str) -> anyhow::Result<wasmtime::Module> {
+        if let Some(entry) = self.cache.get_mut(shortname) {
+            entry.ref_count += 1;
+            tracing::debug!(
+                shortname,
+                ref_count = entry.ref_count,
+                "Module found in cache"
+            );
+            return Ok(entry.module.clone());
+        }
+
+        tracing::info!(shortname, "Fetching module from database");
+        let mut rows = self
+            .db
+            .query(
+                "SELECT path FROM games WHERE shortname = ?1",
+                libsql::params![shortname],
+            )
+            .await?;
+
+        let row = rows.next().await?;
+        let Some(row) = row else {
+            anyhow::bail!("Module '{}' not found in database", shortname);
+        };
+
+        let wasm_path: String = row.get(0)?;
+
+        tracing::info!(shortname, "Compiling module");
+        let module = wasmtime::Module::from_file(&self.engine, wasm_path)?;
+
+        self.cache.insert(
+            shortname.to_string(),
+            ModuleCacheEntry {
+                module: module.clone(),
+                ref_count: 1,
+            },
+        );
+
+        tracing::debug!(shortname, ref_count = 1, "Module added to cache");
+        Ok(module)
+    }
+
+    fn release_module(&mut self, shortname: &str) {
+        if let Some(entry) = self.cache.get_mut(shortname) {
+            entry.ref_count = entry.ref_count.saturating_sub(1);
+            tracing::debug!(
+                shortname,
+                ref_count = entry.ref_count,
+                "Module reference released"
+            );
+
+            if entry.ref_count == 0 {
+                tracing::info!(shortname, "Evicting module from cache (ref_count = 0)");
+                self.cache.remove(shortname);
+            }
+        }
+    }
+}
+
 pub struct App {
     linker: Arc<Mutex<wasmtime::Linker<ComponentRunStates>>>,
-    modules: Arc<Mutex<HashMap<String, wasmtime::Module>>>,
+    module_cache: Arc<Mutex<ModuleCache>>,
     engine: wasmtime::Engine,
+    #[allow(dead_code)]
+    db: libsql::Connection,
     input_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     input_receiver: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     dimensions: Arc<Mutex<(u32, u32)>>,
@@ -80,18 +161,43 @@ pub struct App {
     term: Option<String>,
     args_sender: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
     args_receiver: Option<tokio::sync::oneshot::Receiver<Vec<u8>>>,
+    drop_sender: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct AppServer {
     engine: wasmtime::Engine,
-    modules: Arc<Mutex<HashMap<String, wasmtime::Module>>>,
+    module_cache: Arc<Mutex<ModuleCache>>,
     linker: Arc<Mutex<wasmtime::Linker<ComponentRunStates>>>,
+    db: libsql::Connection,
 }
 
 impl AppServer {
     pub async fn new() -> anyhow::Result<Self> {
         tracing::info!("Initializing runtime");
+
+        let db = libsql::Builder::new_remote(
+            std::env::var("LIBSQL_URL").unwrap(),
+            std::env::var("LIBSQL_AUTH_TOKEN").unwrap(),
+        )
+        .build()
+        .await
+        .unwrap();
+
+        let conn = db.connect().unwrap();
+
+        let tx = conn.transaction().await.unwrap();
+        tx.execute_batch(include_str!("../libsql/migrate-001.sql"))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let _ = conn
+            .execute(
+                "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
+                libsql::params!("kitchen-sink", "examples/kitchen-sink/main.wasm"),
+            )
+            .await;
 
         let mut config = wasmtime::Config::new();
         config.async_support(true);
@@ -259,22 +365,13 @@ impl AppServer {
             },
         )?;
 
-        let mut modules = std::collections::HashMap::new();
-
-        let path = "examples/kitchen-sink/main.wasm";
-        tracing::info!(path, "Compiling");
-        let module = wasmtime::Module::from_file(&engine, path)?;
-        modules.insert("kitchen-sink".to_string(), module);
-
-        let path = "examples/net/main.wasm";
-        tracing::info!(path, "Compiling");
-        let module = wasmtime::Module::from_file(&engine, path)?;
-        modules.insert("net".to_string(), module);
+        let module_cache = ModuleCache::new(engine.clone(), conn.clone());
 
         Ok(Self {
             engine,
-            modules: Arc::new(Mutex::new(modules)),
+            module_cache: Arc::new(Mutex::new(module_cache)),
             linker: Arc::new(Mutex::new(linker)),
+            db: conn,
         })
     }
 
@@ -351,7 +448,8 @@ impl wasmtime_wasi::cli::IsTerminal for MyStdoutStream {
 
 impl Server for AppServer {
     type Handler = App;
-    fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> App {
+    fn new_client(&mut self, addr: Option<std::net::SocketAddr>) -> App {
+        tracing::info!(addr=?addr, "new_client");
         let dimensions = Arc::new(Mutex::new((0, 0)));
 
         let (input_sender, input_receiver) = tokio::sync::mpsc::channel(1);
@@ -359,8 +457,9 @@ impl Server for AppServer {
 
         App {
             linker: self.linker.clone(),
-            modules: self.modules.clone(),
+            module_cache: self.module_cache.clone(),
             engine: self.engine.clone(),
+            db: self.db.clone(),
             input_sender,
             input_receiver: Some(input_receiver),
             dimensions,
@@ -368,6 +467,7 @@ impl Server for AppServer {
             args_receiver: Some(args_receiver),
             term: None,
             username: Arc::new(OnceLock::new()),
+            drop_sender: None,
         }
     }
 }
@@ -385,9 +485,11 @@ impl Handler for App {
         let channel_id = channel.id();
         let dimensions = self.dimensions.clone();
         let engine = self.engine.clone();
-        let modules = self.modules.clone();
+        let module_cache = self.module_cache.clone();
         let linker = self.linker.clone();
         let username = self.username.clone();
+        let remote_sshid = String::from_utf8_lossy(session.remote_sshid()).to_string();
+        let db = self.db.clone();
 
         // safety: nothing else takes these
         let input_receiver = self.input_receiver.take().unwrap();
@@ -399,10 +501,30 @@ impl Handler for App {
 
             let (output_sender, mut output_receiver) = unbounded_channel::<Vec<u8>>();
 
+            let username = username.get().map(|s| s.clone()).unwrap_or_default();
+
+            let args = match args_receiver.try_recv() {
+                Ok(args) => String::from_utf8_lossy(&args).to_string(),
+                _ => "kitchen-sink".to_string(),
+            };
+
+            let mut envs = vec![];
+
+            let mut rows = db.query("SELECT name, value FROM envs JOIN games ON envs.game_id = games.id WHERE shortname = ?1", [args.as_str()]).await.unwrap();
+            while let Some(row) = rows.next().await.unwrap() {
+                let name = row.get(0).unwrap();
+                let value = row.get(1).unwrap();
+                envs.push((name, value));
+            }
+
+            envs.push(("REMOTE_SSHID".to_string(), remote_sshid));
+            envs.push(("USERNAME".to_string(), username.clone()));
+
             let wasi_ctx = wasmtime_wasi::WasiCtx::builder()
                 .stdout(MyStdoutStream {
                     sender: output_sender,
                 })
+                .envs(&envs)
                 .build_p1();
 
             let state = ComponentRunStates {
@@ -418,26 +540,26 @@ impl Handler for App {
             store.limiter(|state| &mut state.limits);
             store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Yield(1)));
 
-            let module = {
-                let modules = modules.lock().await;
-                let args = match args_receiver.try_recv() {
-                    Ok(args) => String::from_utf8_lossy(&args).to_string(),
-                    _ => "kitchen-sink".to_string(),
-                };
-                match modules.get(&args) {
-                    None => {
+            let (module, shortname) = {
+                let mut cache = module_cache.lock().await;
+                match cache.get_module(&args).await {
+                    Ok(module) => (module, args),
+                    Err(e) => {
+                        tracing::error!(error = %e, shortname = %args, "Failed to get module");
                         let _ = handle1
                             .disconnect(
                                 russh::Disconnect::ByApplication,
-                                "Game not found".to_string(),
+                                format!("Game not found: {}", e),
                                 "en-US".to_string(),
                             )
                             .await;
                         return;
                     }
-                    Some(module) => module.clone(),
                 }
             };
+
+            let module_cache_for_release = module_cache.clone();
+            let shortname_for_release = shortname.clone();
 
             let session_start_time = std::time::Instant::now();
 
@@ -454,6 +576,11 @@ impl Handler for App {
                 match func.call_async(&mut store, ()).await {
                     Ok(()) => {}
                     Err(err) => if let Ok(_err) = err.downcast::<wasmtime_wasi::I32Exit>() {},
+                }
+
+                {
+                    let mut cache = module_cache_for_release.lock().await;
+                    cache.release_module(&shortname_for_release);
                 }
 
                 let _ = handle1
@@ -474,11 +601,10 @@ impl Handler for App {
 
                     let (width, height) = *dimensions.lock().await;
                     if width > 0 && height > 0 {
-                        let username = username.get().map_or("", |v| v);
                         let bar = create_status_bar(
                             width,
                             height,
-                            username,
+                            username.as_ref(),
                             vec![
                                 "Check out the new Terminal Miner v0.1".to_string(),
                                 format!("Link test {}", "example.com".link("https://example.com"))
@@ -495,16 +621,44 @@ impl Handler for App {
             });
         });
 
-        tracing::info!(
-            remote_sshid = String::from_utf8_lossy(session.remote_sshid()).as_ref(),
-            "open_session"
-        );
-
         Ok(true)
     }
 
-    async fn auth_publickey(&mut self, user: &str, _: &PublicKey) -> Result<Auth, Self::Error> {
+    async fn auth_publickey(
+        &mut self,
+        user: &str,
+        pubkey: &PublicKey,
+    ) -> Result<Auth, Self::Error> {
         let _ = self.username.set(user.to_string());
+        let mut rows = self
+            .db
+            .query(
+                "
+                INSERT INTO users (pubkey_fingerprint, username) VALUES (?1, ?2)
+                ON CONFLICT DO UPDATE SET pubkey_fingerprint = ?1, username = ?2
+                RETURNING id
+            ",
+                libsql::params!(pubkey.fingerprint(Default::default()).as_bytes(), user),
+            )
+            .await
+            .unwrap();
+        let user_id: u64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        self.drop_sender = Some(tx);
+        let db = self.db.clone();
+        tokio::task::spawn(async move {
+            if let Ok(_) = rx.await {
+                let _ = db
+                    .execute(
+                        "UPDATE users SET session_time = session_time + 1 WHERE id = ?1",
+                        [user_id],
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
         Ok(Auth::Accept)
     }
 
@@ -561,5 +715,13 @@ impl Handler for App {
         self.term = Some(term.to_string());
         session.channel_success(channel)?;
         Ok(())
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(drop_sender) = self.drop_sender.take() {
+            let _ = drop_sender.send(());
+        }
     }
 }
