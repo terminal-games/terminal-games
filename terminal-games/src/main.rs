@@ -10,13 +10,17 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 use wasmtime_wasi::{ResourceTable, p1::WasiP1Ctx};
 
+use crate::ssh::ModuleCache;
+
 pub struct ComponentRunStates {
     pub wasi_ctx: WasiP1Ctx,
     pub resource_table: ResourceTable,
     streams: Vec<tokio::net::TcpStream>,
-    input_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
     limits: MyLimiter,
     dimensions: Arc<Mutex<(u32, u32)>>,
+    next_app_shortname: Arc<Mutex<Option<String>>>,
+    input_receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    module_cache: Arc<Mutex<ModuleCache>>,
 }
 
 struct MyLimiter {

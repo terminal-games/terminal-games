@@ -9,4 +9,5 @@ tasks:
     cmds:
       - GOOS=wasip1 GOARCH=wasm go build -o ./examples/kitchen-sink/main.wasm ./examples/kitchen-sink
       - GOOS=wasip1 GOARCH=wasm go build -o ./examples/net/main.wasm ./examples/net
+      - GOOS=wasip1 GOARCH=wasm go build -o ./cmd/menu/main.wasm ./cmd/menu
       - mold -run cargo run --release

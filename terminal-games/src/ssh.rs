@@ -4,8 +4,9 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use rand_core::OsRng;
 use russh::keys::ssh_key::{self, PublicKey};
@@ -14,6 +15,7 @@ use russh::{Channel, ChannelId, Pty};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::watch;
 use unicode_width::UnicodeWidthStr;
 use yansi::Paint;
 use yansi::hyperlink::HyperlinkExt;
@@ -28,6 +30,7 @@ fn create_status_bar(
     width: u32,
     height: u32,
     username: &str,
+    current_shortname: &str,
     tickers: Vec<String>,
     session_start_time: std::time::Instant,
 ) -> Vec<u8> {
@@ -36,7 +39,8 @@ fn create_status_bar(
 
     bar.extend_from_slice(format!("\x1b[{};1H", height).as_bytes());
 
-    let active_tab = " menu ".bold().black().on_green();
+    let active_tab_text = format!(" {} ", current_shortname);
+    let active_tab = active_tab_text.bold().black().on_green();
     let username = format!(" {} ", username).white().on_fixed(237).to_string();
     let left = active_tab.to_string() + &username;
 
@@ -72,9 +76,10 @@ fn create_status_bar(
 struct ModuleCacheEntry {
     module: wasmtime::Module,
     ref_count: usize,
+    last_zero: Option<Instant>,
 }
 
-struct ModuleCache {
+pub(crate) struct ModuleCache {
     cache: HashMap<String, ModuleCacheEntry>,
     engine: wasmtime::Engine,
     db: libsql::Connection,
@@ -92,6 +97,7 @@ impl ModuleCache {
     async fn get_module(&mut self, shortname: &str) -> anyhow::Result<wasmtime::Module> {
         if let Some(entry) = self.cache.get_mut(shortname) {
             entry.ref_count += 1;
+            entry.last_zero = None;
             tracing::debug!(
                 shortname,
                 ref_count = entry.ref_count,
@@ -124,51 +130,81 @@ impl ModuleCache {
             ModuleCacheEntry {
                 module: module.clone(),
                 ref_count: 1,
+                last_zero: None,
             },
         );
 
-        tracing::debug!(shortname, ref_count = 1, "Module added to cache");
+        tracing::info!(shortname, ref_count = 1, "Module added to cache");
         Ok(module)
     }
 
     fn release_module(&mut self, shortname: &str) {
         if let Some(entry) = self.cache.get_mut(shortname) {
             entry.ref_count = entry.ref_count.saturating_sub(1);
-            tracing::debug!(
+            if entry.ref_count == 0 {
+                entry.last_zero = Some(Instant::now());
+            }
+            tracing::info!(
                 shortname,
                 ref_count = entry.ref_count,
                 "Module reference released"
             );
+        }
+    }
 
+    fn is_warmed(&self, shortname: &str) -> bool {
+        self.cache.contains_key(shortname)
+    }
+
+    fn cleanup(&mut self) {
+        let now = Instant::now();
+        let before_len = self.cache.len();
+
+        self.cache.retain(|shortname, entry| {
             if entry.ref_count == 0 {
-                tracing::info!(shortname, "Evicting module from cache (ref_count = 0)");
-                self.cache.remove(shortname);
+                if let Some(since_zero) = entry.last_zero {
+                    if now.duration_since(since_zero) >= Duration::from_secs(30) {
+                        tracing::info!(
+                            shortname,
+                            "Evicting module from cache after 30s at refcount 0"
+                        );
+                        return false;
+                    }
+                } else {
+                    entry.last_zero = Some(now);
+                }
             }
+            true
+        });
+
+        let after_len = self.cache.len();
+        if after_len != before_len {
+            tracing::debug!(
+                removed = before_len - after_len,
+                remaining = after_len,
+                "Module cache cleanup completed"
+            );
         }
     }
 }
 
 pub struct App {
-    linker: Arc<Mutex<wasmtime::Linker<ComponentRunStates>>>,
-    module_cache: Arc<Mutex<ModuleCache>>,
-    engine: wasmtime::Engine,
-    #[allow(dead_code)]
-    db: libsql::Connection,
     input_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
-    input_receiver: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     dimensions: Arc<Mutex<(u32, u32)>>,
-    username: Arc<OnceLock<String>>,
-    term: Option<String>,
-    args_sender: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
-    args_receiver: Option<tokio::sync::oneshot::Receiver<Vec<u8>>>,
-    drop_sender: Option<tokio::sync::oneshot::Sender<()>>,
+    username: Option<tokio::sync::oneshot::Sender<String>>,
+    term: Option<tokio::sync::oneshot::Sender<String>>,
+    args: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
+    remote_sshid: Option<tokio::sync::oneshot::Sender<String>>,
+    ssh_session: Option<tokio::sync::oneshot::Sender<(Handle, ChannelId)>>,
+    drop_sender: tokio::sync::watch::Sender<()>,
+    server: AppServer,
 }
 
 #[derive(Clone)]
 pub(crate) struct AppServer {
     engine: wasmtime::Engine,
     module_cache: Arc<Mutex<ModuleCache>>,
-    linker: Arc<Mutex<wasmtime::Linker<ComponentRunStates>>>,
+    linker: Arc<wasmtime::Linker<ComponentRunStates>>,
     db: libsql::Connection,
 }
 
@@ -199,6 +235,13 @@ impl AppServer {
             )
             .await;
 
+        let _ = conn
+            .execute(
+                "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
+                libsql::params!("menu", "cmd/menu/main.wasm"),
+            )
+            .await;
+
         let mut config = wasmtime::Config::new();
         config.async_support(true);
         config.epoch_interruption(true);
@@ -215,6 +258,19 @@ impl AppServer {
                 }
             }
         });
+
+        let module_cache = ModuleCache::new(engine.clone(), conn.clone());
+        let module_cache = Arc::new(Mutex::new(module_cache));
+        {
+            let module_cache = module_cache.clone();
+            tokio::task::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let mut cache = module_cache.lock().await;
+                    cache.cleanup();
+                }
+            });
+        }
 
         let mut linker: wasmtime::Linker<ComponentRunStates> = wasmtime::Linker::new(&engine);
         wasmtime_wasi::p1::add_to_linker_async(&mut linker, |t| &mut t.wasi_ctx)?;
@@ -315,24 +371,26 @@ impl AppServer {
             },
         )?;
 
-        linker.func_wrap(
+        linker.func_wrap_async(
             "terminal_games",
             "terminal_read",
-            move |mut caller: wasmtime::Caller<'_, ComponentRunStates>, ptr: i32, _len: u32| {
-                match caller.data_mut().input_receiver.try_recv() {
-                    Ok(buf) => {
-                        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory")
-                        else {
-                            anyhow::bail!("failed to find host memory");
-                        };
-                        let offset = ptr as u32 as usize;
-                        if let Err(_) = mem.write(&mut caller, offset, &buf) {
-                            anyhow::bail!("failed to write to host memory");
+            move |mut caller: wasmtime::Caller<'_, ComponentRunStates>, (ptr, _len): (i32, u32)| {
+                Box::new(async move {
+                    match caller.data_mut().input_receiver.try_recv() {
+                        Ok(buf) => {
+                            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory")
+                            else {
+                                anyhow::bail!("failed to find host memory");
+                            };
+                            let offset = ptr as u32 as usize;
+                            if let Err(_) = mem.write(&mut caller, offset, &buf) {
+                                anyhow::bail!("failed to write to host memory");
+                            }
+                            Ok(buf.len() as i32)
                         }
-                        Ok(buf.len() as i32)
+                        Err(_) => Ok(0),
                     }
-                    Err(_) => Ok(0),
-                }
+                })
             },
         )?;
 
@@ -365,13 +423,76 @@ impl AppServer {
             },
         )?;
 
-        let module_cache = ModuleCache::new(engine.clone(), conn.clone());
+        linker.func_wrap_async(
+            "terminal_games",
+            "change_app",
+            move |mut caller: wasmtime::Caller<'_, ComponentRunStates>, (ptr, len): (i32, u32)| {
+                Box::new(async move {
+                    let len = len as usize;
+                    if len == 0 || len > 128 {
+                        return Ok(-1);
+                    }
+
+                    let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                        anyhow::bail!("failed to find host memory");
+                    };
+
+                    let mut buf = vec![0u8; len];
+                    let offset = ptr as usize;
+                    if let Err(_) = mem.read(&caller, offset, &mut buf) {
+                        anyhow::bail!("failed to read from guest memory");
+                    }
+
+                    let shortname = match String::from_utf8(buf) {
+                        Ok(s) => s,
+                        Err(_) => return Ok(-1),
+                    };
+
+                    *caller.data().next_app_shortname.lock().await = Some(shortname.clone());
+
+                    let module_cache = caller.data().module_cache.clone();
+                    tokio::task::spawn(async move {
+                        let mut cache = module_cache.lock().await;
+                        if let Err(e) = cache.get_module(&shortname).await {
+                            tracing::error!(
+                                error = %e,
+                                shortname,
+                                "Failed to warm module cache for next app"
+                            );
+                        } else {
+                            cache.release_module(&shortname);
+                            tracing::info!(shortname, "Module cache warmed for next app");
+                        }
+                    });
+
+                    Ok(0)
+                })
+            },
+        )?;
+
+        linker.func_wrap_async(
+            "terminal_games",
+            "next_app_ready",
+            move |caller: wasmtime::Caller<'_, ComponentRunStates>, (): ()| {
+                Box::new(async move {
+                    let next_app_shortname = caller.data().next_app_shortname.lock().await.clone();
+                    let shortname = match &next_app_shortname {
+                        Some(s) => s,
+                        None => return Ok(0),
+                    };
+
+                    let cache = caller.data().module_cache.lock().await;
+                    let ready = cache.is_warmed(&shortname);
+                    Ok(if ready { 1 } else { 0 })
+                })
+            },
+        )?;
 
         Ok(Self {
-            engine,
-            module_cache: Arc::new(Mutex::new(module_cache)),
-            linker: Arc::new(Mutex::new(linker)),
             db: conn,
+            engine,
+            linker: Arc::new(linker),
+            module_cache,
         })
     }
 
@@ -450,24 +571,239 @@ impl Server for AppServer {
     type Handler = App;
     fn new_client(&mut self, addr: Option<std::net::SocketAddr>) -> App {
         tracing::info!(addr=?addr, "new_client");
+
+        let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel(1);
+        let (username_sender, username_receiver) = tokio::sync::oneshot::channel::<String>();
+        let (term_sender, mut term_receiver) = tokio::sync::oneshot::channel::<String>();
+        let (args_sender, mut args_receiver) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let (remote_sshid_sender, remote_sshid_receiver) =
+            tokio::sync::oneshot::channel::<String>();
+        let (ssh_session_sender, ssh_session_receiver) =
+            tokio::sync::oneshot::channel::<(Handle, ChannelId)>();
+        let (drop_sender, mut drop_receiver) = watch::channel(());
+
         let dimensions = Arc::new(Mutex::new((0, 0)));
+        let dimensions_clone = dimensions.clone();
 
-        let (input_sender, input_receiver) = tokio::sync::mpsc::channel(1);
-        let (args_sender, args_receiver) = tokio::sync::oneshot::channel();
+        let server = self.clone();
+        tokio::task::spawn(async move {
+            let (session_handle, channel_id) = ssh_session_receiver.await.unwrap();
+            let remote_sshid = remote_sshid_receiver.await.unwrap();
+            let username = username_receiver.await.unwrap();
 
+            // todo: wait for term and args with a 1ms timeout
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            let term = term_receiver.try_recv().ok();
+            let args = args_receiver.try_recv().ok();
+
+            let (output_sender, mut output_receiver) = unbounded_channel::<Vec<u8>>();
+
+            let session_start_time = std::time::Instant::now();
+
+            let current_app_shortname = match args {
+                None => "menu".to_string(),
+                Some(args) => String::from_utf8_lossy(&args).to_string(),
+            };
+
+            let current_app_shortname = Arc::new(Mutex::new(current_app_shortname));
+            let next_app_shortname: Arc<Mutex<Option<String>>> = Default::default();
+
+            {
+                let username = username.clone();
+                let current_app_shortname = current_app_shortname.clone();
+                let dimensions = dimensions.clone();
+                let next_app_shortname = next_app_shortname.clone();
+                let session_handle = session_handle.clone();
+                tokio::task::spawn(async move {
+                    while let Some(data) = output_receiver.recv().await {
+                        let data = if next_app_shortname.lock().await.is_some() {
+                            let mut out = Vec::with_capacity(data.len());
+                            let mut i = 0;
+                            while i < data.len() {
+                                if data[i..].starts_with(b"\x1b[?1049l") {
+                                    i += b"\x1b[?1049l".len();
+                                } else {
+                                    out.push(data[i]);
+                                    i += 1;
+                                }
+                            }
+                            out
+                        } else {
+                            data
+                        };
+
+                        if session_handle.data(channel_id, data.into()).await.is_err() {
+                            tracing::error!("Failed to send output data");
+                            break;
+                        }
+
+                        let (width, height) = *dimensions.lock().await;
+                        if width > 0 && height > 0 {
+                            let bar = create_status_bar(
+                                width,
+                                height,
+                                username.as_ref(),
+                                current_app_shortname.lock().await.as_str(),
+                                vec![
+                                    "Check out the new Terminal Miner v0.1".to_string(),
+                                    format!(
+                                        "Link test {}",
+                                        "example.com".link("https://example.com")
+                                    )
+                                    .to_string(),
+                                ],
+                                session_start_time,
+                            );
+                            if session_handle.data(channel_id, bar.into()).await.is_err() {
+                                tracing::error!("Failed to send status bar");
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+
+            loop {
+                let mut envs = vec![];
+
+                let shortname = { current_app_shortname.lock().await.clone() };
+
+                let mut rows = server.db
+                    .query(
+                        "SELECT name, value FROM envs JOIN games ON envs.game_id = games.id WHERE shortname = ?1",
+                        [shortname.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                while let Some(row) = rows.next().await.unwrap() {
+                    let name = row.get(0).unwrap();
+                    let value = row.get(1).unwrap();
+                    envs.push((name, value));
+                }
+
+                envs.push(("REMOTE_SSHID".to_string(), remote_sshid.clone()));
+                envs.push(("USERNAME".to_string(), username.clone()));
+                if let Some(term) = term.clone() {
+                    envs.push(("TERM".to_string(), term));
+                }
+
+                let wasi_ctx = wasmtime_wasi::WasiCtx::builder()
+                    .stdout(MyStdoutStream {
+                        sender: output_sender.clone(),
+                    })
+                    .envs(&envs)
+                    .build_p1();
+
+                let state = ComponentRunStates {
+                    wasi_ctx,
+                    resource_table: wasmtime_wasi::ResourceTable::new(),
+                    streams: Vec::default(),
+                    limits: MyLimiter::default(),
+                    dimensions: dimensions.clone(),
+                    next_app_shortname: next_app_shortname.clone(),
+                    input_receiver,
+                    module_cache: server.module_cache.clone(),
+                };
+
+                let mut store = wasmtime::Store::new(&server.engine, state);
+                store.limiter(|state| &mut state.limits);
+                store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Yield(1)));
+
+                let module = {
+                    let mut cache = server.module_cache.lock().await;
+                    match cache.get_module(&shortname).await {
+                        Ok(module) => module,
+                        Err(e) => {
+                            tracing::error!(error = %e, shortname = %shortname, "Failed to get module");
+                            let _ = session_handle
+                                .disconnect(
+                                    russh::Disconnect::ByApplication,
+                                    format!("Game not found: {}", e),
+                                    "en-US".to_string(),
+                                )
+                                .await;
+                            return;
+                        }
+                    }
+                };
+
+                let call_result = {
+                    let func = {
+                        let instance = server
+                            .linker
+                            .instantiate_async(&mut store, &module)
+                            .await
+                            .unwrap();
+                        let func = instance
+                            .get_typed_func::<(), ()>(&mut store, "_start")
+                            .unwrap();
+                        func
+                    };
+
+                    tokio::select! {
+                        result = func.call_async(&mut store, ()) => {
+                            result
+                        }
+                        _ = drop_receiver.changed() => {
+                            tracing::info!("Drop signal received, exiting gracefully");
+                            let mut cache = server.module_cache.lock().await;
+                            cache.release_module(&shortname);
+                            break;
+                        }
+                    }
+                };
+
+                let state = store.into_data();
+                input_receiver = state.input_receiver;
+
+                {
+                    let mut cache = server.module_cache.lock().await;
+                    cache.release_module(&shortname);
+                }
+
+                if let Err(err) = call_result {
+                    match err.downcast::<wasmtime_wasi::I32Exit>() {
+                        Ok(_) => {}
+                        Err(other) => {
+                            tracing::error!(error = %other, shortname = %shortname, "Module errored");
+                            break;
+                        }
+                    }
+                }
+
+                {
+                    let mut next_app_shortname = next_app_shortname.lock().await;
+                    if let Some(next_app_shortname) = next_app_shortname.take() {
+                        *current_app_shortname.lock().await = next_app_shortname;
+                        continue;
+                    }
+                }
+
+                break;
+            }
+
+            tracing::info!("leaving session");
+
+            let _ = session_handle
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "Thanks for playing!".to_string(),
+                    "en-US".to_string(),
+                )
+                .await;
+        });
+
+        let server = self.clone();
         App {
-            linker: self.linker.clone(),
-            module_cache: self.module_cache.clone(),
-            engine: self.engine.clone(),
-            db: self.db.clone(),
+            args: Some(args_sender),
             input_sender,
-            input_receiver: Some(input_receiver),
-            dimensions,
-            args_sender: Some(args_sender),
-            args_receiver: Some(args_receiver),
-            term: None,
-            username: Arc::new(OnceLock::new()),
-            drop_sender: None,
+            term: Some(term_sender),
+            username: Some(username_sender),
+            remote_sshid: Some(remote_sshid_sender),
+            ssh_session: Some(ssh_session_sender),
+            drop_sender,
+            dimensions: dimensions_clone,
+            server,
         }
     }
 }
@@ -480,146 +816,14 @@ impl Handler for App {
         channel: Channel<Msg>,
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        let handle1 = session.handle();
-        let handle2 = session.handle();
-        let channel_id = channel.id();
-        let dimensions = self.dimensions.clone();
-        let engine = self.engine.clone();
-        let module_cache = self.module_cache.clone();
-        let linker = self.linker.clone();
-        let username = self.username.clone();
         let remote_sshid = String::from_utf8_lossy(session.remote_sshid()).to_string();
-        let db = self.db.clone();
+        if let Some(remote_sshid_sender) = self.remote_sshid.take() {
+            let _ = remote_sshid_sender.send(remote_sshid);
+        }
 
-        // safety: nothing else takes these
-        let input_receiver = self.input_receiver.take().unwrap();
-        let mut args_receiver = self.args_receiver.take().unwrap();
-
-        tokio::task::spawn(async move {
-            // Wait for a pty request (and maybe also an exec)
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-
-            let (output_sender, mut output_receiver) = unbounded_channel::<Vec<u8>>();
-
-            let username = username.get().map(|s| s.clone()).unwrap_or_default();
-
-            let args = match args_receiver.try_recv() {
-                Ok(args) => String::from_utf8_lossy(&args).to_string(),
-                _ => "kitchen-sink".to_string(),
-            };
-
-            let mut envs = vec![];
-
-            let mut rows = db.query("SELECT name, value FROM envs JOIN games ON envs.game_id = games.id WHERE shortname = ?1", [args.as_str()]).await.unwrap();
-            while let Some(row) = rows.next().await.unwrap() {
-                let name = row.get(0).unwrap();
-                let value = row.get(1).unwrap();
-                envs.push((name, value));
-            }
-
-            envs.push(("REMOTE_SSHID".to_string(), remote_sshid));
-            envs.push(("USERNAME".to_string(), username.clone()));
-
-            let wasi_ctx = wasmtime_wasi::WasiCtx::builder()
-                .stdout(MyStdoutStream {
-                    sender: output_sender,
-                })
-                .envs(&envs)
-                .build_p1();
-
-            let state = ComponentRunStates {
-                wasi_ctx: wasi_ctx,
-                resource_table: wasmtime_wasi::ResourceTable::new(),
-                streams: Vec::default(),
-                input_receiver,
-                limits: MyLimiter::default(),
-                dimensions: dimensions.clone(),
-            };
-
-            let mut store = wasmtime::Store::new(&engine, state);
-            store.limiter(|state| &mut state.limits);
-            store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Yield(1)));
-
-            let (module, shortname) = {
-                let mut cache = module_cache.lock().await;
-                match cache.get_module(&args).await {
-                    Ok(module) => (module, args),
-                    Err(e) => {
-                        tracing::error!(error = %e, shortname = %args, "Failed to get module");
-                        let _ = handle1
-                            .disconnect(
-                                russh::Disconnect::ByApplication,
-                                format!("Game not found: {}", e),
-                                "en-US".to_string(),
-                            )
-                            .await;
-                        return;
-                    }
-                }
-            };
-
-            let module_cache_for_release = module_cache.clone();
-            let shortname_for_release = shortname.clone();
-
-            let session_start_time = std::time::Instant::now();
-
-            tokio::task::spawn(async move {
-                let func = {
-                    let linker = linker.lock().await;
-                    let instance = linker.instantiate_async(&mut store, &module).await.unwrap();
-                    let func = instance
-                        .get_typed_func::<(), ()>(&mut store, "_start")
-                        .unwrap();
-                    func
-                };
-
-                match func.call_async(&mut store, ()).await {
-                    Ok(()) => {}
-                    Err(err) => if let Ok(_err) = err.downcast::<wasmtime_wasi::I32Exit>() {},
-                }
-
-                {
-                    let mut cache = module_cache_for_release.lock().await;
-                    cache.release_module(&shortname_for_release);
-                }
-
-                let _ = handle1
-                    .disconnect(
-                        russh::Disconnect::ByApplication,
-                        "Thanks for playing!".to_string(),
-                        "en-US".to_string(),
-                    )
-                    .await;
-            });
-
-            tokio::task::spawn(async move {
-                while let Some(data) = output_receiver.recv().await {
-                    if handle2.data(channel_id, data.into()).await.is_err() {
-                        tracing::error!("Failed to send output data");
-                        break;
-                    }
-
-                    let (width, height) = *dimensions.lock().await;
-                    if width > 0 && height > 0 {
-                        let bar = create_status_bar(
-                            width,
-                            height,
-                            username.as_ref(),
-                            vec![
-                                "Check out the new Terminal Miner v0.1".to_string(),
-                                format!("Link test {}", "example.com".link("https://example.com"))
-                                    .to_string(),
-                            ],
-                            session_start_time,
-                        );
-                        if handle2.data(channel_id, bar.into()).await.is_err() {
-                            tracing::error!("Failed to send status bar");
-                            break;
-                        }
-                    }
-                }
-            });
-        });
+        if let Some(ssh_session_sender) = self.ssh_session.take() {
+            let _ = ssh_session_sender.send((session.handle(), channel.id()));
+        }
 
         Ok(true)
     }
@@ -629,13 +833,19 @@ impl Handler for App {
         user: &str,
         pubkey: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        let _ = self.username.set(user.to_string());
+        tracing::info!(user, "auth_publickey");
+        if let Some(username_sender) = self.username.take() {
+            tracing::info!(user, "auth_publickey send");
+            let _ = username_sender.send(user.to_string());
+        }
+
         let mut rows = self
+            .server
             .db
             .query(
                 "
                 INSERT INTO users (pubkey_fingerprint, username) VALUES (?1, ?2)
-                ON CONFLICT DO UPDATE SET pubkey_fingerprint = ?1, username = ?2
+                ON CONFLICT DO UPDATE SET username = ?2
                 RETURNING id
             ",
                 libsql::params!(pubkey.fingerprint(Default::default()).as_bytes(), user),
@@ -643,21 +853,22 @@ impl Handler for App {
             .await
             .unwrap();
         let user_id: u64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        _ = user_id;
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        self.drop_sender = Some(tx);
-        let db = self.db.clone();
-        tokio::task::spawn(async move {
-            if let Ok(_) = rx.await {
-                let _ = db
-                    .execute(
-                        "UPDATE users SET session_time = session_time + 1 WHERE id = ?1",
-                        [user_id],
-                    )
-                    .await
-                    .unwrap();
-            }
-        });
+        // let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        // self.drop_sender = Some(tx);
+        // let db = self.db.clone();
+        // tokio::task::spawn(async move {
+        //     if let Ok(_) = rx.await {
+        //         let _ = db
+        //             .execute(
+        //                 "UPDATE users SET session_time = session_time + 1 WHERE id = ?1",
+        //                 [user_id],
+        //             )
+        //             .await
+        //             .unwrap();
+        //     }
+        // });
 
         Ok(Auth::Accept)
     }
@@ -693,8 +904,8 @@ impl Handler for App {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(args_sender) = self.args_sender.take() {
-            args_sender.send(data.to_vec()).unwrap();
+        if let Some(args_sender) = self.args.take() {
+            let _ = args_sender.send(data.to_vec());
         }
         session.channel_success(channel)?;
         Ok(())
@@ -712,7 +923,9 @@ impl Handler for App {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         *self.dimensions.lock().await = (col_width, row_height);
-        self.term = Some(term.to_string());
+        if let Some(term_sender) = self.term.take() {
+            let _ = term_sender.send(term.to_string());
+        }
         session.channel_success(channel)?;
         Ok(())
     }
@@ -720,8 +933,6 @@ impl Handler for App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        if let Some(drop_sender) = self.drop_sender.take() {
-            let _ = drop_sender.send(());
-        }
+        let _ = self.drop_sender.send(());
     }
 }
