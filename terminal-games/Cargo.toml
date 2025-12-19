@@ -15,6 +15,6 @@ tracing-subscriber = "0.3.22"
 wasmtime = "39.0.1"
 wasmtime-wasi = "39.0.1"
 yansi = { version = "1.0.1", features = ["hyperlink"] }
-unicode-width = "0.2.2"
+unicode-width = "0.2"
 strip-ansi-escapes = "0.2.1"
 libsql = "0.9.29"

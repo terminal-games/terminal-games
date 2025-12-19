@@ -242,6 +242,13 @@ impl AppServer {
             )
             .await;
 
+        let _ = conn
+            .execute(
+                "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
+                libsql::params!("ratatui", "target/wasm32-wasip1/debug/ratatui-example.wasm"),
+            )
+            .await;
+
         let mut config = wasmtime::Config::new();
         config.async_support(true);
         config.epoch_interruption(true);

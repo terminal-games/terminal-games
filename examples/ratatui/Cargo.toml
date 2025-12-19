@@ -1,0 +1,11 @@
+[package]
+name = "ratatui-example"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = { version = "0.29.0", default-features = false }
+tachyonfx = { version = "0.21.0", default-features = false, features = [
+    "wasm",
+] }
+terminput = "0.5.12"
