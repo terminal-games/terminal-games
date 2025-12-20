@@ -12,10 +12,10 @@ use rand_core::OsRng;
 use russh::keys::ssh_key::{self, PublicKey};
 use russh::server::*;
 use russh::{Channel, ChannelId, Pty};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
+use tokio_rustls::rustls::pki_types::ServerName;
 use unicode_width::UnicodeWidthStr;
 use yansi::Paint;
 use yansi::hyperlink::HyperlinkExt;
@@ -245,7 +245,10 @@ impl AppServer {
         let _ = conn
             .execute(
                 "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-                libsql::params!("ratatui", "target/wasm32-wasip1/debug/ratatui-example.wasm"),
+                libsql::params!(
+                    "ratatui",
+                    "target/wasm32-wasip1/release/ratatui-example.wasm"
+                ),
             )
             .await;
 
@@ -286,7 +289,7 @@ impl AppServer {
             "terminal_games",
             "dial",
             |mut caller: wasmtime::Caller<'_, ComponentRunStates>,
-             (address_ptr, address_len): (i32, u32)| {
+             (address_ptr, address_len, mode): (i32, u32, u32)| {
                 Box::new(async move {
                     let mut buf = [0u8; 64];
                     if address_len >= buf.len() as u32 {
@@ -304,13 +307,54 @@ impl AppServer {
                     }
                     let address = String::from_utf8_lossy(&buf[..len]);
 
-                    let stream = match tokio::net::TcpStream::connect(address.as_ref()).await {
+                    let tcp_stream = match tokio::net::TcpStream::connect(address.as_ref()).await {
                         Ok(stream) => stream,
                         Err(_) => {
+                            tracing::error!("tcp_stream");
                             return Ok(-1);
                         }
                     };
+
+                    if let Err(e) = tcp_stream.set_nodelay(true) {
+                        tracing::warn!("Failed to set nodelay: {:?}", e);
+                    }
+
+                    let stream = if mode == 1 {
+                        let hostname: String =
+                            address.split(':').next().unwrap_or(&address).to_string();
+
+                        let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
+                        root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                        let mut config = tokio_rustls::rustls::ClientConfig::builder()
+                            .with_root_certificates(root_cert_store)
+                            .with_no_client_auth();
+                        config.alpn_protocols.push(b"h2".to_vec());
+                        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+                        let dnsname = match ServerName::try_from(hostname) {
+                            Ok(name) => name,
+                            Err(_) => {
+                                tracing::error!("dnsname");
+                                return Ok(-1);
+                            }
+                        };
+
+                        let tls_stream = match connector.connect(dnsname, tcp_stream).await {
+                            Ok(stream) => stream,
+                            Err(_) => {
+                                tracing::error!("tls_stream");
+                                return Ok(-1);
+                            }
+                        };
+
+                        crate::Stream::Tls(tls_stream)
+                    } else {
+                        crate::Stream::Tcp(tcp_stream)
+                    };
+
                     caller.data_mut().streams.push(stream);
+
+                    tracing::info!(mode, "dial");
 
                     Ok((caller.data().streams.len() - 1) as i32)
                 })
@@ -324,57 +368,80 @@ impl AppServer {
                 Box::new(async move {
                     let mut buf = [0u8; 4 * 1024];
                     if address_len >= buf.len() as u32 {
-                        anyhow::bail!("address too long")
+                        tracing::error!("conn_write: address too long");
+                        return Ok(-1);
                     }
                     let len = address_len as usize;
                     let offset = address_ptr as usize;
 
                     let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                        anyhow::bail!("failed to find host memory");
+                        tracing::error!("conn_write: failed to find host memory");
+                        return Ok(-1);
                     };
 
                     if let Err(_) = mem.read(&caller, offset, &mut buf[..len]) {
-                        anyhow::bail!("failed to write to host memory");
+                        tracing::error!("conn_write: failed to read from host memory");
+                        return Ok(-1);
                     }
 
                     let Some(stream) = caller.data_mut().streams.get_mut(conn_id as usize) else {
-                        anyhow::bail!("failed to write to host memory");
+                        tracing::error!("conn_write: invalid conn_id: {}", conn_id);
+                        return Ok(-1);
                     };
+
+                    tracing::info!(len, "conn_write");
 
                     match stream.write(&buf[..len]).await {
                         Ok(n) => Ok(n as i32),
-                        Err(_) => anyhow::bail!("failed to write"),
+                        Err(e) => {
+                            tracing::error!("conn_write: stream write failed: {:?}", e);
+                            Ok(-1)
+                        }
                     }
                 })
             },
         )?;
 
-        linker.func_wrap(
+        linker.func_wrap_async(
             "terminal_games",
             "conn_read",
             |mut caller: wasmtime::Caller<'_, ComponentRunStates>,
-             conn_id: i32,
-             ptr: i32,
-             len: u32| {
-                let Some(stream) = caller.data_mut().streams.get_mut(conn_id as usize) else {
-                    anyhow::bail!("failed to write to host memory");
-                };
+             (conn_id, ptr, len): (i32, i32, u32)| {
+                Box::new(async move {
+                    let Some(stream) = caller.data_mut().streams.get_mut(conn_id as usize) else {
+                        tracing::error!("conn_read: invalid conn_id: {}", conn_id);
+                        return Ok(-1);
+                    };
 
-                let mut buf = [0u8; 4 * 1024];
-                let len = std::cmp::min(buf.len(), len as usize);
-                let n = match stream.try_read(&mut buf[..len]) {
-                    Ok(n) => n,
-                    Err(_) => return Ok(0),
-                };
+                    let mut buf = [0u8; 4 * 1024];
+                    let len = std::cmp::min(buf.len(), len as usize);
 
-                let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                    anyhow::bail!("failed to find host memory");
-                };
-                let offset = ptr as u32 as usize;
-                if let Err(_) = mem.write(&mut caller, offset, &buf[..n]) {
-                    anyhow::bail!("failed to write to host memory");
-                }
-                Ok(n as i32)
+                    let n = match stream.try_read(&mut buf[..len]) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            return Ok(0);
+                        }
+                        Err(e) => {
+                            tracing::error!("conn_read: stream read error: {:?}", e);
+                            return Ok(-1);
+                        }
+                    };
+
+                    let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                        tracing::error!("conn_read: failed to find host memory");
+                        return Ok(-1);
+                    };
+                    let offset = ptr as u32 as usize;
+                    if let Err(_) = mem.write(&mut caller, offset, &buf[..n]) {
+                        tracing::error!("conn_read: failed to write to host memory");
+                        return Ok(-1);
+                    }
+                    if n > 0 {
+                        tracing::info!(n, "conn_read");
+                    }
+
+                    Ok(n as i32)
+                })
             },
         )?;
 
@@ -579,7 +646,7 @@ impl Server for AppServer {
     fn new_client(&mut self, addr: Option<std::net::SocketAddr>) -> App {
         tracing::info!(addr=?addr, "new_client");
 
-        let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel(1);
+        let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel(100);
         let (username_sender, username_receiver) = tokio::sync::oneshot::channel::<String>();
         let (term_sender, mut term_receiver) = tokio::sync::oneshot::channel::<String>();
         let (args_sender, mut args_receiver) = tokio::sync::oneshot::channel::<Vec<u8>>();

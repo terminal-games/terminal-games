@@ -11,7 +11,7 @@ import (
 
 //go:wasmimport terminal_games dial
 //go:noescape
-func dial(address_ptr unsafe.Pointer, addressLen uint32) int32
+func dial(address_ptr unsafe.Pointer, addressLen uint32, mode uint32) int32
 
 //go:wasmimport terminal_games conn_write
 //go:noescape
@@ -69,7 +69,7 @@ func (m *WasmHostConn) Write(b []byte) (n int, err error) {
 var _ net.Conn = (*WasmHostConn)(nil)
 
 func DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	ret := dial(unsafe.Pointer(&[]byte(address)[0]), uint32(len(address)))
+	ret := dial(unsafe.Pointer(&[]byte(address)[0]), uint32(len(address)), 0)
 	if ret < 0 {
 		slog.ErrorContext(ctx, "dial error", "ret", ret)
 		return nil, errors.New("dial error")

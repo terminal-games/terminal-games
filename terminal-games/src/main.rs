@@ -12,10 +12,76 @@ use wasmtime_wasi::{ResourceTable, p1::WasiP1Ctx};
 
 use crate::ssh::ModuleCache;
 
+pub enum Stream {
+    Tcp(tokio::net::TcpStream),
+    Tls(tokio_rustls::client::TlsStream<tokio::net::TcpStream>),
+}
+
+impl Stream {
+    pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Tcp(stream) => {
+                use tokio::io::AsyncWriteExt;
+                stream.write(buf).await
+            }
+            Stream::Tls(stream) => {
+                use tokio::io::AsyncWriteExt;
+                stream.write(buf).await
+            }
+        }
+    }
+
+    pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Tcp(stream) => {
+                use tokio::io::AsyncReadExt;
+                stream.read(buf).await
+            }
+            Stream::Tls(stream) => {
+                use tokio::io::AsyncReadExt;
+                stream.read(buf).await
+            }
+        }
+    }
+
+    pub fn try_read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Tcp(stream) => stream.try_read(buf),
+            Stream::Tls(stream) => {
+                use std::pin::Pin;
+                use std::task::{Context, Poll, Waker};
+                use tokio::io::AsyncRead;
+
+                struct NoOpWaker;
+                impl std::task::Wake for NoOpWaker {
+                    fn wake(self: Arc<Self>) {}
+                }
+                let waker = Waker::from(Arc::new(NoOpWaker));
+                let mut cx = Context::from_waker(&waker);
+
+                let mut read_buf = tokio::io::ReadBuf::new(buf);
+
+                match Pin::new(stream).poll_read(&mut cx, &mut read_buf) {
+                    Poll::Ready(Ok(())) => {
+                        let filled = read_buf.filled().len();
+                        if filled == 0 {
+                            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                        } else {
+                            Ok(filled)
+                        }
+                    }
+                    Poll::Ready(Err(e)) => Err(e),
+                    Poll::Pending => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                }
+            }
+        }
+    }
+}
+
 pub struct ComponentRunStates {
     pub wasi_ctx: WasiP1Ctx,
     pub resource_table: ResourceTable,
-    streams: Vec<tokio::net::TcpStream>,
+    streams: Vec<Stream>,
     limits: MyLimiter,
     dimensions: Arc<Mutex<(u32, u32)>>,
     next_app_shortname: Arc<Mutex<Option<String>>>,

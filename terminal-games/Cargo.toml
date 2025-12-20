@@ -18,3 +18,9 @@ yansi = { version = "1.0.1", features = ["hyperlink"] }
 unicode-width = "0.2"
 strip-ansi-escapes = "0.2.1"
 libsql = "0.9.29"
+tokio-rustls = { version = "0.26.4", default-features = false, features = [
+    "tls12",
+] }
+rustls = "0.23.35"
+rustls-pki-types = "1.0.0"
+webpki-roots = "1.0.4"
