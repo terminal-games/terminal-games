@@ -66,6 +66,26 @@ pub fn terminal_read_process() -> std::io::Result<Option<terminput::Event>> {
     terminput::Event::parse_from(initialized_bytes)
 }
 
+struct TerminalReader {}
+
+impl Iterator for TerminalReader {
+    type Item = terminput::Event;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buf = [0u8; 64];
+        let written = unsafe { internal::terminal_read(buf.as_mut_ptr() as *mut u8, 64) };
+        if written < 0 {
+            return None;
+        }
+
+        match terminput::Event::parse_from(&buf[..written as usize]) {
+            Ok(Some(event)) => return Some(event),
+            Ok(None) => return None,
+            Err(_) => return None,
+        }
+    }
+}
+
 struct Conn {
     fd: i32,
     sleep: RefCell<Option<Pin<Box<tokio::time::Sleep>>>>,
@@ -123,17 +143,11 @@ impl AsyncRead for Conn {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let read_size = std::cmp::min(64, buf.remaining());
-        if read_size == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
-        let mut internal_buf = [MaybeUninit::<u8>::uninit(); 64];
         let result = unsafe {
             internal::conn_read(
                 self.fd,
-                internal_buf.as_mut_ptr() as *mut u8,
-                read_size as u32,
+                buf.unfilled_mut().as_mut_ptr() as *mut u8,
+                buf.remaining() as u32,
             )
         };
 
@@ -163,21 +177,11 @@ impl AsyncRead for Conn {
             // Data available, clear the sleep timer since we have data
             self.sleep.borrow_mut().take();
 
-            let result = result as usize;
-            if result > read_size {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "conn_read returned more bytes than requested: {} > {}",
-                        result, read_size
-                    ),
-                )));
-            }
-
-            let initialized_bytes =
-                unsafe { core::slice::from_raw_parts(internal_buf.as_ptr() as *const u8, result) };
-            buf.put_slice(initialized_bytes);
-
+            let bytes_read = result as usize;
+            // SAFETY: we initialized `bytes_read` bytes when writing directly
+            // to the `buf.unfilled_mut()` pointer in the host
+            unsafe { buf.assume_init(bytes_read) };
+            buf.advance(bytes_read);
             Poll::Ready(Ok(()))
         }
     }
@@ -272,43 +276,44 @@ async fn main() -> std::io::Result<()> {
     //     (parts, body)
     // };
 
+    let mut terminal_reader = TerminalReader {};
+
     let start = std::time::Instant::now();
-    let mut counter = 1;
+    let mut frame_counter = 1;
     let mut last_event = None;
-    loop {
+    'outer: loop {
+        let mut event_counter = 0;
+        for event in &mut terminal_reader {
+            event_counter += 1;
+            if let Some(key_event) = event.as_key() {
+                match key_event {
+                    terminput::key!(terminput::KeyCode::Char('q')) => break 'outer,
+                    _ => {}
+                }
+            }
+            last_event = Some(event);
+        }
+
         terminal.draw(|frame| {
             let area = frame.area();
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nval={:#?}\nfps={}\n",
-                    counter,
+                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nval={:#?}\nfps={}\nevent_counter={}\n",
+                    frame_counter,
                     last_event,
                     parts,
                     body,
                     val,
-                    counter as f64 / start.elapsed().as_secs_f64()
+                    frame_counter as f64 / start.elapsed().as_secs_f64(),
+                    event_counter,
                 )),
                 area,
             );
         })?;
-        if counter > 100000 {
+        if frame_counter > 100000 {
             break;
         }
-        counter += 1;
-        match terminal_read_process() {
-            Ok(Some(event)) => {
-                if let Some(key_event) = event.as_key() {
-                    match key_event {
-                        terminput::key!(terminput::KeyCode::Char('q')) => break,
-                        _ => {}
-                    }
-                }
-
-                last_event = Some(event);
-            }
-            Ok(None) => {}
-            Err(_) => {}
-        }
+        frame_counter += 1;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     std::io::stdout().write(b"\x1b[?1003l")?;

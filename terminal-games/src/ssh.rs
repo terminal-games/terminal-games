@@ -188,8 +188,52 @@ impl ModuleCache {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InputEventBuffer {
+    len: u8,
+    data: [u8; 16],
+}
+
+impl InputEventBuffer {
+    pub const fn new() -> Self {
+        Self {
+            len: 0,
+            data: [0; 16],
+        }
+    }
+
+    pub fn from_slice(slice: &[u8]) -> Result<Self, ()> {
+        if slice.len() > 16 {
+            return Err(());
+        }
+
+        let mut v = InputEventBuffer::new();
+        v.data[..slice.len()].copy_from_slice(slice);
+        v.len = slice.len() as u8;
+        Ok(v)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+}
+
+impl AsRef<[u8]> for InputEventBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.data.as_slice()
+    }
+}
+
+impl TryFrom<&[u8]> for InputEventBuffer {
+    type Error = ();
+
+    fn try_from(slice: &[u8]) -> Result<Self, Self::Error> {
+        InputEventBuffer::from_slice(slice)
+    }
+}
+
 pub struct App {
-    input_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    input_sender: tokio::sync::mpsc::Sender<InputEventBuffer>,
     dimensions: Arc<Mutex<(u32, u32)>>,
     username: Option<tokio::sync::oneshot::Sender<String>>,
     term: Option<tokio::sync::oneshot::Sender<String>>,
@@ -457,7 +501,7 @@ impl AppServer {
                                 anyhow::bail!("failed to find host memory");
                             };
                             let offset = ptr as u32 as usize;
-                            if let Err(_) = mem.write(&mut caller, offset, &buf) {
+                            if let Err(_) = mem.write(&mut caller, offset, buf.as_ref()) {
                                 anyhow::bail!("failed to write to host memory");
                             }
                             Ok(buf.len() as i32)
@@ -646,7 +690,7 @@ impl Server for AppServer {
     fn new_client(&mut self, addr: Option<std::net::SocketAddr>) -> App {
         tracing::info!(addr=?addr, "new_client");
 
-        let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel(100);
+        let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel(20);
         let (username_sender, username_receiver) = tokio::sync::oneshot::channel::<String>();
         let (term_sender, mut term_receiver) = tokio::sync::oneshot::channel::<String>();
         let (args_sender, mut args_receiver) = tokio::sync::oneshot::channel::<Vec<u8>>();
@@ -953,7 +997,9 @@ impl Handler for App {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.input_sender.send(data.to_vec()).await?;
+        if let Ok(data) = data.try_into() {
+            self.input_sender.send(data).await?;
+        }
 
         Ok(())
     }
