@@ -290,8 +290,18 @@ impl AppServer {
             .execute(
                 "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
                 libsql::params!(
-                    "ratatui",
-                    "target/wasm32-wasip1/release/ratatui-example.wasm"
+                    "rust-simple",
+                    "target/wasm32-wasip1/release/rust-simple.wasm"
+                ),
+            )
+            .await;
+
+        let _ = conn
+            .execute(
+                "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
+                libsql::params!(
+                    "rust-kitchen-sink",
+                    "target/wasm32-wasip1/release/rust-kitchen-sink.wasm"
                 ),
             )
             .await;

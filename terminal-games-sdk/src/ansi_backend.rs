@@ -13,7 +13,16 @@ use ratatui::{
     style::{Color, Modifier},
 };
 
-use crate::terminal_size;
+/// Functions in [`Backend`] which require terminal emulator API commands and
+/// cannot be done purely with ANSI escapes in [`AnsiBackend`]
+pub trait EmulatorBackend {
+    /// See [`Backend::get_cursor_position`]
+    fn get_cursor_position(&mut self) -> io::Result<Position>;
+    /// See [`Backend::size`]
+    fn size(&self) -> io::Result<Size>;
+    /// See [`Backend::window_size`]
+    fn window_size(&mut self) -> io::Result<WindowSize>;
+}
 
 /// A [`Backend`] implementation that uses pure ANSI escape sequences.
 ///
@@ -37,36 +46,30 @@ use crate::terminal_size;
 /// # std::io::Result::Ok(())
 /// ```
 #[derive(Debug, Default, Clone, Eq, PartialEq, Hash)]
-pub struct AnsiBackend<W>
+pub struct AnsiBackend<W, E>
 where
     W: Write,
+    E: EmulatorBackend,
 {
     writer: W,
+    emulator: E,
 }
 
-impl<W> AnsiBackend<W>
+impl<W, E> AnsiBackend<W, E>
 where
     W: Write,
+    E: EmulatorBackend,
 {
     /// Creates a new ANSI backend with the given writer.
-    pub const fn new(writer: W) -> Self {
-        Self { writer }
+    pub const fn new(writer: W, emulator: E) -> Self {
+        Self { writer, emulator }
     }
-
-    // /// Gets the writer.
-    // pub const fn writer(&self) -> &W {
-    //     &self.writer
-    // }
-
-    // /// Gets the writer as a mutable reference.
-    // pub fn writer_mut(&mut self) -> &mut W {
-    //     &mut self.writer
-    // }
 }
 
-impl<W> Write for AnsiBackend<W>
+impl<W, E> Write for AnsiBackend<W, E>
 where
     W: Write,
+    E: EmulatorBackend,
 {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.writer.write(buf)
@@ -77,9 +80,10 @@ where
     }
 }
 
-impl<W> Backend for AnsiBackend<W>
+impl<W, E> Backend for AnsiBackend<W, E>
 where
     W: Write,
+    E: EmulatorBackend,
 {
     fn clear(&mut self) -> io::Result<()> {
         self.clear_region(ClearType::All)
@@ -116,13 +120,11 @@ where
     fn get_cursor_position(&mut self) -> io::Result<Position> {
         // ANSI escape sequence to query cursor position: ESC[6n
         // Terminal responds with: ESC[{row};{col}R
-        // Note: This is difficult to implement reliably without terminal-specific libraries
-        // as it requires reading from stdin, which may not be available or synchronized
-        panic!("get_cursor_position");
-        // Err(io::Error::new(
-        //     io::ErrorKind::Unsupported,
-        //     "get_cursor_position requires terminal interaction not available in pure ANSI mode",
-        // ))
+        // This is difficult to implement reliably without terminal-specific libraries because
+        // it requires reading from stdin, which may not be available or synchronized. Also in
+        // some cases (like SSH), this would take a whole network round trip but this function
+        // is blocking
+        self.emulator.get_cursor_position()
     }
 
     fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
@@ -180,16 +182,11 @@ where
     }
 
     fn size(&self) -> io::Result<Size> {
-        let (width, height) = terminal_size();
-        Ok(Size { width, height })
+        self.emulator.size()
     }
 
     fn window_size(&mut self) -> io::Result<WindowSize> {
-        let (width, height) = terminal_size();
-        Ok(WindowSize {
-            columns_rows: Size { width, height },
-            pixels: Size::new(0, 0),
-        })
+        self.emulator.window_size()
     }
 
     fn flush(&mut self) -> io::Result<()> {
