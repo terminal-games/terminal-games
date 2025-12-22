@@ -8,13 +8,14 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     task::Poll,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use http_body_util::{BodyExt, Empty};
 use hyper::{Request, Version, body::Bytes};
 use hyper_util::rt::TokioIo;
-use ratatui::{Terminal, widgets::Paragraph};
+use ratatui::{Terminal, style::Color, widgets::Paragraph};
+use tachyonfx::{Interpolation, Motion, fx};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::ansi_backend::AnsiBackend;
@@ -213,75 +214,85 @@ async fn main() -> std::io::Result<()> {
 
     let val = Arc::new(AtomicBool::new(false));
 
-    // let (parts, body) = {
-    let url = "https://example.com".parse::<hyper::Uri>().unwrap();
+    let (parts, body) = {
+        let url = "https://example.com".parse::<hyper::Uri>().unwrap();
 
-    let host = url.host().expect("uri has no host");
-    let port = url.port_u16().unwrap_or(443);
+        let host = url.host().expect("uri has no host");
+        let port = url.port_u16().unwrap_or(443);
 
-    let address = format!("{}:{}", host, port);
-    let stream = Conn::dial(&address, true)?;
-    let io = TokioIo::new(stream);
-    let (mut sender, conn) = match hyper::client::conn::http2::handshake::<
-        TokioExecutor,
-        TokioIo<Conn>,
-        Empty<Bytes>,
-    >(TokioExecutor, io)
-    .await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            eprintln!("HTTP/2 handshake failed: {:?}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                format!("HTTP/2 handshake failed: {}", e),
-            ));
-        }
+        let address = format!("{}:{}", host, port);
+        let stream = Conn::dial(&address, true)?;
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = match hyper::client::conn::http2::handshake::<
+            TokioExecutor,
+            TokioIo<Conn>,
+            Empty<Bytes>,
+        >(TokioExecutor, io)
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("HTTP/2 handshake failed: {:?}", e);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!("HTTP/2 handshake failed: {}", e),
+                ));
+            }
+        };
+        let val_clone = val.clone();
+        tokio::task::spawn(async move {
+            if let Err(err) = conn.await {
+                println!("Connection failed: {:?}", err);
+            }
+            val_clone.store(true, Ordering::SeqCst);
+        });
+
+        let req = Request::builder()
+            .version(Version::HTTP_2)
+            .uri(url)
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let res = match sender.send_request(req).await {
+            Ok(res) => res,
+            Err(e) => {
+                println!("Failed to send request: {:?}", e);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!("Failed to send request: {}", e),
+                ));
+            }
+        };
+        let (parts, body) = res.into_parts();
+        let body = match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                println!("Failed to collect body: {:?}", e);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("Failed to collect body: {}", e),
+                ));
+            }
+        };
+        (parts, body)
     };
-    let val_clone = val.clone();
-    tokio::task::spawn(async move {
-        if let Err(err) = conn.await {
-            println!("Connection failed: {:?}", err);
-        }
-        val_clone.store(true, Ordering::SeqCst);
-    });
-
-    let req = Request::builder()
-        .version(Version::HTTP_2)
-        .uri(url)
-        .body(Empty::<Bytes>::new())
-        .unwrap();
-
-    let res = match sender.send_request(req).await {
-        Ok(res) => res,
-        Err(e) => {
-            println!("Failed to send request: {:?}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                format!("Failed to send request: {}", e),
-            ));
-        }
-    };
-    let (parts, body) = res.into_parts();
-    let body = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            println!("Failed to collect body: {:?}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("Failed to collect body: {}", e),
-            ));
-        }
-    };
-    //     (parts, body)
-    // };
 
     let mut terminal_reader = TerminalReader {};
 
-    let start = std::time::Instant::now();
+    let mut effects: tachyonfx::EffectManager<()> = tachyonfx::EffectManager::default();
+
+    let bg = Color::from_u32(0x282c34);
+    let fx = fx::fade_from_fg(bg, (1000, tachyonfx::Interpolation::QuadOut));
+    effects.add_effect(fx);
+
+    let start = Instant::now();
     let mut frame_counter = 1;
     let mut last_event = None;
+    let mut last_frame = Instant::now();
     'outer: loop {
+        let elapsed = last_frame.elapsed();
+        last_frame = Instant::now();
+
         let mut event_counter = 0;
         for event in &mut terminal_reader {
             event_counter += 1;
@@ -309,6 +320,7 @@ async fn main() -> std::io::Result<()> {
                 )),
                 area,
             );
+            effects.process_effects(elapsed.into(), frame.buffer_mut(), area);
         })?;
         if frame_counter > 100000 {
             break;
