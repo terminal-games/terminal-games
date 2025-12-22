@@ -1,4 +1,5 @@
 pub mod ansi_backend;
+pub mod app;
 pub mod terminal;
 
 #[cfg(feature = "network")]
@@ -11,6 +12,9 @@ mod internal {
     unsafe extern "C" {
         pub(crate) fn terminal_size(width_ptr: *mut u16, height_ptr: *mut u16);
         pub(crate) fn terminal_read(address_ptr: *mut u8, address_len: u32) -> i32;
+
+        pub(crate) fn change_app(address_ptr: *const u8, address_len: u32) -> i32;
+        pub(crate) fn next_app_ready() -> i32;
 
         #[cfg(feature = "network")]
         pub(crate) fn dial(address_ptr: *const u8, address_len: u32, mode: u32) -> i32;

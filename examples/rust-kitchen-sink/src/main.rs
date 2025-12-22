@@ -13,6 +13,7 @@ use hyper_util::rt::TokioIo;
 use ratatui::{Terminal, style::Color, widgets::Paragraph};
 use tachyonfx::fx;
 use terminal_games_sdk::{
+    app,
     network::Conn,
     terminal::{TerminalGamesBackend, TerminalReader},
     terminput,
@@ -42,7 +43,7 @@ async fn main() -> std::io::Result<()> {
     terminal.clear()?;
     std::io::stdout().write(b"\x1b[?1003h")?;
 
-    let val = Arc::new(AtomicBool::new(false));
+    let conn_done = Arc::new(AtomicBool::new(false));
 
     let (parts, body) = {
         let url = "https://example.com".parse::<hyper::Uri>().unwrap();
@@ -64,12 +65,12 @@ async fn main() -> std::io::Result<()> {
                     ));
                 }
             };
-        let val_clone = val.clone();
+        let conn_done_clone = conn_done.clone();
         tokio::task::spawn(async move {
             if let Err(err) = conn.await {
                 println!("Connection failed: {:?}", err);
             }
-            val_clone.store(true, Ordering::SeqCst);
+            conn_done_clone.store(true, Ordering::SeqCst);
         });
 
         let req = Request::builder()
@@ -124,22 +125,29 @@ async fn main() -> std::io::Result<()> {
             if let Some(key_event) = event.as_key() {
                 match key_event {
                     terminput::key!(terminput::KeyCode::Char('q')) => break 'outer,
+                    terminput::key!(terminput::KeyCode::Char('n')) => {
+                        app::change_app("kitchen-sink")?
+                    }
                     _ => {}
                 }
             }
             last_event = Some(event);
         }
 
+        if app::next_app_ready() {
+            break;
+        }
+
         terminal.draw(|frame| {
             let area = frame.area();
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nval={:#?}\nfps={}\nevent_counter={}\n",
+                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n",
                     frame_counter,
                     last_event,
                     parts,
                     body,
-                    val,
+                    conn_done,
                     frame_counter as f64 / start.elapsed().as_secs_f64(),
                     event_counter,
                 )),

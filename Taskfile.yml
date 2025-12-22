@@ -10,5 +10,6 @@ tasks:
       - CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -o ./examples/kitchen-sink/main.wasm ./examples/kitchen-sink
       - CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -o ./examples/net/main.wasm ./examples/net
       - CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -o ./cmd/menu/main.wasm ./cmd/menu
-      - cargo build --target wasm32-wasip1 --release -p ratatui
+      - cargo build --manifest-path examples/rust-kitchen-sink/Cargo.toml --target wasm32-wasip1 --release
+      - cargo build --manifest-path examples/rust-simple/Cargo.toml --target wasm32-wasip1 --release
       - mold -run cargo run --release -p terminal-games

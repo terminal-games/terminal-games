@@ -603,13 +603,19 @@ impl AppServer {
             "next_app_ready",
             move |caller: wasmtime::Caller<'_, ComponentRunStates>, (): ()| {
                 Box::new(async move {
-                    let next_app_shortname = caller.data().next_app_shortname.lock().await.clone();
+                    let next_app_shortname = match caller.data().next_app_shortname.try_lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(_) => return Ok(0),
+                    };
                     let shortname = match &next_app_shortname {
                         Some(s) => s,
                         None => return Ok(0),
                     };
 
-                    let cache = caller.data().module_cache.lock().await;
+                    let cache = match caller.data().module_cache.try_lock() {
+                        Ok(guard) => guard,
+                        Err(_) => return Ok(0), // Lock held (e.g., by get_module), return not ready
+                    };
                     let ready = cache.is_warmed(&shortname);
                     Ok(if ready { 1 } else { 0 })
                 })
