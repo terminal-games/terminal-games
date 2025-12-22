@@ -6,8 +6,6 @@ replace github.com/charmbracelet/bubbletea => github.com/terminal-games/bubblete
 
 replace github.com/muesli/termenv => github.com/amadigan/termenv v0.15.3
 
-replace github.com/xo/terminfo => github.com/terminal-games/terminfo v0.0.1
-
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0

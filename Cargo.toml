@@ -1,3 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["terminal-games"]
+members = [
+    "terminal-games",
+    "terminal-games-sdk",
+    "examples/rust-kitchen-sink",
+    "examples/rust-simple",
+]
