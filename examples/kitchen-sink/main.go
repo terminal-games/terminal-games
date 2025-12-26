@@ -109,10 +109,14 @@ func (m model) View() string {
 	}
 	markedZone := zone.Mark("myId", hoverString)
 	content := m.mainStyle.Render(fmt.Sprintf(
-		"Hi. Last char: %v. Size: %vx%v Mouse: %v %v %v This program will exit in %d seconds...\n\n%v\n\n%+v",
-		m.lastChar, m.w, m.h, m.x, m.y, markedZone, m.timeLeft, m.httpStyle.Render(m.httpBody), os.Environ(),
+		"Hi. Last char: %v. Size: %vx%v Mouse: %v %v %v %s This program will exit in %d seconds...\n\n%v\n\n%+v",
+		m.lastChar, m.w, m.h, m.x, m.y, markedZone, TerminalOSC8Link("https://example.com", "example"), m.timeLeft, m.httpStyle.Render(m.httpBody), os.Environ(),
 	))
 	return zone.Scan(lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, content))
+}
+
+func TerminalOSC8Link(link, text string) string {
+	return fmt.Sprintf("\x1b]8;;%s\x1b\\%s\x1b]8;;\x1b\\", link, text)
 }
 
 func tick() tea.Cmd {

@@ -13,9 +13,7 @@ use hyper_util::rt::TokioIo;
 use ratatui::{
     Terminal,
     style::{Color, Stylize},
-    symbols::border,
-    text::{Line, Span, Text},
-    widgets::{Block, Paragraph, Widget},
+    widgets::Paragraph,
 };
 use tachyonfx::{Interpolation, Motion, fx};
 use terminal_games_sdk::{
@@ -113,12 +111,15 @@ async fn main() -> std::io::Result<()> {
 
     let mut effects: tachyonfx::EffectManager<()> = tachyonfx::EffectManager::default();
 
-    // let bg = Color::from_u32(0x282c34);
-    // let fx = fx::fade_from_fg(bg, (1000, tachyonfx::Interpolation::QuadOut));
-    // let c = Color::from_u32(0x282c34);
     let c = Color::Green;
     let timer = (1000, Interpolation::QuadInOut);
-    let fx = fx::sweep_in(Motion::LeftToRight, 10, 5, c, timer);
+    let fx = fx::repeating(fx::ping_pong(fx::sweep_in(
+        Motion::LeftToRight,
+        10,
+        0,
+        c,
+        timer,
+    )));
     effects.add_effect(fx);
 
     let start = Instant::now();
@@ -150,43 +151,21 @@ async fn main() -> std::io::Result<()> {
 
         terminal.draw(|frame| {
             let area = frame.area();
-            // frame.render_widget(
-            //     Paragraph::new(format!(
-            //         "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}",
-            //         frame_counter,
-            //         last_event,
-            //         parts,
-            //         body,
-            //         conn_done,
-            //         frame_counter as f64 / start.elapsed().as_secs_f64(),
-            //         event_counter,
-            //         "hello there".red().on_red(),
-            //     )),
-            //     area,
-            // );
-            let title = Line::from(" Counter App Tutorial ".bold());
-            let instructions = Line::from(vec![
-                " Decrement ".into(),
-                "<Left>".blue().bold(),
-                " Increment ".into(),
-                "<Right>".blue().bold(),
-                " Quit ".into(),
-                "<Q> ".blue().bold(),
-            ]);
-            let block = Block::bordered()
-                .title(title.centered())
-                .title_bottom(instructions.centered())
-                .border_set(border::THICK);
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}",
+                    frame_counter,
+                    last_event,
+                    parts,
+                    body,
+                    conn_done,
+                    frame_counter as f64 / start.elapsed().as_secs_f64(),
+                    event_counter,
+                    "hello there".red().on_red(),
+                )),
+                area,
+            );
 
-            let counter_text = Text::from(vec![Line::from(vec![
-                "Value: ".into(),
-                1.to_string().yellow(),
-            ])]);
-
-            Paragraph::new(counter_text)
-                .centered()
-                .block(block)
-                .render(area, frame.buffer_mut());
             effects.process_effects(elapsed.into(), frame.buffer_mut(), area);
         })?;
         frame_counter += 1;
