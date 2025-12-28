@@ -10,7 +10,7 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 use wasmtime_wasi::{ResourceTable, p1::WasiP1Ctx};
 
-use crate::ssh::{InputEventBuffer, ModuleCache, ParserCallbacks};
+use crate::ssh::{InputEventBuffer, ModuleCache, Terminal};
 
 pub enum Stream {
     Tcp(tokio::net::TcpStream),
@@ -83,7 +83,7 @@ pub struct ComponentRunStates {
     pub resource_table: ResourceTable,
     streams: Vec<Stream>,
     limits: MyLimiter,
-    terminal: Arc<Mutex<vt100::Parser<ParserCallbacks>>>,
+    terminal: Arc<Mutex<Terminal>>,
     next_app_shortname: Arc<Mutex<Option<String>>>,
     input_receiver: tokio::sync::mpsc::Receiver<InputEventBuffer>,
     module_cache: Arc<Mutex<ModuleCache>>,

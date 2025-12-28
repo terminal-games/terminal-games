@@ -5,4 +5,5 @@ members = [
     "terminal-games-sdk",
     "examples/rust-kitchen-sink",
     "examples/rust-simple",
+    "headless-terminal",
 ]

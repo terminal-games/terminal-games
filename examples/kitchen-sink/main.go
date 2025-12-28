@@ -83,6 +83,9 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 				return httpBodyMsg(body)
 			}
+		case "f":
+			fmt.Fprintf(os.Stdout, "\x1b[%d;%dH%c", m.h+2, 2, 'A')
+			return m, nil
 		}
 	case tickMsg:
 		m.timeLeft--

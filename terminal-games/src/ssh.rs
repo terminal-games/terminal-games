@@ -16,27 +16,74 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 use tokio_rustls::rustls::pki_types::ServerName;
+use unicode_width::UnicodeWidthStr;
 use yansi::Paint;
 
 use crate::{ComponentRunStates, MyLimiter};
 
+pub type Terminal = headless_terminal::Parser;
+
 fn terminal_width(str: &str) -> usize {
-    strip_ansi_escapes::strip_str(str).len()
+    strip_ansi_escapes::strip_str(str).width()
+}
+
+/// Find where an incomplete escape sequence starts at the end of data.
+/// Returns None if data ends with a complete sequence or no sequence.
+fn find_incomplete_escape(data: &[u8]) -> Option<usize> {
+    // Find the last ESC (0x1B) in the data
+    let last_esc = data.iter().rposition(|&b| b == 0x1b)?;
+    let seq = &data[last_esc..];
+
+    if seq.len() == 1 {
+        // Just ESC with nothing following - incomplete
+        return Some(last_esc);
+    }
+
+    match seq[1] {
+        b'[' => {
+            // CSI sequence: ESC [ params final_byte
+            // Final byte is in range 0x40-0x7E (@ through ~)
+            for &b in &seq[2..] {
+                if b >= 0x40 && b <= 0x7E {
+                    return None; // Found final byte, sequence is complete
+                }
+                if b == 0x1b {
+                    // Another ESC before final byte - incomplete
+                    return Some(last_esc);
+                }
+            }
+            // No final byte found - incomplete
+            Some(last_esc)
+        }
+        b']' => {
+            // OSC sequence: ESC ] ... BEL  or  ESC ] ... ESC \
+            let has_bel = seq[2..].contains(&0x07);
+            let has_st = seq[2..].windows(2).any(|w| w == b"\x1b\\");
+            if has_bel || has_st {
+                None // Complete
+            } else {
+                Some(last_esc) // Incomplete
+            }
+        }
+        b if b >= 0x40 && b <= 0x5F => {
+            // Two-byte escape sequence (ESC + Fe byte), e.g. ESC 7, ESC 8
+            None // Complete
+        }
+        _ => {
+            // Unknown sequence type, assume incomplete to be safe
+            Some(last_esc)
+        }
+    }
 }
 
 fn create_status_bar(
-    width: u32,
-    height: u32,
+    width: u16,
     username: &str,
     current_shortname: &str,
-    tickers: Vec<String>,
+    tickers: &Vec<String>,
     session_start_time: std::time::Instant,
 ) -> Vec<u8> {
     let mut bar = Vec::new();
-    bar.extend_from_slice(b"\x1b[s");
-
-    bar.extend_from_slice(format!("\x1b[{};1H", height).as_bytes());
-
     let active_tab_text = format!(" {} ", current_shortname);
     let active_tab = active_tab_text.bold().black().on_green();
     let username = format!(" {} ", username).white().on_fixed(237).to_string();
@@ -65,9 +112,6 @@ fn create_status_bar(
         .to_string();
 
     bar.extend_from_slice((left + &padding + &right).as_bytes());
-
-    bar.extend_from_slice(b"\x1b[0m");
-    bar.extend_from_slice(b"\x1b[u");
     bar
 }
 
@@ -238,7 +282,7 @@ pub struct App {
     remote_sshid: Option<tokio::sync::oneshot::Sender<String>>,
     ssh_session: Option<tokio::sync::oneshot::Sender<(Handle, ChannelId)>>,
     drop_sender: tokio::sync::watch::Sender<()>,
-    terminal: Arc<Mutex<vt100::Parser<ParserCallbacks>>>,
+    terminal: Arc<Mutex<Terminal>>,
     server: AppServer,
 }
 
@@ -532,6 +576,7 @@ impl AppServer {
                     };
                     let (height, width) = caller.data().terminal.lock().await.screen().size();
                     let effective_height = if height > 0 { height - 1 } else { 0 };
+                    // let effective_height = height;
 
                     let width_offset = width_ptr as u32 as usize;
                     if let Err(_) = mem.write(&mut caller, width_offset, &width.to_le_bytes()) {
@@ -700,19 +745,6 @@ impl wasmtime_wasi::cli::IsTerminal for MyStdoutStream {
     }
 }
 
-pub struct ParserCallbacks {
-    // handle: Handle,
-    // channel_id: ChannelId,
-    // tx: UnboundedSender<Vec<u8>>,
-}
-impl vt100::Callbacks for ParserCallbacks {
-    fn unhandled_osc(&mut self, screen: &mut vt100::Screen, params: &[&[u8]]) {
-        tracing::info!(params=?params, pos=?screen.cursor_position(), "unhandled_osc");
-
-        // self.tx.send(data).unwrap();
-    }
-}
-
 impl Server for AppServer {
     type Handler = App;
     fn new_client(&mut self, addr: Option<std::net::SocketAddr>) -> App {
@@ -728,16 +760,7 @@ impl Server for AppServer {
             tokio::sync::oneshot::channel::<(Handle, ChannelId)>();
         let (drop_sender, mut drop_receiver) = watch::channel(());
 
-        // let (osc_callback_tx, mut osc_callback_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let terminal = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
-            34,
-            126,
-            0,
-            ParserCallbacks {
-                // tx: osc_callback_tx,
-            },
-        )));
+        let terminal = Arc::new(Mutex::new(headless_terminal::Parser::new(34, 126, 0)));
         let terminal_clone = terminal.clone();
         let terminal_clone2 = terminal.clone();
 
@@ -764,57 +787,134 @@ impl Server for AppServer {
             let current_app_shortname = Arc::new(Mutex::new(current_app_shortname));
             let next_app_shortname: Arc<Mutex<Option<String>>> = Default::default();
 
-            // {
-            //     let session_handle = session_handle.clone();
-            //     let channel_id = channel_id.clone();
-            //     tokio::task::spawn(async move {
-            //         while let Some(data) = osc_callback_rx.recv().await {
-            //             // tracing::info!(data=?data, "sending");
-            //             session_handle.data(channel_id, data.into()).await.unwrap();
-            //         }
-            //     });
-            // }
-
             {
                 let username = username.clone();
                 let current_app_shortname = current_app_shortname.clone();
-                let next_app_shortname = next_app_shortname.clone();
+                // let next_app_shortname = next_app_shortname.clone();
                 let session_handle = session_handle.clone();
                 tokio::task::spawn(async move {
-                    let mut data = Vec::new();
-                    data.extend_from_slice(b"\x1b[?47h"); // save screen
-                    data.extend_from_slice(b"\x1b[?1003h"); // enable mouse (including drag/hover)
-                    data.extend_from_slice(b"\x1b[>2u"); // enable kitty keyboard protocol (for key release, among others)
-                    data.extend_from_slice(b"\x1b[?25l"); // make cursor invisible
-                    session_handle.data(channel_id, data.into()).await.unwrap();
+                    let tickers = vec!["A".to_string(), "B".to_string(), "C".to_string()];
 
-                    let mut prev_screen: Option<vt100::Screen> = None;
-                    while let Some(data) = output_receiver.recv().await {
-                        let state = {
-                            let mut terminal = terminal_clone.lock().await;
-                            terminal.process(&data);
-                            let diff = if let Some(ref prev_screen) = prev_screen {
-                                if prev_screen.size() == terminal.screen().size() {
-                                    terminal.screen().state_diff(prev_screen)
-                                } else {
-                                    terminal.screen().state_formatted()
-                                }
+                    // Buffer for incomplete escape sequences that we can't send yet
+                    let mut pending_bytes: Vec<u8> = Vec::new();
+
+                    let mut prev_size: (u16, u16) = (0, 0);
+                    let mut prev_status_bar = Vec::new();
+
+                    while let Some(mut data) = output_receiver.recv().await {
+                        // Always strip exiting the alternate screen buffer.
+                        // This makes sure transitions between apps are smooth.
+                        let needle = b"\x1b[?1049l";
+                        let mut read = 0;
+                        let mut write = 0;
+                        while read < data.len() {
+                            if data[read..].starts_with(needle) {
+                                read += needle.len();
                             } else {
-                                terminal.screen().state_formatted()
-                            };
-                            prev_screen = Some(terminal.screen().to_owned());
+                                data[write] = data[read];
+                                write += 1;
+                                read += 1;
+                            }
+                        }
+                        data.truncate(write);
 
-                            diff
+                        let shortname = { current_app_shortname.lock().await.clone() };
+
+                        // Process raw data through vt100 (it handles incomplete sequences internally)
+                        let mut app_terminal = terminal_clone.lock().await;
+                        app_terminal.process(&data);
+
+                        // Prepend any pending bytes from previous incomplete sequence
+                        let full_data = if pending_bytes.is_empty() {
+                            data.to_vec()
+                        } else {
+                            let mut combined = std::mem::take(&mut pending_bytes);
+                            combined.extend_from_slice(&data);
+                            combined
                         };
-                        session_handle.data(channel_id, state.into()).await.unwrap();
+
+                        // Find where incomplete escape sequence starts (if any)
+                        let split_pos =
+                            find_incomplete_escape(&full_data).unwrap_or(full_data.len());
+
+                        // Split: complete part gets sent, incomplete part gets buffered
+                        let to_send = &full_data[..split_pos];
+                        pending_bytes = full_data[split_pos..].to_vec();
+
+                        // Only send and draw bar if we have complete data to send
+                        if !to_send.is_empty() {
+                            // Check if we need to redraw the status bar
+                            let bar = {
+                                let screen = app_terminal.screen_mut();
+                                let (height, width) = screen.size();
+
+                                let dirty = screen.take_damaged_rows();
+                                // tracing::info!(dirty=?dirty, "dirty lines");
+
+                                let status_bar = create_status_bar(
+                                    width,
+                                    &username,
+                                    &shortname,
+                                    &tickers,
+                                    session_start_time,
+                                );
+
+                                let is_overwritten = dirty.contains(&(height - 1));
+                                let is_resized = prev_size != (height, width);
+                                let is_content_changed = prev_status_bar != status_bar;
+
+                                prev_size = (height, width);
+                                prev_status_bar = status_bar.clone();
+
+                                if is_overwritten || is_resized || is_content_changed {
+                                    tracing::info!(
+                                        is_overwritten,
+                                        is_resized,
+                                        is_content_changed,
+                                        "redrawing bar"
+                                    );
+                                    let attributes = screen.attributes_formatted();
+                                    let cursor_state = screen.cursor_state_formatted();
+                                    let input_mode = screen.input_mode_formatted();
+
+                                    let mut bar = Vec::new();
+                                    // Move to last row, reset attributes, draw bar
+                                    bar.extend_from_slice(
+                                        format!("\x1b[{};1H\x1b[0m", height).as_bytes(),
+                                    );
+                                    bar.extend_from_slice(&status_bar);
+
+                                    bar.extend_from_slice(&cursor_state);
+                                    bar.extend_from_slice(&attributes);
+                                    bar.extend_from_slice(&input_mode);
+
+                                    Some(bar)
+                                } else {
+                                    None
+                                }
+                            };
+
+                            drop(app_terminal);
+
+                            // Send raw app output (pass-through)
+                            session_handle
+                                .data(channel_id, to_send.to_vec().into())
+                                .await
+                                .unwrap();
+
+                            if let Some(bar) = bar {
+                                session_handle.data(channel_id, bar.into()).await.unwrap();
+                            }
+                        }
                     }
 
-                    let mut data = Vec::new();
-                    data.extend_from_slice(b"\x1b[?25h"); // make cursor visible
-                    data.extend_from_slice(b"\x1b[<u"); // reset kitty to whatever it was before
-                    data.extend_from_slice(b"\x1b[?1003l"); // disable mouse
-                    data.extend_from_slice(b"\x1b[?47l"); // restore screen
-                    session_handle.data(channel_id, data.into()).await.unwrap();
+                    // Send any remaining pending bytes before closing
+                    if !pending_bytes.is_empty() {
+                        session_handle
+                            .data(channel_id, pending_bytes.into())
+                            .await
+                            .unwrap();
+                    }
                 });
             }
 

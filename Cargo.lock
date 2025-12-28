@@ -1608,6 +1608,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "headless-terminal"
+version = "0.1.0"
+dependencies = [
+ "itoa",
+ "unicode-width 0.2.0",
+ "vte 0.15.0",
+]
+
+[[package]]
 name = "heck"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4011,6 +4020,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures",
+ "headless-terminal",
  "libsql",
  "rand_core 0.6.4",
  "russh",
@@ -4022,7 +4032,7 @@ dependencies = [
  "tracing",
  "tracing-log",
  "tracing-subscriber",
- "vt100",
+ "unicode-width 0.2.0",
  "wasmtime",
  "wasmtime-wasi",
  "webpki-roots 1.0.4",
@@ -4537,15 +4547,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vt100"
-version = "0.16.2"
-dependencies = [
- "itoa",
- "unicode-width 0.2.0",
- "vte 0.15.0",
-]
 
 [[package]]
 name = "vte"
