@@ -27,92 +27,177 @@ fn terminal_width(str: &str) -> usize {
     strip_ansi_escapes::strip_str(str).width()
 }
 
-/// Find where an incomplete escape sequence starts at the end of data.
-/// Returns None if data ends with a complete sequence or no sequence.
-fn find_incomplete_escape(data: &[u8]) -> Option<usize> {
-    // Find the last ESC (0x1B) in the data
-    let last_esc = data.iter().rposition(|&b| b == 0x1b)?;
-    let seq = &data[last_esc..];
-
-    if seq.len() == 1 {
-        // Just ESC with nothing following - incomplete
-        return Some(last_esc);
-    }
-
-    match seq[1] {
-        b'[' => {
-            // CSI sequence: ESC [ params final_byte
-            // Final byte is in range 0x40-0x7E (@ through ~)
-            for &b in &seq[2..] {
-                if b >= 0x40 && b <= 0x7E {
-                    return None; // Found final byte, sequence is complete
-                }
-                if b == 0x1b {
-                    // Another ESC before final byte - incomplete
-                    return Some(last_esc);
-                }
-            }
-            // No final byte found - incomplete
-            Some(last_esc)
-        }
-        b']' => {
-            // OSC sequence: ESC ] ... BEL  or  ESC ] ... ESC \
-            let has_bel = seq[2..].contains(&0x07);
-            let has_st = seq[2..].windows(2).any(|w| w == b"\x1b\\");
-            if has_bel || has_st {
-                None // Complete
-            } else {
-                Some(last_esc) // Incomplete
-            }
-        }
-        b if b >= 0x40 && b <= 0x5F => {
-            // Two-byte escape sequence (ESC + Fe byte), e.g. ESC 7, ESC 8
-            None // Complete
-        }
-        _ => {
-            // Unknown sequence type, assume incomplete to be safe
-            Some(last_esc)
-        }
-    }
+struct StatusBar {
+    terminal: Arc<Mutex<Terminal>>,
+    current_app_shortname: Arc<Mutex<String>>,
+    username: String,
+    tickers: Vec<String>,
+    session_start_time: std::time::Instant,
+    prev_size: (u16, u16),
+    prev_status_bar_content: Vec<u8>,
 }
 
-fn create_status_bar(
-    width: u16,
-    username: &str,
-    current_shortname: &str,
-    tickers: &Vec<String>,
-    session_start_time: std::time::Instant,
-) -> Vec<u8> {
-    let mut bar = Vec::new();
-    let active_tab_text = format!(" {} ", current_shortname);
-    let active_tab = active_tab_text.bold().black().on_green();
-    let username = format!(" {} ", username).white().on_fixed(237).to_string();
-    let left = active_tab.to_string() + &username;
+impl StatusBar {
+    fn new(
+        terminal: Arc<Mutex<Terminal>>,
+        current_app_shortname: Arc<Mutex<String>>,
+        username: String,
+        session_start_time: std::time::Instant,
+    ) -> Self {
+        Self {
+            terminal,
+            current_app_shortname,
+            username,
+            tickers: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            session_start_time,
+            prev_size: (0, 0),
+            prev_status_bar_content: Vec::new(),
+        }
+    }
 
-    let ssh_callout = " ssh terminal-games.fly.dev ".bold().black().on_green();
-    let ticker_index =
-        ((std::time::Instant::now() - session_start_time).as_secs() / 10) as usize % tickers.len();
-    let ticker = format!(
-        " {} {}{}{} ",
-        tickers[ticker_index],
-        "•".repeat(ticker_index).fixed(241),
-        "•".fixed(249),
-        "•"
-            .repeat(tickers.len().saturating_sub(ticker_index + 1))
-            .fixed(241),
-    )
-    .on_fixed(237)
-    .wrap()
-    .to_string();
-    let right = ticker + &ssh_callout.to_string();
+    /// Creates the status bar content (text only, no escape sequences)
+    fn create_status_bar_content(&self, width: u16, shortname: &str) -> Vec<u8> {
+        let mut bar = Vec::new();
+        let active_tab_text = format!(" {} ", shortname);
+        let active_tab = active_tab_text.bold().black().on_green();
+        let username = format!(" {} ", self.username)
+            .white()
+            .on_fixed(237)
+            .to_string();
+        let left = active_tab.to_string() + &username;
 
-    let padding = " "
-        .repeat((width as usize).saturating_sub(terminal_width(&left) + terminal_width(&right)))
-        .on_fixed(236)
+        let ssh_callout = " ssh terminal-games.fly.dev ".bold().black().on_green();
+        let ticker_index = ((std::time::Instant::now() - self.session_start_time).as_secs() / 10)
+            as usize
+            % self.tickers.len();
+        let ticker = format!(
+            " {} {}{}{} ",
+            self.tickers[ticker_index],
+            "•".repeat(ticker_index).fixed(241),
+            "•".fixed(249),
+            "•"
+                .repeat(self.tickers.len().saturating_sub(ticker_index + 1))
+                .fixed(241),
+        )
+        .on_fixed(237)
+        .wrap()
         .to_string();
+        let right = ticker + &ssh_callout.to_string();
 
-    bar.extend_from_slice((left + &padding + &right).as_bytes());
-    bar
+        let padding = " "
+            .repeat((width as usize).saturating_sub(terminal_width(&left) + terminal_width(&right)))
+            .on_fixed(236)
+            .to_string();
+
+        bar.extend_from_slice((left + &padding + &right).as_bytes());
+        bar
+    }
+
+    /// Builds the full status bar bytes with escape sequences, cursor state, etc.
+    fn build_status_bar_bytes(
+        &self,
+        height: u16,
+        width: u16,
+        shortname: &str,
+        cursor_state: &[u8],
+        attributes: &[u8],
+        input_mode: &[u8],
+    ) -> Vec<u8> {
+        let status_bar_content = self.create_status_bar_content(width, shortname);
+        let mut bar = Vec::new();
+        // Move to last row, reset attributes
+        bar.extend_from_slice(format!("\x1b[{};1H\x1b[0m", height).as_bytes());
+        bar.extend_from_slice(&status_bar_content);
+        bar.extend_from_slice(cursor_state);
+        bar.extend_from_slice(attributes);
+        bar.extend_from_slice(input_mode);
+        bar
+    }
+
+    /// Gets current status bar content and checks if it changed
+    async fn get_current_status(&self) -> ((u16, u16), Vec<u8>, String) {
+        let shortname = self.current_app_shortname.lock().await.clone();
+        let app_terminal = self.terminal.lock().await;
+        let screen = app_terminal.screen();
+        let (height, width) = screen.size();
+        let status_bar_content = self.create_status_bar_content(width, &shortname);
+        ((height, width), status_bar_content, shortname)
+    }
+
+    async fn create_bytes(&mut self) -> Vec<u8> {
+        let shortname = self.current_app_shortname.lock().await.clone();
+        let mut app_terminal = self.terminal.lock().await;
+        let screen = app_terminal.screen_mut();
+        let (height, width) = screen.size();
+
+        let attributes = screen.attributes_formatted();
+        let cursor_state = screen.cursor_state_formatted();
+        let input_mode = screen.input_mode_formatted();
+
+        let status_bar_content = self.create_status_bar_content(width, &shortname);
+        let bar = self.build_status_bar_bytes(
+            height,
+            width,
+            &shortname,
+            &cursor_state,
+            &attributes,
+            &input_mode,
+        );
+
+        self.prev_size = (height, width);
+        self.prev_status_bar_content = status_bar_content;
+
+        bar
+    }
+
+    async fn append_if_needed(&mut self, data: &mut Vec<u8>, force: bool) -> bool {
+        let (size, status_bar_content, shortname) = self.get_current_status().await;
+        let (height, width) = size;
+
+        let is_resized = self.prev_size != size;
+        let is_content_changed = self.prev_status_bar_content != status_bar_content;
+        let should_append = force || is_resized || is_content_changed;
+
+        if should_append {
+            tracing::info!(
+                is_overwritten = force,
+                is_resized,
+                is_content_changed,
+                "redrawing bar"
+            );
+
+            let mut app_terminal = self.terminal.lock().await;
+            let screen = app_terminal.screen_mut();
+
+            let attributes = screen.attributes_formatted();
+            let cursor_state = screen.cursor_state_formatted();
+            let input_mode = screen.input_mode_formatted();
+
+            let bar_bytes = self.build_status_bar_bytes(
+                height,
+                width,
+                &shortname,
+                &cursor_state,
+                &attributes,
+                &input_mode,
+            );
+            data.extend_from_slice(&bar_bytes);
+
+            self.prev_size = size;
+            self.prev_status_bar_content = status_bar_content;
+
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn needs_redraw(&self) -> bool {
+        let (size, status_bar_content, _) = self.get_current_status().await;
+        let is_resized = self.prev_size != size;
+        let is_content_changed = self.prev_status_bar_content != status_bar_content;
+        is_resized || is_content_changed
+    }
 }
 
 struct ModuleCacheEntry {
@@ -284,6 +369,7 @@ pub struct App {
     drop_sender: tokio::sync::watch::Sender<()>,
     terminal: Arc<Mutex<Terminal>>,
     server: AppServer,
+    resize_signal_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 #[derive(Clone)]
@@ -759,14 +845,15 @@ impl Server for AppServer {
         let (ssh_session_sender, ssh_session_receiver) =
             tokio::sync::oneshot::channel::<(Handle, ChannelId)>();
         let (drop_sender, mut drop_receiver) = watch::channel(());
+        let (resize_signal_tx, resize_signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-        let terminal = Arc::new(Mutex::new(headless_terminal::Parser::new(34, 126, 0)));
+        let terminal = Arc::new(Mutex::new(headless_terminal::Parser::new(0, 0, 0)));
         let terminal_clone = terminal.clone();
-        let terminal_clone2 = terminal.clone();
 
         let server = self.clone();
         tokio::task::spawn(async move {
             let (session_handle, channel_id) = ssh_session_receiver.await.unwrap();
+            let mut resize_signal_rx = resize_signal_rx;
             let remote_sshid = remote_sshid_receiver.await.unwrap();
             let username = username_receiver.await.unwrap();
 
@@ -787,136 +874,100 @@ impl Server for AppServer {
             let current_app_shortname = Arc::new(Mutex::new(current_app_shortname));
             let next_app_shortname: Arc<Mutex<Option<String>>> = Default::default();
 
-            {
-                let username = username.clone();
-                let current_app_shortname = current_app_shortname.clone();
-                // let next_app_shortname = next_app_shortname.clone();
+            let status_bar = Arc::new(Mutex::new(StatusBar::new(
+                terminal_clone.clone(),
+                current_app_shortname.clone(),
+                username.clone(),
+                session_start_time,
+            )));
+
+            // output task
+            tokio::task::spawn({
+                let next_app_shortname = next_app_shortname.clone();
                 let session_handle = session_handle.clone();
-                tokio::task::spawn(async move {
-                    let tickers = vec!["A".to_string(), "B".to_string(), "C".to_string()];
-
-                    // Buffer for incomplete escape sequences that we can't send yet
-                    let mut pending_bytes: Vec<u8> = Vec::new();
-
-                    let mut prev_size: (u16, u16) = (0, 0);
-                    let mut prev_status_bar = Vec::new();
-
+                let status_bar = status_bar.clone();
+                let terminal_clone = terminal_clone.clone();
+                async move {
                     while let Some(mut data) = output_receiver.recv().await {
-                        // Always strip exiting the alternate screen buffer.
-                        // This makes sure transitions between apps are smooth.
-                        let needle = b"\x1b[?1049l";
-                        let mut read = 0;
-                        let mut write = 0;
-                        while read < data.len() {
-                            if data[read..].starts_with(needle) {
-                                read += needle.len();
-                            } else {
-                                data[write] = data[read];
-                                write += 1;
-                                read += 1;
-                            }
-                        }
-                        data.truncate(write);
-
-                        let shortname = { current_app_shortname.lock().await.clone() };
-
-                        // Process raw data through vt100 (it handles incomplete sequences internally)
-                        let mut app_terminal = terminal_clone.lock().await;
-                        app_terminal.process(&data);
-
-                        // Prepend any pending bytes from previous incomplete sequence
-                        let full_data = if pending_bytes.is_empty() {
-                            data.to_vec()
-                        } else {
-                            let mut combined = std::mem::take(&mut pending_bytes);
-                            combined.extend_from_slice(&data);
-                            combined
-                        };
-
-                        // Find where incomplete escape sequence starts (if any)
-                        let split_pos =
-                            find_incomplete_escape(&full_data).unwrap_or(full_data.len());
-
-                        // Split: complete part gets sent, incomplete part gets buffered
-                        let to_send = &full_data[..split_pos];
-                        pending_bytes = full_data[split_pos..].to_vec();
-
-                        // Only send and draw bar if we have complete data to send
-                        if !to_send.is_empty() {
-                            // Check if we need to redraw the status bar
-                            let bar = {
-                                let screen = app_terminal.screen_mut();
-                                let (height, width) = screen.size();
-
-                                let dirty = screen.take_damaged_rows();
-                                // tracing::info!(dirty=?dirty, "dirty lines");
-
-                                let status_bar = create_status_bar(
-                                    width,
-                                    &username,
-                                    &shortname,
-                                    &tickers,
-                                    session_start_time,
-                                );
-
-                                let is_overwritten = dirty.contains(&(height - 1));
-                                let is_resized = prev_size != (height, width);
-                                let is_content_changed = prev_status_bar != status_bar;
-
-                                prev_size = (height, width);
-                                prev_status_bar = status_bar.clone();
-
-                                if is_overwritten || is_resized || is_content_changed {
-                                    tracing::info!(
-                                        is_overwritten,
-                                        is_resized,
-                                        is_content_changed,
-                                        "redrawing bar"
-                                    );
-                                    let attributes = screen.attributes_formatted();
-                                    let cursor_state = screen.cursor_state_formatted();
-                                    let input_mode = screen.input_mode_formatted();
-
-                                    let mut bar = Vec::new();
-                                    // Move to last row, reset attributes, draw bar
-                                    bar.extend_from_slice(
-                                        format!("\x1b[{};1H\x1b[0m", height).as_bytes(),
-                                    );
-                                    bar.extend_from_slice(&status_bar);
-
-                                    bar.extend_from_slice(&cursor_state);
-                                    bar.extend_from_slice(&attributes);
-                                    bar.extend_from_slice(&input_mode);
-
-                                    Some(bar)
+                        if next_app_shortname.lock().await.is_some() {
+                            // Strip exiting the alternate screen buffer.
+                            // This makes sure transitions between apps are smooth.
+                            let needle = b"\x1b[?1049l";
+                            let needle2 = b"\x1b[?25h";
+                            let mut read = 0;
+                            let mut write = 0;
+                            while read < data.len() {
+                                if data[read..].starts_with(needle) {
+                                    read += needle.len();
+                                } else if data[read..].starts_with(needle2) {
+                                    read += needle2.len();
                                 } else {
-                                    None
+                                    data[write] = data[read];
+                                    write += 1;
+                                    read += 1;
                                 }
-                            };
+                            }
+                            data.truncate(write);
+                        }
 
-                            drop(app_terminal);
+                        let is_dirty = {
+                            // process raw data through the vt
+                            let mut app_terminal = terminal_clone.lock().await;
+                            app_terminal.process(&data);
 
-                            // Send raw app output (pass-through)
-                            session_handle
-                                .data(channel_id, to_send.to_vec().into())
+                            // check if status bar was overwritten
+                            let screen = app_terminal.screen_mut();
+                            let (height, _width) = screen.size();
+                            let dirty = screen.take_damaged_rows();
+                            dirty.contains(&(height - 1))
+                        };
+                        if is_dirty {
+                            status_bar
+                                .lock()
                                 .await
-                                .unwrap();
+                                .append_if_needed(&mut data, true)
+                                .await;
+                        }
 
-                            if let Some(bar) = bar {
-                                session_handle.data(channel_id, bar.into()).await.unwrap();
+                        session_handle.data(channel_id, data.into()).await.unwrap();
+                    }
+                }
+            });
+
+            // status bar task
+            tokio::task::spawn({
+                let session_handle = session_handle.clone();
+                let status_bar = status_bar.clone();
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+                    loop {
+                        tokio::select! {
+                            result = resize_signal_rx.recv() => {
+                                match result {
+                                    Some(()) => {
+                                        let bar = status_bar.lock().await.create_bytes().await;
+                                        if let Err(_) = session_handle.data(channel_id, bar.into()).await {
+                                            break;
+                                        }
+                                    }
+                                    None => {
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = interval.tick() => {
+                                if status_bar.lock().await.needs_redraw().await {
+                                    let bar = status_bar.lock().await.create_bytes().await;
+                                    if let Err(_) = session_handle.data(channel_id, bar.into()).await {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
-
-                    // Send any remaining pending bytes before closing
-                    if !pending_bytes.is_empty() {
-                        session_handle
-                            .data(channel_id, pending_bytes.into())
-                            .await
-                            .unwrap();
-                    }
-                });
-            }
+                }
+            });
 
             loop {
                 let mut envs = vec![];
@@ -954,7 +1005,7 @@ impl Server for AppServer {
                     resource_table: wasmtime_wasi::ResourceTable::new(),
                     streams: Vec::default(),
                     limits: MyLimiter::default(),
-                    terminal: terminal_clone2.clone(),
+                    terminal: terminal_clone.clone(),
                     next_app_shortname: next_app_shortname.clone(),
                     input_receiver,
                     module_cache: server.module_cache.clone(),
@@ -1059,6 +1110,7 @@ impl Server for AppServer {
             drop_sender,
             terminal,
             server,
+            resize_signal_tx: Some(resize_signal_tx),
         }
     }
 }
@@ -1156,6 +1208,10 @@ impl Handler for App {
             .await
             .screen_mut()
             .set_size(row_height as u16, col_width as u16);
+        // Notify status bar task of resize
+        if let Some(ref tx) = self.resize_signal_tx {
+            let _ = tx.send(());
+        }
         session.channel_success(channel)?;
         Ok(())
     }
@@ -1189,6 +1245,10 @@ impl Handler for App {
             .await
             .screen_mut()
             .set_size(row_height as u16, col_width as u16);
+        // Notify status bar task of resize
+        if let Some(ref tx) = self.resize_signal_tx {
+            let _ = tx.send(());
+        }
         if let Some(term_sender) = self.term.take() {
             let _ = term_sender.send(term.to_string());
         }

@@ -139,6 +139,11 @@ async fn main() -> std::io::Result<()> {
                     terminput::key!(terminput::KeyCode::Char('n')) => {
                         app::change_app("kitchen-sink")?
                     }
+                    terminput::key!(terminput::KeyCode::Char('f')) => {
+                        let size = terminal.size().unwrap();
+                        std::io::stdout()
+                            .write(format!("\x1b[{};2HA", size.height + 1).as_bytes())?;
+                    }
                     _ => {}
                 }
             }
