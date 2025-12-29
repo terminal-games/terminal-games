@@ -665,6 +665,13 @@ impl Server for AppServer {
             let remote_sshid = remote_sshid_receiver.await.unwrap();
             let username = username_receiver.await.unwrap();
 
+            // enter the alternate screen so that we aren't moving the cursor
+            // around and overwriting the original terminal
+            session_handle
+                .data(channel_id, b"\x1b[?1049h".to_vec().into())
+                .await
+                .unwrap();
+
             // todo: wait for term and args with a 1ms timeout
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             let term = term_receiver.try_recv().ok();
@@ -737,7 +744,7 @@ impl Server for AppServer {
                                 .await;
                         }
 
-                        tracing::info!(data = String::from_utf8_lossy(&data).as_ref(), "output");
+                        // tracing::info!(data = String::from_utf8_lossy(&data).as_ref(), "output");
                         session_handle.data(channel_id, data.into()).await.unwrap();
                     }
                 }
@@ -996,11 +1003,11 @@ impl Handler for App {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        tracing::info!(
-            data = String::from_utf8_lossy(&data).as_ref(),
-            len = data.len(),
-            "input"
-        );
+        // tracing::info!(
+        //     data = String::from_utf8_lossy(&data).as_ref(),
+        //     len = data.len(),
+        //     "input"
+        // );
         self.input_sender.send(data.into()).await?;
 
         Ok(())
