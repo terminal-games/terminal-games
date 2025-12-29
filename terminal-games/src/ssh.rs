@@ -137,52 +137,8 @@ impl ModuleCache {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct InputEventBuffer {
-    len: u8,
-    data: [u8; 16],
-}
-
-impl InputEventBuffer {
-    pub const fn new() -> Self {
-        Self {
-            len: 0,
-            data: [0; 16],
-        }
-    }
-
-    pub fn from_slice(slice: &[u8]) -> Result<Self, ()> {
-        if slice.len() > 16 {
-            return Err(());
-        }
-
-        let mut v = InputEventBuffer::new();
-        v.data[..slice.len()].copy_from_slice(slice);
-        v.len = slice.len() as u8;
-        Ok(v)
-    }
-
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-}
-
-impl AsRef<[u8]> for InputEventBuffer {
-    fn as_ref(&self) -> &[u8] {
-        self.data.as_slice()
-    }
-}
-
-impl TryFrom<&[u8]> for InputEventBuffer {
-    type Error = ();
-
-    fn try_from(slice: &[u8]) -> Result<Self, Self::Error> {
-        InputEventBuffer::from_slice(slice)
-    }
-}
-
 pub struct App {
-    input_sender: tokio::sync::mpsc::Sender<InputEventBuffer>,
+    input_sender: tokio::sync::mpsc::Sender<smallvec::SmallVec<[u8; 16]>>,
     username: Option<tokio::sync::oneshot::Sender<String>>,
     term: Option<tokio::sync::oneshot::Sender<String>>,
     args: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
@@ -781,6 +737,7 @@ impl Server for AppServer {
                                 .await;
                         }
 
+                        tracing::info!(data = String::from_utf8_lossy(&data).as_ref(), "output");
                         session_handle.data(channel_id, data.into()).await.unwrap();
                     }
                 }
@@ -1039,10 +996,12 @@ impl Handler for App {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // tracing::info!(data=?data, "recv");
-        if let Ok(data) = data.try_into() {
-            self.input_sender.send(data).await?;
-        }
+        tracing::info!(
+            data = String::from_utf8_lossy(&data).as_ref(),
+            len = data.len(),
+            "input"
+        );
+        self.input_sender.send(data.into()).await?;
 
         Ok(())
     }

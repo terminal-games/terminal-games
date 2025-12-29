@@ -25,3 +25,4 @@ rustls = "0.23.35"
 rustls-pki-types = "1.0.0"
 webpki-roots = "1.0.4"
 headless-terminal = { path = "../headless-terminal" }
+smallvec = "1"

@@ -11,7 +11,7 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 use wasmtime_wasi::{ResourceTable, p1::WasiP1Ctx};
 
-use crate::ssh::{InputEventBuffer, ModuleCache, Terminal};
+use crate::ssh::{ModuleCache, Terminal};
 
 pub enum Stream {
     Tcp(tokio::net::TcpStream),
@@ -86,7 +86,7 @@ pub struct ComponentRunStates {
     limits: MyLimiter,
     terminal: Arc<Mutex<Terminal>>,
     next_app_shortname: Arc<Mutex<Option<String>>>,
-    input_receiver: tokio::sync::mpsc::Receiver<InputEventBuffer>,
+    input_receiver: tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
     module_cache: Arc<Mutex<ModuleCache>>,
 }
 
