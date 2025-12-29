@@ -11,6 +11,7 @@ mod internal {
     #[link(wasm_import_module = "terminal_games")]
     unsafe extern "C" {
         pub(crate) fn terminal_size(width_ptr: *mut u16, height_ptr: *mut u16);
+        pub(crate) fn terminal_cursor(x_ptr: *mut u16, y_ptr: *mut u16);
         pub(crate) fn terminal_read(address_ptr: *mut u8, address_len: u32) -> i32;
 
         pub(crate) fn change_app(address_ptr: *const u8, address_len: u32) -> i32;

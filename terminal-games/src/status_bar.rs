@@ -85,9 +85,12 @@ impl StatusBar {
         let (height, width) = screen.size();
 
         let content = self.content(width).await;
-        if !force && self.prev_size == (height, width) && self.prev_status_bar_content == content {
+        let size_changed = self.prev_size != (height, width);
+        let content_changed = self.prev_status_bar_content != content;
+        if !force && !size_changed && !content_changed {
             return false;
         }
+        tracing::info!(force, size_changed, content_changed, "draw status bar");
 
         buf.extend_from_slice(format!("\x1b[{};1H\x1b[0m", height).as_bytes());
         buf.extend_from_slice(&content);

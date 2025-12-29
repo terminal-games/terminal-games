@@ -484,7 +484,6 @@ impl AppServer {
                     };
                     let (height, width) = caller.data().terminal.lock().await.screen().size();
                     let effective_height = if height > 0 { height - 1 } else { 0 };
-                    // let effective_height = height;
 
                     let width_offset = width_ptr as u32 as usize;
                     if let Err(_) = mem.write(&mut caller, width_offset, &width.to_le_bytes()) {
@@ -495,6 +494,37 @@ impl AppServer {
                     if let Err(_) =
                         mem.write(&mut caller, height_offset, &effective_height.to_le_bytes())
                     {
+                        anyhow::bail!("failed to write to host memory");
+                    }
+
+                    Ok(())
+                })
+            },
+        )?;
+
+        linker.func_wrap_async(
+            "terminal_games",
+            "terminal_cursor",
+            |mut caller: wasmtime::Caller<'_, ComponentRunStates>, (x_ptr, y_ptr): (i32, i32)| {
+                Box::new(async move {
+                    let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                        anyhow::bail!("failed to find host memory");
+                    };
+                    let (y, x) = caller
+                        .data()
+                        .terminal
+                        .lock()
+                        .await
+                        .screen()
+                        .cursor_position();
+
+                    let x_offset = x_ptr as u32 as usize;
+                    if let Err(_) = mem.write(&mut caller, x_offset, &x.to_le_bytes()) {
+                        anyhow::bail!("failed to write to host memory");
+                    }
+
+                    let y_offset = y_ptr as u32 as usize;
+                    if let Err(_) = mem.write(&mut caller, y_offset, &y.to_le_bytes()) {
                         anyhow::bail!("failed to write to host memory");
                     }
 
@@ -744,7 +774,11 @@ impl Server for AppServer {
                             dirty.contains(&(height - 1))
                         };
                         if is_dirty {
-                            status_bar.lock().await.maybe_render_into(&mut data, true).await;
+                            status_bar
+                                .lock()
+                                .await
+                                .maybe_render_into(&mut data, true)
+                                .await;
                         }
 
                         session_handle.data(channel_id, data.into()).await.unwrap();
