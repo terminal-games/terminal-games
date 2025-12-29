@@ -147,7 +147,7 @@ pub struct App {
     drop_sender: tokio::sync::watch::Sender<()>,
     terminal: Arc<Mutex<Terminal>>,
     server: AppServer,
-    resize_signal_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    resize_signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
 #[derive(Clone)]
@@ -705,8 +705,8 @@ impl Server for AppServer {
                 async move {
                     while let Some(mut data) = output_receiver.recv().await {
                         if next_app_shortname.lock().await.is_some() {
-                            // Strip exiting the alternate screen buffer.
-                            // This makes sure transitions between apps are smooth.
+                            // strip exiting the alternate screen buffer to make
+                            // sure transitions between apps are smooth
                             let needle = b"\x1b[?1049l";
                             let needle2 = b"\x1b[?25h";
                             let mut read = 0;
@@ -927,7 +927,7 @@ impl Server for AppServer {
             drop_sender,
             terminal,
             server,
-            resize_signal_tx: Some(resize_signal_tx),
+            resize_signal_tx,
         }
     }
 }
@@ -1027,10 +1027,7 @@ impl Handler for App {
             .await
             .screen_mut()
             .set_size(row_height as u16, col_width as u16);
-        // Notify status bar task of resize
-        if let Some(ref tx) = self.resize_signal_tx {
-            let _ = tx.send(());
-        }
+        let _ = self.resize_signal_tx.send(());
         session.channel_success(channel)?;
         Ok(())
     }
@@ -1064,10 +1061,7 @@ impl Handler for App {
             .await
             .screen_mut()
             .set_size(row_height as u16, col_width as u16);
-        // Notify status bar task of resize
-        if let Some(ref tx) = self.resize_signal_tx {
-            let _ = tx.send(());
-        }
+        let _ = self.resize_signal_tx.send(());
         if let Some(term_sender) = self.term.take() {
             let _ = term_sender.send(term.to_string());
         }
