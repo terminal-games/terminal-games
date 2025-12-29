@@ -16,189 +16,11 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 use tokio_rustls::rustls::pki_types::ServerName;
-use unicode_width::UnicodeWidthStr;
-use yansi::Paint;
 
+use crate::status_bar::StatusBar;
 use crate::{ComponentRunStates, MyLimiter};
 
 pub type Terminal = headless_terminal::Parser;
-
-fn terminal_width(str: &str) -> usize {
-    strip_ansi_escapes::strip_str(str).width()
-}
-
-struct StatusBar {
-    terminal: Arc<Mutex<Terminal>>,
-    current_app_shortname: Arc<Mutex<String>>,
-    username: String,
-    tickers: Vec<String>,
-    session_start_time: std::time::Instant,
-    prev_size: (u16, u16),
-    prev_status_bar_content: Vec<u8>,
-}
-
-impl StatusBar {
-    fn new(
-        terminal: Arc<Mutex<Terminal>>,
-        current_app_shortname: Arc<Mutex<String>>,
-        username: String,
-        session_start_time: std::time::Instant,
-    ) -> Self {
-        Self {
-            terminal,
-            current_app_shortname,
-            username,
-            tickers: vec!["A".to_string(), "B".to_string(), "C".to_string()],
-            session_start_time,
-            prev_size: (0, 0),
-            prev_status_bar_content: Vec::new(),
-        }
-    }
-
-    /// Creates the status bar content (text only, no escape sequences)
-    fn create_status_bar_content(&self, width: u16, shortname: &str) -> Vec<u8> {
-        let mut bar = Vec::new();
-        let active_tab_text = format!(" {} ", shortname);
-        let active_tab = active_tab_text.bold().black().on_green();
-        let username = format!(" {} ", self.username)
-            .white()
-            .on_fixed(237)
-            .to_string();
-        let left = active_tab.to_string() + &username;
-
-        let ssh_callout = " ssh terminal-games.fly.dev ".bold().black().on_green();
-        let ticker_index = ((std::time::Instant::now() - self.session_start_time).as_secs() / 10)
-            as usize
-            % self.tickers.len();
-        let ticker = format!(
-            " {} {}{}{} ",
-            self.tickers[ticker_index],
-            "•".repeat(ticker_index).fixed(241),
-            "•".fixed(249),
-            "•"
-                .repeat(self.tickers.len().saturating_sub(ticker_index + 1))
-                .fixed(241),
-        )
-        .on_fixed(237)
-        .wrap()
-        .to_string();
-        let right = ticker + &ssh_callout.to_string();
-
-        let padding = " "
-            .repeat((width as usize).saturating_sub(terminal_width(&left) + terminal_width(&right)))
-            .on_fixed(236)
-            .to_string();
-
-        bar.extend_from_slice((left + &padding + &right).as_bytes());
-        bar
-    }
-
-    /// Builds the full status bar bytes with escape sequences, cursor state, etc.
-    fn build_status_bar_bytes(
-        &self,
-        height: u16,
-        width: u16,
-        shortname: &str,
-        cursor_state: &[u8],
-        attributes: &[u8],
-        input_mode: &[u8],
-    ) -> Vec<u8> {
-        let status_bar_content = self.create_status_bar_content(width, shortname);
-        let mut bar = Vec::new();
-        // Move to last row, reset attributes
-        bar.extend_from_slice(format!("\x1b[{};1H\x1b[0m", height).as_bytes());
-        bar.extend_from_slice(&status_bar_content);
-        bar.extend_from_slice(cursor_state);
-        bar.extend_from_slice(attributes);
-        bar.extend_from_slice(input_mode);
-        bar
-    }
-
-    /// Gets current status bar content and checks if it changed
-    async fn get_current_status(&self) -> ((u16, u16), Vec<u8>, String) {
-        let shortname = self.current_app_shortname.lock().await.clone();
-        let app_terminal = self.terminal.lock().await;
-        let screen = app_terminal.screen();
-        let (height, width) = screen.size();
-        let status_bar_content = self.create_status_bar_content(width, &shortname);
-        ((height, width), status_bar_content, shortname)
-    }
-
-    async fn create_bytes(&mut self) -> Vec<u8> {
-        let shortname = self.current_app_shortname.lock().await.clone();
-        let mut app_terminal = self.terminal.lock().await;
-        let screen = app_terminal.screen_mut();
-        let (height, width) = screen.size();
-
-        let attributes = screen.attributes_formatted();
-        let cursor_state = screen.cursor_state_formatted();
-        let input_mode = screen.input_mode_formatted();
-
-        let status_bar_content = self.create_status_bar_content(width, &shortname);
-        let bar = self.build_status_bar_bytes(
-            height,
-            width,
-            &shortname,
-            &cursor_state,
-            &attributes,
-            &input_mode,
-        );
-
-        self.prev_size = (height, width);
-        self.prev_status_bar_content = status_bar_content;
-
-        bar
-    }
-
-    async fn append_if_needed(&mut self, data: &mut Vec<u8>, force: bool) -> bool {
-        let (size, status_bar_content, shortname) = self.get_current_status().await;
-        let (height, width) = size;
-
-        let is_resized = self.prev_size != size;
-        let is_content_changed = self.prev_status_bar_content != status_bar_content;
-        let should_append = force || is_resized || is_content_changed;
-
-        if should_append {
-            tracing::info!(
-                is_overwritten = force,
-                is_resized,
-                is_content_changed,
-                "redrawing bar"
-            );
-
-            let mut app_terminal = self.terminal.lock().await;
-            let screen = app_terminal.screen_mut();
-
-            let attributes = screen.attributes_formatted();
-            let cursor_state = screen.cursor_state_formatted();
-            let input_mode = screen.input_mode_formatted();
-
-            let bar_bytes = self.build_status_bar_bytes(
-                height,
-                width,
-                &shortname,
-                &cursor_state,
-                &attributes,
-                &input_mode,
-            );
-            data.extend_from_slice(&bar_bytes);
-
-            self.prev_size = size;
-            self.prev_status_bar_content = status_bar_content;
-
-            true
-        } else {
-            false
-        }
-    }
-
-    async fn needs_redraw(&self) -> bool {
-        let (size, status_bar_content, _) = self.get_current_status().await;
-        let is_resized = self.prev_size != size;
-        let is_content_changed = self.prev_status_bar_content != status_bar_content;
-        is_resized || is_content_changed
-    }
-}
 
 struct ModuleCacheEntry {
     module: wasmtime::Module,
@@ -922,11 +744,7 @@ impl Server for AppServer {
                             dirty.contains(&(height - 1))
                         };
                         if is_dirty {
-                            status_bar
-                                .lock()
-                                .await
-                                .append_if_needed(&mut data, true)
-                                .await;
+                            status_bar.lock().await.maybe_render_into(&mut data, true).await;
                         }
 
                         session_handle.data(channel_id, data.into()).await.unwrap();
@@ -946,8 +764,9 @@ impl Server for AppServer {
                             result = resize_signal_rx.recv() => {
                                 match result {
                                     Some(()) => {
-                                        let bar = status_bar.lock().await.create_bytes().await;
-                                        if let Err(_) = session_handle.data(channel_id, bar.into()).await {
+                                        let mut buf = Vec::new();
+                                        status_bar.lock().await.maybe_render_into(&mut buf, true).await;
+                                        if let Err(_) = session_handle.data(channel_id, buf.into()).await {
                                             break;
                                         }
                                     }
@@ -957,9 +776,9 @@ impl Server for AppServer {
                                 }
                             }
                             _ = interval.tick() => {
-                                if status_bar.lock().await.needs_redraw().await {
-                                    let bar = status_bar.lock().await.create_bytes().await;
-                                    if let Err(_) = session_handle.data(channel_id, bar.into()).await {
+                                let mut buf = Vec::new();
+                                if status_bar.lock().await.maybe_render_into(&mut buf, false).await {
+                                    if let Err(_) = session_handle.data(channel_id, buf.into()).await {
                                         break;
                                     }
                                 }

@@ -24,11 +24,4 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = [
 rustls = "0.23.35"
 rustls-pki-types = "1.0.0"
 webpki-roots = "1.0.4"
-# wezterm-term = { git = "https://github.com/wezterm/wezterm" }
-# termwiz = "0.23"
-# avt = "0.17"
-# vt100 = "0.16"
-# vt100 = { path = "/var/home/mbund/home/dev/terminal-games/vt100-rust" }
 headless-terminal = { path = "../headless-terminal" }
-# itoa = "1.0"
-# vte = "0.15.0"
