@@ -38,10 +38,10 @@ pub struct TerminalGamesTerminalEmulator {}
 
 impl EmulatorBackend for TerminalGamesTerminalEmulator {
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Cannot get cursor position in Terminal Games",
-        ))
+        let mut x: u16 = 0;
+        let mut y: u16 = 0;
+        unsafe { crate::internal::terminal_cursor(&mut x, &mut y) };
+        Ok(Position { x, y })
     }
 
     fn size(&self) -> io::Result<Size> {

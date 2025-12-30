@@ -10,8 +10,12 @@ use std::{
 use http_body_util::{BodyExt, Empty};
 use hyper::{Request, Version, body::Bytes};
 use hyper_util::rt::TokioIo;
-use ratatui::{Terminal, style::Color, widgets::Paragraph};
-use tachyonfx::fx;
+use ratatui::{
+    Terminal,
+    style::{Color, Stylize},
+    widgets::Paragraph,
+};
+use tachyonfx::{Interpolation, Motion, fx};
 use terminal_games_sdk::{
     app,
     network::Conn,
@@ -107,8 +111,15 @@ async fn main() -> std::io::Result<()> {
 
     let mut effects: tachyonfx::EffectManager<()> = tachyonfx::EffectManager::default();
 
-    let bg = Color::from_u32(0x282c34);
-    let fx = fx::fade_from_fg(bg, (1000, tachyonfx::Interpolation::QuadOut));
+    let c = Color::Green;
+    let timer = (1000, Interpolation::QuadInOut);
+    let fx = fx::repeating(fx::ping_pong(fx::sweep_in(
+        Motion::LeftToRight,
+        10,
+        0,
+        c,
+        timer,
+    )));
     effects.add_effect(fx);
 
     let start = Instant::now();
@@ -128,6 +139,11 @@ async fn main() -> std::io::Result<()> {
                     terminput::key!(terminput::KeyCode::Char('n')) => {
                         app::change_app("kitchen-sink")?
                     }
+                    terminput::key!(terminput::KeyCode::Char('f')) => {
+                        let size = terminal.size().unwrap();
+                        std::io::stdout()
+                            .write(format!("\x1b[{};2HA", size.height + 1).as_bytes())?;
+                    }
                     _ => {}
                 }
             }
@@ -142,7 +158,7 @@ async fn main() -> std::io::Result<()> {
             let area = frame.area();
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n",
+                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}",
                     frame_counter,
                     last_event,
                     parts,
@@ -150,9 +166,11 @@ async fn main() -> std::io::Result<()> {
                     conn_done,
                     frame_counter as f64 / start.elapsed().as_secs_f64(),
                     event_counter,
+                    "hello there".red().on_red(),
                 )),
                 area,
             );
+
             effects.process_effects(elapsed.into(), frame.buffer_mut(), area);
         })?;
         frame_counter += 1;

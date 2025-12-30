@@ -3,6 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 mod ssh;
+mod status_bar;
 
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 use wasmtime_wasi::{ResourceTable, p1::WasiP1Ctx};
 
-use crate::ssh::{InputEventBuffer, ModuleCache};
+use crate::ssh::{ModuleCache, Terminal};
 
 pub enum Stream {
     Tcp(tokio::net::TcpStream),
@@ -83,9 +84,9 @@ pub struct ComponentRunStates {
     pub resource_table: ResourceTable,
     streams: Vec<Stream>,
     limits: MyLimiter,
-    dimensions: Arc<Mutex<(u32, u32)>>,
+    terminal: Arc<Mutex<Terminal>>,
     next_app_shortname: Arc<Mutex<Option<String>>>,
-    input_receiver: tokio::sync::mpsc::Receiver<InputEventBuffer>,
+    input_receiver: tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
     module_cache: Arc<Mutex<ModuleCache>>,
 }
 

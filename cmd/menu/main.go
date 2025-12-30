@@ -54,6 +54,9 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return tea.Quit()
 			}
+		case "f":
+			fmt.Fprintf(os.Stdout, "\x1b[%d;%dH%c", m.h+2, 2, 'A')
+			return m, nil
 		}
 	case tea.WindowSizeMsg:
 		m.w = msg.Width

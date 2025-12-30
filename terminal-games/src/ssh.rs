@@ -16,62 +16,11 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 use tokio_rustls::rustls::pki_types::ServerName;
-use unicode_width::UnicodeWidthStr;
-use yansi::Paint;
-use yansi::hyperlink::HyperlinkExt;
 
+use crate::status_bar::StatusBar;
 use crate::{ComponentRunStates, MyLimiter};
 
-fn terminal_width(str: &str) -> usize {
-    strip_ansi_escapes::strip_str(str).width()
-}
-
-fn create_status_bar(
-    width: u32,
-    height: u32,
-    username: &str,
-    current_shortname: &str,
-    tickers: Vec<String>,
-    session_start_time: std::time::Instant,
-) -> Vec<u8> {
-    let mut bar = Vec::new();
-    bar.extend_from_slice(b"\x1b[s");
-
-    bar.extend_from_slice(format!("\x1b[{};1H", height).as_bytes());
-
-    let active_tab_text = format!(" {} ", current_shortname);
-    let active_tab = active_tab_text.bold().black().on_green();
-    let username = format!(" {} ", username).white().on_fixed(237).to_string();
-    let left = active_tab.to_string() + &username;
-
-    let ssh_callout = " ssh terminal-games.fly.dev ".bold().black().on_green();
-    let ticker_index =
-        ((std::time::Instant::now() - session_start_time).as_secs() / 10) as usize % tickers.len();
-    let ticker = format!(
-        " {} {}{}{} ",
-        tickers[ticker_index],
-        "•".repeat(ticker_index).fixed(241),
-        "•".fixed(249),
-        "•"
-            .repeat(tickers.len().saturating_sub(ticker_index + 1))
-            .fixed(241),
-    )
-    .on_fixed(237)
-    .wrap()
-    .to_string();
-    let right = ticker + &ssh_callout.to_string();
-
-    let padding = " "
-        .repeat((width as usize).saturating_sub(terminal_width(&left) + terminal_width(&right)))
-        .on_fixed(236)
-        .to_string();
-
-    bar.extend_from_slice((left + &padding + &right).as_bytes());
-
-    bar.extend_from_slice(b"\x1b[0m");
-    bar.extend_from_slice(b"\x1b[u");
-    bar
-}
+pub type Terminal = headless_terminal::Parser;
 
 struct ModuleCacheEntry {
     module: wasmtime::Module,
@@ -188,60 +137,17 @@ impl ModuleCache {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct InputEventBuffer {
-    len: u8,
-    data: [u8; 16],
-}
-
-impl InputEventBuffer {
-    pub const fn new() -> Self {
-        Self {
-            len: 0,
-            data: [0; 16],
-        }
-    }
-
-    pub fn from_slice(slice: &[u8]) -> Result<Self, ()> {
-        if slice.len() > 16 {
-            return Err(());
-        }
-
-        let mut v = InputEventBuffer::new();
-        v.data[..slice.len()].copy_from_slice(slice);
-        v.len = slice.len() as u8;
-        Ok(v)
-    }
-
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-}
-
-impl AsRef<[u8]> for InputEventBuffer {
-    fn as_ref(&self) -> &[u8] {
-        self.data.as_slice()
-    }
-}
-
-impl TryFrom<&[u8]> for InputEventBuffer {
-    type Error = ();
-
-    fn try_from(slice: &[u8]) -> Result<Self, Self::Error> {
-        InputEventBuffer::from_slice(slice)
-    }
-}
-
 pub struct App {
-    input_sender: tokio::sync::mpsc::Sender<InputEventBuffer>,
-    dimensions: Arc<Mutex<(u32, u32)>>,
+    input_sender: tokio::sync::mpsc::Sender<smallvec::SmallVec<[u8; 16]>>,
     username: Option<tokio::sync::oneshot::Sender<String>>,
     term: Option<tokio::sync::oneshot::Sender<String>>,
     args: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
     remote_sshid: Option<tokio::sync::oneshot::Sender<String>>,
     ssh_session: Option<tokio::sync::oneshot::Sender<(Handle, ChannelId)>>,
     drop_sender: tokio::sync::watch::Sender<()>,
+    terminal: Arc<Mutex<Terminal>>,
     server: AppServer,
+    resize_signal_tx: tokio::sync::mpsc::UnboundedSender<()>,
 }
 
 #[derive(Clone)]
@@ -414,6 +320,7 @@ impl AppServer {
                 })
             },
         )?;
+
         linker.func_wrap_async(
             "terminal_games",
             "conn_write",
@@ -531,7 +438,7 @@ impl AppServer {
                     let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
                         anyhow::bail!("failed to find host memory");
                     };
-                    let (width, height) = *caller.data().dimensions.lock().await;
+                    let (height, width) = caller.data().terminal.lock().await.screen().size();
                     let effective_height = if height > 0 { height - 1 } else { 0 };
 
                     let width_offset = width_ptr as u32 as usize;
@@ -543,6 +450,37 @@ impl AppServer {
                     if let Err(_) =
                         mem.write(&mut caller, height_offset, &effective_height.to_le_bytes())
                     {
+                        anyhow::bail!("failed to write to host memory");
+                    }
+
+                    Ok(())
+                })
+            },
+        )?;
+
+        linker.func_wrap_async(
+            "terminal_games",
+            "terminal_cursor",
+            |mut caller: wasmtime::Caller<'_, ComponentRunStates>, (x_ptr, y_ptr): (i32, i32)| {
+                Box::new(async move {
+                    let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                        anyhow::bail!("failed to find host memory");
+                    };
+                    let (y, x) = caller
+                        .data()
+                        .terminal
+                        .lock()
+                        .await
+                        .screen()
+                        .cursor_position();
+
+                    let x_offset = x_ptr as u32 as usize;
+                    if let Err(_) = mem.write(&mut caller, x_offset, &x.to_le_bytes()) {
+                        anyhow::bail!("failed to write to host memory");
+                    }
+
+                    let y_offset = y_ptr as u32 as usize;
+                    if let Err(_) = mem.write(&mut caller, y_offset, &y.to_le_bytes()) {
                         anyhow::bail!("failed to write to host memory");
                     }
 
@@ -715,15 +653,24 @@ impl Server for AppServer {
         let (ssh_session_sender, ssh_session_receiver) =
             tokio::sync::oneshot::channel::<(Handle, ChannelId)>();
         let (drop_sender, mut drop_receiver) = watch::channel(());
+        let (resize_signal_tx, resize_signal_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-        let dimensions = Arc::new(Mutex::new((0, 0)));
-        let dimensions_clone = dimensions.clone();
+        let terminal = Arc::new(Mutex::new(headless_terminal::Parser::new(0, 0, 0)));
+        let terminal_clone = terminal.clone();
 
         let server = self.clone();
         tokio::task::spawn(async move {
             let (session_handle, channel_id) = ssh_session_receiver.await.unwrap();
+            let mut resize_signal_rx = resize_signal_rx;
             let remote_sshid = remote_sshid_receiver.await.unwrap();
             let username = username_receiver.await.unwrap();
+
+            // enter the alternate screen so that we aren't moving the cursor
+            // around and overwriting the original terminal
+            session_handle
+                .data(channel_id, b"\x1b[?1049h".to_vec().into())
+                .await
+                .unwrap();
 
             // todo: wait for term and args with a 1ms timeout
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -742,60 +689,102 @@ impl Server for AppServer {
             let current_app_shortname = Arc::new(Mutex::new(current_app_shortname));
             let next_app_shortname: Arc<Mutex<Option<String>>> = Default::default();
 
-            {
-                let username = username.clone();
-                let current_app_shortname = current_app_shortname.clone();
-                let dimensions = dimensions.clone();
+            let status_bar = Arc::new(Mutex::new(StatusBar::new(
+                terminal_clone.clone(),
+                current_app_shortname.clone(),
+                username.clone(),
+                session_start_time,
+            )));
+
+            // output task
+            tokio::task::spawn({
                 let next_app_shortname = next_app_shortname.clone();
                 let session_handle = session_handle.clone();
-                tokio::task::spawn(async move {
-                    while let Some(data) = output_receiver.recv().await {
-                        let data = if next_app_shortname.lock().await.is_some() {
-                            let mut out = Vec::with_capacity(data.len());
-                            let mut i = 0;
-                            while i < data.len() {
-                                if data[i..].starts_with(b"\x1b[?1049l") {
-                                    i += b"\x1b[?1049l".len();
+                let status_bar = status_bar.clone();
+                let terminal_clone = terminal_clone.clone();
+                async move {
+                    while let Some(mut data) = output_receiver.recv().await {
+                        if next_app_shortname.lock().await.is_some() {
+                            // strip exiting the alternate screen buffer to make
+                            // sure transitions between apps are smooth
+                            let needle = b"\x1b[?1049l";
+                            let needle2 = b"\x1b[?25h";
+                            let mut read = 0;
+                            let mut write = 0;
+                            while read < data.len() {
+                                if data[read..].starts_with(needle) {
+                                    read += needle.len();
+                                } else if data[read..].starts_with(needle2) {
+                                    read += needle2.len();
                                 } else {
-                                    out.push(data[i]);
-                                    i += 1;
+                                    data[write] = data[read];
+                                    write += 1;
+                                    read += 1;
                                 }
                             }
-                            out
-                        } else {
-                            data
-                        };
-
-                        if session_handle.data(channel_id, data.into()).await.is_err() {
-                            tracing::error!("Failed to send output data");
-                            break;
+                            data.truncate(write);
                         }
 
-                        let (width, height) = *dimensions.lock().await;
-                        if width > 0 && height > 0 {
-                            let bar = create_status_bar(
-                                width,
-                                height,
-                                username.as_ref(),
-                                current_app_shortname.lock().await.as_str(),
-                                vec![
-                                    "Check out the new Terminal Miner v0.1".to_string(),
-                                    format!(
-                                        "Link test {}",
-                                        "example.com".link("https://example.com")
-                                    )
-                                    .to_string(),
-                                ],
-                                session_start_time,
-                            );
-                            if session_handle.data(channel_id, bar.into()).await.is_err() {
-                                tracing::error!("Failed to send status bar");
-                                break;
+                        let is_dirty = {
+                            // process raw data through the vt
+                            let mut app_terminal = terminal_clone.lock().await;
+                            app_terminal.process(&data);
+
+                            // check if status bar was overwritten
+                            let screen = app_terminal.screen_mut();
+                            let (height, _width) = screen.size();
+                            let dirty = screen.take_damaged_rows();
+                            dirty.contains(&(height - 1))
+                        };
+                        if is_dirty {
+                            status_bar
+                                .lock()
+                                .await
+                                .maybe_render_into(&mut data, true)
+                                .await;
+                        }
+
+                        // tracing::info!(data = String::from_utf8_lossy(&data).as_ref(), "output");
+                        session_handle.data(channel_id, data.into()).await.unwrap();
+                    }
+                }
+            });
+
+            // status bar task
+            tokio::task::spawn({
+                let session_handle = session_handle.clone();
+                let status_bar = status_bar.clone();
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+                    loop {
+                        tokio::select! {
+                            result = resize_signal_rx.recv() => {
+                                match result {
+                                    Some(()) => {
+                                        let mut buf = Vec::new();
+                                        status_bar.lock().await.maybe_render_into(&mut buf, true).await;
+                                        if let Err(_) = session_handle.data(channel_id, buf.into()).await {
+                                            break;
+                                        }
+                                    }
+                                    None => {
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = interval.tick() => {
+                                let mut buf = Vec::new();
+                                if status_bar.lock().await.maybe_render_into(&mut buf, false).await {
+                                    if let Err(_) = session_handle.data(channel_id, buf.into()).await {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
-                });
-            }
+                }
+            });
 
             loop {
                 let mut envs = vec![];
@@ -833,7 +822,7 @@ impl Server for AppServer {
                     resource_table: wasmtime_wasi::ResourceTable::new(),
                     streams: Vec::default(),
                     limits: MyLimiter::default(),
-                    dimensions: dimensions.clone(),
+                    terminal: terminal_clone.clone(),
                     next_app_shortname: next_app_shortname.clone(),
                     input_receiver,
                     module_cache: server.module_cache.clone(),
@@ -936,8 +925,9 @@ impl Server for AppServer {
             remote_sshid: Some(remote_sshid_sender),
             ssh_session: Some(ssh_session_sender),
             drop_sender,
-            dimensions: dimensions_clone,
+            terminal,
             server,
+            resize_signal_tx,
         }
     }
 }
@@ -1013,9 +1003,12 @@ impl Handler for App {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Ok(data) = data.try_into() {
-            self.input_sender.send(data).await?;
-        }
+        // tracing::info!(
+        //     data = String::from_utf8_lossy(&data).as_ref(),
+        //     len = data.len(),
+        //     "input"
+        // );
+        self.input_sender.send(data.into()).await?;
 
         Ok(())
     }
@@ -1029,7 +1022,12 @@ impl Handler for App {
         _: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        *self.dimensions.lock().await = (col_width, row_height);
+        self.terminal
+            .lock()
+            .await
+            .screen_mut()
+            .set_size(row_height as u16, col_width as u16);
+        let _ = self.resize_signal_tx.send(());
         session.channel_success(channel)?;
         Ok(())
     }
@@ -1058,7 +1056,12 @@ impl Handler for App {
         _: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        *self.dimensions.lock().await = (col_width, row_height);
+        self.terminal
+            .lock()
+            .await
+            .screen_mut()
+            .set_size(row_height as u16, col_width as u16);
+        let _ = self.resize_signal_tx.send(());
         if let Some(term_sender) = self.term.take() {
             let _ = term_sender.send(term.to_string());
         }
