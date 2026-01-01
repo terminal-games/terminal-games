@@ -406,26 +406,24 @@ impl AppServer {
             },
         )?;
 
-        linker.func_wrap_async(
+        linker.func_wrap(
             "terminal_games",
             "terminal_read",
-            move |mut caller: wasmtime::Caller<'_, ComponentRunStates>, (ptr, _len): (i32, u32)| {
-                Box::new(async move {
-                    match caller.data_mut().input_receiver.try_recv() {
-                        Ok(buf) => {
-                            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory")
-                            else {
-                                anyhow::bail!("failed to find host memory");
-                            };
-                            let offset = ptr as u32 as usize;
-                            if let Err(_) = mem.write(&mut caller, offset, buf.as_ref()) {
-                                anyhow::bail!("failed to write to host memory");
-                            }
-                            Ok(buf.len() as i32)
+            move |mut caller: wasmtime::Caller<'_, ComponentRunStates>, ptr: i32, _len: u32| {
+                match caller.data_mut().input_receiver.try_recv() {
+                    Ok(buf) => {
+                        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory")
+                        else {
+                            anyhow::bail!("failed to find host memory");
+                        };
+                        let offset = ptr as u32 as usize;
+                        if let Err(_) = mem.write(&mut caller, offset, buf.as_ref()) {
+                            anyhow::bail!("failed to write to host memory");
                         }
-                        Err(_) => Ok(0),
+                        Ok(buf.len() as i32)
                     }
-                })
+                    Err(_) => Ok(0),
+                }
             },
         )?;
 
