@@ -1,5 +1,10 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 pub mod ansi_backend;
 pub mod app;
+pub mod peer;
 pub mod terminal;
 
 #[cfg(feature = "network")]
@@ -23,5 +28,17 @@ mod internal {
         pub(crate) fn conn_write(conn_id: i32, address_ptr: *const u8, address_len: u32) -> i32;
         #[cfg(feature = "network")]
         pub(crate) fn conn_read(conn_id: i32, address_ptr: *mut u8, address_len: u32) -> i32;
+
+        pub(crate) fn peer_send(
+            peer_ids_ptr: *const u8,
+            peer_ids_count: u32,
+            data_ptr: *const u8,
+            data_len: u32,
+        ) -> i32;
+        pub(crate) fn peer_recv(
+            from_peer_ptr: *mut u8,
+            data_ptr: *mut u8,
+            data_max_len: u32,
+        ) -> i32;
     }
 }
