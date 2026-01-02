@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Instant, SystemTime},
 };
 
 use http_body_util::{BodyExt, Empty};
@@ -19,9 +19,21 @@ use tachyonfx::{Interpolation, Motion, fx};
 use terminal_games_sdk::{
     app,
     network::Conn,
+    peer::{self, PeerId},
     terminal::{TerminalGamesBackend, TerminalReader},
     terminput,
 };
+
+fn format_time(time: SystemTime) -> String {
+    let duration = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let total_seconds = duration.as_secs();
+    let seconds = total_seconds % 60;
+    let minutes = (total_seconds / 60) % 60;
+    let hours = (total_seconds / 3600) % 24;
+    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+}
 
 #[derive(Clone)]
 // An Executor that uses the tokio runtime.
@@ -41,6 +53,14 @@ where
     }
 }
 
+#[derive(Clone)]
+struct PeerMessage {
+    from: PeerId,
+    message: String,
+    #[allow(dead_code)]
+    time: SystemTime,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
     let mut terminal = Terminal::new(TerminalGamesBackend::new(std::io::stdout()))?;
@@ -48,6 +68,11 @@ async fn main() -> std::io::Result<()> {
     std::io::stdout().write(b"\x1b[?1003h")?;
 
     let conn_done = Arc::new(AtomicBool::new(false));
+
+    let peer_id = peer::current_id();
+    let target_peer_id = std::env::var("APP_ARGS")
+        .ok()
+        .and_then(|s| s.parse::<PeerId>().ok());
 
     let (parts, body) = {
         let url = "https://example.com".parse::<hyper::Uri>().unwrap();
@@ -108,6 +133,8 @@ async fn main() -> std::io::Result<()> {
     };
 
     let mut terminal_reader = TerminalReader {};
+    let mut peer_messages = peer::MessageReader::new();
+    let mut messages = vec![];
 
     let mut effects: tachyonfx::EffectManager<()> = tachyonfx::EffectManager::default();
 
@@ -144,6 +171,16 @@ async fn main() -> std::io::Result<()> {
                         std::io::stdout()
                             .write(format!("\x1b[{};2HA", size.height + 1).as_bytes())?;
                     }
+                    terminput::key!(terminput::KeyCode::Char('p')) => {
+                        if let Some(target_peer_id) = target_peer_id {
+                            let message = format!(
+                                "Hello from {} at {}",
+                                peer_id.to_string(),
+                                format_time(SystemTime::now())
+                            );
+                            let _ = target_peer_id.send(message.as_bytes());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -154,11 +191,48 @@ async fn main() -> std::io::Result<()> {
             break;
         }
 
+        for msg in &mut peer_messages {
+            let message_str = String::from_utf8_lossy(&msg.data).to_string();
+            let peer_msg = PeerMessage {
+                from: msg.from,
+                message: message_str.clone(),
+                time: SystemTime::now(),
+            };
+
+            messages.push(peer_msg);
+            if messages.len() > 10 {
+                messages.remove(0);
+            }
+
+            if message_str != "pong" {
+                let _ = msg.from.send(b"pong".as_slice());
+            }
+        }
+
+        let peer_messages_text = {
+            if messages.is_empty() {
+                "No messages yet".to_string()
+            } else {
+                messages
+                    .iter()
+                    .map(|msg| {
+                        format!(
+                            "[{}] From {}: {}",
+                            format_time(msg.time),
+                            msg.from.to_string(),
+                            msg.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        };
+
         terminal.draw(|frame| {
             let area = frame.area();
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}",
+                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}\n\nPeer ID: {}\nPress 'p' to send a message to peer {}\n\nRecent Messages:\n{}",
                     frame_counter,
                     last_event,
                     parts,
@@ -167,6 +241,11 @@ async fn main() -> std::io::Result<()> {
                     frame_counter as f64 / start.elapsed().as_secs_f64(),
                     event_counter,
                     "hello there".red().on_red(),
+                    peer_id,
+                    target_peer_id.as_ref()
+                        .map(|v| format!("Some({})", v))
+                        .unwrap_or_else(|| "None".into()),
+                    peer_messages_text,
                 )),
                 area,
             );
