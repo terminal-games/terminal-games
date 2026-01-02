@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use hex::ToHex;
 use rand_core::OsRng;
 use russh::keys::ssh_key::{self, PublicKey};
 use russh::server::*;
@@ -17,6 +18,7 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 use tokio_rustls::rustls::pki_types::ServerName;
 
+use crate::mesh::{AppId, Mesh, PeerId};
 use crate::status_bar::StatusBar;
 use crate::{ComponentRunStates, MyLimiter};
 
@@ -156,10 +158,11 @@ pub(crate) struct AppServer {
     module_cache: Arc<Mutex<ModuleCache>>,
     linker: Arc<wasmtime::Linker<ComponentRunStates>>,
     db: libsql::Connection,
+    mesh: Arc<Mesh>,
 }
 
 impl AppServer {
-    pub async fn new() -> anyhow::Result<Self> {
+    pub async fn new(mesh: Arc<Mesh>) -> anyhow::Result<Self> {
         tracing::info!("Initializing runtime");
 
         let db = libsql::Builder::new_remote(
@@ -558,11 +561,134 @@ impl AppServer {
             },
         )?;
 
+        linker.func_wrap(
+            "terminal_games",
+            "peer_send",
+            move |mut caller: wasmtime::Caller<'_, ComponentRunStates>,
+                  peer_ids_ptr: i32,
+                  peer_ids_count: u32,
+                  data_ptr: i32,
+                  data_len: u32| {
+                let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                    tracing::error!("peer_send: failed to find host memory");
+                    return Ok(-1);
+                };
+
+                if peer_ids_count == 0 || peer_ids_count > 1024 {
+                    tracing::error!("peer_send: invalid peer_ids_count: {}", peer_ids_count);
+                    return Ok(-1);
+                }
+
+                if data_len == 0 {
+                    // not sure why someone would do this but it's pretty easy to send no data
+                    return Ok(0);
+                }
+
+                if data_len > 64 * 1024 {
+                    tracing::error!("peer_send: data_len too large: {}", data_len);
+                    return Ok(-1);
+                }
+                const PEER_ID_SIZE: usize = std::mem::size_of::<PeerId>();
+                let peer_ids_offset = peer_ids_ptr as usize;
+                let peer_ids_count = peer_ids_count as usize;
+                let total_peer_ids_size = peer_ids_count * std::mem::size_of::<PeerId>();
+
+                let mut peer_ids_buf = vec![0u8; total_peer_ids_size];
+                if let Err(_) = mem.read(&caller, peer_ids_offset, &mut peer_ids_buf) {
+                    tracing::error!("peer_send: failed to read peer IDs from memory");
+                    return Ok(-1);
+                }
+
+                let mut peer_ids = Vec::with_capacity(peer_ids_count);
+                for i in 0..peer_ids_count {
+                    let offset = i * PEER_ID_SIZE;
+                    if offset + PEER_ID_SIZE > peer_ids_buf.len() {
+                        tracing::error!("peer_send: peer ID buffer overflow");
+                        return Ok(-1);
+                    }
+
+                    let mut peer_id_bytes = [0u8; PEER_ID_SIZE];
+                    peer_id_bytes.copy_from_slice(&peer_ids_buf[offset..offset + PEER_ID_SIZE]);
+                    peer_ids.push(crate::mesh::PeerId::from_bytes(peer_id_bytes));
+                }
+
+                let data_offset = data_ptr as usize;
+                let data_len = data_len as usize;
+                let mut data_buf = vec![0u8; data_len];
+                if let Err(_) = mem.read(&caller, data_offset, &mut data_buf) {
+                    tracing::error!("peer_send: failed to read data from memory");
+                    return Ok(-1);
+                }
+
+                match caller.data_mut().peer_tx.try_send((peer_ids, data_buf)) {
+                    Ok(_) => {
+                        tracing::debug!("peer_send: sent message to {} peers", peer_ids_count);
+                        Ok(0)
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!("peer_send: channel full, message dropped");
+                        Ok(-1)
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::error!("peer_send: channel closed");
+                        Ok(-1)
+                    }
+                }
+            },
+        )?;
+
+        linker.func_wrap(
+            "terminal_games",
+            "peer_recv",
+            move |mut caller: wasmtime::Caller<'_, ComponentRunStates>,
+                  from_peer_ptr: i32,
+                  data_ptr: i32,
+                  data_max_len: u32| {
+                let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                    tracing::error!("peer_recv: failed to find host memory");
+                    return Ok(-1);
+                };
+
+                let msg = match caller.data_mut().peer_rx.try_recv() {
+                    Ok(msg) => msg,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        return Ok(0);
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        tracing::error!("peer_recv: channel disconnected");
+                        return Ok(-1);
+                    }
+                };
+
+                let from_peer_offset = from_peer_ptr as usize;
+                let peer_id_buf = msg.from_peer().to_bytes();
+
+                if let Err(_) = mem.write(&mut caller, from_peer_offset, &peer_id_buf) {
+                    tracing::error!("peer_recv: failed to write from_peer to memory");
+                    return Ok(-1);
+                }
+
+                let data_offset = data_ptr as usize;
+                let data_max_len = data_max_len as usize;
+                let data = msg.data();
+                let data_to_write = std::cmp::min(data.len(), data_max_len);
+
+                if let Err(_) = mem.write(&mut caller, data_offset, &data[..data_to_write]) {
+                    tracing::error!("peer_recv: failed to write data to memory");
+                    return Ok(-1);
+                }
+
+                tracing::debug!("peer_recv: received message of {} bytes", data_to_write);
+                Ok(data_to_write as i32)
+            },
+        )?;
+
         Ok(Self {
             db: conn,
             engine,
             linker: Arc::new(linker),
             module_cache,
+            mesh,
         })
     }
 
@@ -578,8 +704,14 @@ impl AppServer {
             ..Default::default()
         };
 
-        tracing::info!("Running SSH server");
-        self.run_on_address(Arc::new(config), ("0.0.0.0", 2222))
+        let listen_addr: std::net::SocketAddr = std::env::var("SSH_LISTEN_ADDR")
+            .unwrap_or_else(|_| "0.0.0.0:2222".to_string())
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid SSH_LISTEN_ADDR: {}", e))?;
+
+        let ip_str = listen_addr.ip().to_string();
+        tracing::info!(addr = %listen_addr, "Running SSH server");
+        self.run_on_address(Arc::new(config), (ip_str.as_str(), listen_addr.port()))
             .await?;
         Ok(())
     }
@@ -655,6 +787,7 @@ impl Server for AppServer {
 
         let terminal = Arc::new(Mutex::new(headless_terminal::Parser::new(0, 0, 0)));
         let terminal_clone = terminal.clone();
+        let mesh = self.mesh.clone();
 
         let server = self.clone();
         tokio::task::spawn(async move {
@@ -679,10 +812,20 @@ impl Server for AppServer {
 
             let session_start_time = std::time::Instant::now();
 
-            let current_app_shortname = match args {
-                None => "menu".to_string(),
-                Some(args) => String::from_utf8_lossy(&args).to_string(),
+            let (current_app_shortname, app_args) = match args {
+                None => ("menu".to_string(), None),
+                Some(args_bytes) => {
+                    let args_str = String::from_utf8_lossy(&args_bytes);
+                    if let Some(space_idx) = args_str.find(' ') {
+                        let shortname = args_str[..space_idx].to_string();
+                        let remaining_args = args_str[space_idx + 1..].to_string();
+                        (shortname, Some(remaining_args))
+                    } else {
+                        (args_str.to_string(), None)
+                    }
+                }
             };
+            let app_args = Arc::new(app_args);
 
             let current_app_shortname = Arc::new(Mutex::new(current_app_shortname));
             let next_app_shortname: Arc<Mutex<Option<String>>> = Default::default();
@@ -789,11 +932,26 @@ impl Server for AppServer {
 
                 let shortname = { current_app_shortname.lock().await.clone() };
 
-                let mut rows = server.db
+                let app_id = server
+                    .db
                     .query(
-                        "SELECT name, value FROM envs JOIN games ON envs.game_id = games.id WHERE shortname = ?1",
+                        "SELECT id FROM games WHERE shortname = ?1",
                         [shortname.as_str()],
                     )
+                    .await
+                    .unwrap()
+                    .next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<u64>(0)
+                    .unwrap();
+
+                let (peer_id, peer_rx, peer_tx) = mesh.clone().new_peer(AppId(app_id)).await;
+
+                let mut rows = server
+                    .db
+                    .query("SELECT name, value FROM envs WHERE game_id = ?1", [app_id])
                     .await
                     .unwrap();
                 while let Some(row) = rows.next().await.unwrap() {
@@ -804,8 +962,12 @@ impl Server for AppServer {
 
                 envs.push(("REMOTE_SSHID".to_string(), remote_sshid.clone()));
                 envs.push(("USERNAME".to_string(), username.clone()));
+                envs.push(("PEER_ID".to_string(), peer_id.to_bytes().encode_hex()));
                 if let Some(term) = term.clone() {
                     envs.push(("TERM".to_string(), term));
+                }
+                if let Some(ref args) = *app_args {
+                    envs.push(("APP_ARGS".to_string(), args.clone()));
                 }
 
                 let wasi_ctx = wasmtime_wasi::WasiCtx::builder()
@@ -824,6 +986,8 @@ impl Server for AppServer {
                     next_app_shortname: next_app_shortname.clone(),
                     input_receiver,
                     module_cache: server.module_cache.clone(),
+                    peer_rx,
+                    peer_tx,
                 };
 
                 let mut store = wasmtime::Store::new(&server.engine, state);

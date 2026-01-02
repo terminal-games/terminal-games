@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+mod mesh;
 mod ssh;
 mod status_bar;
 
@@ -11,7 +12,10 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 use wasmtime_wasi::{ResourceTable, p1::WasiP1Ctx};
 
-use crate::ssh::{ModuleCache, Terminal};
+use crate::{
+    mesh::{Mesh, PeerId, PeerMessageApp},
+    ssh::{ModuleCache, Terminal},
+};
 
 pub enum Stream {
     Tcp(tokio::net::TcpStream),
@@ -88,6 +92,8 @@ pub struct ComponentRunStates {
     next_app_shortname: Arc<Mutex<Option<String>>>,
     input_receiver: tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
     module_cache: Arc<Mutex<ModuleCache>>,
+    peer_rx: tokio::sync::mpsc::Receiver<PeerMessageApp>,
+    peer_tx: tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>,
 }
 
 struct MyLimiter {
@@ -138,7 +144,11 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let mut server = ssh::AppServer::new().await?;
+    let mesh = Mesh::new();
+    mesh.clone().connect_to_nodes().await.unwrap();
+    mesh.clone().serve().await.unwrap();
+
+    let mut server = ssh::AppServer::new(mesh).await?;
     server.run().await.expect("Failed running server");
 
     Ok(())
