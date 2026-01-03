@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use wasmtime_wasi::{ResourceTable, p1::WasiP1Ctx};
 
 use crate::{
-    mesh::{Mesh, PeerId, PeerMessageApp},
+    mesh::{EnvDiscovery, Mesh, PeerId, PeerMessageApp},
     ssh::{ModuleCache, Terminal},
 };
 
@@ -144,8 +144,8 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let mesh = Mesh::new();
-    mesh.clone().connect_to_nodes().await.unwrap();
+    let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
+    mesh.clone().start_discovery().await.unwrap();
     mesh.clone().serve().await.unwrap();
 
     let mut server = ssh::AppServer::new(mesh).await?;

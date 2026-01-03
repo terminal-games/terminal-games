@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{collections::HashMap, fmt::Display, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{collections::{HashMap, HashSet}, fmt::Display, net::SocketAddr, pin::Pin, sync::Arc};
 
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -111,24 +111,79 @@ impl PeerMessageApp {
     }
 }
 
+#[async_trait::async_trait]
+pub trait Discovery: Send + Sync {
+    async fn discover_peers(&self) -> anyhow::Result<HashSet<(RegionId, SocketAddr)>>;
+}
+
+pub struct EnvDiscovery;
+
+impl EnvDiscovery {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait::async_trait]
+impl Discovery for EnvDiscovery {
+    async fn discover_peers(&self) -> anyhow::Result<HashSet<(RegionId, SocketAddr)>> {
+        let nodes_env = std::env::var("PEER_NODES").unwrap_or_else(|_| String::new());
+        
+        if nodes_env.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        nodes_env
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let colon_idx = s.find(':').ok_or_else(|| {
+                    anyhow::anyhow!("Invalid peer node format '{}': expected 'region:address' (e.g., 'loca:127.0.0.1:3001')", s)
+                })?;
+                
+                let region_str = &s[..colon_idx];
+                let addr_str = &s[colon_idx + 1..];
+
+                if region_str.is_empty() {
+                    return Err(anyhow::anyhow!("Invalid peer node format '{}': region cannot be empty", s));
+                }
+
+                let mut region_bytes = [0u8; 4];
+                let region_id_bytes = region_str.as_bytes();
+                let copy_len = region_id_bytes.len().min(4);
+                region_bytes[..copy_len].copy_from_slice(&region_id_bytes[..copy_len]);
+                let region = RegionId(region_bytes);
+
+                let addr = addr_str.parse::<SocketAddr>()
+                    .map_err(|e| anyhow::anyhow!("Invalid socket address '{}': {}", addr_str, e))?;
+
+                Ok((region, addr))
+            })
+            .collect()
+    }
+}
+
 pub struct Mesh {
     region: RegionId,
     other_regions: Mutex<HashMap<RegionId, (SocketAddr, tokio::sync::mpsc::Sender<Message>)>>,
     peers: Mutex<HashMap<(PeerId, AppId), tokio::sync::mpsc::Sender<PeerMessageApp>>>,
+    discovery: Arc<dyn Discovery>,
 }
 
 impl Mesh {
-    pub fn new() -> Arc<Self> {
+    pub fn new(discovery: Arc<dyn Discovery>) -> Arc<Self> {
         let region_id_str = std::env::var("REGION_ID").unwrap_or_else(|_| "loca".to_string());
         let mut region_bytes = [0u8; 4];
         let region_id_bytes = region_id_str.as_bytes();
         let copy_len = region_id_bytes.len().min(4);
         region_bytes[..copy_len].copy_from_slice(&region_id_bytes[..copy_len]);
-        
+
         Arc::new(Self {
             region: RegionId(region_bytes),
             other_regions: Default::default(),
             peers: Default::default(),
+            discovery,
         })
     }
 
@@ -172,7 +227,7 @@ impl Mesh {
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
                         tracing::info!(peer = %peer_addr, "Incoming mesh connection");
-                        tokio::spawn(self.clone().handle_connection(stream, peer_addr));
+                        tokio::spawn(self.clone().handle_connection(stream, peer_addr, None));
                     }
                     Err(e) => {
                         tracing::error!("Failed to accept connection: {}", e);
@@ -256,40 +311,113 @@ impl Mesh {
         futures::future::join_all(send_futures).await;
     }
 
-    pub async fn connect_to_node(self: Arc<Self>, addr: SocketAddr) -> anyhow::Result<()> {
+    async fn connect_to_node(self: Arc<Self>, region: RegionId, addr: SocketAddr) -> anyhow::Result<()> {
         let stream = TcpStream::connect(addr).await?;
-        tracing::info!(peer = %addr, "Connecting to mesh node");
-        tokio::spawn(self.clone().handle_connection(stream, addr));
+        tracing::info!(%region, peer = %addr, "Connected to mesh node");
+        tokio::spawn(self.handle_connection(stream, addr, Some(region)));
         Ok(())
     }
 
-    pub async fn connect_to_nodes(self: Arc<Self>) -> anyhow::Result<()> {
-        let nodes_env = std::env::var("PEER_NODES").unwrap_or_else(|_| String::new());
-        
-        if nodes_env.is_empty() {
+    pub async fn start_discovery(self: Arc<Self>) -> anyhow::Result<()> {
+        self.clone().initial_connect().await?;
+
+        let mesh = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if let Err(e) = mesh.clone().heal_network().await {
+                    tracing::error!(?e, "Failed to heal network");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn initial_connect(self: Arc<Self>) -> anyhow::Result<()> {
+        let discovered = self.discovery.discover_peers().await?;
+
+        let current_regions: HashSet<RegionId> =
+            self.other_regions.lock().await.keys().copied().collect();
+
+        let targets: Vec<(RegionId, SocketAddr)> = discovered
+            .into_iter()
+            .filter(|(region, _)| *region != self.region)
+            .filter(|(region, _)| !current_regions.contains(region))
+            .collect();
+
+        if targets.is_empty() {
             return Ok(());
         }
 
-        let addrs: Vec<SocketAddr> = nodes_env
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                s.parse::<SocketAddr>()
-                    .map_err(|e| anyhow::anyhow!("Invalid socket address '{}': {}", s, e))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        tracing::info!(count = targets.len(), "Initial connection to discovered nodes");
 
-        for addr in addrs {
-            if let Err(e) = self.clone().connect_to_node(addr).await {
-                tracing::error!(peer = %addr, ?e, "Failed to connect to node");
+        let connect_futures: Vec<_> = targets
+            .into_iter()
+            .map(|(region, addr)| {
+                let mesh = self.clone();
+                async move {
+                    if let Err(e) = mesh.connect_to_node(region, addr).await {
+                        tracing::warn!(%region, %addr, ?e, "Failed initial connection");
+                    }
+                }
+            })
+            .collect();
+
+        futures::future::join_all(connect_futures).await;
+        Ok(())
+    }
+
+    async fn heal_network(self: Arc<Self>) -> anyhow::Result<()> {
+        let discovered = self.discovery.discover_peers().await?;
+
+        let desired_regions: HashMap<RegionId, SocketAddr> = discovered
+            .into_iter()
+            .filter(|(region, _)| *region != self.region)
+            .collect();
+
+        let current_regions: HashSet<RegionId> =
+            self.other_regions.lock().await.keys().copied().collect();
+
+        let desired_region_ids: HashSet<RegionId> = desired_regions.keys().copied().collect();
+
+        let to_connect: Vec<(RegionId, SocketAddr)> = desired_regions
+            .iter()
+            .filter(|(region, _)| !current_regions.contains(region))
+            .map(|(r, a)| (*r, *a))
+            .collect();
+
+        let to_disconnect: Vec<RegionId> = current_regions
+            .iter()
+            .filter(|region| !desired_region_ids.contains(region))
+            .copied()
+            .collect();
+
+        for region in to_disconnect {
+            tracing::info!(%region, "Disconnecting stale region");
+            self.disconnect_region(region).await;
+        }
+
+        for (region, addr) in to_connect {
+            tracing::info!(%region, %addr, "Connecting to discovered region");
+            if let Err(e) = self.clone().connect_to_node(region, addr).await {
+                tracing::error!(%region, %addr, ?e, "Failed to connect to discovered region");
             }
         }
 
         Ok(())
     }
 
-    async fn handle_connection(self: Arc<Self>, stream: TcpStream, addr: SocketAddr) {
+    async fn disconnect_region(&self, region: RegionId) {
+        let removed = self.other_regions.lock().await.remove(&region);
+        if let Some((addr, sender)) = removed {
+            tracing::info!(%region, %addr, "Cleaned up region connection");
+            drop(sender);
+        }
+    }
+
+    async fn handle_connection(self: Arc<Self>, stream: TcpStream, addr: SocketAddr, expected_region: Option<RegionId>) {
         let (mut sink, mut stream) = Framed::new(stream, MessageCodec).split();
 
         if let Err(error) = sink
@@ -299,6 +427,7 @@ impl Mesh {
             .await
         {
             tracing::error!(?error, "failed to send handshake");
+            return;
         }
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -310,6 +439,8 @@ impl Mesh {
                 }
             }
         });
+
+        let mut connected_region: Option<RegionId> = expected_region;
 
         while let Some(result) = stream.next().await {
             match result {
@@ -359,14 +490,43 @@ impl Mesh {
                     }
                 }
                 Ok(Message::Handshake(msg)) => {
-                    self.other_regions
-                        .lock()
-                        .await
-                        .insert(msg.region, (addr, tx.clone()));
+                    if let Some(expected) = expected_region {
+                        if msg.region != expected {
+                            tracing::warn!(
+                                expected = %expected,
+                                actual = %msg.region,
+                                %addr,
+                                "Region mismatch on handshake, closing connection"
+                            );
+                            break;
+                        }
+                    }
+
+                    // Only register if not already connected to this region
+                    let mut other_regions = self.other_regions.lock().await;
+                    if other_regions.contains_key(&msg.region) {
+                        tracing::debug!(region = %msg.region, %addr, "Already connected to region, closing duplicate");
+                        break;
+                    }
+
+                    connected_region = Some(msg.region);
+                    other_regions.insert(msg.region, (addr, tx.clone()));
+                    drop(other_regions);
+                    tracing::info!(region = %msg.region, %addr, "Handshake completed");
                 }
                 Err(error) => {
                     tracing::error!(%addr, ?error, "Error reading from connection");
                     break;
+                }
+            }
+        }
+
+        if let Some(region) = connected_region {
+            let mut other_regions = self.other_regions.lock().await;
+            if let Some((stored_addr, _)) = other_regions.get(&region) {
+                if *stored_addr == addr {
+                    other_regions.remove(&region);
+                    tracing::info!(%region, %addr, "Connection ended, removed from other_regions");
                 }
             }
         }
