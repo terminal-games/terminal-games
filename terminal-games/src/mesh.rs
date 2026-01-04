@@ -380,24 +380,11 @@ impl Mesh {
         let current_regions: HashSet<RegionId> =
             self.other_regions.lock().await.keys().copied().collect();
 
-        let desired_region_ids: HashSet<RegionId> = desired_regions.keys().copied().collect();
-
         let to_connect: Vec<(RegionId, SocketAddr)> = desired_regions
             .iter()
             .filter(|(region, _)| !current_regions.contains(region))
             .map(|(r, a)| (*r, *a))
             .collect();
-
-        let to_disconnect: Vec<RegionId> = current_regions
-            .iter()
-            .filter(|region| !desired_region_ids.contains(region))
-            .copied()
-            .collect();
-
-        for region in to_disconnect {
-            tracing::info!(%region, "Disconnecting stale region");
-            self.disconnect_region(region).await;
-        }
 
         for (region, addr) in to_connect {
             tracing::info!(%region, %addr, "Connecting to discovered region");
@@ -407,14 +394,6 @@ impl Mesh {
         }
 
         Ok(())
-    }
-
-    async fn disconnect_region(&self, region: RegionId) {
-        let removed = self.other_regions.lock().await.remove(&region);
-        if let Some((addr, sender)) = removed {
-            tracing::info!(%region, %addr, "Cleaned up region connection");
-            drop(sender);
-        }
     }
 
     async fn handle_connection(self: Arc<Self>, stream: TcpStream, addr: SocketAddr, expected_region: Option<RegionId>) {
