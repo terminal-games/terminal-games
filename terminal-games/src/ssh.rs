@@ -158,11 +158,11 @@ pub(crate) struct AppServer {
     module_cache: Arc<Mutex<ModuleCache>>,
     linker: Arc<wasmtime::Linker<ComponentRunStates>>,
     db: libsql::Connection,
-    mesh: Arc<Mesh>,
+    mesh: Mesh,
 }
 
 impl AppServer {
-    pub async fn new(mesh: Arc<Mesh>) -> anyhow::Result<Self> {
+    pub async fn new(mesh: Mesh) -> anyhow::Result<Self> {
         tracing::info!("Initializing runtime");
 
         let db = libsql::Builder::new_remote(
@@ -975,7 +975,7 @@ impl Server for AppServer {
                     .get::<u64>(0)
                     .unwrap();
 
-                let (peer_id, peer_rx, peer_tx) = mesh.clone().new_peer(AppId(app_id)).await;
+                let (peer_id, peer_rx, peer_tx) = mesh.new_peer(AppId(app_id)).await;
 
                 let mut rows = server
                     .db

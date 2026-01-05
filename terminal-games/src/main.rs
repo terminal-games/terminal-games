@@ -94,7 +94,7 @@ pub struct ComponentRunStates {
     module_cache: Arc<Mutex<ModuleCache>>,
     peer_rx: tokio::sync::mpsc::Receiver<PeerMessageApp>,
     peer_tx: tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>,
-    mesh: Arc<Mesh>,
+    mesh: Mesh,
 }
 
 struct MyLimiter {
@@ -146,11 +146,12 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
-    mesh.clone().start_discovery().await.unwrap();
-    mesh.clone().serve().await.unwrap();
+    mesh.start_discovery().await.unwrap();
+    mesh.serve().await.unwrap();
 
-    let mut server = ssh::AppServer::new(mesh).await?;
+    let mut server = ssh::AppServer::new(mesh.clone()).await?;
     server.run().await.expect("Failed running server");
+    mesh.graceful_shutdown().await;
 
     Ok(())
 }

@@ -13,7 +13,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
-use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio_util::{codec::{Decoder, Encoder, Framed}, sync::CancellationToken, task::TaskTracker};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Message {
@@ -258,31 +258,43 @@ impl RegionState {
     }
 }
 
-pub struct Mesh {
+struct MeshInner {
     region: RegionId,
     regions: Mutex<HashMap<RegionId, RegionState>>,
     peers: Mutex<HashMap<(PeerId, AppId), tokio::sync::mpsc::Sender<PeerMessageApp>>>,
     discovery: Arc<dyn Discovery>,
+    cancel: CancellationToken,
+    tasks: TaskTracker,
 }
 
+#[derive(Clone)]
+pub struct Mesh {
+    inner: Arc<MeshInner>,
+}
+
+
 impl Mesh {
-    pub fn new(discovery: Arc<dyn Discovery>) -> Arc<Self> {
+    pub fn new(discovery: Arc<dyn Discovery>) -> Self {
         let region_id_str = std::env::var("REGION_ID").unwrap_or_else(|_| "loca".to_string());
         let mut region_bytes = [0u8; 4];
         let region_id_bytes = region_id_str.as_bytes();
         let copy_len = region_id_bytes.len().min(4);
         region_bytes[..copy_len].copy_from_slice(&region_id_bytes[..copy_len]);
 
-        Arc::new(Self {
-            region: RegionId::from_bytes(region_bytes),
-            regions: Default::default(),
-            peers: Default::default(),
-            discovery,
-        })
+        Self {
+            inner: Arc::new(MeshInner {
+                region: RegionId::from_bytes(region_bytes),
+                regions: Default::default(),
+                peers: Default::default(),
+                discovery,
+                cancel: CancellationToken::new(),
+                tasks: TaskTracker::new(),
+            }),
+        }
     }
 
     pub async fn new_peer(
-        self: Arc<Self>,
+        &self,
         app_id: AppId,
     ) -> (PeerId, tokio::sync::mpsc::Receiver<PeerMessageApp>, tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>) {
         let peer_id = PeerId {
@@ -291,43 +303,61 @@ impl Mesh {
                 .unwrap()
                 .as_millis() as u64,
             randomness: rand_core::OsRng.next_u32(),
-            region: self.region,
+            region: self.inner.region,
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let (tx2, mut rx2) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(async move {
-            self.peers.lock().await.insert((peer_id, app_id), tx);
+        
+        let inner = self.inner.clone();
+        self.inner.tasks.spawn(async move {
+            inner.peers.lock().await.insert((peer_id, app_id), tx);
 
-            while let Some((to_peers, data)) = rx2.recv().await {
-                self.send_peer_message(PeerMessage { from_peer: peer_id, to_peers, app_id, data }).await
+            loop {
+                tokio::select! {
+                    _ = inner.cancel.cancelled() => break,
+                    msg = rx2.recv() => {
+                        match msg {
+                            Some((to_peers, data)) => {
+                                inner.send_peer_message(PeerMessage { from_peer: peer_id, to_peers, app_id, data }).await;
+                            }
+                            None => break,
+                        }
+                    }
+                }
             }
 
-            self.peers.lock().await.remove(&(peer_id, app_id));
+            inner.peers.lock().await.remove(&(peer_id, app_id));
         });
 
         (peer_id, rx, tx2)
     }
 
-    pub async fn serve(self: Arc<Self>) -> anyhow::Result<()> {
+    pub async fn serve(&self) -> anyhow::Result<()> {
         let listen_addr: SocketAddr = std::env::var("PEER_LISTEN_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:3001".to_string())
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid PEER_LISTEN_ADDR: {}", e))?;
         let listener = TcpListener::bind(listen_addr).await?;
 
-        tokio::spawn(async move {
+        let inner = self.inner.clone();
+        self.inner.tasks.spawn(async move {
             loop {
-                match listener.accept().await {
-                    Ok((stream, peer_addr)) => {
-                        tracing::info!(peer = %peer_addr, "Incoming mesh connection");
-                        let mesh = self.clone();
-                        tokio::spawn(async move {
-                            let _ = mesh.handle_connection(stream, peer_addr, None).await;
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to accept connection: {}", e);
+                tokio::select! {
+                    _ = inner.cancel.cancelled() => break,
+                    result = listener.accept() => {
+                        match result {
+                            Ok((stream, peer_addr)) => {
+                                tracing::info!(peer = %peer_addr, "Incoming mesh connection");
+                                let inner2 = inner.clone();
+                                inner.tasks.spawn(async move {
+                                    inner2.handle_connection(stream, peer_addr, None).await;
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to accept connection: {}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -336,6 +366,56 @@ impl Mesh {
         Ok(())
     }
 
+    pub async fn start_discovery(&self) -> anyhow::Result<()> {
+        let inner = self.inner.clone();
+        self.inner.tasks.spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tokio::select! {
+                    _ = inner.cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(e) = inner.heal_network().await {
+                            tracing::error!(?e, "Failed to connect to discovered peers");
+                        }
+                    }
+                }
+            }
+        });
+
+        let inner = self.inner.clone();
+        self.inner.tasks.spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut ping_seq: u64 = 0;
+            loop {
+                tokio::select! {
+                    _ = inner.cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        inner.send_due_pings(&mut ping_seq).await;
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    pub async fn get_region_latency(&self, region: RegionId) -> Option<u32> {
+        let regions = self.inner.regions.lock().await;
+        regions.get(&region)
+            .and_then(|s| s.as_active())
+            .and_then(|conn| conn.latency.average_latency())
+    }
+
+    pub async fn graceful_shutdown(&self) {
+        tracing::info!("Mesh graceful shutdown initiated");
+        self.inner.cancel.cancel();
+        self.inner.tasks.close();
+        self.inner.tasks.wait().await;
+        tracing::info!("Mesh graceful shutdown complete");
+    }
+}
+
+impl MeshInner {
     async fn send_peer_message(&self, message: PeerMessage) {
         let mut region_partitions: HashMap<RegionId, Vec<PeerId>> = Default::default();
         let num_peers = message.to_peers.len();
@@ -408,7 +488,7 @@ impl Mesh {
         futures::future::join_all(send_futures).await;
     }
 
-    async fn connect_to_node(self: Arc<Self>, region: RegionId, addr: SocketAddr) -> anyhow::Result<()> {
+    async fn connect_to_node(self: &Arc<Self>, region: RegionId, addr: SocketAddr) -> anyhow::Result<()> {
         {
             // Mark as pending before connecting to prevent heal_network
             let mut regions = self.regions.lock().await;
@@ -430,32 +510,9 @@ impl Mesh {
             }
         };
 
-        let mesh = self.clone();
-        tokio::spawn(mesh.handle_connection(stream, addr, Some(region)));
-
-        Ok(())
-    }
-
-    pub async fn start_discovery(self: Arc<Self>) -> anyhow::Result<()> {
-        let mesh = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                if let Err(e) = mesh.clone().heal_network().await {
-                    tracing::error!(?e, "Failed to connect to discovered peers");
-                }
-            }
-        });
-
-        let mesh = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            let mut ping_seq: u64 = 0;
-            loop {
-                interval.tick().await;
-                mesh.send_due_pings(&mut ping_seq).await;
-            }
+        let inner = self.clone();
+        self.tasks.spawn(async move {
+            inner.handle_connection(stream, addr, Some(region)).await;
         });
 
         Ok(())
@@ -486,7 +543,7 @@ impl Mesh {
         }
     }
 
-    async fn heal_network(self: Arc<Self>) -> anyhow::Result<()> {
+    async fn heal_network(self: &Arc<Self>) -> anyhow::Result<()> {
         let discovered = self.discovery.discover_peers().await?;
 
         let current_regions: HashSet<RegionId> =
@@ -507,9 +564,9 @@ impl Mesh {
         let connect_futures: Vec<_> = targets
             .into_iter()
             .map(|(region, addr)| {
-                let mesh = self.clone();
+                let inner = self.clone();
                 async move {
-                    if let Err(e) = mesh.connect_to_node(region, addr).await {
+                    if let Err(e) = inner.connect_to_node(region, addr).await {
                         tracing::warn!(%region, %addr, ?e, "Failed to connect");
                     }
                 }
@@ -520,18 +577,16 @@ impl Mesh {
         Ok(())
     }
 
-    async fn handle_connection(self: Arc<Self>, stream: TcpStream, addr: SocketAddr, expected_region: Option<RegionId>) -> anyhow::Result<()> {
-        let result = self.clone().handle_connection_inner(stream, addr, expected_region).await;
+    async fn handle_connection(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr, expected_region: Option<RegionId>) {
+        let result = self.handle_connection_inner(stream, addr, expected_region).await;
 
         if let Some(region) = result.as_ref().ok().copied().or(expected_region) {
             self.regions.lock().await.remove(&region);
             tracing::info!(region=%region, %addr, "Disconnected");
         }
-
-        result.map(|_| ())
     }
 
-    async fn handle_connection_inner(self: Arc<Self>, stream: TcpStream, addr: SocketAddr, expected_region: Option<RegionId>) -> anyhow::Result<RegionId> {
+    async fn handle_connection_inner(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr, expected_region: Option<RegionId>) -> anyhow::Result<RegionId> {
         let (mut sink, mut stream) = Framed::new(stream, MessageCodec).split();
 
         sink.send(Message::Handshake(HandshakeMessage { region: self.region }))
@@ -554,10 +609,21 @@ impl Mesh {
             let mut regions = self.regions.lock().await;
             
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
-            tokio::spawn(async move {
-                while let Some(msg) = rx.recv().await {
-                    if sink.send(msg).await.is_err() {
-                        break;
+            let cancel = self.cancel.clone();
+            self.tasks.spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        msg = rx.recv() => {
+                            match msg {
+                                Some(msg) => {
+                                    if sink.send(msg).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
                     }
                 }
             });
@@ -571,28 +637,32 @@ impl Mesh {
             tx
         };
 
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(Message::PeerMessage(msg)) => {
-                    self.handle_peer_message(msg).await;
-                }
-                Ok(Message::Ping(seq)) => {
-                    if tx.send(Message::Pong(seq)).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(Message::Pong(seq)) => {
-                    let mut regions = self.regions.lock().await;
-                    if let Some(conn) = regions.get_mut(&their_region).and_then(|s| s.as_active_mut()) {
-                        if conn.latency.pending_ping.as_ref().map(|(s, _)| *s == seq).unwrap_or(false) {
-                            let (_, sent_at) = conn.latency.pending_ping.take().unwrap();
-                            conn.latency.record_sample(sent_at.elapsed().as_millis() as u32);
-                            // tracing::info!(region=%their_region, %addr, ms=sent_at.elapsed().as_millis(), "Ping received");
+        loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                result = stream.next() => {
+                    match result {
+                        Some(Ok(Message::PeerMessage(msg))) => {
+                            self.handle_peer_message(msg).await;
                         }
+                        Some(Ok(Message::Ping(seq))) => {
+                            if tx.send(Message::Pong(seq)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Pong(seq))) => {
+                            let mut regions = self.regions.lock().await;
+                            if let Some(conn) = regions.get_mut(&their_region).and_then(|s| s.as_active_mut()) {
+                                if conn.latency.pending_ping.as_ref().map(|(s, _)| *s == seq).unwrap_or(false) {
+                                    let (_, sent_at) = conn.latency.pending_ping.take().unwrap();
+                                    conn.latency.record_sample(sent_at.elapsed().as_millis() as u32);
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Handshake(_))) => {}
+                        Some(Err(_)) | None => break,
                     }
                 }
-                Ok(Message::Handshake(_)) => {}
-                Err(_) => break,
             }
         }
 
@@ -639,13 +709,6 @@ impl Mesh {
                 peers.remove(&key);
             }
         }
-    }
-
-    pub async fn get_region_latency(&self, region: RegionId) -> Option<u32> {
-        let regions = self.regions.lock().await;
-        regions.get(&region)
-            .and_then(|s| s.as_active())
-            .and_then(|conn| conn.latency.average_latency())
     }
 }
 

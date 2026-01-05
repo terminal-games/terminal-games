@@ -28,7 +28,7 @@ headless-terminal = { path = "../headless-terminal" }
 smallvec = "1"
 serde = { version = "1.0", features = ["derive"] }
 postcard = { version = "1", default-features = false }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
 bytes = "1"
 hex = "0.4"
 async-trait = "0.1"
