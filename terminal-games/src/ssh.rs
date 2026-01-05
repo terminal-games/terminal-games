@@ -658,7 +658,7 @@ impl AppServer {
 
                     let mesh = caller.data().mesh.clone();
                     match mesh.get_region_latency(region_id).await {
-                        Some(latency) => Ok(latency as i32),
+                        Some(latency) => Ok(latency.as_millis() as i32),
                         None => Ok(-1),
                     }
                 })

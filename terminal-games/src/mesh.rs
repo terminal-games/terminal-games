@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{collections::{HashMap, HashSet}, fmt::Display, net::SocketAddr, pin::Pin, sync::Arc, time::Instant};
+use std::{collections::{HashMap, HashSet}, fmt::Display, net::SocketAddr, os::unix::io::{AsRawFd, RawFd}, pin::Pin, sync::Arc, time::Duration};
 use std::future::Future;
 
 use bytes::{Buf, BufMut, BytesMut};
@@ -19,8 +19,6 @@ use tokio_util::{codec::{Decoder, Encoder, Framed}, sync::CancellationToken, tas
 enum Message {
     Handshake(HandshakeMessage),
     PeerMessage(PeerMessage),
-    Ping(u64),
-    Pong(u64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,69 +170,9 @@ impl Discovery for EnvDiscovery {
     }
 }
 
-/// Number of latency samples to keep for averaging
-const LATENCY_SAMPLE_COUNT: usize = 3;
-
-struct LatencyTracker {
-    samples: [u32; LATENCY_SAMPLE_COUNT],
-    sample_count: usize,
-    next_index: usize,
-    current_interval: std::time::Duration,
-    next_ping_at: Instant,
-    pub(crate) pending_ping: Option<(u64, Instant)>,
-}
-
-impl LatencyTracker {
-    fn new() -> Self {
-        Self {
-            samples: [0; LATENCY_SAMPLE_COUNT],
-            sample_count: 0,
-            next_index: 0,
-            current_interval: std::time::Duration::from_secs(2),
-            next_ping_at: Instant::now(),
-            pending_ping: None,
-        }
-    }
-
-    fn record_sample(&mut self, latency_ms: u32) {
-        self.samples[self.next_index] = latency_ms;
-        self.next_index = (self.next_index + 1) % LATENCY_SAMPLE_COUNT;
-        if self.sample_count < LATENCY_SAMPLE_COUNT {
-            self.sample_count += 1;
-        }
-
-        self.current_interval = std::cmp::min(self.current_interval.mul_f64(1.5), std::time::Duration::from_secs(60));
-        self.next_ping_at = Instant::now() + self.current_interval;
-    }
-
-    fn average_latency(&self) -> Option<u32> {
-        if self.sample_count == 0 {
-            return None;
-        }
-        let sum: u32 = self.samples[..self.sample_count].iter().sum();
-        Some(sum / self.sample_count as u32)
-    }
-
-    fn should_ping(&self) -> bool {
-        // Don't send a new ping if we're still waiting for a pong (unless it timed out)
-        let pending_expired = self.pending_ping
-            .as_ref()
-            .map(|(_, sent_at)| sent_at.elapsed() > std::time::Duration::from_secs(30))
-            .unwrap_or(false);
-
-        (self.pending_ping.is_none() || pending_expired) && Instant::now() >= self.next_ping_at
-    }
-
-    fn mark_ping_sent(&mut self, seq: u64) {
-        self.pending_ping = Some((seq, Instant::now()));
-        // Schedule next ping attempt at current interval (prevents spamming if pong is lost)
-        self.next_ping_at = Instant::now() + self.current_interval;
-    }
-}
-
 struct ActiveConnection {
     tx: tokio::sync::mpsc::Sender<Message>,
-    latency: LatencyTracker,
+    conn_fd: RawFd,
 }
 
 enum RegionState {
@@ -244,13 +182,6 @@ enum RegionState {
 
 impl RegionState {
     fn as_active(&self) -> Option<&ActiveConnection> {
-        match self {
-            RegionState::Active(conn) => Some(conn),
-            RegionState::Pending => None,
-        }
-    }
-
-    fn as_active_mut(&mut self) -> Option<&mut ActiveConnection> {
         match self {
             RegionState::Active(conn) => Some(conn),
             RegionState::Pending => None,
@@ -382,28 +313,14 @@ impl Mesh {
             }
         });
 
-        let inner = self.inner.clone();
-        self.inner.tasks.spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            let mut ping_seq: u64 = 0;
-            loop {
-                tokio::select! {
-                    _ = inner.cancel.cancelled() => break,
-                    _ = interval.tick() => {
-                        inner.send_due_pings(&mut ping_seq).await;
-                    }
-                }
-            }
-        });
-
         Ok(())
     }
 
-    pub async fn get_region_latency(&self, region: RegionId) -> Option<u32> {
+    pub async fn get_region_latency(&self, region: RegionId) -> Option<Duration> {
         let regions = self.inner.regions.lock().await;
         regions.get(&region)
             .and_then(|s| s.as_active())
-            .and_then(|conn| conn.latency.average_latency())
+            .and_then(|conn| get_tcp_rtt_from_fd(conn.conn_fd).ok())
     }
 
     pub async fn graceful_shutdown(&self) {
@@ -518,31 +435,6 @@ impl MeshInner {
         Ok(())
     }
 
-    async fn send_due_pings(&self, ping_seq: &mut u64) {
-        let regions_to_ping: Vec<(RegionId, tokio::sync::mpsc::Sender<Message>)> = {
-            let regions = self.regions.lock().await;
-            regions
-                .iter()
-                .filter_map(|(region, state)| state.as_active().map(|c| (*region, c)))
-                .filter(|(_, conn)| conn.latency.should_ping())
-                .map(|(region, conn)| (region, conn.tx.clone()))
-                .collect()
-        };
-
-        for (region, tx) in regions_to_ping {
-            *ping_seq = ping_seq.wrapping_add(1);
-            let seq = *ping_seq;
-
-            if let Some(conn) = self.regions.lock().await.get_mut(&region).and_then(|s| s.as_active_mut()) {
-                conn.latency.mark_ping_sent(seq);
-            }
-
-            if let Err(error) = tx.send(Message::Ping(seq)).await {
-                tracing::warn!(%region, ?error, "Failed to send ping");
-            }
-        }
-    }
-
     async fn heal_network(self: &Arc<Self>) -> anyhow::Result<()> {
         let discovered = self.discovery.discover_peers().await?;
 
@@ -587,6 +479,7 @@ impl MeshInner {
     }
 
     async fn handle_connection_inner(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr, expected_region: Option<RegionId>) -> anyhow::Result<RegionId> {
+        let fd = stream.as_raw_fd();
         let (mut sink, mut stream) = Framed::new(stream, MessageCodec).split();
 
         sink.send(Message::Handshake(HandshakeMessage { region: self.region }))
@@ -605,7 +498,7 @@ impl MeshInner {
             }
         }
 
-        let tx = {
+        {
             let mut regions = self.regions.lock().await;
             
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
@@ -629,12 +522,11 @@ impl MeshInner {
             });
 
             regions.insert(their_region, RegionState::Active(ActiveConnection {
-                tx: tx.clone(),
-                latency: LatencyTracker::new(),
+                tx,
+                conn_fd: fd,
             }));
             
             tracing::info!(region=%their_region, %addr, "Connected");
-            tx
         };
 
         loop {
@@ -644,20 +536,6 @@ impl MeshInner {
                     match result {
                         Some(Ok(Message::PeerMessage(msg))) => {
                             self.handle_peer_message(msg).await;
-                        }
-                        Some(Ok(Message::Ping(seq))) => {
-                            if tx.send(Message::Pong(seq)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Some(Ok(Message::Pong(seq))) => {
-                            let mut regions = self.regions.lock().await;
-                            if let Some(conn) = regions.get_mut(&their_region).and_then(|s| s.as_active_mut()) {
-                                if conn.latency.pending_ping.as_ref().map(|(s, _)| *s == seq).unwrap_or(false) {
-                                    let (_, sent_at) = conn.latency.pending_ping.take().unwrap();
-                                    conn.latency.record_sample(sent_at.elapsed().as_millis() as u32);
-                                }
-                            }
                         }
                         Some(Ok(Message::Handshake(_))) => {}
                         Some(Err(_)) | None => break,
@@ -710,6 +588,27 @@ impl MeshInner {
             }
         }
     }
+}
+
+fn get_tcp_rtt_from_fd(fd: RawFd) -> std::io::Result<Duration> {
+    let mut tcp_info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            &mut tcp_info as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(Duration::from_micros(tcp_info.tcpi_rtt as u64))
 }
 
 struct MessageCodec;

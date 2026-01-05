@@ -32,3 +32,4 @@ tokio-util = { version = "0.7", features = ["codec", "rt"] }
 bytes = "1"
 hex = "0.4"
 async-trait = "0.1"
+libc = "0.2"

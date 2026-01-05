@@ -4018,6 +4018,7 @@ dependencies = [
  "futures",
  "headless-terminal",
  "hex",
+ "libc",
  "libsql",
  "postcard",
  "rand_core 0.6.4",
