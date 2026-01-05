@@ -498,36 +498,32 @@ impl MeshInner {
             }
         }
 
-        {
-            let mut regions = self.regions.lock().await;
-            
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
-            let cancel = self.cancel.clone();
-            self.tasks.spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        msg = rx.recv() => {
-                            match msg {
-                                Some(msg) => {
-                                    if sink.send(msg).await.is_err() {
-                                        break;
-                                    }
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
+        let cancel = self.cancel.clone();
+        self.tasks.spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(msg) => {
+                                if sink.send(msg).await.is_err() {
+                                    break;
                                 }
-                                None => break,
                             }
+                            None => break,
                         }
                     }
                 }
-            });
+            }
+        });
 
-            regions.insert(their_region, RegionState::Active(ActiveConnection {
-                tx,
-                conn_fd: fd,
-            }));
-            
-            tracing::info!(region=%their_region, %addr, "Connected");
-        };
+        self.regions.lock().await.insert(their_region, RegionState::Active(ActiveConnection {
+            tx,
+            conn_fd: fd,
+        }));
+        
+        tracing::info!(region=%their_region, %addr, "Connected");
 
         loop {
             tokio::select! {
@@ -537,8 +533,7 @@ impl MeshInner {
                         Some(Ok(Message::PeerMessage(msg))) => {
                             self.handle_peer_message(msg).await;
                         }
-                        Some(Ok(Message::Handshake(_))) => {}
-                        Some(Err(_)) | None => break,
+                        _ => break,
                     }
                 }
             }
@@ -563,14 +558,8 @@ impl MeshInner {
             .into_iter()
             .map(|(peer_id, tx)| {
                 let data = data.clone();
-                let from_peer = msg.from_peer;
-                let app_id = msg.app_id;
                 Box::pin(async move {
-                    if tx.send(PeerMessageApp { from_peer, data }).await.is_err() {
-                        Some((peer_id, app_id))
-                    } else {
-                        None
-                    }
+                    tx.send(PeerMessageApp { from_peer: msg.from_peer, data }).await.is_err().then_some((peer_id, msg.app_id))
                 }) as Pin<Box<dyn Future<Output = Option<(PeerId, AppId)>> + Send>>
             })
             .collect();
