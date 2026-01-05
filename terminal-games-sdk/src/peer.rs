@@ -6,25 +6,53 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RegionId([u8; 4]);
+
+impl RegionId {
+    pub fn from_bytes(bytes: [u8; 4]) -> Self {
+        Self(bytes)
+    }
+
+    /// Returns the current latency to this region in milliseconds.
+    /// Returns `None` if the latency is unknown or the region is not connected.
+    pub fn latency(&self) -> Option<u32> {
+        let ret = unsafe { crate::internal::region_latency(self.0.as_ptr()) };
+        if ret < 0 { None } else { Some(ret as u32) }
+    }
+}
+
+impl std::fmt::Display for RegionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let end = self.0.iter().position(|&b| b == 0).unwrap_or(4);
+        if let Ok(s) = std::str::from_utf8(&self.0[..end]) {
+            write!(f, "{}", s)
+        } else {
+            for b in &self.0 {
+                write!(f, "{:02x}", b)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PeerId([u8; 16]);
 
 impl PeerId {
     /// Returns the time the peer ID was created
     pub fn timestamp(&self) -> SystemTime {
-        let ms = u64::from_le_bytes([
-            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5], self.0[6], self.0[7],
-        ]);
+        let ms = u64::from_le_bytes(self.0[0..8].try_into().unwrap());
         UNIX_EPOCH + std::time::Duration::from_millis(ms)
     }
 
     /// Returns the randomness component of the peer ID
     pub fn randomness(&self) -> u32 {
-        u32::from_le_bytes([self.0[8], self.0[9], self.0[10], self.0[11]])
+        u32::from_le_bytes(self.0[8..12].try_into().unwrap())
     }
 
     /// Returns the region component of the peer ID
-    pub fn region(&self) -> [u8; 4] {
-        [self.0[12], self.0[13], self.0[14], self.0[15]]
+    pub fn region(&self) -> RegionId {
+        RegionId::from_bytes(self.0[12..16].try_into().unwrap())
     }
 
     /// Sends data to this peer
@@ -35,6 +63,12 @@ impl PeerId {
     /// Returns the raw bytes of the ID
     pub fn as_bytes(&self) -> &[u8; 16] {
         &self.0
+    }
+
+    /// Returns the current latency to the peer in milliseconds.
+    /// Returns `None` if the latency is unknown
+    pub fn latency(&self) -> Option<u32> {
+        self.region().latency()
     }
 }
 

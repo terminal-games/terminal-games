@@ -22,8 +22,37 @@ func peer_send(peer_ids_ptr unsafe.Pointer, peer_ids_count uint32, data_ptr unsa
 //go:noescape
 func peer_recv(from_peer_ptr unsafe.Pointer, data_ptr unsafe.Pointer, data_max_len uint32) int32
 
+//go:wasmimport terminal_games region_latency
+//go:noescape
+func region_latency(region_ptr unsafe.Pointer) int32
+
 // ID represents a peer identifier
 type ID [16]byte
+
+type RegionID [4]byte
+
+func (r RegionID) String() string {
+	// Filter out null bytes and return as string
+	end := 4
+	for i := 0; i < 4; i++ {
+		if r[i] == 0 {
+			end = i
+			break
+		}
+	}
+	return string(r[:end])
+}
+
+var ErrLatencyUnknown = errors.New("latency unknown")
+
+// Latency returns the current latency to this region in milliseconds.
+func (r RegionID) Latency() (uint32, error) {
+	ms := region_latency(unsafe.Pointer(&r[0]))
+	if ms < 0 {
+		return 0, ErrLatencyUnknown
+	}
+	return uint32(ms), nil
+}
 
 // String returns a hex-encoded string representation of the ID
 func (id ID) String() string {
@@ -56,10 +85,15 @@ func (id ID) Randomness() uint32 {
 }
 
 // Region returns the region component of the peer ID
-func (id ID) Region() [4]byte {
+func (id ID) Region() RegionID {
 	var region [4]byte
 	copy(region[:], id[12:16])
 	return region
+}
+
+// Latency returns the current latency to this peer in milliseconds
+func (id ID) Latency() (uint32, error) {
+	return id.Region().Latency()
 }
 
 // Send is shorthand for `peer.Send(data, id)`

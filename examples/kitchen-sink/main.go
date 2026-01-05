@@ -43,9 +43,10 @@ type httpBodyMsg string
 type tickMsg time.Time
 
 type peerMessage struct {
-	From    peer.ID
-	Message string
-	Time    time.Time
+	From          peer.ID
+	Message       string
+	Time          time.Time
+	latencyAtTime uint32
 }
 
 type peerMsg peer.Message
@@ -131,10 +132,12 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case peerMsg:
 		pm := peer.Message(msg)
+		ms, _ := pm.From.Latency()
 		receivedMsg := peerMessage{
-			From:    pm.From,
-			Message: string(pm.Data),
-			Time:    time.Now(),
+			From:          pm.From,
+			Message:       string(pm.Data),
+			Time:          time.Now(),
+			latencyAtTime: ms,
 		}
 		m.recentMessages = append(m.recentMessages, receivedMsg)
 		if len(m.recentMessages) > 10 {
@@ -167,8 +170,9 @@ func (m model) View() string {
 			if i > 0 {
 				peerMessagesText += "\n"
 			}
-			peerMessagesText += fmt.Sprintf("[%s] From %s: %s",
+			peerMessagesText += fmt.Sprintf("[%s %vms] From %s: %s",
 				msg.Time.Format("15:04:05"),
+				msg.latencyAtTime,
 				msg.From.String(),
 				msg.Message,
 			)

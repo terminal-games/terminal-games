@@ -40,5 +40,6 @@ mod internal {
             data_ptr: *mut u8,
             data_max_len: u32,
         ) -> i32;
+        pub(crate) fn region_latency(region_ptr: *const u8) -> i32;
     }
 }

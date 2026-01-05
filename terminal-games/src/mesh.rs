@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{collections::{HashMap, HashSet}, fmt::Display, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{collections::{HashMap, HashSet}, fmt::Display, net::SocketAddr, pin::Pin, sync::Arc, time::Instant};
+use std::future::Future;
 
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -18,6 +19,8 @@ use tokio_util::codec::{Decoder, Encoder, Framed};
 enum Message {
     Handshake(HandshakeMessage),
     PeerMessage(PeerMessage),
+    Ping(u64),
+    Pong(u64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,15 +29,25 @@ struct HandshakeMessage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct RegionId([u8; 4]);
+pub struct RegionId([u8; 4]);
+
+impl RegionId {
+    pub fn from_bytes(bytes: [u8; 4]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 4] {
+        &self.0
+    }
+}
 
 impl Display for RegionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let filtered: Vec<u8> = self.0.iter().copied().filter(|&b| b != 0).collect();
+        let filtered: Vec<u8> = self.as_bytes().iter().copied().filter(|&b| b != 0).collect();
         if let Ok(s) = std::str::from_utf8(&filtered) {
             write!(f, "{}", s)
         } else {
-            write!(f, "{}", hex::encode(self.0))
+            write!(f, "{}", hex::encode(self.as_bytes()))
         }
     }
 }
@@ -51,19 +64,14 @@ impl PeerId {
         let mut bytes = [0u8; 16];
         bytes[0..8].copy_from_slice(&self.timestamp.to_le_bytes());
         bytes[8..12].copy_from_slice(&self.randomness.to_le_bytes());
-        bytes[12..16].copy_from_slice(&self.region.0);
+        bytes[12..16].copy_from_slice(self.region.as_bytes());
         bytes
     }
 
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        let timestamp = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
-        ]);
-        let randomness = u32::from_le_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11],
-        ]);
-        let region = RegionId([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        let timestamp = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let randomness = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let region = RegionId::from_bytes(bytes[12..16].try_into().unwrap());
         Self {
             timestamp,
             randomness,
@@ -153,7 +161,7 @@ impl Discovery for EnvDiscovery {
                 let region_id_bytes = region_str.as_bytes();
                 let copy_len = region_id_bytes.len().min(4);
                 region_bytes[..copy_len].copy_from_slice(&region_id_bytes[..copy_len]);
-                let region = RegionId(region_bytes);
+                let region = RegionId::from_bytes(region_bytes);
 
                 let addr = addr_str.parse::<SocketAddr>()
                     .map_err(|e| anyhow::anyhow!("Invalid socket address '{}': {}", addr_str, e))?;
@@ -164,9 +172,95 @@ impl Discovery for EnvDiscovery {
     }
 }
 
+/// Number of latency samples to keep for averaging
+const LATENCY_SAMPLE_COUNT: usize = 3;
+
+struct LatencyTracker {
+    samples: [u32; LATENCY_SAMPLE_COUNT],
+    sample_count: usize,
+    next_index: usize,
+    current_interval: std::time::Duration,
+    next_ping_at: Instant,
+    pub(crate) pending_ping: Option<(u64, Instant)>,
+}
+
+impl LatencyTracker {
+    fn new() -> Self {
+        Self {
+            samples: [0; LATENCY_SAMPLE_COUNT],
+            sample_count: 0,
+            next_index: 0,
+            current_interval: std::time::Duration::from_secs(2),
+            next_ping_at: Instant::now(),
+            pending_ping: None,
+        }
+    }
+
+    fn record_sample(&mut self, latency_ms: u32) {
+        self.samples[self.next_index] = latency_ms;
+        self.next_index = (self.next_index + 1) % LATENCY_SAMPLE_COUNT;
+        if self.sample_count < LATENCY_SAMPLE_COUNT {
+            self.sample_count += 1;
+        }
+
+        self.current_interval = std::cmp::min(self.current_interval.mul_f64(1.5), std::time::Duration::from_secs(60));
+        self.next_ping_at = Instant::now() + self.current_interval;
+    }
+
+    fn average_latency(&self) -> Option<u32> {
+        if self.sample_count == 0 {
+            return None;
+        }
+        let sum: u32 = self.samples[..self.sample_count].iter().sum();
+        Some(sum / self.sample_count as u32)
+    }
+
+    fn should_ping(&self) -> bool {
+        // Don't send a new ping if we're still waiting for a pong (unless it timed out)
+        let pending_expired = self.pending_ping
+            .as_ref()
+            .map(|(_, sent_at)| sent_at.elapsed() > std::time::Duration::from_secs(30))
+            .unwrap_or(false);
+
+        (self.pending_ping.is_none() || pending_expired) && Instant::now() >= self.next_ping_at
+    }
+
+    fn mark_ping_sent(&mut self, seq: u64) {
+        self.pending_ping = Some((seq, Instant::now()));
+        // Schedule next ping attempt at current interval (prevents spamming if pong is lost)
+        self.next_ping_at = Instant::now() + self.current_interval;
+    }
+}
+
+struct ActiveConnection {
+    tx: tokio::sync::mpsc::Sender<Message>,
+    latency: LatencyTracker,
+}
+
+enum RegionState {
+    Pending,
+    Active(ActiveConnection),
+}
+
+impl RegionState {
+    fn as_active(&self) -> Option<&ActiveConnection> {
+        match self {
+            RegionState::Active(conn) => Some(conn),
+            RegionState::Pending => None,
+        }
+    }
+
+    fn as_active_mut(&mut self) -> Option<&mut ActiveConnection> {
+        match self {
+            RegionState::Active(conn) => Some(conn),
+            RegionState::Pending => None,
+        }
+    }
+}
+
 pub struct Mesh {
     region: RegionId,
-    other_regions: Mutex<HashMap<RegionId, (SocketAddr, tokio::sync::mpsc::Sender<Message>)>>,
+    regions: Mutex<HashMap<RegionId, RegionState>>,
     peers: Mutex<HashMap<(PeerId, AppId), tokio::sync::mpsc::Sender<PeerMessageApp>>>,
     discovery: Arc<dyn Discovery>,
 }
@@ -180,8 +274,8 @@ impl Mesh {
         region_bytes[..copy_len].copy_from_slice(&region_id_bytes[..copy_len]);
 
         Arc::new(Self {
-            region: RegionId(region_bytes),
-            other_regions: Default::default(),
+            region: RegionId::from_bytes(region_bytes),
+            regions: Default::default(),
             peers: Default::default(),
             discovery,
         })
@@ -227,7 +321,10 @@ impl Mesh {
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
                         tracing::info!(peer = %peer_addr, "Incoming mesh connection");
-                        tokio::spawn(self.clone().handle_connection(stream, peer_addr, None));
+                        let mesh = self.clone();
+                        tokio::spawn(async move {
+                            let _ = mesh.handle_connection(stream, peer_addr, None).await;
+                        });
                     }
                     Err(e) => {
                         tracing::error!("Failed to accept connection: {}", e);
@@ -285,8 +382,8 @@ impl Mesh {
                 }
             } else {
                 let remote_tx = {
-                    let other_regions = self.other_regions.lock().await;
-                    other_regions.get(&region).map(|(_, tx)| tx.clone())
+                    let regions = self.regions.lock().await;
+                    regions.get(&region).and_then(|s| s.as_active()).map(|conn| conn.tx.clone())
                 };
 
                 if let Some(tx) = remote_tx {
@@ -312,34 +409,88 @@ impl Mesh {
     }
 
     async fn connect_to_node(self: Arc<Self>, region: RegionId, addr: SocketAddr) -> anyhow::Result<()> {
-        let stream = TcpStream::connect(addr).await?;
-        tracing::info!(%region, peer = %addr, "Connected to mesh node");
-        tokio::spawn(self.handle_connection(stream, addr, Some(region)));
+        {
+            // Mark as pending before connecting to prevent heal_network
+            let mut regions = self.regions.lock().await;
+            if regions.contains_key(&region) {
+                tracing::debug!(%region, "Already connected or connecting to region, skipping");
+                return Ok(());
+            }
+            regions.insert(region, RegionState::Pending);
+        }
+
+        let stream = match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                tracing::info!(%region, peer = %addr, "Connected to mesh node");
+                stream
+            }
+            Err(e) => {
+                self.regions.lock().await.remove(&region);
+                return Err(e.into());
+            }
+        };
+
+        let mesh = self.clone();
+        tokio::spawn(mesh.handle_connection(stream, addr, Some(region)));
+
         Ok(())
     }
 
     pub async fn start_discovery(self: Arc<Self>) -> anyhow::Result<()> {
-        self.clone().initial_connect().await?;
-
         let mesh = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
                 if let Err(e) = mesh.clone().heal_network().await {
-                    tracing::error!(?e, "Failed to heal network");
+                    tracing::error!(?e, "Failed to connect to discovered peers");
                 }
+            }
+        });
+
+        let mesh = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut ping_seq: u64 = 0;
+            loop {
+                interval.tick().await;
+                mesh.send_due_pings(&mut ping_seq).await;
             }
         });
 
         Ok(())
     }
 
-    async fn initial_connect(self: Arc<Self>) -> anyhow::Result<()> {
+    async fn send_due_pings(&self, ping_seq: &mut u64) {
+        let regions_to_ping: Vec<(RegionId, tokio::sync::mpsc::Sender<Message>)> = {
+            let regions = self.regions.lock().await;
+            regions
+                .iter()
+                .filter_map(|(region, state)| state.as_active().map(|c| (*region, c)))
+                .filter(|(_, conn)| conn.latency.should_ping())
+                .map(|(region, conn)| (region, conn.tx.clone()))
+                .collect()
+        };
+
+        for (region, tx) in regions_to_ping {
+            *ping_seq = ping_seq.wrapping_add(1);
+            let seq = *ping_seq;
+
+            if let Some(conn) = self.regions.lock().await.get_mut(&region).and_then(|s| s.as_active_mut()) {
+                conn.latency.mark_ping_sent(seq);
+            }
+
+            if let Err(error) = tx.send(Message::Ping(seq)).await {
+                tracing::warn!(%region, ?error, "Failed to send ping");
+            }
+        }
+    }
+
+    async fn heal_network(self: Arc<Self>) -> anyhow::Result<()> {
         let discovered = self.discovery.discover_peers().await?;
 
         let current_regions: HashSet<RegionId> =
-            self.other_regions.lock().await.keys().copied().collect();
+            self.regions.lock().await.keys().copied().collect();
 
         let targets: Vec<(RegionId, SocketAddr)> = discovered
             .into_iter()
@@ -351,7 +502,7 @@ impl Mesh {
             return Ok(());
         }
 
-        tracing::info!(count = targets.len(), "Initial connection to discovered nodes");
+        tracing::info!(count = targets.len(), "Connecting to discovered peers");
 
         let connect_futures: Vec<_> = targets
             .into_iter()
@@ -359,7 +510,7 @@ impl Mesh {
                 let mesh = self.clone();
                 async move {
                     if let Err(e) = mesh.connect_to_node(region, addr).await {
-                        tracing::warn!(%region, %addr, ?e, "Failed initial connection");
+                        tracing::warn!(%region, %addr, ?e, "Failed to connect");
                     }
                 }
             })
@@ -369,146 +520,132 @@ impl Mesh {
         Ok(())
     }
 
-    async fn heal_network(self: Arc<Self>) -> anyhow::Result<()> {
-        let discovered = self.discovery.discover_peers().await?;
+    async fn handle_connection(self: Arc<Self>, stream: TcpStream, addr: SocketAddr, expected_region: Option<RegionId>) -> anyhow::Result<()> {
+        let result = self.clone().handle_connection_inner(stream, addr, expected_region).await;
 
-        let desired_regions: HashMap<RegionId, SocketAddr> = discovered
-            .into_iter()
-            .filter(|(region, _)| *region != self.region)
-            .collect();
-
-        let current_regions: HashSet<RegionId> =
-            self.other_regions.lock().await.keys().copied().collect();
-
-        let to_connect: Vec<(RegionId, SocketAddr)> = desired_regions
-            .iter()
-            .filter(|(region, _)| !current_regions.contains(region))
-            .map(|(r, a)| (*r, *a))
-            .collect();
-
-        for (region, addr) in to_connect {
-            tracing::info!(%region, %addr, "Connecting to discovered region");
-            if let Err(e) = self.clone().connect_to_node(region, addr).await {
-                tracing::error!(%region, %addr, ?e, "Failed to connect to discovered region");
-            }
+        if let Some(region) = result.as_ref().ok().copied().or(expected_region) {
+            self.regions.lock().await.remove(&region);
+            tracing::info!(region=%region, %addr, "Disconnected");
         }
 
-        Ok(())
+        result.map(|_| ())
     }
 
-    async fn handle_connection(self: Arc<Self>, stream: TcpStream, addr: SocketAddr, expected_region: Option<RegionId>) {
+    async fn handle_connection_inner(self: Arc<Self>, stream: TcpStream, addr: SocketAddr, expected_region: Option<RegionId>) -> anyhow::Result<RegionId> {
         let (mut sink, mut stream) = Framed::new(stream, MessageCodec).split();
 
-        if let Err(error) = sink
-            .send(Message::Handshake(HandshakeMessage {
-                region: self.region,
-            }))
+        sink.send(Message::Handshake(HandshakeMessage { region: self.region }))
             .await
-        {
-            tracing::error!(?error, "failed to send handshake");
-            return;
+            .map_err(|e| anyhow::anyhow!("Failed to send handshake: {}", e))?;
+
+        let their_region = match stream.next().await {
+            Some(Ok(Message::Handshake(h))) => h.region,
+            _ => return Err(anyhow::anyhow!("Bad handshake")),
+        };
+
+        if let Some(expected) = expected_region {
+            if their_region != expected {
+                tracing::warn!(%expected, actual=%their_region, %addr, "Region mismatch");
+                return Err(anyhow::anyhow!("Region mismatch: expected {}, got {}", expected, their_region));
+            }
         }
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                if let Err(error) = sink.send(msg).await {
-                    tracing::error!(?error, "Failed to send message to region");
-                    break;
+        let tx = {
+            let mut regions = self.regions.lock().await;
+            
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
+            tokio::spawn(async move {
+                while let Some(msg) = rx.recv().await {
+                    if sink.send(msg).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            });
 
-        let mut connected_region: Option<RegionId> = expected_region;
+            regions.insert(their_region, RegionState::Active(ActiveConnection {
+                tx: tx.clone(),
+                latency: LatencyTracker::new(),
+            }));
+            
+            tracing::info!(region=%their_region, %addr, "Connected");
+            tx
+        };
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(Message::PeerMessage(msg)) => {
-                    let data = Arc::new(msg.data);
-
-                    let peer_sends: Vec<_> = {
-                        let peers = self.peers.lock().await;
-                        msg.to_peers
-                            .iter()
-                            .filter_map(|&peer_id| {
-                                let key = (peer_id, msg.app_id);
-                                peers.get(&key).map(|tx| (peer_id, tx.clone()))
-                            })
-                            .collect()
-                    };
-
-                    let send_futures: Vec<_> = peer_sends
-                        .into_iter()
-                        .map(|(peer_id, tx)| {
-                            let data = data.clone();
-                            Box::pin(async move {
-                                if let Err(error) = tx
-                                    .send(PeerMessageApp {
-                                        from_peer: msg.from_peer,
-                                        data,
-                                    })
-                                    .await
-                                {
-                                    tracing::error!(%peer_id, app_id=%msg.app_id, ?error, "failed to send to peer");
-                                    Some((peer_id, msg.app_id))
-                                } else {
-                                    None
-                                }
-                            }) as Pin<Box<dyn Future<Output = Option<(PeerId, AppId)>> + Send>>
-                        })
-                        .collect();
-
-                    let results = futures::future::join_all(send_futures).await;
-
-                    let failed_peers: Vec<_> = results.into_iter().flatten().collect();
-                    if !failed_peers.is_empty() {
-                        let mut peers = self.peers.lock().await;
-                        for (peer_id, app_id) in failed_peers {
-                            peers.remove(&(peer_id, app_id));
-                        }
-                    }
+                    self.handle_peer_message(msg).await;
                 }
-                Ok(Message::Handshake(msg)) => {
-                    if let Some(expected) = expected_region {
-                        if msg.region != expected {
-                            tracing::warn!(
-                                expected = %expected,
-                                actual = %msg.region,
-                                %addr,
-                                "Region mismatch on handshake, closing connection"
-                            );
-                            break;
-                        }
-                    }
-
-                    // Only register if not already connected to this region
-                    let mut other_regions = self.other_regions.lock().await;
-                    if other_regions.contains_key(&msg.region) {
-                        tracing::debug!(region = %msg.region, %addr, "Already connected to region, closing duplicate");
+                Ok(Message::Ping(seq)) => {
+                    if tx.send(Message::Pong(seq)).await.is_err() {
                         break;
                     }
-
-                    connected_region = Some(msg.region);
-                    other_regions.insert(msg.region, (addr, tx.clone()));
-                    drop(other_regions);
-                    tracing::info!(region = %msg.region, %addr, "Handshake completed");
                 }
-                Err(error) => {
-                    tracing::error!(%addr, ?error, "Error reading from connection");
-                    break;
+                Ok(Message::Pong(seq)) => {
+                    let mut regions = self.regions.lock().await;
+                    if let Some(conn) = regions.get_mut(&their_region).and_then(|s| s.as_active_mut()) {
+                        if conn.latency.pending_ping.as_ref().map(|(s, _)| *s == seq).unwrap_or(false) {
+                            let (_, sent_at) = conn.latency.pending_ping.take().unwrap();
+                            conn.latency.record_sample(sent_at.elapsed().as_millis() as u32);
+                            // tracing::info!(region=%their_region, %addr, ms=sent_at.elapsed().as_millis(), "Ping received");
+                        }
+                    }
                 }
+                Ok(Message::Handshake(_)) => {}
+                Err(_) => break,
             }
         }
 
-        if let Some(region) = connected_region {
-            let mut other_regions = self.other_regions.lock().await;
-            if let Some((stored_addr, _)) = other_regions.get(&region) {
-                if *stored_addr == addr {
-                    other_regions.remove(&region);
-                    tracing::info!(%region, %addr, "Connection ended, removed from other_regions");
-                }
+        Ok(their_region)
+    }
+
+    async fn handle_peer_message(&self, msg: PeerMessage) {
+        let data = Arc::new(msg.data);
+        let peer_sends: Vec<_> = {
+            let peers = self.peers.lock().await;
+            msg.to_peers
+                .iter()
+                .filter_map(|&peer_id| {
+                    peers.get(&(peer_id, msg.app_id)).map(|tx| (peer_id, tx.clone()))
+                })
+                .collect()
+        };
+
+        let send_futures: Vec<_> = peer_sends
+            .into_iter()
+            .map(|(peer_id, tx)| {
+                let data = data.clone();
+                let from_peer = msg.from_peer;
+                let app_id = msg.app_id;
+                Box::pin(async move {
+                    if tx.send(PeerMessageApp { from_peer, data }).await.is_err() {
+                        Some((peer_id, app_id))
+                    } else {
+                        None
+                    }
+                }) as Pin<Box<dyn Future<Output = Option<(PeerId, AppId)>> + Send>>
+            })
+            .collect();
+
+        let failed: Vec<_> = futures::future::join_all(send_futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+
+        if !failed.is_empty() {
+            let mut peers = self.peers.lock().await;
+            for key in failed {
+                peers.remove(&key);
             }
         }
+    }
+
+    pub async fn get_region_latency(&self, region: RegionId) -> Option<u32> {
+        let regions = self.regions.lock().await;
+        regions.get(&region)
+            .and_then(|s| s.as_active())
+            .and_then(|conn| conn.latency.average_latency())
     }
 }
 

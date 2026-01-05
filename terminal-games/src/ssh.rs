@@ -18,7 +18,7 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 use tokio_rustls::rustls::pki_types::ServerName;
 
-use crate::mesh::{AppId, Mesh, PeerId};
+use crate::mesh::{AppId, Mesh, PeerId, RegionId};
 use crate::status_bar::StatusBar;
 use crate::{ComponentRunStates, MyLimiter};
 
@@ -637,6 +637,34 @@ impl AppServer {
             },
         )?;
 
+        linker.func_wrap_async(
+            "terminal_games",
+            "region_latency",
+            |mut caller: wasmtime::Caller<'_, ComponentRunStates>, (region_ptr,): (i32,)| {
+                Box::new(async move {
+                    let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                        tracing::error!("region_latency: failed to find host memory");
+                        return Ok(-1i32);
+                    };
+
+                    let region_offset = region_ptr as usize;
+                    let mut region_bytes = [0u8; 4];
+                    if let Err(_) = mem.read(&caller, region_offset, &mut region_bytes) {
+                        tracing::error!("region_latency: failed to read region from memory");
+                        return Ok(-1);
+                    }
+
+                    let region_id = RegionId::from_bytes(region_bytes);
+
+                    let mesh = caller.data().mesh.clone();
+                    match mesh.get_region_latency(region_id).await {
+                        Some(latency) => Ok(latency as i32),
+                        None => Ok(-1),
+                    }
+                })
+            },
+        )?;
+
         linker.func_wrap(
             "terminal_games",
             "peer_recv",
@@ -804,7 +832,7 @@ impl Server for AppServer {
                 .unwrap();
 
             // todo: wait for term and args with a 1ms timeout
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let term = term_receiver.try_recv().ok();
             let args = args_receiver.try_recv().ok();
 
@@ -988,6 +1016,7 @@ impl Server for AppServer {
                     module_cache: server.module_cache.clone(),
                     peer_rx,
                     peer_tx,
+                    mesh: mesh.clone(),
                 };
 
                 let mut store = wasmtime::Store::new(&server.engine, state);

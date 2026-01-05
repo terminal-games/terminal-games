@@ -94,6 +94,7 @@ pub struct ComponentRunStates {
     module_cache: Arc<Mutex<ModuleCache>>,
     peer_rx: tokio::sync::mpsc::Receiver<PeerMessageApp>,
     peer_tx: tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>,
+    mesh: Arc<Mesh>,
 }
 
 struct MyLimiter {
