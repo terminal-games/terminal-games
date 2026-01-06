@@ -19,11 +19,26 @@ use tokio_util::{codec::{Decoder, Encoder, Framed}, sync::CancellationToken, tas
 enum Message {
     Handshake(HandshakeMessage),
     PeerMessage(PeerMessage),
+    PeerListSync(PeerListSyncMessage),
+    PeerAdded(PeerChangeMessage),
+    PeerRemoved(PeerChangeMessage),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HandshakeMessage {
     region: RegionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PeerListSyncMessage {
+    region: RegionId,
+    peers_by_app: Vec<(AppId, Vec<PeerId>)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PeerChangeMessage {
+    peer_id: PeerId,
+    app_id: AppId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -192,7 +207,8 @@ impl RegionState {
 struct MeshInner {
     region: RegionId,
     regions: Mutex<HashMap<RegionId, RegionState>>,
-    peers: Mutex<HashMap<(PeerId, AppId), tokio::sync::mpsc::Sender<PeerMessageApp>>>,
+    peers: Mutex<HashMap<AppId, HashMap<PeerId, tokio::sync::mpsc::Sender<PeerMessageApp>>>>,
+    global_peers: Mutex<HashMap<AppId, HashSet<PeerId>>>,
     discovery: Arc<dyn Discovery>,
     cancel: CancellationToken,
     tasks: TaskTracker,
@@ -202,7 +218,6 @@ struct MeshInner {
 pub struct Mesh {
     inner: Arc<MeshInner>,
 }
-
 
 impl Mesh {
     pub fn new(discovery: Arc<dyn Discovery>) -> Self {
@@ -217,6 +232,7 @@ impl Mesh {
                 region: RegionId::from_bytes(region_bytes),
                 regions: Default::default(),
                 peers: Default::default(),
+                global_peers: Default::default(),
                 discovery,
                 cancel: CancellationToken::new(),
                 tasks: TaskTracker::new(),
@@ -242,7 +258,15 @@ impl Mesh {
         
         let inner = self.inner.clone();
         self.inner.tasks.spawn(async move {
-            inner.peers.lock().await.insert((peer_id, app_id), tx);
+            inner.peers.lock().await
+                .entry(app_id)
+                .or_default()
+                .insert(peer_id, tx);
+            inner.global_peers.lock().await
+                .entry(app_id)
+                .or_insert_with(HashSet::new)
+                .insert(peer_id);
+            inner.broadcast(Message::PeerAdded(PeerChangeMessage { peer_id, app_id })).await;
 
             loop {
                 tokio::select! {
@@ -258,10 +282,35 @@ impl Mesh {
                 }
             }
 
-            inner.peers.lock().await.remove(&(peer_id, app_id));
+            {
+                let mut peers = inner.peers.lock().await;
+                if let Some(app_peers) = peers.get_mut(&app_id) {
+                    app_peers.remove(&peer_id);
+                    if app_peers.is_empty() {
+                        peers.remove(&app_id);
+                    }
+                }
+            }
+            {
+                let mut global_peers = inner.global_peers.lock().await;
+                if let Some(peers) = global_peers.get_mut(&app_id) {
+                    peers.remove(&peer_id);
+                    if peers.is_empty() {
+                        global_peers.remove(&app_id);
+                    }
+                }
+            }
+            inner.broadcast(Message::PeerRemoved(PeerChangeMessage { peer_id, app_id })).await;
         });
 
         (peer_id, rx, tx2)
+    }
+
+    pub async fn get_peers_for_app(&self, app_id: AppId) -> HashSet<PeerId> {
+        self.inner.global_peers.lock().await
+            .get(&app_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub async fn serve(&self) -> anyhow::Result<()> {
@@ -333,6 +382,28 @@ impl Mesh {
 }
 
 impl MeshInner {
+    async fn broadcast(&self, message: Message) {
+        let region_txs: Vec<_> = {
+            let regions = self.regions.lock().await;
+            regions
+                .iter()
+                .filter_map(|(_, state)| state.as_active().map(|conn| conn.tx.clone()))
+                .collect()
+        };
+
+        let send_futures: Vec<_> = region_txs
+            .into_iter()
+            .map(|tx| {
+                let msg = message.clone();
+                async move {
+                    let _ = tx.send(msg).await;
+                }
+            })
+            .collect();
+
+        futures::future::join_all(send_futures).await;
+    }
+
     async fn send_peer_message(&self, message: PeerMessage) {
         let mut region_partitions: HashMap<RegionId, Vec<PeerId>> = Default::default();
         let num_peers = message.to_peers.len();
@@ -350,11 +421,13 @@ impl MeshInner {
             if region == self.region {
                 let local_sends: Vec<_> = {
                     let peers = self.peers.lock().await;
+                    let app_peers = peers.get(&message.app_id);
                     peer_ids
                         .into_iter()
                         .filter_map(|peer_id| {
-                            let key = (peer_id, message.app_id);
-                            peers.get(&key).map(|tx| (peer_id, tx.clone()))
+                            app_peers
+                                .and_then(|p| p.get(&peer_id))
+                                .map(|tx| (peer_id, tx.clone()))
                         })
                         .collect()
                 };
@@ -498,6 +571,15 @@ impl MeshInner {
             }
         }
 
+        let local_peers_by_app = self.peers.lock().await
+            .iter()
+            .map(|(app_id, peer_map)| (*app_id, peer_map.keys().copied().collect()))
+            .collect();
+        sink.send(Message::PeerListSync(PeerListSyncMessage {
+            region: self.region,
+            peers_by_app: local_peers_by_app,
+        })).await.map_err(|e| anyhow::anyhow!("Failed to send peer list sync: {}", e))?;
+
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
         let cancel = self.cancel.clone();
         self.tasks.spawn(async move {
@@ -522,7 +604,7 @@ impl MeshInner {
             tx,
             conn_fd: fd,
         }));
-        
+
         tracing::info!(region=%their_region, %addr, "Connected");
 
         loop {
@@ -530,8 +612,24 @@ impl MeshInner {
                 _ = self.cancel.cancelled() => break,
                 result = stream.next() => {
                     match result {
-                        Some(Ok(Message::PeerMessage(msg))) => {
-                            self.handle_peer_message(msg).await;
+                        Some(Ok(message)) => {
+                            match message {
+                                Message::PeerMessage(msg) => {
+                                    self.handle_peer_message(msg).await;
+                                }
+                                Message::PeerListSync(msg) => {
+                                    self.handle_peer_list_sync(msg).await;
+                                }
+                                Message::PeerAdded(msg) => {
+                                    self.handle_peer_added(msg).await;
+                                }
+                                Message::PeerRemoved(msg) => {
+                                    self.handle_peer_removed(msg).await;
+                                }
+                                Message::Handshake(_) => {
+                                    tracing::warn!(%their_region, "Unexpected handshake after connection established");
+                                }
+                            }
                         }
                         _ => break,
                     }
@@ -539,17 +637,77 @@ impl MeshInner {
             }
         }
 
+        self.handle_region_disconnect(their_region).await;
+
         Ok(their_region)
+    }
+
+    async fn handle_peer_list_sync(&self, msg: PeerListSyncMessage) {
+        let mut global_peers = self.global_peers.lock().await;
+
+        // Remove old peers from this region
+        for (_, peers) in global_peers.iter_mut() {
+            peers.retain(|p| p.region != msg.region);
+        }
+        global_peers.retain(|_, peers| !peers.is_empty());
+
+        // Add new peers from this region
+        for (app_id, peer_ids) in msg.peers_by_app {
+            global_peers
+                .entry(app_id)
+                .or_insert_with(HashSet::new)
+                .extend(peer_ids);
+        }
+
+        let total_peers: usize = global_peers.values().map(|s| s.len()).sum();
+        tracing::debug!(region=%msg.region, total_peers, "Received peer list sync");
+    }
+
+    async fn handle_peer_added(&self, msg: PeerChangeMessage) {
+        let mut global_peers = self.global_peers.lock().await;
+        global_peers
+            .entry(msg.app_id)
+            .or_insert_with(HashSet::new)
+            .insert(msg.peer_id);
+
+        tracing::debug!(peer=%msg.peer_id, app=%msg.app_id, "Remote peer added");
+    }
+
+    async fn handle_peer_removed(&self, msg: PeerChangeMessage) {
+        let mut global_peers = self.global_peers.lock().await;
+        if let Some(peers) = global_peers.get_mut(&msg.app_id) {
+            peers.remove(&msg.peer_id);
+            if peers.is_empty() {
+                global_peers.remove(&msg.app_id);
+            }
+        }
+
+        tracing::debug!(peer=%msg.peer_id, app=%msg.app_id, "Remote peer removed");
+    }
+
+    async fn handle_region_disconnect(&self, region: RegionId) {
+        let mut global_peers = self.global_peers.lock().await;
+
+        for (_, peers) in global_peers.iter_mut() {
+            peers.retain(|p| p.region != region);
+        }
+
+        global_peers.retain(|_, peers| !peers.is_empty());
+
+        tracing::debug!(%region, "Region disconnected, removed all its peers");
     }
 
     async fn handle_peer_message(&self, msg: PeerMessage) {
         let data = Arc::new(msg.data);
         let peer_sends: Vec<_> = {
             let peers = self.peers.lock().await;
+            let app_peers = peers.get(&msg.app_id);
             msg.to_peers
                 .iter()
                 .filter_map(|&peer_id| {
-                    peers.get(&(peer_id, msg.app_id)).map(|tx| (peer_id, tx.clone()))
+                    app_peers
+                        .and_then(|p| p.get(&peer_id))
+                        .map(|tx| (peer_id, tx.clone()))
                 })
                 .collect()
         };
@@ -559,8 +717,8 @@ impl MeshInner {
             .map(|(peer_id, tx)| {
                 let data = data.clone();
                 Box::pin(async move {
-                    tx.send(PeerMessageApp { from_peer: msg.from_peer, data }).await.is_err().then_some((peer_id, msg.app_id))
-                }) as Pin<Box<dyn Future<Output = Option<(PeerId, AppId)>> + Send>>
+                    tx.send(PeerMessageApp { from_peer: msg.from_peer, data }).await.is_err().then_some(peer_id)
+                }) as Pin<Box<dyn Future<Output = Option<PeerId>> + Send>>
             })
             .collect();
 
@@ -572,8 +730,13 @@ impl MeshInner {
 
         if !failed.is_empty() {
             let mut peers = self.peers.lock().await;
-            for key in failed {
-                peers.remove(&key);
+            if let Some(app_peers) = peers.get_mut(&msg.app_id) {
+                for peer_id in failed {
+                    app_peers.remove(&peer_id);
+                }
+                if app_peers.is_empty() {
+                    peers.remove(&msg.app_id);
+                }
             }
         }
     }

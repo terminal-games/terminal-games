@@ -118,6 +118,86 @@ pub fn current_id() -> PeerId {
     parse_id(&std::env::var("PEER_ID").unwrap()).unwrap()
 }
 
+#[derive(Clone, Debug)]
+pub struct PeerListResult {
+    /// A subset of peers connected to this app
+    pub peers: Vec<PeerId>,
+    /// Total number of peers available across all regions to this app
+    pub total_count: u32,
+}
+
+/// Returns all peers currently connected to this app across all regions,
+/// including the current peer.
+///
+/// Note: this list is _eventually consistent_ and unordered, meaning that each
+/// instance of your app may not see the same list at the same time or in the
+/// same order
+pub fn list() -> Result<Vec<PeerId>, PeerError> {
+    let mut all_peers = Vec::new();
+    let mut offset = 0;
+
+    loop {
+        let result = list_page(offset, 1024)?;
+        let count = result.peers.len();
+        all_peers.extend(result.peers);
+
+        if all_peers.len() >= result.total_count as usize {
+            break;
+        }
+        offset += count as u32;
+    }
+
+    Ok(all_peers)
+}
+
+/// Returns a page of peers currently connected to this app.
+///
+/// Note: see the note in [`list`]
+pub fn list_page(offset: u32, length: u32) -> Result<PeerListResult, PeerError> {
+    let length = length.min(1024);
+    if length == 0 {
+        let mut total_count: u32 = 0;
+        let ret =
+            unsafe { crate::internal::peer_list(std::ptr::null_mut(), 0, 0, &mut total_count) };
+        if ret < 0 {
+            return Err(PeerError::ListFailed);
+        }
+        return Ok(PeerListResult {
+            peers: Vec::new(),
+            total_count,
+        });
+    }
+
+    let mut buf = vec![0u8; length as usize * 16];
+    let mut total_count: u32 = 0;
+
+    let ret =
+        unsafe { crate::internal::peer_list(buf.as_mut_ptr(), offset, length, &mut total_count) };
+
+    if ret < 0 {
+        return Err(PeerError::ListFailed);
+    }
+
+    let count = ret as usize;
+    let mut peers = Vec::with_capacity(count);
+
+    for i in 0..count {
+        let buf_offset = i * 16;
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&buf[buf_offset..buf_offset + 16]);
+        peers.push(PeerId(id));
+    }
+
+    Ok(PeerListResult { peers, total_count })
+}
+
+/// Returns the total count of peers connected to this app without fetching the
+/// list.
+pub fn count() -> Result<u32, PeerError> {
+    let result = list_page(0, 0)?;
+    Ok(result.total_count)
+}
+
 /// A message received from a peer
 #[derive(Clone, Debug)]
 pub struct Message {
@@ -133,6 +213,7 @@ pub enum PeerError {
     TooManyPeerIds,
     SendFailed,
     RecvFailed,
+    ListFailed,
 }
 
 impl std::fmt::Display for PeerError {
@@ -144,6 +225,7 @@ impl std::fmt::Display for PeerError {
             PeerError::TooManyPeerIds => write!(f, "too many peer IDs: maximum 1024"),
             PeerError::SendFailed => write!(f, "peer_send failed"),
             PeerError::RecvFailed => write!(f, "peer_recv failed"),
+            PeerError::ListFailed => write!(f, "peer_list failed"),
         }
     }
 }

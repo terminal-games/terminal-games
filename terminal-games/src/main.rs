@@ -95,6 +95,7 @@ pub struct ComponentRunStates {
     peer_rx: tokio::sync::mpsc::Receiver<PeerMessageApp>,
     peer_tx: tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>,
     mesh: Mesh,
+    app_id: crate::mesh::AppId,
 }
 
 struct MyLimiter {

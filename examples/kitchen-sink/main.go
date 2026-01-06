@@ -34,13 +34,16 @@ type model struct {
 	httpBody          string
 	hasDarkBackground bool
 	peerID            peer.ID
-	targetPeerID      peer.ID
+	peers             []peer.ID
+	selectedPeerIdx   int
 	recentMessages    []peerMessage
 }
 
 type httpBodyMsg string
 
 type tickMsg time.Time
+
+type peerListMsg []peer.ID
 
 type peerMessage struct {
 	From          peer.ID
@@ -54,16 +57,6 @@ type peerMsg peer.Message
 func main() {
 	r := bubblewrap.MakeRenderer()
 
-	var targetID peer.ID
-	appArgs := os.Getenv("APP_ARGS")
-	if appArgs != "" {
-		parsedID, err := peer.ParseID(appArgs)
-		if err != nil {
-			log.Fatalf("Warning: failed to parse target peer ID from APP_ARGS (%q): %v", appArgs, err)
-		}
-		targetID = parsedID
-	}
-
 	zone.NewGlobal()
 	p := bubblewrap.NewProgram(model{
 		timeLeft:          300,
@@ -71,7 +64,8 @@ func main() {
 		httpStyle:         lipgloss.NewStyle().Width(100),
 		hasDarkBackground: r.HasDarkBackground(),
 		peerID:            peer.CurrentID(),
-		targetPeerID:      targetID,
+		peers:             []peer.ID{},
+		selectedPeerIdx:   0,
 		recentMessages:    make([]peerMessage, 0),
 	}, tea.WithAltScreen(), tea.WithMouseAllMotion())
 
@@ -81,7 +75,7 @@ func main() {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(tick(), listenForPeerMessage())
+	return tea.Batch(tick(), listenForPeerMessage(), refreshPeerList())
 }
 
 func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -96,6 +90,23 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "esc", "ctrl+c":
 			return m, tea.Quit
+		case "up", "k":
+			if m.selectedPeerIdx > 0 {
+				m.selectedPeerIdx--
+			}
+			return m, nil
+		case "down", "j":
+			if m.selectedPeerIdx < len(m.peers)-1 {
+				m.selectedPeerIdx++
+			}
+			return m, nil
+		case "enter":
+			if len(m.peers) > 0 && m.selectedPeerIdx < len(m.peers) {
+				targetPeer := m.peers[m.selectedPeerIdx]
+				message := fmt.Sprintf("Hello from %s at %s", m.peerID.String(), time.Now().Format("15:04:05"))
+				return m, sendPeerMessage(targetPeer, message)
+			}
+			return m, nil
 		case "r":
 			url := fmt.Sprintf("https://pokeapi.co/api/v2/pokemon?limit=1&offset=%v", rand.Int32N(800))
 
@@ -117,16 +128,19 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "f":
 			fmt.Fprintf(os.Stdout, "\x1b[%d;%dH%c", m.h+2, 2, 'A')
 			return m, nil
-		case "p":
-			message := fmt.Sprintf("Hello from %s at %s", m.peerID.String(), time.Now().Format("15:04:05"))
-			return m, sendPeerMessage(m.targetPeerID, message)
 		}
 	case tickMsg:
 		m.timeLeft--
 		if m.timeLeft <= 0 {
 			return m, tea.Quit
 		}
-		return m, tick()
+		return m, tea.Batch(tick(), refreshPeerList())
+	case peerListMsg:
+		m.peers = msg
+		if m.selectedPeerIdx >= len(m.peers) {
+			m.selectedPeerIdx = max(0, len(m.peers)-1)
+		}
+		return m, nil
 	case httpBodyMsg:
 		m.httpBody = string(msg)
 		return m, nil
@@ -163,6 +177,30 @@ func (m model) View() string {
 	}
 	markedZone := zone.Mark("myId", hoverString)
 
+	peerListText := "No peers connected"
+	if len(m.peers) > 0 {
+		peerListText = ""
+		for i, p := range m.peers {
+			if i > 0 {
+				peerListText += "\n"
+			}
+			cursor := "  "
+			if i == m.selectedPeerIdx {
+				cursor = "> "
+			}
+			selfMarker := ""
+			if p == m.peerID {
+				selfMarker = " (you)"
+			}
+			latency, err := p.Latency()
+			latencyStr := "local"
+			if err == nil && latency > 0 {
+				latencyStr = fmt.Sprintf("%dms", latency)
+			}
+			peerListText += fmt.Sprintf("%s%s [%s] %s%s", cursor, p.String(), p.Region(), latencyStr, selfMarker)
+		}
+	}
+
 	peerMessagesText := "No messages yet"
 	if len(m.recentMessages) > 0 {
 		peerMessagesText = ""
@@ -181,13 +219,13 @@ func (m model) View() string {
 
 	content := m.mainStyle.Render(fmt.Sprintf(
 		"Hi. Last char: %v. Size: %vx%v Mouse: %v %v %v %s This program will exit in %d seconds...\n\n"+
-			"Peer ID: %s\n"+
-			"Press 'p' to send a message to peer %s\n\n"+
+			"Peer ID: %s\n\n"+
+			"Peers (↑/↓ to select, Enter to send message):\n%s\n\n"+
 			"Recent Messages:\n%s\n\n"+
 			"%v\n\n%+v\nhasDarkBackground=%v",
 		m.lastChar, m.w, m.h, m.x, m.y, markedZone, TerminalOSC8Link("https://example.com", "example"), m.timeLeft,
 		m.peerID.String(),
-		m.targetPeerID.String(),
+		peerListText,
 		peerMessagesText,
 		m.httpStyle.Render(m.httpBody), os.Environ(), m.hasDarkBackground,
 	))
@@ -221,5 +259,15 @@ func listenForPeerMessage() tea.Cmd {
 			time.Sleep(100 * time.Millisecond)
 		}
 		return peerMsg(msg)
+	}
+}
+
+func refreshPeerList() tea.Cmd {
+	return func() tea.Msg {
+		peers, err := peer.List()
+		if err != nil {
+			return peerListMsg([]peer.ID{})
+		}
+		return peerListMsg(peers)
 	}
 }

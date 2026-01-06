@@ -26,6 +26,10 @@ func peer_recv(from_peer_ptr unsafe.Pointer, data_ptr unsafe.Pointer, data_max_l
 //go:noescape
 func region_latency(region_ptr unsafe.Pointer) int32
 
+//go:wasmimport terminal_games peer_list
+//go:noescape
+func peer_list(peer_ids_ptr unsafe.Pointer, offset uint32, length uint32, total_count_ptr unsafe.Pointer) int32
+
 // ID represents a peer identifier
 type ID [16]byte
 
@@ -105,6 +109,71 @@ func CurrentID() ID {
 	// PEER_ID is always defined as a valid peer id, so we can ignore the error
 	id, _ := ParseID(os.Getenv("PEER_ID"))
 	return id
+}
+
+// List returns all peers currently connected to this app across all regions.
+// This includes the current peer.
+func List() ([]ID, error) {
+	var allPeers []ID
+	offset := uint32(0)
+
+	for {
+		peers, totalCount, err := ListPage(offset, 1024)
+		if err != nil {
+			return nil, err
+		}
+		allPeers = append(allPeers, peers...)
+
+		if uint32(len(allPeers)) >= totalCount {
+			break
+		}
+		offset += uint32(len(peers))
+	}
+
+	return allPeers, nil
+}
+
+// ListPage returns a page of peers currently connected to this app.
+// offset is the starting index, length is the max number to return (capped at 1024).
+func ListPage(offset, length uint32) ([]ID, uint32, error) {
+	if length > 1024 {
+		length = 1024
+	}
+
+	var totalCount uint32
+
+	if length == 0 {
+		ret := peer_list(nil, 0, 0, unsafe.Pointer(&totalCount))
+		if ret < 0 {
+			return nil, 0, errors.New("peer_list failed")
+		}
+		return nil, totalCount, nil
+	}
+
+	buf := make([]byte, length*16)
+	ret := peer_list(unsafe.Pointer(&buf[0]), offset, length, unsafe.Pointer(&totalCount))
+	if ret < 0 {
+		return nil, totalCount, errors.New("peer_list failed")
+	}
+
+	count := int(ret)
+	peers := make([]ID, count)
+	for i := range count {
+		var id ID
+		copy(id[:], buf[i*16:(i+1)*16])
+		peers[i] = id
+	}
+
+	return peers, totalCount, nil
+}
+
+// Count returns the total number of peers connected to this app without fetching the list.
+func Count() (uint32, error) {
+	_, totalCount, err := ListPage(0, 0)
+	if err != nil {
+		return 0, err
+	}
+	return totalCount, nil
 }
 
 // Message represents a message received from a peer
