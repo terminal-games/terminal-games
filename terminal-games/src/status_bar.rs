@@ -90,7 +90,7 @@ impl StatusBar {
         if !force && !size_changed && !content_changed {
             return false;
         }
-        tracing::info!(force, size_changed, content_changed, "draw status bar");
+        // tracing::info!(force, size_changed, content_changed, "draw status bar");
 
         buf.extend_from_slice(format!("\x1b[{};1H\x1b[0m", height).as_bytes());
         buf.extend_from_slice(&content);

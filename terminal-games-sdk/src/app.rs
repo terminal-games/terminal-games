@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
 /// Asks the host to switch to another app identified by its shortname.
 /// The current guest should exit after calling this function so the host can
 /// start the next app.
