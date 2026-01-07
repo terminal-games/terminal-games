@@ -42,7 +42,6 @@ mod internal {
         ) -> i32;
         pub(crate) fn peer_list(
             peer_ids_ptr: *mut u8,
-            offset: u32,
             length: u32,
             total_count_ptr: *mut u32,
         ) -> i32;

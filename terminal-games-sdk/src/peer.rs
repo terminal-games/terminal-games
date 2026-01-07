@@ -35,24 +35,24 @@ impl std::fmt::Display for RegionId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PeerId([u8; 16]);
 
 impl PeerId {
     /// Returns the time the peer ID was created
     pub fn timestamp(&self) -> SystemTime {
-        let ms = u64::from_le_bytes(self.0[0..8].try_into().unwrap());
+        let ms = u64::from_be_bytes(self.0[4..12].try_into().unwrap());
         UNIX_EPOCH + std::time::Duration::from_millis(ms)
     }
 
     /// Returns the randomness component of the peer ID
     pub fn randomness(&self) -> u32 {
-        u32::from_le_bytes(self.0[8..12].try_into().unwrap())
+        u32::from_be_bytes(self.0[12..16].try_into().unwrap())
     }
 
     /// Returns the region component of the peer ID
     pub fn region(&self) -> RegionId {
-        RegionId::from_bytes(self.0[12..16].try_into().unwrap())
+        RegionId::from_bytes(self.0[0..4].try_into().unwrap())
     }
 
     /// Sends data to this peer
@@ -118,14 +118,6 @@ pub fn current_id() -> PeerId {
     parse_id(&std::env::var("PEER_ID").unwrap()).unwrap()
 }
 
-#[derive(Clone, Debug)]
-pub struct PeerListResult {
-    /// A subset of peers connected to this app
-    pub peers: Vec<PeerId>,
-    /// Total number of peers available across all regions to this app
-    pub total_count: u32,
-}
-
 /// Returns all peers currently connected to this app across all regions,
 /// including the current peer.
 ///
@@ -133,69 +125,51 @@ pub struct PeerListResult {
 /// instance of your app may not see the same list at the same time or in the
 /// same order
 pub fn list() -> Result<Vec<PeerId>, PeerError> {
-    let mut all_peers = Vec::new();
-    let mut offset = 0;
-
     loop {
-        let result = list_page(offset, 1024)?;
-        let count = result.peers.len();
-        all_peers.extend(result.peers);
-
-        if all_peers.len() >= result.total_count as usize {
-            break;
+        let pre_count = count()?;
+        let (peers, total_count) = list_n(pre_count)?;
+        if pre_count == total_count {
+            return Ok(peers);
         }
-        offset += count as u32;
     }
-
-    Ok(all_peers)
 }
 
-/// Returns a page of peers currently connected to this app.
-///
-/// Note: see the note in [`list`]
-pub fn list_page(offset: u32, length: u32) -> Result<PeerListResult, PeerError> {
-    let length = length.min(1024);
+fn list_n(length: u32) -> Result<(Vec<PeerId>, u32), PeerError> {
+    let mut total_count: u32 = 0;
+
     if length == 0 {
-        let mut total_count: u32 = 0;
-        let ret =
-            unsafe { crate::internal::peer_list(std::ptr::null_mut(), 0, 0, &mut total_count) };
+        let ret = unsafe { crate::internal::peer_list(std::ptr::null_mut(), 0, &mut total_count) };
         if ret < 0 {
             return Err(PeerError::ListFailed);
         }
-        return Ok(PeerListResult {
-            peers: Vec::new(),
-            total_count,
-        });
+        return Ok((Vec::new(), total_count));
     }
 
     let mut buf = vec![0u8; length as usize * 16];
-    let mut total_count: u32 = 0;
 
-    let ret =
-        unsafe { crate::internal::peer_list(buf.as_mut_ptr(), offset, length, &mut total_count) };
+    let ret = unsafe { crate::internal::peer_list(buf.as_mut_ptr(), length, &mut total_count) };
 
     if ret < 0 {
         return Err(PeerError::ListFailed);
     }
 
     let count = ret as usize;
-    let mut peers = Vec::with_capacity(count);
+    let peers_vec = unsafe {
+        let ptr = buf.as_mut_ptr() as *mut PeerId;
+        let len = count;
+        let cap = length as usize;
+        std::mem::forget(buf);
+        Vec::from_raw_parts(ptr, len, cap)
+    };
 
-    for i in 0..count {
-        let buf_offset = i * 16;
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&buf[buf_offset..buf_offset + 16]);
-        peers.push(PeerId(id));
-    }
-
-    Ok(PeerListResult { peers, total_count })
+    Ok((peers_vec, total_count))
 }
 
 /// Returns the total count of peers connected to this app without fetching the
 /// list.
 pub fn count() -> Result<u32, PeerError> {
-    let result = list_page(0, 0)?;
-    Ok(result.total_count)
+    let (_, total_count) = list_n(0)?;
+    Ok(total_count)
 }
 
 /// A message received from a peer

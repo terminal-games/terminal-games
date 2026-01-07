@@ -5,11 +5,14 @@
 package peer
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
+	"sort"
 	"time"
 	"unsafe"
 )
@@ -28,7 +31,7 @@ func region_latency(region_ptr unsafe.Pointer) int32
 
 //go:wasmimport terminal_games peer_list
 //go:noescape
-func peer_list(peer_ids_ptr unsafe.Pointer, offset uint32, length uint32, total_count_ptr unsafe.Pointer) int32
+func peer_list(peer_ids_ptr unsafe.Pointer, max_length uint32, total_count_ptr unsafe.Pointer) int32
 
 // ID represents a peer identifier
 type ID [16]byte
@@ -79,19 +82,19 @@ func ParseID(s string) (ID, error) {
 
 // Timestamp returns the time the peer ID was created
 func (id ID) Timestamp() time.Time {
-	ms := binary.LittleEndian.Uint64(id[0:8])
+	ms := binary.BigEndian.Uint64(id[4:12])
 	return time.Unix(int64(ms/1000), int64(ms%1000)*int64(time.Millisecond))
 }
 
 // Randomness returns the randomness component of the peer ID
 func (id ID) Randomness() uint32 {
-	return binary.LittleEndian.Uint32(id[8:12])
+	return binary.BigEndian.Uint32(id[12:16])
 }
 
 // Region returns the region component of the peer ID
 func (id ID) Region() RegionID {
 	var region [4]byte
-	copy(region[:], id[12:16])
+	copy(region[:], id[0:4])
 	return region
 }
 
@@ -114,36 +117,27 @@ func CurrentID() ID {
 // List returns all peers currently connected to this app across all regions.
 // This includes the current peer.
 func List() ([]ID, error) {
-	var allPeers []ID
-	offset := uint32(0)
-
 	for {
-		peers, totalCount, err := ListPage(offset, 1024)
+		preCount, err := Count()
 		if err != nil {
 			return nil, err
 		}
-		allPeers = append(allPeers, peers...)
-
-		if uint32(len(allPeers)) >= totalCount {
-			break
+		peers, totalCount, err := listN(preCount)
+		if err != nil {
+			return nil, err
 		}
-		offset += uint32(len(peers))
+		if preCount == totalCount {
+			return peers, nil
+		}
+		runtime.Gosched()
 	}
-
-	return allPeers, nil
 }
 
-// ListPage returns a page of peers currently connected to this app.
-// offset is the starting index, length is the max number to return (capped at 1024).
-func ListPage(offset, length uint32) ([]ID, uint32, error) {
-	if length > 1024 {
-		length = 1024
-	}
-
+func listN(length uint32) ([]ID, uint32, error) {
 	var totalCount uint32
 
 	if length == 0 {
-		ret := peer_list(nil, 0, 0, unsafe.Pointer(&totalCount))
+		ret := peer_list(nil, 0, unsafe.Pointer(&totalCount))
 		if ret < 0 {
 			return nil, 0, errors.New("peer_list failed")
 		}
@@ -151,25 +145,20 @@ func ListPage(offset, length uint32) ([]ID, uint32, error) {
 	}
 
 	buf := make([]byte, length*16)
-	ret := peer_list(unsafe.Pointer(&buf[0]), offset, length, unsafe.Pointer(&totalCount))
+	ret := peer_list(unsafe.Pointer(&buf[0]), length, unsafe.Pointer(&totalCount))
 	if ret < 0 {
 		return nil, totalCount, errors.New("peer_list failed")
 	}
 
 	count := int(ret)
-	peers := make([]ID, count)
-	for i := range count {
-		var id ID
-		copy(id[:], buf[i*16:(i+1)*16])
-		peers[i] = id
-	}
+	peers := unsafe.Slice((*ID)(unsafe.Pointer(&buf[0])), count)
 
 	return peers, totalCount, nil
 }
 
 // Count returns the total number of peers connected to this app without fetching the list.
 func Count() (uint32, error) {
-	_, totalCount, err := ListPage(0, 0)
+	_, totalCount, err := listN(0)
 	if err != nil {
 		return 0, err
 	}
@@ -249,3 +238,11 @@ func Recv() (Message, error) {
 		}
 	}
 }
+
+type ByPeerId []ID
+
+var _ sort.Interface = ByPeerId(nil)
+
+func (p ByPeerId) Len() int           { return len(p) }
+func (p ByPeerId) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
+func (p ByPeerId) Less(i, j int) bool { return bytes.Compare(p[i][:], p[j][:]) < 0 }

@@ -135,6 +135,8 @@ async fn main() -> std::io::Result<()> {
     let mut terminal_reader = TerminalReader {};
     let mut peer_messages = peer::MessageReader::new();
     let mut messages = vec![];
+    let mut peers_list = Vec::<PeerId>::new();
+    let mut last_peer_update = Instant::now();
 
     let mut effects: tachyonfx::EffectManager<()> = tachyonfx::EffectManager::default();
 
@@ -209,6 +211,14 @@ async fn main() -> std::io::Result<()> {
             }
         }
 
+        if last_peer_update.elapsed().as_secs() >= 1 {
+            if let Ok(peers) = peer::list() {
+                peers_list = peers;
+                peers_list.sort();
+            }
+            last_peer_update = Instant::now();
+        }
+
         let peer_messages_text = {
             if messages.is_empty() {
                 "No messages yet".to_string()
@@ -228,11 +238,27 @@ async fn main() -> std::io::Result<()> {
             }
         };
 
+        let peers_list_text = {
+            if peers_list.is_empty() {
+                "No peers connected".to_string()
+            } else {
+                peers_list
+                    .iter()
+                    .map(|p| {
+                        let is_current = *p == peer_id;
+                        let marker = if is_current { "→ " } else { "  " };
+                        format!("{}{}", marker, p.to_string())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        };
+
         terminal.draw(|frame| {
             let area = frame.area();
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}\n\nPeer ID: {}\nPress 'p' to send a message to peer {}\n\nRecent Messages:\n{}",
+                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}\n\nPeer ID: {}\nPress 'p' to send a message to peer {}\n\nConnected Peers ({}):\n{}\n\nRecent Messages:\n{}",
                     frame_counter,
                     last_event,
                     parts,
@@ -245,6 +271,8 @@ async fn main() -> std::io::Result<()> {
                     target_peer_id.as_ref()
                         .map(|v| format!("Some({})", v))
                         .unwrap_or_else(|| "None".into()),
+                    peers_list.len(),
+                    peers_list_text,
                     peer_messages_text,
                 )),
                 area,

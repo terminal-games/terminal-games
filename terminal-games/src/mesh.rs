@@ -41,7 +41,7 @@ struct PeerChangeMessage {
     app_id: AppId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct RegionId([u8; 4]);
 
 impl RegionId {
@@ -65,26 +65,26 @@ impl Display for RegionId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct PeerId {
+    region: RegionId,
     timestamp: u64,
     randomness: u32,
-    region: RegionId,
 }
 
 impl PeerId {
     pub fn to_bytes(&self) -> [u8; 16] {
         let mut bytes = [0u8; 16];
-        bytes[0..8].copy_from_slice(&self.timestamp.to_le_bytes());
-        bytes[8..12].copy_from_slice(&self.randomness.to_le_bytes());
-        bytes[12..16].copy_from_slice(self.region.as_bytes());
+        bytes[0..4].copy_from_slice(self.region.as_bytes());
+        bytes[4..12].copy_from_slice(&self.timestamp.to_be_bytes());
+        bytes[12..16].copy_from_slice(&self.randomness.to_be_bytes());
         bytes
     }
 
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        let timestamp = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let randomness = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let region = RegionId::from_bytes(bytes[12..16].try_into().unwrap());
+        let region = RegionId::from_bytes(bytes[0..4].try_into().unwrap());
+        let timestamp = u64::from_be_bytes(bytes[4..12].try_into().unwrap());
+        let randomness = u32::from_be_bytes(bytes[12..16].try_into().unwrap());
         Self {
             timestamp,
             randomness,

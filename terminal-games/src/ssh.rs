@@ -715,7 +715,7 @@ impl AppServer {
             "terminal_games",
             "peer_list",
             |mut caller: wasmtime::Caller<'_, ComponentRunStates>,
-             (peer_ids_ptr, offset, length, total_count_ptr): (i32, u32, u32, i32)| {
+             (peer_ids_ptr, length, total_count_ptr): (i32, u32, i32)| {
                 Box::new(async move {
                     let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
                         tracing::error!("peer_list: failed to find host memory");
@@ -727,8 +727,7 @@ impl AppServer {
                     let peers = mesh.get_peers_for_app(app_id).await;
 
                     let total_count = peers.len();
-                    let offset = offset as usize;
-                    let length = std::cmp::min(length as usize, 1024);
+                    let length = std::cmp::min(length as usize, 65536);
 
                     let total_count_offset = total_count_ptr as usize;
                     if let Err(_) = mem.write(
@@ -740,38 +739,20 @@ impl AppServer {
                         return Ok(-1);
                     }
 
-                    let count_to_write = if offset >= total_count {
-                        0
-                    } else {
-                        std::cmp::min(length, total_count - offset)
-                    };
-
-                    if count_to_write == 0 {
-                        return Ok(0);
-                    }
-
                     const PEER_ID_SIZE: usize = 16;
-                    let mut buf = vec![0u8; count_to_write * PEER_ID_SIZE];
-
-                    for (i, peer_id) in peers.iter().skip(offset).take(count_to_write).enumerate() {
-                        let buf_offset = i * PEER_ID_SIZE;
-                        buf[buf_offset..buf_offset + PEER_ID_SIZE]
-                            .copy_from_slice(&peer_id.to_bytes());
-                    }
-
                     let ptr_offset = peer_ids_ptr as usize;
-                    if let Err(_) = mem.write(&mut caller, ptr_offset, &buf) {
-                        tracing::error!("peer_list: failed to write peer IDs to memory");
-                        return Ok(-1);
+
+                    for (i, peer_id) in peers.iter().take(length).enumerate() {
+                        let write_offset = ptr_offset + (i * PEER_ID_SIZE);
+                        let peer_id_bytes = peer_id.to_bytes();
+                        if let Err(_) = mem.write(&mut caller, write_offset, &peer_id_bytes) {
+                            tracing::error!("peer_list: failed to write peer ID to memory");
+                            return Ok(-1);
+                        }
                     }
 
-                    tracing::debug!(
-                        "peer_list: returned {} of {} peers (offset {})",
-                        count_to_write,
-                        total_count,
-                        offset
-                    );
-                    Ok(count_to_write as i32)
+                    tracing::debug!("peer_list: returned {} of {} peers", length, total_count);
+                    Ok(length as i32)
                 })
             },
         )?;
