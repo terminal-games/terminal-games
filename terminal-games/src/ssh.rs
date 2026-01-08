@@ -978,8 +978,8 @@ impl Server for AppServer {
 
         let (input_sender, mut input_receiver) = tokio::sync::mpsc::channel(20);
         let (username_sender, username_receiver) = tokio::sync::oneshot::channel::<String>();
-        let (term_sender, mut term_receiver) = tokio::sync::oneshot::channel::<String>();
-        let (args_sender, mut args_receiver) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let (term_sender, term_receiver) = tokio::sync::oneshot::channel::<String>();
+        let (args_sender, args_receiver) = tokio::sync::oneshot::channel::<Vec<u8>>();
         let (remote_sshid_sender, remote_sshid_receiver) =
             tokio::sync::oneshot::channel::<String>();
         let (ssh_session_sender, ssh_session_receiver) =
@@ -1005,10 +1005,34 @@ impl Server for AppServer {
                 .await
                 .unwrap();
 
-            // todo: wait for term and args with a 1ms timeout
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let term = term_receiver.try_recv().ok();
-            let args = args_receiver.try_recv().ok();
+            let term =
+                match tokio::time::timeout(std::time::Duration::from_millis(500), term_receiver)
+                    .await
+                {
+                    Ok(Ok(term)) => Some(term),
+                    Ok(Err(_)) => None,
+                    Err(_) => {
+                        tracing::info!("No pty_request received within 500ms, cleaning up");
+                        let _ = session_handle
+                            .disconnect(
+                                russh::Disconnect::ByApplication,
+                                "Bad terminal or ping too high (>500ms)".to_string(),
+                                "en-US".to_string(),
+                            )
+                            .await;
+                        return;
+                    }
+                };
+
+            let args = match tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                args_receiver,
+            )
+            .await
+            {
+                Ok(Ok(args)) => Some(args),
+                _ => None,
+            };
 
             let (output_sender, mut output_receiver) = unbounded_channel::<Vec<u8>>();
 
