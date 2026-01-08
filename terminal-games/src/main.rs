@@ -139,8 +139,6 @@ impl wasmtime::ResourceLimiter for MyLimiter {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_log::LogTracer::init().expect("Failed to set logger");
-
     let subscriber = tracing_subscriber::fmt()
         // .with_max_level(tracing::Level::TRACE)
         .finish();
