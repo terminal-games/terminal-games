@@ -795,6 +795,134 @@ struct MyStdoutStream {
     sender: UnboundedSender<Vec<u8>>,
 }
 
+struct EscapeSequenceBuffer {
+    buffer: Vec<u8>,
+}
+
+impl EscapeSequenceBuffer {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::with_capacity(64),
+        }
+    }
+
+    const MAX_SCAN: usize = 256;
+
+    /// Check if the sequence starting at `seq` (which begins with ESC) is complete.
+    /// Returns the length of incomplete data, or 0 if complete.
+    #[inline]
+    fn check_escape_sequence(seq: &[u8]) -> usize {
+        debug_assert!(!seq.is_empty() && seq[0] == 0x1b);
+
+        if seq.len() == 1 {
+            return 1;
+        }
+
+        match seq[1] {
+            b'[' => {
+                // CSI sequence: ESC [ (params) (intermediate) final
+                if seq.len() == 2 {
+                    return 2;
+                }
+                for i in 2..seq.len() {
+                    let b = seq[i];
+                    if b >= 0x40 && b <= 0x7E {
+                        return 0; // Complete
+                    }
+                    if b < 0x20 || b > 0x3F {
+                        return 0; // Malformed, treat as complete
+                    }
+                }
+                seq.len()
+            }
+            b']' => {
+                // OSC sequence: terminated by BEL or ST
+                if seq.len() == 2 {
+                    return 2;
+                }
+                for i in 2..seq.len() {
+                    if seq[i] == 0x07 {
+                        return 0;
+                    }
+                    if seq[i] == 0x1b && i + 1 < seq.len() && seq[i + 1] == b'\\' {
+                        return 0;
+                    }
+                }
+                seq.len()
+            }
+            b'P' | b'X' | b'^' | b'_' => {
+                // DCS, SOS, PM, APC: terminated by ST
+                if seq.len() == 2 {
+                    return 2;
+                }
+                for i in 2..seq.len() {
+                    if seq[i] == 0x1b && i + 1 < seq.len() && seq[i + 1] == b'\\' {
+                        return 0;
+                    }
+                }
+                seq.len()
+            }
+            b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b' ' => {
+                // 3-byte sequences
+                if seq.len() < 3 { seq.len() } else { 0 }
+            }
+            _ => 0, // 2-byte sequences are complete
+        }
+    }
+
+    #[inline]
+    fn incomplete_escape_len(data: &[u8]) -> usize {
+        if data.is_empty() {
+            return 0;
+        }
+
+        let scan_start = data.len().saturating_sub(Self::MAX_SCAN);
+        let tail = &data[scan_start..];
+
+        let Some(rel_pos) = tail.iter().rposition(|&b| b == 0x1b) else {
+            return 0;
+        };
+
+        let seq = &tail[rel_pos..];
+        Self::check_escape_sequence(seq)
+    }
+
+    /// Add data to the buffer and return data that's safe to send
+    #[inline]
+    fn push(&mut self, mut data: Vec<u8>) -> Vec<u8> {
+        // Fast path: buffer is empty, check if incoming data is complete
+        if self.buffer.is_empty() {
+            let incomplete_len = Self::incomplete_escape_len(&data);
+            if incomplete_len == 0 {
+                return data;
+            }
+            if incomplete_len == data.len() {
+                self.buffer = data;
+                return Vec::new();
+            }
+            let split_at = data.len() - incomplete_len;
+            self.buffer.extend_from_slice(&data[split_at..]);
+            data.truncate(split_at);
+            return data;
+        }
+
+        // Slow path: we have buffered data, need to combine
+        self.buffer.append(&mut data);
+
+        let incomplete_len = Self::incomplete_escape_len(&self.buffer);
+        if incomplete_len == 0 {
+            std::mem::take(&mut self.buffer)
+        } else if incomplete_len < self.buffer.len() {
+            let split_at = self.buffer.len() - incomplete_len;
+            let incomplete = self.buffer.split_off(split_at);
+            let complete = std::mem::replace(&mut self.buffer, incomplete);
+            complete
+        } else {
+            Vec::new()
+        }
+    }
+}
+
 struct AsyncStdoutWriter {
     sender: UnboundedSender<Vec<u8>>,
     buffer: Vec<u8>,
@@ -918,80 +1046,77 @@ impl Server for AppServer {
                 let status_bar = status_bar.clone();
                 let terminal_clone = terminal_clone.clone();
                 async move {
-                    while let Some(mut data) = output_receiver.recv().await {
-                        if next_app_shortname.lock().await.is_some() {
-                            // strip exiting the alternate screen buffer to make
-                            // sure transitions between apps are smooth
-                            let needle = b"\x1b[?1049l";
-                            let needle2 = b"\x1b[?25h";
-                            let mut read = 0;
-                            let mut write = 0;
-                            while read < data.len() {
-                                if data[read..].starts_with(needle) {
-                                    read += needle.len();
-                                } else if data[read..].starts_with(needle2) {
-                                    read += needle2.len();
-                                } else {
-                                    data[write] = data[read];
-                                    write += 1;
-                                    read += 1;
-                                }
-                            }
-                            data.truncate(write);
-                        }
-
-                        let is_dirty = {
-                            // process raw data through the vt
-                            let mut app_terminal = terminal_clone.lock().await;
-                            app_terminal.process(&data);
-
-                            // check if status bar was overwritten
-                            let screen = app_terminal.screen_mut();
-                            let (height, _width) = screen.size();
-                            let dirty = screen.take_damaged_rows();
-                            dirty.contains(&(height - 1))
-                        };
-                        if is_dirty {
-                            status_bar
-                                .lock()
-                                .await
-                                .maybe_render_into(&mut data, true)
-                                .await;
-                        }
-
-                        // tracing::info!(data = String::from_utf8_lossy(&data).as_ref(), "output");
-                        session_handle.data(channel_id, data.into()).await.unwrap();
-                    }
-                }
-            });
-
-            // status bar task
-            tokio::task::spawn({
-                let session_handle = session_handle.clone();
-                let status_bar = status_bar.clone();
-                async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(1));
+                    let mut escape_buffer = EscapeSequenceBuffer::new();
+                    let mut status_bar_interval = tokio::time::interval(Duration::from_secs(1));
 
                     loop {
                         tokio::select! {
-                            result = resize_signal_rx.recv() => {
-                                match result {
-                                    Some(()) => {
-                                        let mut buf = Vec::new();
-                                        status_bar.lock().await.maybe_render_into(&mut buf, true).await;
-                                        if let Err(_) = session_handle.data(channel_id, buf.into()).await {
-                                            break;
+                            biased;
+
+                            result = output_receiver.recv() => {
+                                let Some(mut data) = result else { break };
+
+                                if next_app_shortname.lock().await.is_some() {
+                                    // strip exiting the alternate screen buffer to make
+                                    // sure transitions between apps are smooth
+                                    let needle = b"\x1b[?1049l";
+                                    let needle2 = b"\x1b[?25h";
+                                    let mut read = 0;
+                                    let mut write = 0;
+                                    while read < data.len() {
+                                        if data[read..].starts_with(needle) {
+                                            read += needle.len();
+                                        } else if data[read..].starts_with(needle2) {
+                                            read += needle2.len();
+                                        } else {
+                                            data[write] = data[read];
+                                            write += 1;
+                                            read += 1;
                                         }
                                     }
-                                    None => {
+                                    data.truncate(write);
+                                }
+
+                                let complete_data = escape_buffer.push(data);
+                                if complete_data.is_empty() {
+                                    continue;
+                                }
+
+                                let is_dirty = {
+                                    let mut app_terminal = terminal_clone.lock().await;
+                                    app_terminal.process(&complete_data);
+                                    let screen = app_terminal.screen_mut();
+                                    let (height, _width) = screen.size();
+                                    let dirty = screen.take_damaged_rows();
+                                    dirty.contains(&(height - 1))
+                                };
+
+                                let mut output = complete_data;
+                                if is_dirty {
+                                    status_bar.lock().await.maybe_render_into(&mut output, true).await;
+                                }
+
+                                if session_handle.data(channel_id, output.into()).await.is_err() {
+                                    break;
+                                }
+                            }
+
+                            result = resize_signal_rx.recv() => {
+                                if result.is_none() { break }
+
+                                let mut buf = Vec::new();
+                                status_bar.lock().await.maybe_render_into(&mut buf, true).await;
+                                if !buf.is_empty() {
+                                    if session_handle.data(channel_id, buf.into()).await.is_err() {
                                         break;
                                     }
                                 }
                             }
-                            _ = interval.tick() => {
+
+                            _ = status_bar_interval.tick() => {
                                 let mut buf = Vec::new();
                                 if status_bar.lock().await.maybe_render_into(&mut buf, false).await {
-                                    if let Err(_) = session_handle.data(channel_id, buf.into()).await {
+                                    if session_handle.data(channel_id, buf.into()).await.is_err() {
                                         break;
                                     }
                                 }
