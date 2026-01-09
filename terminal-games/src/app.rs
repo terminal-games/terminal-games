@@ -48,6 +48,20 @@ impl AppServer {
         config.async_support(true);
         config.epoch_interruption(true);
         let engine = wasmtime::Engine::new(&config)?;
+        tokio::task::spawn({
+            let engine = engine.clone();
+            let mut epoch_interval = tokio::time::interval(Duration::from_millis(20));
+
+            async move {
+                loop {
+                    tokio::select! {
+                        _ = epoch_interval.tick() => {
+                           engine.increment_epoch();
+                        }
+                    }
+                }
+            }
+        });
 
         let mut linker = wasmtime::Linker::<AppState>::new(&engine);
         wasmtime_wasi::p1::add_to_linker_async(&mut linker, |t| &mut t.wasi_ctx)?;
@@ -607,8 +621,6 @@ impl AppServer {
                 .has_next_app_shortname
                 .store(true, Ordering::Release);
 
-            // *caller.data().next_app_shortname.lock().await = Some(shortname.clone());
-
             // let module_cache = caller.data().module_cache.clone();
             // tokio::task::spawn(async move {
             //     let mut cache = module_cache.lock().await;
@@ -1092,19 +1104,6 @@ impl Stream {
             Stream::Tls(stream) => {
                 use tokio::io::AsyncWriteExt;
                 stream.write(buf).await
-            }
-        }
-    }
-
-    pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            Stream::Tcp(stream) => {
-                use tokio::io::AsyncReadExt;
-                stream.read(buf).await
-            }
-            Stream::Tls(stream) => {
-                use tokio::io::AsyncReadExt;
-                stream.read(buf).await
             }
         }
     }
