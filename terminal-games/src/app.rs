@@ -16,6 +16,8 @@ use std::{
 use hex::ToHex;
 use smallvec::SmallVec;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use wasmtime_wasi::I32Exit;
 
 use crate::{
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
@@ -33,10 +35,11 @@ pub struct AppInstantiationParams {
     pub input_receiver: tokio::sync::mpsc::Receiver<SmallVec<[u8; 16]>>,
     pub output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     pub window_size_receiver: tokio::sync::mpsc::Receiver<(u16, u16)>,
+    pub graceful_shutdown_token: CancellationToken,
     pub username: String,
     pub remote_sshid: String,
     pub term: Option<String>,
-    pub args: Option<String>,
+    pub args: Option<Vec<u8>>,
 }
 
 impl AppServer {
@@ -70,7 +73,13 @@ impl AppServer {
         })
     }
 
-    pub fn instantiate_app(&self, params: AppInstantiationParams) {
+    /// Run an app with IO defined in [`params`] in the background
+    pub fn instantiate_app(
+        &self,
+        params: AppInstantiationParams,
+    ) -> tokio::sync::oneshot::Receiver<I32Exit> {
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+
         let mesh = self.mesh.clone();
         let db = self.db.clone();
         let engine = self.engine.clone();
@@ -79,7 +88,6 @@ impl AppServer {
             let engine = engine;
             let mut window_size_receiver = params.window_size_receiver;
             let mut terminal = Arc::new(Mutex::new(headless_terminal::Parser::new(0, 0, 0)));
-            let mut current_app_shortname = params.args.unwrap_or("menu".into());
             let (app_output_sender, mut app_output_receiver) =
                 tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
             let mut input_receiver = params.input_receiver;
@@ -87,8 +95,26 @@ impl AppServer {
             let (shortname_sender, mut shortname_receiver) =
                 tokio::sync::mpsc::channel::<String>(1);
 
+            let hard_shutdown_token = CancellationToken::new();
+
+            let (mut current_app_shortname, _app_args) = match params.args {
+                None => ("menu".to_string(), None),
+                Some(args_bytes) => {
+                    let args_str = String::from_utf8_lossy(&args_bytes);
+                    if let Some(space_idx) = args_str.find(' ') {
+                        let shortname = args_str[..space_idx].to_string();
+                        let remaining_args = args_str[space_idx + 1..].to_string();
+                        (shortname, Some(remaining_args))
+                    } else {
+                        (args_str.to_string(), None)
+                    }
+                }
+            };
+
             // output task
             tokio::task::spawn({
+                let hard_shutdown_token = hard_shutdown_token.clone();
+                let graceful_shutdown_token = params.graceful_shutdown_token;
                 let output_sender = params.output_sender;
                 let username = params.username.clone();
                 let current_app_shortname = current_app_shortname.clone();
@@ -101,8 +127,21 @@ impl AppServer {
 
                     loop {
                         tokio::select! {
-                            result = app_output_receiver.recv() => {
-                                let Some(mut data) = result else { break };
+                            biased;
+
+                            _ = hard_shutdown_token.cancelled() => {
+                                tracing::info!("hard shutdown 1");
+                                break;
+                            }
+
+                            _ = graceful_shutdown_token.cancelled() => {
+                                tracing::info!("initiating graceful shutdown");
+                                tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+                                hard_shutdown_token.cancel();
+                            }
+
+                            data = app_output_receiver.recv() => {
+                                let Some(mut data) = data else { continue };
 
                                 if has_next_app_shortname.load(Ordering::Acquire) {
                                     // strip exiting the alternate screen buffer to make
@@ -141,11 +180,11 @@ impl AppServer {
                                     }
                                 }
 
-                                output_sender.send(output).await.unwrap();
+                                let _ = output_sender.send(output).await;
                             }
 
                             result = window_size_receiver.recv() => {
-                                let Some((width, height)) = result else { break };
+                                let Some((width, height)) = result else { continue };
 
                                 let mut output = Vec::new();
                                 {
@@ -155,7 +194,7 @@ impl AppServer {
                                     status_bar.maybe_render_into(screen, &mut output, true);
                                 }
                                 if !output.is_empty() {
-                                    output_sender.send(output).await.unwrap();
+                                    let _ = output_sender.send(output).await;
                                 }
                             }
 
@@ -163,7 +202,7 @@ impl AppServer {
                                 let mut output = Vec::new();
                                 status_bar.maybe_render_into(terminal.lock().await.screen(), &mut output, false);
                                 if !output.is_empty() {
-                                    output_sender.send(output).await.unwrap();
+                                    let _ = output_sender.send(output).await;
                                 }
                             }
 
@@ -176,6 +215,8 @@ impl AppServer {
                     }
                 }
             });
+
+            let mut exit_code = I32Exit(0);
 
             loop {
                 let app_id = db
@@ -260,24 +301,25 @@ impl AppServer {
 
                     has_next_app_shortname.store(false, Ordering::Release);
                     tokio::select! {
+                        _ = hard_shutdown_token.cancelled() => {
+                            tracing::info!("hard shutdown 2");
+                            break;
+                        }
+
                         result = func.call_async(&mut store, ()) => {
                             result
                         }
-                        // _ = drop_receiver.changed() => {
-                        //     tracing::info!("Drop signal received, exiting gracefully");
-                        //     let mut cache = server.module_cache.lock().await;
-                        //     cache.release_module(&shortname);
-                        //     break;
-                        // }
                     }
                 };
 
                 if let Err(err) = call_result {
                     match err.downcast::<wasmtime_wasi::I32Exit>() {
-                        Ok(_) => {}
+                        Ok(code) => {
+                            tracing::info!(?code, "exit");
+                            exit_code = code;
+                        }
                         Err(other) => {
                             tracing::error!(error = %other, shortname = %current_app_shortname, "Module errored");
-                            break;
                         }
                     }
                 }
@@ -297,7 +339,12 @@ impl AppServer {
 
                 break;
             }
+
+            hard_shutdown_token.cancel();
+            let _ = exit_tx.send(exit_code);
         });
+
+        return exit_rx;
     }
 
     fn host_dial(

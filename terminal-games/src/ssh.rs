@@ -20,7 +20,6 @@ pub struct SshSession {
     args: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
     remote_sshid: Option<tokio::sync::oneshot::Sender<String>>,
     ssh_session: Option<tokio::sync::oneshot::Sender<(Handle, ChannelId)>>,
-    #[allow(dead_code)]
     cancellation_token: CancellationToken,
     server: SshServer,
 }
@@ -95,6 +94,13 @@ impl SshServer {
     }
 }
 
+impl Drop for SshSession {
+    fn drop(&mut self) {
+        tracing::info!("drop");
+        self.cancellation_token.cancel();
+    }
+}
+
 impl Server for SshServer {
     type Handler = SshSession;
     fn new_client(&mut self, addr: Option<std::net::SocketAddr>) -> SshSession {
@@ -155,51 +161,40 @@ impl Server for SshServer {
                 _ => None,
             };
 
-            let (current_app_shortname, app_args) = match args {
-                None => ("menu".to_string(), None),
-                Some(args_bytes) => {
-                    let args_str = String::from_utf8_lossy(&args_bytes);
-                    if let Some(space_idx) = args_str.find(' ') {
-                        let shortname = args_str[..space_idx].to_string();
-                        let remaining_args = args_str[space_idx + 1..].to_string();
-                        (shortname, Some(remaining_args))
-                    } else {
-                        (args_str.to_string(), None)
-                    }
-                }
-            };
-
             let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(20);
-            app_server.instantiate_app(AppInstantiationParams {
-                args: app_args,
+            let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
+                args,
                 input_receiver: input_rx,
                 output_sender: output_tx,
                 remote_sshid,
                 term,
                 username,
                 window_size_receiver: resize_rx,
+                graceful_shutdown_token: token,
             });
             loop {
                 tokio::select! {
                     biased;
 
-                    _ = token.cancelled() => {
+                    exit_code = &mut exit_rx => {
+                        if let Ok(exit_code) = exit_code {
+                            tracing::info!(?exit_code, "App exited");
+                        }
                         break;
                     }
 
                     data = output_rx.recv() => {
                         let Some(data) = data else { break };
-                        session_handle.data(channel_id, data.into()).await.unwrap();
+                        let _ = session_handle.data(channel_id, data.into()).await;
                     }
                 }
             }
 
             tracing::info!("leaving session");
 
-            session_handle
+            let _ = session_handle
                 .data(channel_id, b"\x1b[?1049l".to_vec().into())
-                .await
-                .unwrap();
+                .await;
 
             let _ = session_handle
                 .disconnect(
