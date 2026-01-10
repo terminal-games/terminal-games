@@ -89,6 +89,8 @@ where
     W: Write,
     E: EmulatorBackend,
 {
+    type Error = io::Error;
+
     fn clear(&mut self) -> io::Result<()> {
         self.clear_region(ClearType::All)
     }
