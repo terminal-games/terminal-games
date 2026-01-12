@@ -3,14 +3,13 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::HashMap,
     pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use hex::ToHex;
@@ -47,6 +46,8 @@ impl AppServer {
         let mut config = wasmtime::Config::new();
         config.async_support(true);
         config.epoch_interruption(true);
+        let cache_config = wasmtime::CacheConfig::new();
+        config.cache(Some(wasmtime::Cache::new(cache_config).unwrap()));
         let engine = wasmtime::Engine::new(&config)?;
         tokio::task::spawn({
             let engine = engine.clone();
@@ -64,7 +65,7 @@ impl AppServer {
         });
 
         let mut linker = wasmtime::Linker::<AppState>::new(&engine);
-        wasmtime_wasi::p1::add_to_linker_async(&mut linker, |t| &mut t.wasi_ctx)?;
+        wasmtime_wasi::p1::add_to_linker_async(&mut linker, |t| &mut t.app.wasi_ctx)?;
 
         linker.func_wrap_async("terminal_games", "dial", Self::host_dial)?;
         linker.func_wrap_async("terminal_games", "conn_write", Self::conn_write)?;
@@ -111,7 +112,7 @@ impl AppServer {
 
             let hard_shutdown_token = CancellationToken::new();
 
-            let (mut current_app_shortname, _app_args) = match params.args {
+            let (first_app_shortname, _app_args) = match params.args {
                 None => ("menu".to_string(), None),
                 Some(args_bytes) => {
                     let args_str = String::from_utf8_lossy(&args_bytes);
@@ -131,13 +132,13 @@ impl AppServer {
                 let graceful_shutdown_token = params.graceful_shutdown_token;
                 let output_sender = params.output_sender;
                 let username = params.username.clone();
-                let current_app_shortname = current_app_shortname.clone();
+                let first_app_shortname = first_app_shortname.clone();
                 let has_next_app_shortname = has_next_app_shortname.clone();
                 let terminal = terminal.clone();
                 async move {
                     let mut escape_buffer = EscapeSequenceBuffer::new();
                     let mut status_bar_interval = tokio::time::interval(Duration::from_secs(1));
-                    let mut status_bar = StatusBar::new(current_app_shortname, username);
+                    let mut status_bar = StatusBar::new(first_app_shortname, username);
 
                     loop {
                         tokio::select! {
@@ -231,82 +232,36 @@ impl AppServer {
             });
 
             let mut exit_code = I32Exit(0);
+            let mut ctx = Arc::new(AppContext {
+                db,
+                linker,
+                mesh,
+                app_output_sender,
+                remote_sshid: params.remote_sshid,
+                term: params.term,
+                username: params.username,
+            });
+            let (mut app, mut instance_pre) = Self::prepare_instantiate(&ctx, first_app_shortname).await.unwrap();
 
             loop {
-                let app_id = db
-                    .query(
-                        "SELECT id FROM games WHERE shortname = ?1",
-                        [current_app_shortname.as_str()],
-                    )
-                    .await
-                    .unwrap()
-                    .next()
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .get::<u64>(0)
-                    .unwrap();
-
-                let (peer_id, peer_rx, peer_tx) = mesh.new_peer(AppId(app_id)).await;
-
-                let mut envs = vec![];
-                let mut rows = db
-                    .query("SELECT name, value FROM envs WHERE game_id = ?1", [app_id])
-                    .await
-                    .unwrap();
-                while let Some(row) = rows.next().await.unwrap() {
-                    let name = row.get(0).unwrap();
-                    let value = row.get(1).unwrap();
-                    envs.push((name, value));
-                }
-                envs.push(("REMOTE_SSHID".to_string(), params.remote_sshid.clone()));
-                envs.push(("USERNAME".to_string(), params.username.clone()));
-                envs.push(("PEER_ID".to_string(), peer_id.to_bytes().encode_hex()));
-                if let Some(term) = params.term.clone() {
-                    envs.push(("TERM".to_string(), term));
-                }
-
-                let wasi_ctx = wasmtime_wasi::WasiCtx::builder()
-                    .stdout(MyStdoutStream {
-                        sender: app_output_sender.clone(),
-                    })
-                    .envs(&envs)
-                    .build_p1();
-
                 let state = AppState {
-                    wasi_ctx,
+                    app,
+                    ctx,
                     streams: Vec::default(),
                     limits: AppLimiter::default(),
                     terminal: terminal,
-                    next_app_shortname: None,
+                    next_app: None,
                     input_receiver: input_receiver,
-                    has_next_app_shortname: has_next_app_shortname.clone(),
-                    // module_cache: server.module_cache.clone(),
-                    peer_rx,
-                    peer_tx,
-                    mesh: mesh.clone(),
-                    app_id: AppId(app_id),
+                    has_next_app: has_next_app_shortname.clone(),
                 };
 
                 let mut store = wasmtime::Store::new(&engine, state);
                 store.limiter(|state| &mut state.limits);
                 store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Yield(1)));
 
-                let mut rows = db
-                    .query(
-                        "SELECT path FROM games WHERE shortname = ?1",
-                        libsql::params![current_app_shortname.as_str()],
-                    )
-                    .await
-                    .unwrap();
-
-                let row = rows.next().await.unwrap().unwrap();
-                let wasm_path: String = row.get(0).unwrap();
-                let module = wasmtime::Module::from_file(&engine, wasm_path).unwrap();
-
                 let call_result = {
                     let func = {
-                        let instance = linker.instantiate_async(&mut store, &module).await.unwrap();
+                        let instance = instance_pre.instantiate_async(&mut store).await.unwrap();
                         let func = instance
                             .get_typed_func::<(), ()>(&mut store, "_start")
                             .unwrap();
@@ -333,7 +288,7 @@ impl AppServer {
                             exit_code = code;
                         }
                         Err(other) => {
-                            tracing::error!(error = %other, shortname = %current_app_shortname, "Module errored");
+                            tracing::error!(error = %other, "Module errored");
                         }
                     }
                 }
@@ -341,13 +296,16 @@ impl AppServer {
                 let mut state = store.into_data();
                 input_receiver = state.input_receiver;
                 terminal = state.terminal;
+                ctx = state.ctx;
 
-                if let Some(next_app_shortname) = state.next_app_shortname.take() {
+                if let Some(next_app) = state.next_app.take() {
+                    let (next_app, next_instance_pre) = next_app.await.unwrap();
                     shortname_sender
-                        .send(next_app_shortname.clone())
+                        .send(next_app.shortname.clone())
                         .await
                         .unwrap();
-                    current_app_shortname = next_app_shortname;
+                    app = next_app;
+                    instance_pre = next_instance_pre;
                     continue;
                 }
 
@@ -359,6 +317,63 @@ impl AppServer {
         });
 
         return exit_rx;
+    }
+
+    async fn prepare_instantiate(ctx: &AppContext, shortname: String) -> anyhow::Result<(PreloadedAppState, wasmtime::InstancePre<AppState>)> {
+        let app_id = ctx.db
+            .query(
+                "SELECT id FROM games WHERE shortname = ?1",
+                [shortname.as_str()],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<u64>(0)
+            .unwrap();
+
+        let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(AppId(app_id)).await;
+
+        let mut envs = vec![];
+        let mut rows = ctx.db
+            .query("SELECT name, value FROM envs WHERE game_id = ?1", [app_id])
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            let name = row.get(0).unwrap();
+            let value = row.get(1).unwrap();
+            envs.push((name, value));
+        }
+        envs.push(("REMOTE_SSHID".to_string(), ctx.remote_sshid.clone()));
+        envs.push(("USERNAME".to_string(), ctx.username.clone()));
+        envs.push(("PEER_ID".to_string(), peer_id.to_bytes().encode_hex()));
+        if let Some(term) = ctx.term.clone() {
+            envs.push(("TERM".to_string(), term));
+        }
+
+        let wasi_ctx = wasmtime_wasi::WasiCtx::builder()
+            .stdout(MyStdoutStream {
+                sender: ctx.app_output_sender.clone(),
+            })
+            .envs(&envs)
+            .build_p1();
+
+        let mut rows = ctx.db
+            .query(
+                "SELECT path FROM games WHERE id = ?1",
+                libsql::params![app_id],
+            )
+            .await
+            .unwrap();
+
+        let row = rows.next().await.unwrap().unwrap();
+        let wasm_path: String = row.get(0).unwrap();
+        let module = wasmtime::Module::from_file(ctx.linker.engine(), wasm_path).unwrap();
+        let instance_pre = ctx.linker.instantiate_pre(&module).unwrap();
+
+        Ok((PreloadedAppState { wasi_ctx, peer_rx, peer_tx, app_id: AppId(app_id), shortname }, instance_pre))
     }
 
     fn host_dial(
@@ -615,26 +630,18 @@ impl AppServer {
                 Err(_) => return Ok(-1),
             };
 
-            caller.data_mut().next_app_shortname = Some(shortname);
-            caller
-                .data()
-                .has_next_app_shortname
-                .store(true, Ordering::Release);
-
-            // let module_cache = caller.data().module_cache.clone();
-            // tokio::task::spawn(async move {
-            //     let mut cache = module_cache.lock().await;
-            //     if let Err(e) = cache.get_module(&shortname).await {
-            //         tracing::error!(
-            //             error = %e,
-            //             shortname,
-            //             "Failed to warm module cache for next app"
-            //         );
-            //     } else {
-            //         cache.release_module(&shortname);
-            //         tracing::info!(shortname, "Module cache warmed for next app");
-            //     }
-            // });
+            let has_next_app = caller.data().has_next_app.clone();
+            if caller.data().next_app.is_none() || has_next_app.load(Ordering::Acquire) {
+                has_next_app.store(false, Ordering::Release);
+                let ctx = caller.data().ctx.clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                caller.data_mut().next_app = Some(rx);
+                tokio::task::spawn(async move {
+                    let next_app = Self::prepare_instantiate(&ctx, shortname).await.unwrap();
+                    let _ = tx.send(next_app);
+                    has_next_app.store(true, Ordering::Release);
+                });
+            }
 
             Ok(0)
         })
@@ -645,22 +652,8 @@ impl AppServer {
         (): (),
     ) -> Box<dyn Future<Output = anyhow::Result<i32>> + Send + '_> {
         Box::new(async move {
-            // let next_app_shortname = match caller.data().next_app_shortname.try_lock() {
-            //     Ok(guard) => guard.clone(),
-            //     Err(_) => return Ok(0),
-            // };
-            // let shortname = match &next_app_shortname {
-            //     Some(s) => s,
-            //     None => return Ok(0),
-            // };
-
-            // let cache = match caller.data().module_cache.try_lock() {
-            //     Ok(guard) => guard,
-            //     Err(_) => return Ok(0), // Lock held (e.g., by get_module), return not ready
-            // };
-            // let ready = cache.is_warmed(&shortname);
-            // Ok(if ready { 1 } else { 0 })
-            Ok(1)
+            let ready = caller.data().has_next_app.load(Ordering::Acquire);
+            Ok(if ready { 1 } else { 0 })
         })
     }
 
@@ -722,7 +715,7 @@ impl AppServer {
             return Ok(-1);
         }
 
-        match caller.data_mut().peer_tx.try_send((peer_ids, data_buf)) {
+        match caller.data_mut().app.peer_tx.try_send((peer_ids, data_buf)) {
             Ok(_) => {
                 tracing::debug!("peer_send: sent message to {} peers", peer_ids_count);
                 Ok(0)
@@ -749,7 +742,7 @@ impl AppServer {
             return Ok(-1);
         };
 
-        let msg = match caller.data_mut().peer_rx.try_recv() {
+        let msg = match caller.data_mut().app.peer_rx.try_recv() {
             Ok(msg) => msg,
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
                 return Ok(0);
@@ -801,7 +794,7 @@ impl AppServer {
 
             let region_id = RegionId::from_bytes(region_bytes);
 
-            let mesh = caller.data().mesh.clone();
+            let mesh = &caller.data().ctx.mesh;
             match mesh.get_region_latency(region_id).await {
                 Some(latency) => Ok(latency.as_millis() as i32),
                 None => Ok(-1),
@@ -819,8 +812,8 @@ impl AppServer {
                 return Ok(-1i32);
             };
 
-            let app_id = caller.data().app_id;
-            let mesh = caller.data().mesh.clone();
+            let app_id = caller.data().app.app_id;
+            let mesh = &caller.data().ctx.mesh;
             let peers = mesh.get_peers_for_app(app_id).await;
 
             let total_count = peers.len();
@@ -854,20 +847,34 @@ impl AppServer {
     }
 }
 
-pub struct AppState {
+pub struct PreloadedAppState {
     wasi_ctx: wasmtime_wasi::p1::WasiP1Ctx,
+    peer_rx: tokio::sync::mpsc::Receiver<PeerMessageApp>,
+    peer_tx: tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>,
+    app_id: AppId,
+    shortname: String,
+}
+
+pub struct AppContext {
+    db: libsql::Connection,
+    mesh: Mesh,
+    remote_sshid: String,
+    username: String,
+    term: Option<String>,
+    linker: Arc<wasmtime::Linker<AppState>>,
+    app_output_sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+}
+
+pub struct AppState {
+    app: PreloadedAppState,
+    ctx: Arc<AppContext>,
     streams: Vec<Stream>,
     limits: AppLimiter,
     terminal: Arc<Mutex<Terminal>>,
-    next_app_shortname: Option<String>,
+    next_app: Option<tokio::sync::oneshot::Receiver<(PreloadedAppState, wasmtime::InstancePre<AppState>)>>,
     /// Must be kept in sync with [`next_app_shortname`]
-    has_next_app_shortname: Arc<AtomicBool>,
+    has_next_app: Arc<AtomicBool>,
     input_receiver: tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
-    // module_cache: Arc<Mutex<ModuleCache>>,
-    peer_rx: tokio::sync::mpsc::Receiver<PeerMessageApp>,
-    peer_tx: tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>,
-    mesh: Mesh,
-    app_id: crate::mesh::AppId,
 }
 
 struct AppLimiter {
@@ -1143,118 +1150,3 @@ impl Stream {
 }
 
 pub type Terminal = headless_terminal::Parser;
-
-struct ModuleCacheEntry {
-    module: wasmtime::Module,
-    ref_count: usize,
-    last_zero: Option<Instant>,
-}
-
-pub(crate) struct ModuleCache {
-    cache: HashMap<String, ModuleCacheEntry>,
-    engine: wasmtime::Engine,
-    db: libsql::Connection,
-}
-
-impl ModuleCache {
-    fn new(engine: wasmtime::Engine, db: libsql::Connection) -> Self {
-        Self {
-            cache: HashMap::new(),
-            engine,
-            db,
-        }
-    }
-
-    async fn get_module(&mut self, shortname: &str) -> anyhow::Result<wasmtime::Module> {
-        if let Some(entry) = self.cache.get_mut(shortname) {
-            entry.ref_count += 1;
-            entry.last_zero = None;
-            tracing::debug!(
-                shortname,
-                ref_count = entry.ref_count,
-                "Module found in cache"
-            );
-            return Ok(entry.module.clone());
-        }
-
-        tracing::info!(shortname, "Fetching module from database");
-        let mut rows = self
-            .db
-            .query(
-                "SELECT path FROM games WHERE shortname = ?1",
-                libsql::params![shortname],
-            )
-            .await?;
-
-        let row = rows.next().await?;
-        let Some(row) = row else {
-            anyhow::bail!("Module '{}' not found in database", shortname);
-        };
-
-        let wasm_path: String = row.get(0)?;
-
-        tracing::info!(shortname, "Compiling module");
-        let module = wasmtime::Module::from_file(&self.engine, wasm_path)?;
-
-        self.cache.insert(
-            shortname.to_string(),
-            ModuleCacheEntry {
-                module: module.clone(),
-                ref_count: 1,
-                last_zero: None,
-            },
-        );
-
-        tracing::info!(shortname, ref_count = 1, "Module added to cache");
-        Ok(module)
-    }
-
-    fn release_module(&mut self, shortname: &str) {
-        if let Some(entry) = self.cache.get_mut(shortname) {
-            entry.ref_count = entry.ref_count.saturating_sub(1);
-            if entry.ref_count == 0 {
-                entry.last_zero = Some(Instant::now());
-            }
-            tracing::info!(
-                shortname,
-                ref_count = entry.ref_count,
-                "Module reference released"
-            );
-        }
-    }
-
-    fn is_warmed(&self, shortname: &str) -> bool {
-        self.cache.contains_key(shortname)
-    }
-
-    fn cleanup(&mut self) {
-        let now = Instant::now();
-        let before_len = self.cache.len();
-
-        self.cache.retain(|shortname, entry| {
-            if entry.ref_count == 0 {
-                if let Some(since_zero) = entry.last_zero {
-                    if now.duration_since(since_zero) >= Duration::from_secs(30) {
-                        tracing::info!(
-                            shortname,
-                            "Evicting module from cache after 30s at refcount 0"
-                        );
-                        return false;
-                    }
-                } else {
-                    entry.last_zero = Some(now);
-                }
-            }
-            true
-        });
-
-        let after_len = self.cache.len();
-        if after_len != before_len {
-            tracing::debug!(
-                removed = before_len - after_len,
-                remaining = after_len,
-                "Module cache cleanup completed"
-            );
-        }
-    }
-}

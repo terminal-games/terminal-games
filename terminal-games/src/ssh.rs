@@ -33,39 +33,6 @@ impl SshServer {
     pub async fn new(app_server: Arc<AppServer>) -> anyhow::Result<Self> {
         tracing::info!("Initializing ssh server");
 
-        // let mut config = wasmtime::Config::new();
-        // config.async_support(true);
-        // config.epoch_interruption(true);
-        // let engine = wasmtime::Engine::new(&config)?;
-
-        // let engine_weak = engine.weak();
-        // tokio::task::spawn(async move {
-        //     loop {
-        //         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        //         if let Some(engine) = engine_weak.upgrade() {
-        //             engine.increment_epoch();
-        //         } else {
-        //             return;
-        //         }
-        //     }
-        // });
-
-        // let module_cache = ModuleCache::new(engine.clone(), conn.clone());
-        // let module_cache = Arc::new(Mutex::new(module_cache));
-        // {
-        //     let module_cache = module_cache.clone();
-        //     tokio::task::spawn(async move {
-        //         loop {
-        //             tokio::time::sleep(Duration::from_secs(5)).await;
-        //             let mut cache = module_cache.lock().await;
-        //             cache.cleanup();
-        //         }
-        //     });
-        // }
-
-        // let mut linker: wasmtime::Linker<AppState> = wasmtime::Linker::new(&engine);
-        // wasmtime_wasi::p1::add_to_linker_async(&mut linker, |t| &mut t.wasi_ctx)?;
-
         Ok(Self { app_server })
     }
 
