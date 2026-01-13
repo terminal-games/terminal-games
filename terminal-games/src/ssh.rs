@@ -18,8 +18,7 @@ pub struct SshSession {
     username: Option<tokio::sync::oneshot::Sender<String>>,
     term: Option<tokio::sync::oneshot::Sender<String>>,
     args: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
-    remote_sshid: Option<tokio::sync::oneshot::Sender<String>>,
-    ssh_session: Option<tokio::sync::oneshot::Sender<(Handle, ChannelId)>>,
+    ssh_session: Option<tokio::sync::oneshot::Sender<(Handle, ChannelId, String)>>,
     cancellation_token: CancellationToken,
     server: SshServer,
 }
@@ -76,10 +75,7 @@ impl Server for SshServer {
         let (username_sender, username_receiver) = tokio::sync::oneshot::channel::<String>();
         let (term_sender, term_receiver) = tokio::sync::oneshot::channel::<String>();
         let (args_sender, args_receiver) = tokio::sync::oneshot::channel::<Vec<u8>>();
-        let (remote_sshid_sender, remote_sshid_receiver) =
-            tokio::sync::oneshot::channel::<String>();
-        let (ssh_session_sender, ssh_session_receiver) =
-            tokio::sync::oneshot::channel::<(Handle, ChannelId)>();
+        let (ssh_session_sender, ssh_session_receiver) = tokio::sync::oneshot::channel::<(Handle, ChannelId, String)>();
 
         let (input_tx, input_rx) = tokio::sync::mpsc::channel(20);
         let (resize_tx, resize_rx) = tokio::sync::mpsc::channel(1);
@@ -88,8 +84,7 @@ impl Server for SshServer {
         let app_server = self.app_server.clone();
 
         tokio::task::spawn(async move {
-            let (session_handle, channel_id) = ssh_session_receiver.await.unwrap();
-            let remote_sshid = remote_sshid_receiver.await.unwrap();
+            let (session_handle, channel_id, remote_sshid) = ssh_session_receiver.await.unwrap();
             let username = username_receiver.await.unwrap();
 
             // enter the alternate screen so that we aren't moving the cursor
@@ -179,7 +174,6 @@ impl Server for SshServer {
             username: Some(username_sender),
             term: Some(term_sender),
             args: Some(args_sender),
-            remote_sshid: Some(remote_sshid_sender),
             ssh_session: Some(ssh_session_sender),
             server: self.clone(),
         }
@@ -195,12 +189,8 @@ impl Handler for SshSession {
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
         let remote_sshid = String::from_utf8_lossy(session.remote_sshid()).to_string();
-        if let Some(remote_sshid_sender) = self.remote_sshid.take() {
-            let _ = remote_sshid_sender.send(remote_sshid);
-        }
-
         if let Some(ssh_session_sender) = self.ssh_session.take() {
-            let _ = ssh_session_sender.send((session.handle(), channel.id()));
+            let _ = ssh_session_sender.send((session.handle(), channel.id(), remote_sshid));
         }
 
         Ok(true)
