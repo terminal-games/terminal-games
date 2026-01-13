@@ -241,7 +241,9 @@ impl AppServer {
                 term: params.term,
                 username: params.username,
             });
-            let (mut app, mut instance_pre) = Self::prepare_instantiate(&ctx, first_app_shortname).await.unwrap();
+            let (mut app, mut instance_pre) = Self::prepare_instantiate(&ctx, first_app_shortname)
+                .await
+                .unwrap();
 
             loop {
                 let state = AppState {
@@ -319,8 +321,12 @@ impl AppServer {
         return exit_rx;
     }
 
-    async fn prepare_instantiate(ctx: &AppContext, shortname: String) -> anyhow::Result<(PreloadedAppState, wasmtime::InstancePre<AppState>)> {
-        let app_id = ctx.db
+    async fn prepare_instantiate(
+        ctx: &AppContext,
+        shortname: String,
+    ) -> anyhow::Result<(PreloadedAppState, wasmtime::InstancePre<AppState>)> {
+        let app_id = ctx
+            .db
             .query(
                 "SELECT id FROM games WHERE shortname = ?1",
                 [shortname.as_str()],
@@ -337,7 +343,8 @@ impl AppServer {
         let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(AppId(app_id)).await;
 
         let mut envs = vec![];
-        let mut rows = ctx.db
+        let mut rows = ctx
+            .db
             .query("SELECT name, value FROM envs WHERE game_id = ?1", [app_id])
             .await
             .unwrap();
@@ -360,7 +367,8 @@ impl AppServer {
             .envs(&envs)
             .build_p1();
 
-        let mut rows = ctx.db
+        let mut rows = ctx
+            .db
             .query(
                 "SELECT path FROM games WHERE id = ?1",
                 libsql::params![app_id],
@@ -373,7 +381,16 @@ impl AppServer {
         let module = wasmtime::Module::from_file(ctx.linker.engine(), wasm_path).unwrap();
         let instance_pre = ctx.linker.instantiate_pre(&module).unwrap();
 
-        Ok((PreloadedAppState { wasi_ctx, peer_rx, peer_tx, app_id: AppId(app_id), shortname }, instance_pre))
+        Ok((
+            PreloadedAppState {
+                wasi_ctx,
+                peer_rx,
+                peer_tx,
+                app_id: AppId(app_id),
+                shortname,
+            },
+            instance_pre,
+        ))
     }
 
     fn host_dial(
@@ -871,7 +888,9 @@ pub struct AppState {
     streams: Vec<Stream>,
     limits: AppLimiter,
     terminal: Arc<Mutex<Terminal>>,
-    next_app: Option<tokio::sync::oneshot::Receiver<(PreloadedAppState, wasmtime::InstancePre<AppState>)>>,
+    next_app: Option<
+        tokio::sync::oneshot::Receiver<(PreloadedAppState, wasmtime::InstancePre<AppState>)>,
+    >,
     /// Must be kept in sync with [`next_app_shortname`]
     has_next_app: Arc<AtomicBool>,
     input_receiver: tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,

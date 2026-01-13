@@ -2,8 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{collections::{HashMap, HashSet}, fmt::Display, net::SocketAddr, os::unix::io::{AsRawFd, RawFd}, pin::Pin, sync::Arc, time::Duration};
 use std::future::Future;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    net::SocketAddr,
+    os::unix::io::{AsRawFd, RawFd},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::{Buf, BufMut, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -13,7 +21,11 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
-use tokio_util::{codec::{Decoder, Encoder, Framed}, sync::CancellationToken, task::TaskTracker};
+use tokio_util::{
+    codec::{Decoder, Encoder, Framed},
+    sync::CancellationToken,
+    task::TaskTracker,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Message {
@@ -56,7 +68,12 @@ impl RegionId {
 
 impl Display for RegionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let filtered: Vec<u8> = self.as_bytes().iter().copied().filter(|&b| b != 0).collect();
+        let filtered: Vec<u8> = self
+            .as_bytes()
+            .iter()
+            .copied()
+            .filter(|&b| b != 0)
+            .collect();
         if let Ok(s) = std::str::from_utf8(&filtered) {
             write!(f, "{}", s)
         } else {
@@ -149,7 +166,7 @@ impl EnvDiscovery {
 impl Discovery for EnvDiscovery {
     async fn discover_peers(&self) -> anyhow::Result<HashSet<(RegionId, SocketAddr)>> {
         let nodes_env = std::env::var("PEER_NODES").unwrap_or_else(|_| String::new());
-        
+
         if nodes_env.is_empty() {
             return Ok(HashSet::new());
         }
@@ -162,7 +179,7 @@ impl Discovery for EnvDiscovery {
                 let colon_idx = s.find(':').ok_or_else(|| {
                     anyhow::anyhow!("Invalid peer node format '{}': expected 'region:address' (e.g., 'loca:127.0.0.1:3001')", s)
                 })?;
-                
+
                 let region_str = &s[..colon_idx];
                 let addr_str = &s[colon_idx + 1..];
 
@@ -243,7 +260,11 @@ impl Mesh {
     pub async fn new_peer(
         &self,
         app_id: AppId,
-    ) -> (PeerId, tokio::sync::mpsc::Receiver<PeerMessageApp>, tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>) {
+    ) -> (
+        PeerId,
+        tokio::sync::mpsc::Receiver<PeerMessageApp>,
+        tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>,
+    ) {
         let peer_id = PeerId {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -255,7 +276,7 @@ impl Mesh {
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let (tx2, mut rx2) = tokio::sync::mpsc::channel(1);
-        
+
         let inner = self.inner.clone();
         self.inner.tasks.spawn(async move {
             inner.peers.lock().await
@@ -307,7 +328,10 @@ impl Mesh {
     }
 
     pub async fn get_peers_for_app(&self, app_id: AppId) -> HashSet<PeerId> {
-        self.inner.global_peers.lock().await
+        self.inner
+            .global_peers
+            .lock()
+            .await
             .get(&app_id)
             .cloned()
             .unwrap_or_default()
@@ -367,7 +391,8 @@ impl Mesh {
 
     pub async fn get_region_latency(&self, region: RegionId) -> Option<Duration> {
         let regions = self.inner.regions.lock().await;
-        regions.get(&region)
+        regions
+            .get(&region)
             .and_then(|s| s.as_active())
             .and_then(|conn| get_tcp_rtt_from_fd(conn.conn_fd).ok())
     }
@@ -416,7 +441,8 @@ impl MeshInner {
 
         let data = Arc::new(message.data);
 
-        let mut send_futures: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::with_capacity(region_partitions.len() - 1 + num_peers);
+        let mut send_futures: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> =
+            Vec::with_capacity(region_partitions.len() - 1 + num_peers);
         for (region, peer_ids) in region_partitions {
             if region == self.region {
                 let local_sends: Vec<_> = {
@@ -436,24 +462,20 @@ impl MeshInner {
                     let data = data.clone();
                     let from_peer = message.from_peer;
                     let app_id = message.app_id;
-                    
+
                     send_futures.push(Box::pin(async move {
-                        if let Err(e) = tx
-                            .send(PeerMessageApp {
-                                from_peer,
-                                data,
-                            })
-                            .await
-                        {
-                            tracing::error!(%peer_id, %app_id, e=?e, 
-                                "failed to send to local peer");
+                        if let Err(error) = tx.send(PeerMessageApp { from_peer, data }).await {
+                            tracing::error!(%peer_id, %app_id, error=?error, "failed to send to local peer");
                         }
                     }));
                 }
             } else {
                 let remote_tx = {
                     let regions = self.regions.lock().await;
-                    regions.get(&region).and_then(|s| s.as_active()).map(|conn| conn.tx.clone())
+                    regions
+                        .get(&region)
+                        .and_then(|s| s.as_active())
+                        .map(|conn| conn.tx.clone())
                 };
 
                 if let Some(tx) = remote_tx {
@@ -478,7 +500,11 @@ impl MeshInner {
         futures::future::join_all(send_futures).await;
     }
 
-    async fn connect_to_node(self: &Arc<Self>, region: RegionId, addr: SocketAddr) -> anyhow::Result<()> {
+    async fn connect_to_node(
+        self: &Arc<Self>,
+        region: RegionId,
+        addr: SocketAddr,
+    ) -> anyhow::Result<()> {
         {
             // Mark as pending before connecting to prevent heal_network
             let mut regions = self.regions.lock().await;
@@ -542,8 +568,15 @@ impl MeshInner {
         Ok(())
     }
 
-    async fn handle_connection(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr, expected_region: Option<RegionId>) {
-        let result = self.handle_connection_inner(stream, addr, expected_region).await;
+    async fn handle_connection(
+        self: &Arc<Self>,
+        stream: TcpStream,
+        addr: SocketAddr,
+        expected_region: Option<RegionId>,
+    ) {
+        let result = self
+            .handle_connection_inner(stream, addr, expected_region)
+            .await;
 
         if let Some(region) = result.as_ref().ok().copied().or(expected_region) {
             self.regions.lock().await.remove(&region);
@@ -551,13 +584,20 @@ impl MeshInner {
         }
     }
 
-    async fn handle_connection_inner(self: &Arc<Self>, stream: TcpStream, addr: SocketAddr, expected_region: Option<RegionId>) -> anyhow::Result<RegionId> {
+    async fn handle_connection_inner(
+        self: &Arc<Self>,
+        stream: TcpStream,
+        addr: SocketAddr,
+        expected_region: Option<RegionId>,
+    ) -> anyhow::Result<RegionId> {
         let fd = stream.as_raw_fd();
         let (mut sink, mut stream) = Framed::new(stream, MessageCodec).split();
 
-        sink.send(Message::Handshake(HandshakeMessage { region: self.region }))
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to send handshake: {}", e))?;
+        sink.send(Message::Handshake(HandshakeMessage {
+            region: self.region,
+        }))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to send handshake: {}", e))?;
 
         let their_region = match stream.next().await {
             Some(Ok(Message::Handshake(h))) => h.region,
@@ -567,18 +607,27 @@ impl MeshInner {
         if let Some(expected) = expected_region {
             if their_region != expected {
                 tracing::warn!(%expected, actual=%their_region, %addr, "Region mismatch");
-                return Err(anyhow::anyhow!("Region mismatch: expected {}, got {}", expected, their_region));
+                return Err(anyhow::anyhow!(
+                    "Region mismatch: expected {}, got {}",
+                    expected,
+                    their_region
+                ));
             }
         }
 
-        let local_peers_by_app = self.peers.lock().await
+        let local_peers_by_app = self
+            .peers
+            .lock()
+            .await
             .iter()
             .map(|(app_id, peer_map)| (*app_id, peer_map.keys().copied().collect()))
             .collect();
         sink.send(Message::PeerListSync(PeerListSyncMessage {
             region: self.region,
             peers_by_app: local_peers_by_app,
-        })).await.map_err(|e| anyhow::anyhow!("Failed to send peer list sync: {}", e))?;
+        }))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to send peer list sync: {}", e))?;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
         let cancel = self.cancel.clone();
@@ -600,10 +649,10 @@ impl MeshInner {
             }
         });
 
-        self.regions.lock().await.insert(their_region, RegionState::Active(ActiveConnection {
-            tx,
-            conn_fd: fd,
-        }));
+        self.regions.lock().await.insert(
+            their_region,
+            RegionState::Active(ActiveConnection { tx, conn_fd: fd }),
+        );
 
         tracing::info!(region=%their_region, %addr, "Connected");
 
@@ -717,7 +766,13 @@ impl MeshInner {
             .map(|(peer_id, tx)| {
                 let data = data.clone();
                 Box::pin(async move {
-                    tx.send(PeerMessageApp { from_peer: msg.from_peer, data }).await.is_err().then_some(peer_id)
+                    tx.send(PeerMessageApp {
+                        from_peer: msg.from_peer,
+                        data,
+                    })
+                    .await
+                    .is_err()
+                    .then_some(peer_id)
                 }) as Pin<Box<dyn Future<Output = Option<PeerId>> + Send>>
             })
             .collect();

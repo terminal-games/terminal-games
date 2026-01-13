@@ -75,7 +75,8 @@ impl Server for SshServer {
         let (username_sender, username_receiver) = tokio::sync::oneshot::channel::<String>();
         let (term_sender, term_receiver) = tokio::sync::oneshot::channel::<String>();
         let (args_sender, args_receiver) = tokio::sync::oneshot::channel::<Vec<u8>>();
-        let (ssh_session_sender, ssh_session_receiver) = tokio::sync::oneshot::channel::<(Handle, ChannelId, String)>();
+        let (ssh_session_sender, ssh_session_receiver) =
+            tokio::sync::oneshot::channel::<(Handle, ChannelId, String)>();
 
         let (input_tx, input_rx) = tokio::sync::mpsc::channel(20);
         let (resize_tx, resize_rx) = tokio::sync::mpsc::channel(1);
