@@ -6,6 +6,7 @@ mod app;
 mod mesh;
 mod ssh;
 mod status_bar;
+mod web;
 
 use std::sync::Arc;
 
@@ -77,10 +78,26 @@ async fn main() -> Result<()> {
     mesh.start_discovery().await.unwrap();
     mesh.serve().await.unwrap();
 
-    let app_server = AppServer::new(mesh.clone(), conn).unwrap();
+    let app_server = Arc::new(AppServer::new(mesh.clone(), conn).unwrap());
 
-    let mut server = ssh::SshServer::new(Arc::new(app_server)).await?;
-    server.run().await.expect("Failed running server");
+    let ssh_app_server = app_server.clone();
+    let web_app_server = app_server.clone();
+
+    tokio::select! {
+        result = async {
+            let mut server = ssh::SshServer::new(ssh_app_server).await?;
+            server.run().await
+        } => {
+            result.expect("Failed running SSH server");
+        }
+        result = async {
+            let server = web::WebServer::new(web_app_server);
+            server.run().await
+        } => {
+            result.expect("Failed running web server");
+        }
+    }
+
     mesh.graceful_shutdown().await;
 
     Ok(())

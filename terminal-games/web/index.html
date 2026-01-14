@@ -1,0 +1,96 @@
+<!-- This Source Code Form is subject to the terms of the Mozilla Public
+   - License, v. 2.0. If a copy of the MPL was not distributed with this
+   - file, You can obtain one at https://mozilla.org/MPL/2.0/. -->
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>Terminal Games</title>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css" />
+        <style>
+            html, body {
+                height: 100%;
+                margin: 0;
+                padding: 0;
+                overflow: hidden;
+            }
+            #terminal {
+                width: 100%;
+                height: 100%;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="terminal"></div>
+        <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/lib/xterm.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.19.0/lib/addon-webgl.js"></script>
+        <script>
+            const term = new Terminal({
+                scrollback: 0,
+            });
+
+            // Enter alternate screen buffer
+            term.write("\x1b[?1049h");
+            
+            const fitAddon = new FitAddon.FitAddon();
+            term.loadAddon(fitAddon);
+            
+            try {
+                const webglAddon = new WebglAddon.WebglAddon();
+                term.loadAddon(webglAddon);
+            } catch (e) {
+                console.warn('WebGL renderer not available, using default renderer:', e);
+            }
+            
+            term.open(document.getElementById('terminal'));
+            fitAddon.fit();
+
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const queryString = window.location.search;
+            const wsUrl = `${protocol}//${window.location.host}/ws${queryString}`;
+            const socket = new WebSocket(wsUrl);
+            
+            socket.binaryType = 'arraybuffer';
+
+            socket.onopen = () => {
+                const cols = term.cols;
+                const rows = term.rows;
+                socket.send(`resize:${cols}:${rows}`);
+            };
+
+            socket.onmessage = (event) => {
+                if (event.data instanceof ArrayBuffer) {
+                    const bytes = new Uint8Array(event.data);
+                    term.write(bytes);
+                }
+            };
+
+            socket.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                term.write('\r\n\x1b[31mWebSocket connection error\x1b[0m\r\n');
+            };
+
+            socket.onclose = () => {
+                term.write('\r\n\x1b[31mWebSocket connection closed\x1b[0m\r\n');
+            };
+
+            term.onData((data) => {
+                if (socket.readyState === WebSocket.OPEN) {
+                    const encoder = new TextEncoder();
+                    const bytes = encoder.encode(data);
+                    socket.send(bytes.buffer);
+                }
+            });
+
+            term.onResize((size) => {
+                if (socket.readyState === WebSocket.OPEN) {
+                    socket.send(`resize:${size.cols}:${size.rows}`);
+                }
+            });
+
+            window.addEventListener('resize', () => {
+                fitAddon.fit();
+            });
+        </script>
+    </body>
+</html>
