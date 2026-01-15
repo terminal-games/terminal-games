@@ -56,7 +56,7 @@ var fromHost = &yieldingReadWriter{buf: bytes.NewBuffer(nil)}
 
 func init() {
 	go func() {
-		buffer := make([]byte, 64)
+		buffer := make([]byte, 512)
 
 		for {
 			n := terminal_read(unsafe.Pointer(&buffer[0]), uint32(len(buffer)))
