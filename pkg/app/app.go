@@ -17,6 +17,10 @@ func change_app(address_ptr unsafe.Pointer, addressLen uint32) int32
 //go:noescape
 func next_app_ready() int32
 
+//go:wasmimport terminal_games graceful_shutdown_poll
+//go:noescape
+func graceful_shutdown_poll() int32
+
 // Change asks the host to switch to another app identified by its shortname.
 // The current guest should exit after calling this function so the host can
 // start the next app.
@@ -42,4 +46,14 @@ func Change(shortname string) error {
 // useful for building a loading UI
 func Ready() bool {
 	return next_app_ready() > 0
+}
+
+// GracefulShutdownPoll polls whether a graceful shutdown has been triggered by the host.
+//
+// Returns true if a graceful shutdown has been initiated, false otherwise.
+// This can be called periodically by the guest to check if it should begin
+// shutting down gracefully (e.g., saving state, closing connections, etc.)
+// before the host forces a hard shutdown.
+func GracefulShutdownPoll() bool {
+	return graceful_shutdown_poll() > 0
 }

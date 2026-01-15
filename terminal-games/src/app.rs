@@ -79,6 +79,11 @@ impl AppServer {
         linker.func_wrap("terminal_games", "peer_recv", Self::peer_recv)?;
         linker.func_wrap_async("terminal_games", "region_latency", Self::region_latency)?;
         linker.func_wrap_async("terminal_games", "peer_list", Self::peer_list)?;
+        linker.func_wrap(
+            "terminal_games",
+            "graceful_shutdown_poll",
+            Self::graceful_shutdown_poll,
+        )?;
 
         Ok(Self {
             linker: Arc::new(linker),
@@ -129,7 +134,7 @@ impl AppServer {
             // output task
             tokio::task::spawn({
                 let hard_shutdown_token = hard_shutdown_token.clone();
-                let graceful_shutdown_token = params.graceful_shutdown_token;
+                let graceful_shutdown_token = params.graceful_shutdown_token.clone();
                 let output_sender = params.output_sender;
                 let username = params.username.clone();
                 let first_app_shortname = first_app_shortname.clone();
@@ -145,14 +150,18 @@ impl AppServer {
                             biased;
 
                             _ = hard_shutdown_token.cancelled() => {
-                                tracing::info!("hard shutdown 1");
                                 break;
                             }
 
                             _ = graceful_shutdown_token.cancelled() => {
-                                tracing::info!("initiating graceful shutdown");
-                                tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
-                                hard_shutdown_token.cancel();
+                                tokio::select! {
+                                    _ = tokio::time::sleep(std::time::Duration::from_millis(5000)) => {
+                                        hard_shutdown_token.cancel();
+                                    }
+                                    _ = hard_shutdown_token.cancelled() => {
+                                        break;
+                                    }
+                                }
                             }
 
                             data = app_output_receiver.recv() => {
@@ -245,6 +254,7 @@ impl AppServer {
                 .await
                 .unwrap();
 
+            let mut graceful_shutdown_token = params.graceful_shutdown_token;
             loop {
                 let state = AppState {
                     app,
@@ -255,6 +265,7 @@ impl AppServer {
                     next_app: None,
                     input_receiver: input_receiver,
                     has_next_app: has_next_app_shortname.clone(),
+                    graceful_shutdown_token,
                 };
 
                 let mut store = wasmtime::Store::new(&engine, state);
@@ -273,7 +284,6 @@ impl AppServer {
                     has_next_app_shortname.store(false, Ordering::Release);
                     tokio::select! {
                         _ = hard_shutdown_token.cancelled() => {
-                            tracing::info!("hard shutdown 2");
                             break;
                         }
 
@@ -286,7 +296,6 @@ impl AppServer {
                 if let Err(err) = call_result {
                     match err.downcast::<wasmtime_wasi::I32Exit>() {
                         Ok(code) => {
-                            tracing::info!(?code, "exit");
                             exit_code = code;
                         }
                         Err(other) => {
@@ -296,6 +305,7 @@ impl AppServer {
                 }
 
                 let mut state = store.into_data();
+                graceful_shutdown_token = state.graceful_shutdown_token;
                 input_receiver = state.input_receiver;
                 terminal = state.terminal;
                 ctx = state.ctx;
@@ -862,6 +872,11 @@ impl AppServer {
             Ok(length as i32)
         })
     }
+
+    fn graceful_shutdown_poll(caller: wasmtime::Caller<'_, AppState>) -> anyhow::Result<i32> {
+        let is_cancelled = caller.data().graceful_shutdown_token.is_cancelled();
+        Ok(if is_cancelled { 1 } else { 0 })
+    }
 }
 
 pub struct PreloadedAppState {
@@ -894,6 +909,7 @@ pub struct AppState {
     /// Must be kept in sync with [`next_app_shortname`]
     has_next_app: Arc<AtomicBool>,
     input_receiver: tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
+    graceful_shutdown_token: CancellationToken,
 }
 
 struct AppLimiter {

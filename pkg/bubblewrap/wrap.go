@@ -20,6 +20,8 @@ import (
 	"github.com/charmbracelet/x/input"
 	"github.com/lucasb-eyer/go-colorful"
 	"github.com/muesli/termenv"
+
+	"github.com/terminal-games/terminal-games/pkg/app"
 )
 
 type yieldingReadWriter struct {
@@ -74,6 +76,7 @@ func NewProgram(model tea.Model, opts ...tea.ProgramOption) *tea.Program {
 	p := tea.NewProgram(model, append([]tea.ProgramOption{tea.WithInput(fromHost), tea.WithoutSignalHandler()}, opts...)...)
 
 	var currentSize dimensions
+	sentQuit := false
 	go func() {
 		for {
 			var newSize dimensions
@@ -81,6 +84,11 @@ func NewProgram(model tea.Model, opts ...tea.ProgramOption) *tea.Program {
 			if newSize != currentSize {
 				p.Send(tea.WindowSizeMsg{Width: int(newSize.w), Height: int(newSize.h)})
 				currentSize = newSize
+			}
+
+			if app.GracefulShutdownPoll() && !sentQuit {
+				p.Quit()
+				sentQuit = true
 			}
 
 			time.Sleep(1 * time.Millisecond)

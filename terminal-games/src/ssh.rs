@@ -62,7 +62,6 @@ impl SshServer {
 
 impl Drop for SshSession {
     fn drop(&mut self) {
-        tracing::info!("drop");
         self.cancellation_token.cancel();
     }
 }
@@ -152,8 +151,6 @@ impl Server for SshServer {
                     }
                 }
             }
-
-            tracing::info!("leaving session");
 
             let _ = session_handle
                 .data(channel_id, b"\x1b[?1049l".to_vec().into())

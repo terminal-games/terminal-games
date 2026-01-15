@@ -193,6 +193,10 @@ async fn main() -> std::io::Result<()> {
             break;
         }
 
+        if app::graceful_shutdown_poll() {
+            break;
+        }
+
         for msg in &mut peer_messages {
             let message_str = String::from_utf8_lossy(&msg.data).to_string();
             let peer_msg = PeerMessage {

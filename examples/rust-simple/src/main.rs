@@ -2,6 +2,7 @@ use std::{io::Write, time::Instant};
 
 use ratatui::{Terminal, widgets::Paragraph};
 use terminal_games_sdk::{
+    app,
     terminal::{TerminalGamesBackend, TerminalReader},
     terminput,
 };
@@ -17,6 +18,10 @@ fn main() -> std::io::Result<()> {
     let mut frame_counter = 1;
     let mut last_event = None;
     'outer: loop {
+        if app::graceful_shutdown_poll() {
+            break;
+        }
+
         let mut event_counter = 0;
         for event in &mut terminal_reader {
             event_counter += 1;

@@ -27,3 +27,13 @@ pub fn change_app(shortname: impl AsRef<str>) -> Result<(), std::io::Error> {
 pub fn next_app_ready() -> bool {
     return unsafe { crate::internal::next_app_ready() } > 0;
 }
+
+/// Polls whether a graceful shutdown has been triggered by the host.
+///
+/// Returns `true` if a graceful shutdown has been initiated, `false` otherwise.
+/// This can be called periodically by the guest to check if it should begin
+/// shutting down gracefully (e.g., saving state, closing connections, etc.)
+/// before the host forces a hard shutdown.
+pub fn graceful_shutdown_poll() -> bool {
+    return unsafe { crate::internal::graceful_shutdown_poll() } > 0;
+}
