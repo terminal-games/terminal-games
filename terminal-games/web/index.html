@@ -7,11 +7,16 @@
         <title>Terminal Games</title>
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/css/xterm.css" />
         <style>
+            @font-face {
+                font-family: "JetBrainsMonoNL NFM";
+                src: url("https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@3.4.0/patched-fonts/JetBrainsMono/NoLigatures/Regular/JetBrainsMonoNLNerdFontMono-Regular.ttf");
+            }
             html, body {
                 height: 100%;
                 margin: 0;
                 padding: 0;
                 overflow: hidden;
+                background-color: black;
             }
             #terminal {
                 width: 100%;
@@ -20,13 +25,18 @@
         </style>
     </head>
     <body>
+        <script>document.fonts.load(`14px "JetBrainsMonoNL NFM"`)</script>
         <div id="terminal"></div>
         <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@6.0.0/lib/xterm.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.11.0/lib/addon-fit.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.19.0/lib/addon-webgl.js"></script>
-        <script>
+        <script type="module">
+            await document.fonts.ready;
+
             const term = new Terminal({
                 scrollback: 0,
+                fontFamily: '"JetBrainsMonoNL NFM", monospace',
+                fontSize: 14,
             });
 
             // Enter alternate screen buffer
@@ -58,10 +68,30 @@
                 socket.send(`resize:${cols}:${rows}`);
             };
 
-            socket.onmessage = (event) => {
+            socket.onmessage = async (event) => {
                 if (event.data instanceof ArrayBuffer) {
-                    const bytes = new Uint8Array(event.data);
-                    term.write(bytes);
+                    try {
+                        const decompressionStream = new DecompressionStream('deflate-raw');
+                        const stream = new ReadableStream({
+                            start(controller) {
+                                controller.enqueue(new Uint8Array(event.data));
+                                controller.close();
+                            }
+                        });
+                        
+                        const decompressedStream = stream.pipeThrough(decompressionStream);
+                        const reader = decompressedStream.getReader();
+                        
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            term.write(value);
+                        }
+                    } catch (error) {
+                        console.error('Decompression error:', error);
+                        const bytes = new Uint8Array(event.data);
+                        term.write(bytes);
+                    }
                 }
             };
 

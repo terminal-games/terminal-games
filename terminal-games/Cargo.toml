@@ -8,6 +8,7 @@ anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
+flate2 = "1"
 futures = "0.3"
 headless-terminal = { path = "../headless-terminal" }
 hex = "0.4"

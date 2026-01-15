@@ -2,22 +2,24 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use axum::{
+    Router,
     extract::{
+        Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
-        Query,
     },
     http::HeaderMap,
     response::{Html, Response},
     routing::get,
-    Router,
 };
-use serde::Deserialize;
 use bytes::Bytes;
+use flate2::Compression;
+use flate2::write::DeflateEncoder;
 use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::app::{AppInstantiationParams, AppServer};
@@ -72,13 +74,18 @@ async fn websocket_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown")
         .to_string();
-    
+
     let args = query.args.map(|s| s.into_bytes());
-    
+
     ws.on_upgrade(move |socket| handle_socket(socket, server, user_agent, args))
 }
 
-async fn handle_socket(socket: WebSocket, server: WebServer, user_agent: String, args: Option<Vec<u8>>) {
+async fn handle_socket(
+    socket: WebSocket,
+    server: WebServer,
+    user_agent: String,
+    args: Option<Vec<u8>>,
+) {
     let (mut sender, mut receiver) = socket.split();
 
     let remote_sshid = sanitize_user_agent(&user_agent);
@@ -103,8 +110,17 @@ async fn handle_socket(socket: WebSocket, server: WebServer, user_agent: String,
 
     tokio::task::spawn(async move {
         while let Some(data) = output_rx.recv().await {
+            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+            if encoder.write_all(&data).is_err() {
+                break;
+            }
+            let compressed = match encoder.finish() {
+                Ok(compressed) => compressed,
+                Err(_) => break,
+            };
+
             if sender
-                .send(Message::Binary(Bytes::from(data)))
+                .send(Message::Binary(Bytes::from(compressed)))
                 .await
                 .is_err()
             {
@@ -163,7 +179,5 @@ fn parse_resize(text: &str) -> Option<(u16, u16)> {
 }
 
 fn sanitize_user_agent(ua: &str) -> String {
-    ua.chars()
-        .take(200)
-        .collect()
+    ua.chars().take(256).collect()
 }
