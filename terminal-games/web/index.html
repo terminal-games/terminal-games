@@ -112,6 +112,16 @@
                 }
             });
 
+            term.onBinary((data) => {
+                if (socket.readyState === WebSocket.OPEN) {
+                    const bytes = new Uint8Array(data.length);
+                    for (let i = 0; i < data.length; i++) {
+                        bytes[i] = data.charCodeAt(i) & 0xFF;
+                    }
+                    socket.send(bytes.buffer);
+                }
+            });
+
             term.onResize((size) => {
                 if (socket.readyState === WebSocket.OPEN) {
                     socket.send(`resize:${size.cols}:${size.rows}`);

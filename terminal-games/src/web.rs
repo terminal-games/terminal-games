@@ -89,7 +89,7 @@ async fn handle_socket(
     let (mut sender, mut receiver) = socket.split();
 
     let remote_sshid = sanitize_user_agent(&user_agent);
-    let username = "web-user".to_string();
+    let username = "web".to_string();
 
     let (input_tx, input_rx) = tokio::sync::mpsc::channel(20);
     let (resize_tx, resize_rx) = tokio::sync::mpsc::channel(10);
