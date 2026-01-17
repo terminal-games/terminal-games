@@ -2,8 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, AtomicU64};
+use std::task::Poll;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use tokio::io::{AsyncRead, AsyncWrite};
 use rand_core::OsRng;
 use russh::keys::ssh_key::{self, PublicKey};
 use russh::server::*;
@@ -46,17 +51,68 @@ impl SshServer {
             nodelay: true,
             ..Default::default()
         };
+        let config = Arc::new(config);
 
         let listen_addr: std::net::SocketAddr = std::env::var("SSH_LISTEN_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:2222".to_string())
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid SSH_LISTEN_ADDR: {}", e))?;
 
-        let ip_str = listen_addr.ip().to_string();
+        // let ip_str = listen_addr.ip().to_string();
         tracing::info!(addr = %listen_addr, "Running SSH server");
-        self.run_on_address(Arc::new(config), (ip_str.as_str(), listen_addr.port()))
-            .await?;
-        Ok(())
+        // self.run_on_address(Arc::new(config), (ip_str.as_str(), listen_addr.port()))
+        //     .await?;
+
+        let socket = tokio::net::TcpListener::bind(listen_addr).await?;
+        loop {
+            let (tcp_stream, peer_addr) = socket.accept().await?;
+
+            if config.nodelay {
+                if let Err(e) = tcp_stream.set_nodelay(true) {
+                    tracing::warn!("set_nodelay() failed: {e:?}");
+                }
+            }
+
+            // let fd = tcp_stream.as_raw_fd();
+            // let bytes_per_sec: u64 = 10 * 1024;
+            // let ret = unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_MAX_PACING_RATE, &bytes_per_sec as *const u64 as *const libc::c_void, std::mem::size_of::<u64>() as libc::socklen_t) };
+            // if ret != 0 {
+            //     panic!("ret {}", ret);
+            // }
+
+            let network_info = Arc::new(NetworkInformation::new());
+            let wrapped_stream = RateLimitedStream::new(tcp_stream, network_info.clone());
+            tokio::spawn(async move {
+                loop {
+                    tracing::info!(bytes_per_sec_in=network_info.bytes_per_sec_in(), bytes_per_sec_out=network_info.bytes_per_sec_out(), "network");
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                }
+            });
+
+            let handler = self.new_client(Some(peer_addr));
+
+            tokio::spawn({
+                let config = config.clone();
+                async move {
+                    let session = match russh::server::run_stream(config, wrapped_stream, handler).await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::info!("Connection setup failed: {:?}", e);
+                            return;
+                        }
+                    };
+
+                    if let Err(e) = session.await {
+                        tracing::info!("Connection closed with error: {:?}", e);
+                    } else {
+                        tracing::info!("Connection closed");
+                    }
+                }
+            });
+        }
+
+        // Ok(())
     }
 }
 
@@ -123,7 +179,7 @@ impl Server for SshServer {
                 _ => None,
             };
 
-            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(20);
+            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
             let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
                 args,
                 input_receiver: input_rx,
@@ -148,6 +204,7 @@ impl Server for SshServer {
                     data = output_rx.recv() => {
                         let Some(data) = data else { break };
                         let _ = session_handle.data(channel_id, data.into()).await;
+                        // tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
                     }
                 }
             }
@@ -306,5 +363,202 @@ impl Handler for SshSession {
         }
         session.channel_success(channel)?;
         Ok(())
+    }
+}
+
+struct EwmaRate {
+    bytes_per_sec: AtomicU64,
+    last_update_ns: AtomicU64,
+    tau_seconds: f64,
+}
+
+impl EwmaRate {
+    fn new(tau_seconds: f64) -> Self {
+        let now_ns = Self::now_ns();
+        Self {
+            bytes_per_sec: AtomicU64::new(0.0f64.to_bits()),
+            last_update_ns: AtomicU64::new(now_ns),
+            tau_seconds,
+        }
+    }
+
+    fn now_ns() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    }
+
+    fn update(&self, bytes: usize) {
+        let now_ns = Self::now_ns();
+        let old_last_update_ns = self.last_update_ns.swap(now_ns, std::sync::atomic::Ordering::Relaxed);
+        let old_bytes_per_sec = f64::from_bits(self.bytes_per_sec.load(std::sync::atomic::Ordering::Relaxed));
+        let delta_t_sec = (now_ns.saturating_sub(old_last_update_ns) as f64 / 1_000_000_000.0).max(0.001);
+        let instant = bytes as f64 / delta_t_sec;
+        let alpha = 1.0 - (-delta_t_sec / self.tau_seconds).exp();
+        self.bytes_per_sec.store((alpha * instant + (1.0 - alpha) * old_bytes_per_sec).to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn get(&self) -> f64 {
+        let now_ns = Self::now_ns();
+        let last_update_ns = self.last_update_ns.load(std::sync::atomic::Ordering::Relaxed);
+        let bytes_per_sec = f64::from_bits(self.bytes_per_sec.load(std::sync::atomic::Ordering::Relaxed));
+        let delta_t_sec = (now_ns.saturating_sub(last_update_ns) as f64 / 1_000_000_000.0).max(0.001);
+        let alpha = 1.0 - (-delta_t_sec / self.tau_seconds).exp();
+        (1.0 - alpha) * bytes_per_sec
+    }
+}
+
+pub struct NetworkInformation {
+    bytes_in: AtomicUsize,
+    bytes_out: AtomicUsize,
+    latency_ms: AtomicUsize,
+    send_rate: EwmaRate,
+    recv_rate: EwmaRate,
+}
+
+impl NetworkInformation {
+    pub fn new() -> Self {
+        Self {
+            bytes_in: AtomicUsize::new(0),
+            bytes_out: AtomicUsize::new(0),
+            latency_ms: AtomicUsize::new(0),
+            send_rate: EwmaRate::new(1.0),
+            recv_rate: EwmaRate::new(1.0),
+        }
+    }
+
+    pub fn send(&self, bytes: usize) {
+        self.bytes_out.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.send_rate.update(bytes);
+    }
+
+    pub fn recv(&self, bytes: usize) {
+        self.bytes_in.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.recv_rate.update(bytes);
+    }
+
+    pub fn bytes_per_sec_out(&self) -> f64 {
+        self.send_rate.get()
+    }
+
+    pub fn bytes_per_sec_in(&self) -> f64 {
+        self.recv_rate.get()
+    }
+}
+
+struct RateLimitedStream<S> {
+    inner: S,
+    write_bucket: TokenBucket,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    duration: std::time::Duration,
+    info: Arc<NetworkInformation>,
+}
+
+impl<S> RateLimitedStream<S> {
+    pub fn new(inner: S, info: Arc<NetworkInformation>) -> Self {
+        let duration = std::time::Duration::from_millis(10);
+        RateLimitedStream {
+            inner,
+            write_bucket: TokenBucket::new(50*1024, 50*1024),
+            sleep: Box::pin(tokio::time::sleep(duration)),
+            duration,
+            info,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for RateLimitedStream<S> {
+    fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+        let initial_filled = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            let bytes_read = buf.filled().len() - initial_filled;
+            if bytes_read > 0 {
+                self.info.recv(bytes_read);
+            }
+        }
+        poll
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for RateLimitedStream<S> {
+    fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+        let want = estimate_overhead(buf.len());
+        let allowed = self.write_bucket.allow(want);
+        if allowed < want {
+            if let Poll::Ready(_) = self.sleep.as_mut().poll(cx) {
+                let next = std::time::Instant::now() + self.duration;
+                self.sleep.as_mut().reset(next.into());
+            }
+            return Poll::Pending
+        }
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            let n = estimate_overhead(*n);
+            self.write_bucket.consume(n);
+            self.info.send(n);
+        }
+
+        poll
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+fn estimate_overhead(bytes: usize) -> usize {
+    bytes + 40 * bytes.div_ceil(1460)
+}
+
+#[derive(Debug)]
+pub struct TokenBucket {
+    tokens_per_sec: u64, 
+    capacity: u64,
+    tokens: u64,
+    last: std::time::Instant,
+}
+
+impl TokenBucket {
+    pub fn new(tokens_per_sec: u64, capacity: u64) -> Self {
+        Self {
+            tokens_per_sec,
+            capacity,
+            tokens: capacity,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn refill(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last);
+        self.last = now;
+
+        let nanos = elapsed.as_nanos() as u64;
+        let added = nanos.saturating_mul(self.tokens_per_sec) / 1_000_000_000;
+
+        self.tokens = (self.tokens.saturating_add(added)).min(self.capacity);
+    }
+
+    pub fn allow(&mut self, demand: usize) -> usize {
+        self.refill();
+        // tracing::info!(tokens=self.tokens, "tokens");
+        let want = demand as u64;
+        let allow = self.tokens.min(want);
+        allow as usize
+    }
+
+    pub fn consume(&mut self, tokens: usize) {
+        self.tokens = self.tokens.saturating_sub(tokens as u64);
     }
 }

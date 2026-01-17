@@ -109,7 +109,7 @@ impl AppServer {
             let mut window_size_receiver = params.window_size_receiver;
             let mut terminal = Arc::new(Mutex::new(headless_terminal::Parser::new(0, 0, 0)));
             let (app_output_sender, mut app_output_receiver) =
-                tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                tokio::sync::mpsc::channel::<Vec<u8>>(1);
             let mut input_receiver = params.input_receiver;
             let has_next_app_shortname = Arc::new(AtomicBool::new(false));
             let (shortname_sender, mut shortname_receiver) =
@@ -894,7 +894,7 @@ pub struct AppContext {
     username: String,
     term: Option<String>,
     linker: Arc<wasmtime::Linker<AppState>>,
-    app_output_sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    app_output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
 pub struct AppState {
@@ -1079,49 +1079,96 @@ impl EscapeSequenceBuffer {
     }
 }
 
-struct AsyncStdoutWriter {
-    sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    buffer: Vec<u8>,
+// struct AsyncStdoutWriter {
+//     sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+//     buffer: Vec<u8>,
+// }
+
+// impl tokio::io::AsyncWrite for AsyncStdoutWriter {
+//     fn poll_write(
+//         mut self: Pin<&mut Self>,
+//         _cx: &mut Context<'_>,
+//         buf: &[u8],
+//     ) -> Poll<std::io::Result<usize>> {
+//         self.buffer.extend_from_slice(buf);
+//         Poll::Ready(Ok(buf.len()))
+//     }
+
+//     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+//         if !self.buffer.is_empty() {
+//             let data = std::mem::take(&mut self.buffer);
+//             match self.sender.try_send(data) {
+//                 Ok(()) => {}
+//                 Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
+//                     self.buffer = data;
+//                     cx.waker().wake_by_ref();
+//                     return Poll::Pending;
+//                 }
+//                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+//                     return Poll::Ready(Err(std::io::Error::new(
+//                         std::io::ErrorKind::BrokenPipe,
+//                         "channel closed",
+//                     )));
+//                 }
+//             }
+//         }
+//         Poll::Ready(Ok(()))
+//     }
+
+//     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+//         self.poll_flush(cx)
+//     }
+// }
+
+pub struct AsyncStdoutWriter {
+    sender: tokio_util::sync::PollSender<Vec<u8>>,
+}
+
+impl AsyncStdoutWriter {
+    pub fn new(sender: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        Self { sender: tokio_util::sync::PollSender::new(sender) }
+    }
 }
 
 impl tokio::io::AsyncWrite for AsyncStdoutWriter {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        self.buffer.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if !self.buffer.is_empty() {
-            let data = std::mem::take(&mut self.buffer);
-            if self.sender.send(data).is_err() {
-                return Poll::Ready(Err(std::io::Error::new(
+        match self.sender.poll_reserve(cx) {
+            Poll::Ready(Ok(())) => {
+                let data = buf.to_vec();
+                let len = data.len();
+                let _ = self.sender.send_item(data);
+                Poll::Ready(Ok(len))
+            }
+            Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "channel closed",
-                )));
+                )))
             }
+            Poll::Pending => Poll::Pending,
         }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.poll_flush(cx)
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
 struct MyStdoutStream {
-    sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
 impl wasmtime_wasi::cli::StdoutStream for MyStdoutStream {
     fn async_stream(&self) -> Box<dyn tokio::io::AsyncWrite + Send + Sync> {
-        Box::new(AsyncStdoutWriter {
-            sender: self.sender.clone(),
-            buffer: Vec::new(),
-        })
+        Box::new(AsyncStdoutWriter::new(self.sender.clone()))
     }
 }
 
