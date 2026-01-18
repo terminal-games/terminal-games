@@ -58,11 +58,7 @@ impl SshServer {
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid SSH_LISTEN_ADDR: {}", e))?;
 
-        // let ip_str = listen_addr.ip().to_string();
         tracing::info!(addr = %listen_addr, "Running SSH server");
-        // self.run_on_address(Arc::new(config), (ip_str.as_str(), listen_addr.port()))
-        //     .await?;
-
         let socket = tokio::net::TcpListener::bind(listen_addr).await?;
         loop {
             let (tcp_stream, peer_addr) = socket.accept().await?;
@@ -303,12 +299,13 @@ impl Handler for SshSession {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // tracing::info!(
-        //     data = String::from_utf8_lossy(&data).as_ref(),
-        //     len = data.len(),
-        //     "input"
-        // );
-        self.input_sender.send(data.into()).await?;
+        match self.input_sender.try_send(data.into()) {
+            Ok(()) => {},
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {},
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("input channel closed");
+            },
+        }
 
         Ok(())
     }
@@ -403,6 +400,7 @@ impl EwmaRate {
         let delta_t_sec = (now_ns.saturating_sub(last_update_ns) as f64 / 1_000_000_000.0).max(0.001);
         let alpha = 1.0 - (-delta_t_sec / self.tau_seconds).exp();
         (1.0 - alpha) * bytes_per_sec
+        // f64::from_bits(self.bytes_per_sec.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -448,18 +446,15 @@ struct RateLimitedStream<S> {
     inner: S,
     write_bucket: TokenBucket,
     sleep: Pin<Box<tokio::time::Sleep>>,
-    duration: std::time::Duration,
     info: Arc<NetworkInformation>,
 }
 
 impl<S> RateLimitedStream<S> {
     pub fn new(inner: S, info: Arc<NetworkInformation>) -> Self {
-        let duration = std::time::Duration::from_millis(10);
         RateLimitedStream {
             inner,
-            write_bucket: TokenBucket::new(50*1024, 50*1024),
-            sleep: Box::pin(tokio::time::sleep(duration)),
-            duration,
+            write_bucket: TokenBucket::new(50*1024, 100*1024),
+            sleep: Box::pin(tokio::time::sleep_until(tokio::time::Instant::now())),
             info,
         }
     }
@@ -489,23 +484,25 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for RateLimitedStream<S> {
             cx: &mut std::task::Context<'_>,
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
-        let want = estimate_overhead(buf.len());
-        let allowed = self.write_bucket.allow(want);
-        if allowed < want {
-            if let Poll::Ready(_) = self.sleep.as_mut().poll(cx) {
-                let next = std::time::Instant::now() + self.duration;
-                self.sleep.as_mut().reset(next.into());
+        let len = buf.len().min(4096);
+        let estimate = estimate_with_overhead(len);
+
+        if estimate < self.write_bucket.tokens() {
+            let poll = Pin::new(&mut self.inner).poll_write(cx, &buf[..len]);
+            if let Poll::Ready(Ok(n)) = poll {
+                let tokens_consumed = estimate_with_overhead(n);
+                self.write_bucket.consume(tokens_consumed);
+                self.info.send(tokens_consumed);
             }
-            return Poll::Pending
-        }
-        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(n)) = &poll {
-            let n = estimate_overhead(*n);
-            self.write_bucket.consume(n);
-            self.info.send(n);
+            return poll;
         }
 
-        poll
+        let until = self.write_bucket.until(estimate);
+
+        let deadline = std::time::Instant::now() + until;
+        self.sleep.as_mut().reset(deadline.into());
+        let _ = self.sleep.as_mut().poll(cx);
+        Poll::Pending
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
@@ -517,8 +514,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for RateLimitedStream<S> {
     }
 }
 
-fn estimate_overhead(bytes: usize) -> usize {
-    bytes + 40 * bytes.div_ceil(1460)
+fn estimate_with_overhead(bytes: usize) -> usize {
+    bytes + 40
 }
 
 #[derive(Debug)]
@@ -550,15 +547,20 @@ impl TokenBucket {
         self.tokens = (self.tokens.saturating_add(added)).min(self.capacity);
     }
 
-    pub fn allow(&mut self, demand: usize) -> usize {
+    pub fn tokens(&mut self) -> usize {
         self.refill();
-        // tracing::info!(tokens=self.tokens, "tokens");
-        let want = demand as u64;
-        let allow = self.tokens.min(want);
-        allow as usize
+        self.tokens as usize
+    }
+
+    pub fn until(&mut self, target: usize) -> std::time::Duration {
+        let current = self.tokens();
+        let needed = target - current;
+        let seconds_needed = needed as f64 / self.tokens_per_sec as f64;
+        std::time::Duration::from_secs_f64(seconds_needed)
     }
 
     pub fn consume(&mut self, tokens: usize) {
+        self.refill();
         self.tokens = self.tokens.saturating_sub(tokens as u64);
     }
 }

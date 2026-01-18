@@ -1079,54 +1079,15 @@ impl EscapeSequenceBuffer {
     }
 }
 
-// struct AsyncStdoutWriter {
-//     sender: tokio::sync::mpsc::Sender<Vec<u8>>,
-//     buffer: Vec<u8>,
-// }
-
-// impl tokio::io::AsyncWrite for AsyncStdoutWriter {
-//     fn poll_write(
-//         mut self: Pin<&mut Self>,
-//         _cx: &mut Context<'_>,
-//         buf: &[u8],
-//     ) -> Poll<std::io::Result<usize>> {
-//         self.buffer.extend_from_slice(buf);
-//         Poll::Ready(Ok(buf.len()))
-//     }
-
-//     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-//         if !self.buffer.is_empty() {
-//             let data = std::mem::take(&mut self.buffer);
-//             match self.sender.try_send(data) {
-//                 Ok(()) => {}
-//                 Err(tokio::sync::mpsc::error::TrySendError::Full(data)) => {
-//                     self.buffer = data;
-//                     cx.waker().wake_by_ref();
-//                     return Poll::Pending;
-//                 }
-//                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-//                     return Poll::Ready(Err(std::io::Error::new(
-//                         std::io::ErrorKind::BrokenPipe,
-//                         "channel closed",
-//                     )));
-//                 }
-//             }
-//         }
-//         Poll::Ready(Ok(()))
-//     }
-
-//     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-//         self.poll_flush(cx)
-//     }
-// }
-
 pub struct AsyncStdoutWriter {
     sender: tokio_util::sync::PollSender<Vec<u8>>,
 }
 
 impl AsyncStdoutWriter {
     pub fn new(sender: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
-        Self { sender: tokio_util::sync::PollSender::new(sender) }
+        Self {
+            sender: tokio_util::sync::PollSender::new(sender),
+        }
     }
 }
 
@@ -1153,11 +1114,17 @@ impl tokio::io::AsyncWrite for AsyncStdoutWriter {
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
