@@ -6,6 +6,7 @@ mod app;
 mod mesh;
 mod ssh;
 mod status_bar;
+mod rate_limiting;
 mod web;
 
 use std::sync::Arc;

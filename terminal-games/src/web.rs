@@ -2,9 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::io::Write;
+use std::{convert::Infallible, io::Write};
 use std::sync::Arc;
 
+use axum::extract::Request;
 use axum::{
     Router,
     extract::{
@@ -19,10 +20,14 @@ use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
 use futures::{SinkExt, StreamExt};
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
+use tower::{Service, ServiceExt};
 
 use crate::app::{AppInstantiationParams, AppServer};
+use crate::rate_limiting::{NetworkInformation, RateLimitedStream};
 
 #[derive(Clone)]
 pub struct WebServer {
@@ -47,10 +52,43 @@ impl WebServer {
             .route("/ws", get(websocket_handler))
             .with_state(self.clone());
 
+        let mut make_service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
         let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-        axum::serve(listener, app).await?;
+        loop {
+            let (socket, remote_addr) = listener.accept().await.unwrap();
+            let tower_service = unwrap_infallible(make_service.call(remote_addr).await);
 
-        Ok(())
+            let network_info = Arc::new(NetworkInformation::new());
+            let wrapped_stream = RateLimitedStream::new(socket, network_info.clone());
+            tokio::spawn(async move {
+                loop {
+                    tracing::info!(bytes_per_sec_in=network_info.bytes_per_sec_in(), bytes_per_sec_out=network_info.bytes_per_sec_out(), "network (web)");
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                }
+            });
+
+            tokio::spawn(async move {
+                let socket = TokioIo::new(wrapped_stream);
+
+                let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
+                    tower_service.clone().oneshot(request)
+                });
+
+                if let Err(err) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(socket, hyper_service)
+                    .await
+                {
+                    eprintln!("failed to serve connection: {err:#}");
+                }
+            });
+        }
+    }
+}
+
+fn unwrap_infallible<T>(result: Result<T, Infallible>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(err) => match err {},
     }
 }
 

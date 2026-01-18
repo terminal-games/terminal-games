@@ -12,6 +12,8 @@ flate2 = "1"
 futures = "0.3"
 headless-terminal = { path = "../headless-terminal" }
 hex = "0.4"
+hyper = "1"
+hyper-util = "0.1"
 libc = "0.2"
 libsql = "0.9"
 postcard = { version = "1", default-features = false }
@@ -27,6 +29,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "tls12",
 ] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 unicode-width = "0.2"
