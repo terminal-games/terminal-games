@@ -1,7 +1,7 @@
 use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, AtomicU64};
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::task::Poll;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,27 +24,44 @@ impl EwmaRate {
     }
 
     fn now_ns() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
     }
 
     fn update(&self, bytes: usize) {
         let now_ns = Self::now_ns();
-        let old_last_update_ns = self.last_update_ns.swap(now_ns, std::sync::atomic::Ordering::Relaxed);
-        let old_bytes_per_sec = f64::from_bits(self.bytes_per_sec.load(std::sync::atomic::Ordering::Relaxed));
-        let delta_t_sec = (now_ns.saturating_sub(old_last_update_ns) as f64 / 1_000_000_000.0).max(0.001);
+        let old_last_update_ns = self
+            .last_update_ns
+            .swap(now_ns, std::sync::atomic::Ordering::Relaxed);
+        let old_bytes_per_sec = f64::from_bits(
+            self.bytes_per_sec
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let delta_t_sec =
+            (now_ns.saturating_sub(old_last_update_ns) as f64 / 1_000_000_000.0).max(0.001);
         let instant = bytes as f64 / delta_t_sec;
         let alpha = 1.0 - (-delta_t_sec / self.tau_seconds).exp();
-        self.bytes_per_sec.store((alpha * instant + (1.0 - alpha) * old_bytes_per_sec).to_bits(), std::sync::atomic::Ordering::Relaxed);
+        self.bytes_per_sec.store(
+            (alpha * instant + (1.0 - alpha) * old_bytes_per_sec).to_bits(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     fn get(&self) -> f64 {
         let now_ns = Self::now_ns();
-        let last_update_ns = self.last_update_ns.load(std::sync::atomic::Ordering::Relaxed);
-        let bytes_per_sec = f64::from_bits(self.bytes_per_sec.load(std::sync::atomic::Ordering::Relaxed));
-        let delta_t_sec = (now_ns.saturating_sub(last_update_ns) as f64 / 1_000_000_000.0).max(0.001);
+        let last_update_ns = self
+            .last_update_ns
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let bytes_per_sec = f64::from_bits(
+            self.bytes_per_sec
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let delta_t_sec =
+            (now_ns.saturating_sub(last_update_ns) as f64 / 1_000_000_000.0).max(0.001);
         let alpha = 1.0 - (-delta_t_sec / self.tau_seconds).exp();
         (1.0 - alpha) * bytes_per_sec
-        // f64::from_bits(self.bytes_per_sec.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -71,17 +88,22 @@ impl NetworkInformation {
     }
 
     fn send(&self, bytes: usize) {
-        self.bytes_out.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_out
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         self.send_rate.update(bytes);
     }
 
     fn recv(&self, bytes: usize) {
-        self.bytes_in.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.bytes_in
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         self.recv_rate.update(bytes);
     }
 
     fn set_last_throttled(&self, time: std::time::SystemTime) {
-        self.last_throttled.store(time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64, std::sync::atomic::Ordering::Release);
+        self.last_throttled.store(
+            time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     pub fn bytes_per_sec_out(&self) -> f64 {
@@ -93,7 +115,9 @@ impl NetworkInformation {
     }
 
     pub fn last_throttled(&self) -> std::time::SystemTime {
-        let unix_millis = self.last_throttled.load(std::sync::atomic::Ordering::Acquire);
+        let unix_millis = self
+            .last_throttled
+            .load(std::sync::atomic::Ordering::Acquire);
         UNIX_EPOCH + std::time::Duration::from_millis(unix_millis)
     }
 
@@ -113,7 +137,7 @@ impl<S> RateLimitedStream<S> {
     pub fn new(inner: S, info: Arc<NetworkInformation>) -> Self {
         RateLimitedStream {
             inner,
-            write_bucket: TokenBucket::new(50*1024, 100*1024),
+            write_bucket: TokenBucket::new(50 * 1024, 100 * 1024),
             sleep: Box::pin(tokio::time::sleep_until(tokio::time::Instant::now())),
             info,
         }
@@ -122,10 +146,10 @@ impl<S> RateLimitedStream<S> {
 
 impl<S: AsyncRead + Unpin> AsyncRead for RateLimitedStream<S> {
     fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         let initial_filled = buf.filled().len();
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &poll {
@@ -140,10 +164,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for RateLimitedStream<S> {
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for RateLimitedStream<S> {
     fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         let len = buf.len().min(4096);
         let estimate = estimate_with_overhead(len);
 
@@ -165,11 +189,17 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for RateLimitedStream<S> {
         Poll::Pending
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -180,7 +210,7 @@ fn estimate_with_overhead(bytes: usize) -> usize {
 
 #[derive(Debug)]
 pub struct TokenBucket {
-    tokens_per_sec: u64, 
+    tokens_per_sec: u64,
     capacity: u64,
     tokens: u64,
     last: std::time::Instant,

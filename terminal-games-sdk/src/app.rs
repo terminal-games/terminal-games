@@ -37,3 +37,50 @@ pub fn next_app_ready() -> bool {
 pub fn graceful_shutdown_poll() -> bool {
     return unsafe { crate::internal::graceful_shutdown_poll() } > 0;
 }
+
+/// Information about the current session's network connection to the host.
+#[derive(Debug, Clone)]
+pub struct NetworkInfo {
+    /// Receive rate in bytes per second.
+    pub bytes_per_sec_in: f64,
+    /// Send rate in bytes per second.
+    pub bytes_per_sec_out: f64,
+    /// When the connection was last throttled, or `None` if never.
+    pub last_throttled: Option<std::time::SystemTime>,
+    /// TCP RTT latency in milliseconds, or -1 if unavailable.
+    pub latency_ms: i32,
+}
+
+/// Fetches network information from the host (throughput, throttling, RTT).
+///
+/// Returns an error if the host call fails.
+pub fn network_info() -> std::io::Result<NetworkInfo> {
+    let mut bytes_per_sec_in = 0.0f64;
+    let mut bytes_per_sec_out = 0.0f64;
+    let mut last_throttled_ms = 0i64;
+    let mut latency_ms = 0i32;
+    let result = unsafe {
+        crate::internal::network_info(
+            &mut bytes_per_sec_in,
+            &mut bytes_per_sec_out,
+            &mut last_throttled_ms,
+            &mut latency_ms,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "network_info host call failed",
+        ));
+    }
+    let last_throttled = (last_throttled_ms > 0).then(|| {
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(last_throttled_ms as u64)
+    });
+
+    Ok(NetworkInfo {
+        bytes_per_sec_in,
+        bytes_per_sec_out,
+        last_throttled,
+        latency_ms,
+    })
+}

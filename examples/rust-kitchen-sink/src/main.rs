@@ -258,11 +258,29 @@ async fn main() -> std::io::Result<()> {
             }
         };
 
+        let net_info_str = app::network_info()
+            .map(|n| {
+                let rtt = if n.latency_ms >= 0 {
+                    format!("{}ms", n.latency_ms)
+                } else {
+                    "N/A".into()
+                };
+                let throttled = n
+                    .last_throttled
+                    .map(format_time)
+                    .unwrap_or_else(|| "never".into());
+                format!(
+                    "↑{:.0} ↓{:.0} B/s RTT {} throttled: {}",
+                    n.bytes_per_sec_in, n.bytes_per_sec_out, rtt, throttled
+                )
+            })
+            .unwrap_or_else(|_| "N/A".into());
+
         terminal.draw(|frame| {
             let area = frame.area();
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}\n\nPeer ID: {}\nPress 'p' to send a message to peer {}\n\nConnected Peers ({}):\n{}\n\nRecent Messages:\n{}",
+                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}\n\nNetwork: {}\n\nPeer ID: {}\nPress 'p' to send a message to peer {}\n\nConnected Peers ({}):\n{}\n\nRecent Messages:\n{}",
                     frame_counter,
                     last_event,
                     parts,
@@ -271,6 +289,7 @@ async fn main() -> std::io::Result<()> {
                     frame_counter as f64 / start.elapsed().as_secs_f64(),
                     event_counter,
                     "hello there".red().on_red(),
+                    net_info_str,
                     peer_id,
                     target_peer_id.as_ref()
                         .map(|v| format!("Some({})", v))

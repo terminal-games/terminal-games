@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use hex::ToHex;
@@ -19,7 +19,9 @@ use tokio_util::sync::CancellationToken;
 use wasmtime_wasi::I32Exit;
 
 use crate::{
-    mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId}, rate_limiting::NetworkInformation, status_bar::StatusBar
+    mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
+    rate_limiting::NetworkInformation,
+    status_bar::StatusBar,
 };
 
 pub struct AppServer {
@@ -84,6 +86,7 @@ impl AppServer {
             "graceful_shutdown_poll",
             Self::graceful_shutdown_poll,
         )?;
+        linker.func_wrap("terminal_games", "network_info", Self::host_network_info)?;
 
         Ok(Self {
             linker: Arc::new(linker),
@@ -115,6 +118,7 @@ impl AppServer {
             let (shortname_sender, mut shortname_receiver) =
                 tokio::sync::mpsc::channel::<String>(1);
 
+            let network_info = params.network_info.clone();
             let hard_shutdown_token = CancellationToken::new();
 
             let (first_app_shortname, _app_args) = match params.args {
@@ -140,11 +144,12 @@ impl AppServer {
                 let first_app_shortname = first_app_shortname.clone();
                 let has_next_app_shortname = has_next_app_shortname.clone();
                 let terminal = terminal.clone();
-                let network_info = params.network_info;
+                let network_info = network_info.clone();
                 async move {
                     let mut escape_buffer = EscapeSequenceBuffer::new();
                     let mut status_bar_interval = tokio::time::interval(Duration::from_secs(1));
-                    let mut status_bar = StatusBar::new(first_app_shortname, username, network_info);
+                    let mut status_bar =
+                        StatusBar::new(first_app_shortname, username, network_info);
 
                     loop {
                         tokio::select! {
@@ -267,6 +272,7 @@ impl AppServer {
                     input_receiver: input_receiver,
                     has_next_app: has_next_app_shortname.clone(),
                     graceful_shutdown_token,
+                    network_info: network_info.clone(),
                 };
 
                 let mut store = wasmtime::Store::new(&engine, state);
@@ -878,6 +884,65 @@ impl AppServer {
         let is_cancelled = caller.data().graceful_shutdown_token.is_cancelled();
         Ok(if is_cancelled { 1 } else { 0 })
     }
+
+    fn host_network_info(
+        mut caller: wasmtime::Caller<'_, AppState>,
+        bytes_per_sec_in_ptr: i32,
+        bytes_per_sec_out_ptr: i32,
+        last_throttled_ms_ptr: i32,
+        latency_ms_ptr: i32,
+    ) -> anyhow::Result<i32> {
+        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+            tracing::error!("network_info: failed to find host memory");
+            return Ok(-1);
+        };
+
+        let info = &caller.data().network_info;
+
+        let bytes_per_sec_in = info.bytes_per_sec_in();
+        let bytes_per_sec_out = info.bytes_per_sec_out();
+        let last_throttled_ms = info
+            .last_throttled()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let latency_ms = info.latency().map(|d| d.as_millis() as i32).unwrap_or(-1);
+
+        if let Err(_) = mem.write(
+            &mut caller,
+            bytes_per_sec_in_ptr as usize,
+            &bytes_per_sec_in.to_le_bytes(),
+        ) {
+            tracing::error!("network_info: failed to write bytes_per_sec_in");
+            return Ok(-1);
+        }
+        if let Err(_) = mem.write(
+            &mut caller,
+            bytes_per_sec_out_ptr as usize,
+            &bytes_per_sec_out.to_le_bytes(),
+        ) {
+            tracing::error!("network_info: failed to write bytes_per_sec_out");
+            return Ok(-1);
+        }
+        if let Err(_) = mem.write(
+            &mut caller,
+            last_throttled_ms_ptr as usize,
+            &last_throttled_ms.to_le_bytes(),
+        ) {
+            tracing::error!("network_info: failed to write last_throttled_ms");
+            return Ok(-1);
+        }
+        if let Err(_) = mem.write(
+            &mut caller,
+            latency_ms_ptr as usize,
+            &latency_ms.to_le_bytes(),
+        ) {
+            tracing::error!("network_info: failed to write latency_ms");
+            return Ok(-1);
+        }
+
+        Ok(0)
+    }
 }
 
 pub struct PreloadedAppState {
@@ -911,6 +976,7 @@ pub struct AppState {
     has_next_app: Arc<AtomicBool>,
     input_receiver: tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
     graceful_shutdown_token: CancellationToken,
+    network_info: Arc<NetworkInformation>,
 }
 
 struct AppLimiter {
@@ -1105,27 +1171,19 @@ impl tokio::io::AsyncWrite for AsyncStdoutWriter {
                 let _ = self.sender.send_item(data);
                 Poll::Ready(Ok(len))
             }
-            Poll::Ready(Err(_)) => {
-                Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "channel closed",
-                )))
-            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "channel closed",
+            ))),
             Poll::Pending => Poll::Pending,
         }
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }

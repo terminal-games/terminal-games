@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::sync::Arc;
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
 
 use rand_core::OsRng;
 use russh::keys::ssh_key::{self, PublicKey};
@@ -73,14 +73,14 @@ impl SshServer {
             tokio::spawn({
                 let config = config.clone();
                 async move {
-                    let session = match russh::server::run_stream(config, wrapped_stream, handler).await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::info!("Connection setup failed: {:?}", e);
-                            return;
-                        }
-                    };
+                    let session =
+                        match russh::server::run_stream(config, wrapped_stream, handler).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::info!("Connection setup failed: {:?}", e);
+                                return;
+                            }
+                        };
 
                     if let Err(e) = session.await {
                         tracing::info!("Connection closed with error: {:?}", e);
@@ -94,7 +94,11 @@ impl SshServer {
         // Ok(())
     }
 
-    fn new_client(&self, addr: std::net::SocketAddr, network_info: Arc<NetworkInformation>) -> SshSession {
+    fn new_client(
+        &self,
+        addr: std::net::SocketAddr,
+        network_info: Arc<NetworkInformation>,
+    ) -> SshSession {
         tracing::info!(addr=?addr, "new_client");
 
         let (username_sender, username_receiver) = tokio::sync::oneshot::channel::<String>();
@@ -281,11 +285,11 @@ impl Handler for SshSession {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         match self.input_sender.try_send(data.into()) {
-            Ok(()) => {},
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {},
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 anyhow::bail!("input channel closed");
-            },
+            }
         }
 
         Ok(())

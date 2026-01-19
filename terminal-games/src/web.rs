@@ -2,9 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{convert::Infallible, io::Write};
-use std::sync::Arc;
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use std::{convert::Infallible, io::Write};
 
 use axum::extract::connect_info::Connected;
 use axum::extract::{ConnectInfo, Request};
@@ -75,15 +75,22 @@ impl WebServer {
 
             let fd = stream.as_raw_fd();
             let network_info = Arc::new(NetworkInformation::new(fd));
-            let tower_service = unwrap_infallible(make_service.call(MyConnectInfo{network_info: network_info.clone()}).await);
+            let tower_service = unwrap_infallible(
+                make_service
+                    .call(MyConnectInfo {
+                        network_info: network_info.clone(),
+                    })
+                    .await,
+            );
             let wrapped_stream = RateLimitedStream::new(stream, network_info);
 
             tokio::spawn(async move {
                 let socket = TokioIo::new(wrapped_stream);
 
-                let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
-                    tower_service.clone().oneshot(request)
-                });
+                let hyper_service =
+                    hyper::service::service_fn(move |request: Request<Incoming>| {
+                        tower_service.clone().oneshot(request)
+                    });
 
                 if let Err(err) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
                     .serve_connection_with_upgrades(socket, hyper_service)
