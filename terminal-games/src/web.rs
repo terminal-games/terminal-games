@@ -5,7 +5,8 @@
 use std::{convert::Infallible, io::Write};
 use std::sync::Arc;
 
-use axum::extract::Request;
+use axum::extract::connect_info::Connected;
+use axum::extract::{ConnectInfo, Request};
 use axum::{
     Router,
     extract::{
@@ -30,6 +31,17 @@ use crate::app::{AppInstantiationParams, AppServer};
 use crate::rate_limiting::{NetworkInformation, RateLimitedStream};
 
 #[derive(Clone)]
+struct MyConnectInfo {
+    network_info: Arc<NetworkInformation>,
+}
+
+impl Connected<MyConnectInfo> for MyConnectInfo {
+    fn connect_info(this: Self) -> Self {
+        this
+    }
+}
+
+#[derive(Clone)]
 pub struct WebServer {
     app_server: Arc<AppServer>,
 }
@@ -52,20 +64,17 @@ impl WebServer {
             .route("/ws", get(websocket_handler))
             .with_state(self.clone());
 
-        let mut make_service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        let mut make_service = app.into_make_service_with_connect_info::<MyConnectInfo>();
         let listener = tokio::net::TcpListener::bind(listen_addr).await?;
         loop {
-            let (socket, remote_addr) = listener.accept().await.unwrap();
-            let tower_service = unwrap_infallible(make_service.call(remote_addr).await);
-
+            let (stream, _remote_addr) = listener.accept().await.unwrap();
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::warn!("set_nodelay() failed: {e:?}");
+            }
+    
             let network_info = Arc::new(NetworkInformation::new());
-            let wrapped_stream = RateLimitedStream::new(socket, network_info.clone());
-            tokio::spawn(async move {
-                loop {
-                    tracing::info!(bytes_per_sec_in=network_info.bytes_per_sec_in(), bytes_per_sec_out=network_info.bytes_per_sec_out(), "network (web)");
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                }
-            });
+            let tower_service = unwrap_infallible(make_service.call(MyConnectInfo{network_info: network_info.clone()}).await);
+            let wrapped_stream = RateLimitedStream::new(stream, network_info);
 
             tokio::spawn(async move {
                 let socket = TokioIo::new(wrapped_stream);
@@ -106,6 +115,7 @@ async fn websocket_handler(
     headers: HeaderMap,
     Query(query): Query<WebSocketQuery>,
     State(server): State<WebServer>,
+    ConnectInfo(connect_info): ConnectInfo<MyConnectInfo>,
 ) -> Response {
     let user_agent = headers
         .get("user-agent")
@@ -115,7 +125,7 @@ async fn websocket_handler(
 
     let args = query.args.map(|s| s.into_bytes());
 
-    ws.on_upgrade(move |socket| handle_socket(socket, server, user_agent, args))
+    ws.on_upgrade(move |socket| handle_socket(socket, server, user_agent, args, connect_info))
 }
 
 async fn handle_socket(
@@ -123,6 +133,7 @@ async fn handle_socket(
     server: WebServer,
     user_agent: String,
     args: Option<Vec<u8>>,
+    connect_info: MyConnectInfo,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -144,6 +155,7 @@ async fn handle_socket(
         username: username.clone(),
         window_size_receiver: resize_rx,
         graceful_shutdown_token: token,
+        network_info: connect_info.network_info,
     });
 
     tokio::task::spawn(async move {

@@ -58,7 +58,6 @@ impl SshServer {
         let socket = tokio::net::TcpListener::bind(listen_addr).await?;
         loop {
             let (tcp_stream, peer_addr) = socket.accept().await?;
-
             if config.nodelay {
                 if let Err(e) = tcp_stream.set_nodelay(true) {
                     tracing::warn!("set_nodelay() failed: {e:?}");
@@ -66,22 +65,10 @@ impl SshServer {
             }
 
             // let fd = tcp_stream.as_raw_fd();
-            // let bytes_per_sec: u64 = 10 * 1024;
-            // let ret = unsafe { libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_MAX_PACING_RATE, &bytes_per_sec as *const u64 as *const libc::c_void, std::mem::size_of::<u64>() as libc::socklen_t) };
-            // if ret != 0 {
-            //     panic!("ret {}", ret);
-            // }
 
             let network_info = Arc::new(NetworkInformation::new());
             let wrapped_stream = RateLimitedStream::new(tcp_stream, network_info.clone());
-            tokio::spawn(async move {
-                loop {
-                    tracing::info!(bytes_per_sec_in=network_info.bytes_per_sec_in(), bytes_per_sec_out=network_info.bytes_per_sec_out(), "network (ssh)");
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                }
-            });
-
-            let handler = self.new_client(Some(peer_addr));
+            let handler = self.new_client(peer_addr, network_info);
 
             tokio::spawn({
                 let config = config.clone();
@@ -106,17 +93,8 @@ impl SshServer {
 
         // Ok(())
     }
-}
 
-impl Drop for SshSession {
-    fn drop(&mut self) {
-        self.cancellation_token.cancel();
-    }
-}
-
-impl Server for SshServer {
-    type Handler = SshSession;
-    fn new_client(&mut self, addr: Option<std::net::SocketAddr>) -> SshSession {
+    fn new_client(&self, addr: std::net::SocketAddr, network_info: Arc<NetworkInformation>) -> SshSession {
         tracing::info!(addr=?addr, "new_client");
 
         let (username_sender, username_receiver) = tokio::sync::oneshot::channel::<String>();
@@ -181,6 +159,7 @@ impl Server for SshServer {
                 username,
                 window_size_receiver: resize_rx,
                 graceful_shutdown_token: token,
+                network_info,
             });
             loop {
                 tokio::select! {
@@ -224,6 +203,12 @@ impl Server for SshServer {
             ssh_session: Some(ssh_session_sender),
             server: self.clone(),
         }
+    }
+}
+
+impl Drop for SshSession {
+    fn drop(&mut self) {
+        self.cancellation_token.cancel();
     }
 }
 

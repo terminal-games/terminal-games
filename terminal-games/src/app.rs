@@ -19,8 +19,7 @@ use tokio_util::sync::CancellationToken;
 use wasmtime_wasi::I32Exit;
 
 use crate::{
-    mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
-    status_bar::StatusBar,
+    mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId}, rate_limiting::NetworkInformation, status_bar::StatusBar
 };
 
 pub struct AppServer {
@@ -39,6 +38,7 @@ pub struct AppInstantiationParams {
     pub remote_sshid: String,
     pub term: Option<String>,
     pub args: Option<Vec<u8>>,
+    pub network_info: Arc<NetworkInformation>,
 }
 
 impl AppServer {
@@ -140,10 +140,11 @@ impl AppServer {
                 let first_app_shortname = first_app_shortname.clone();
                 let has_next_app_shortname = has_next_app_shortname.clone();
                 let terminal = terminal.clone();
+                let network_info = params.network_info;
                 async move {
                     let mut escape_buffer = EscapeSequenceBuffer::new();
                     let mut status_bar_interval = tokio::time::interval(Duration::from_secs(1));
-                    let mut status_bar = StatusBar::new(first_app_shortname, username);
+                    let mut status_bar = StatusBar::new(first_app_shortname, username, network_info);
 
                     loop {
                         tokio::select! {

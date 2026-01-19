@@ -1,8 +1,12 @@
+use std::sync::Arc;
+
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 use unicode_width::UnicodeWidthStr;
 use yansi::Paint;
+
+use crate::rate_limiting::NetworkInformation;
 
 fn terminal_width(str: &str) -> usize {
     strip_ansi_escapes::strip_str(str).width()
@@ -15,10 +19,11 @@ pub struct StatusBar {
     session_start_time: std::time::Instant,
     prev_size: (u16, u16),
     prev_status_bar_content: Vec<u8>,
+    network_info: Arc<NetworkInformation>
 }
 
 impl StatusBar {
-    pub fn new(shortname: String, username: String) -> Self {
+    pub fn new(shortname: String, username: String, network_info: Arc<NetworkInformation>) -> Self {
         Self {
             shortname,
             username,
@@ -26,15 +31,15 @@ impl StatusBar {
             session_start_time: std::time::Instant::now(),
             prev_size: (0, 0),
             prev_status_bar_content: Vec::new(),
+            network_info,
         }
     }
 
     fn content(&self, width: u16) -> Vec<u8> {
-        let active_tab_text = format!(" {} ", self.shortname);
-        let active_tab = active_tab_text.bold().black().on_green().to_string();
-        let username_text = format!(" {} ", self.username);
-        let username = username_text.white().on_fixed(237).to_string();
-        let left = active_tab + &username;
+        let active_tab = format!(" {} ", self.shortname).bold().black().on_green().to_string();
+        let username = format!(" {} ", self.username).white().on_fixed(237).to_string();
+        let net = format!(" ↓ {} kBps ", (self.network_info.bytes_per_sec_out() / 1024.0).ceil() as usize).white().on_fixed(236).to_string();
+        let left = active_tab + &username + &net;
 
         let ssh_callout = " ssh terminal-games.fly.dev ".bold().black().on_green();
         let ticker_index = ((std::time::Instant::now() - self.session_start_time).as_secs() / 10)

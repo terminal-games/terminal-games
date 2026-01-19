@@ -1,3 +1,4 @@
+use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, AtomicU64};
@@ -50,7 +51,6 @@ impl EwmaRate {
 pub struct NetworkInformation {
     bytes_in: AtomicUsize,
     bytes_out: AtomicUsize,
-    latency_ms: AtomicUsize,
     send_rate: EwmaRate,
     recv_rate: EwmaRate,
 }
@@ -60,7 +60,6 @@ impl NetworkInformation {
         Self {
             bytes_in: AtomicUsize::new(0),
             bytes_out: AtomicUsize::new(0),
-            latency_ms: AtomicUsize::new(0),
             send_rate: EwmaRate::new(1.0),
             recv_rate: EwmaRate::new(1.0),
         }
@@ -80,6 +79,7 @@ impl NetworkInformation {
         self.send_rate.get()
     }
 
+    #[allow(unused)]
     pub fn bytes_per_sec_in(&self) -> f64 {
         self.recv_rate.get()
     }
@@ -96,7 +96,7 @@ impl<S> RateLimitedStream<S> {
     pub fn new(inner: S, info: Arc<NetworkInformation>) -> Self {
         RateLimitedStream {
             inner,
-            write_bucket: TokenBucket::new(100*1024, 100*1024),
+            write_bucket: TokenBucket::new(50*1024, 100*1024),
             sleep: Box::pin(tokio::time::sleep_until(tokio::time::Instant::now())),
             info,
         }
@@ -206,4 +206,25 @@ impl TokenBucket {
         self.refill();
         self.tokens = self.tokens.saturating_sub(tokens as u64);
     }
+}
+
+pub fn get_tcp_rtt_from_fd(fd: RawFd) -> std::io::Result<std::time::Duration> {
+    let mut tcp_info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            &mut tcp_info as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(std::time::Duration::from_micros(tcp_info.tcpi_rtt as u64))
 }
