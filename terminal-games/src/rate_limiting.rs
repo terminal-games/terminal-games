@@ -53,40 +53,57 @@ pub struct NetworkInformation {
     bytes_out: AtomicUsize,
     send_rate: EwmaRate,
     recv_rate: EwmaRate,
+    last_throttled: AtomicU64,
+
+    fd: RawFd,
 }
 
 impl NetworkInformation {
-    pub fn new() -> Self {
+    pub fn new(fd: RawFd) -> Self {
         Self {
             bytes_in: AtomicUsize::new(0),
             bytes_out: AtomicUsize::new(0),
             send_rate: EwmaRate::new(1.0),
             recv_rate: EwmaRate::new(1.0),
+            last_throttled: AtomicU64::new(0),
+            fd,
         }
     }
 
-    pub fn send(&self, bytes: usize) {
+    fn send(&self, bytes: usize) {
         self.bytes_out.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         self.send_rate.update(bytes);
     }
 
-    pub fn recv(&self, bytes: usize) {
+    fn recv(&self, bytes: usize) {
         self.bytes_in.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         self.recv_rate.update(bytes);
+    }
+
+    fn set_last_throttled(&self, time: std::time::SystemTime) {
+        self.last_throttled.store(time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64, std::sync::atomic::Ordering::Release);
     }
 
     pub fn bytes_per_sec_out(&self) -> f64 {
         self.send_rate.get()
     }
 
-    #[allow(unused)]
     pub fn bytes_per_sec_in(&self) -> f64 {
         self.recv_rate.get()
+    }
+
+    pub fn last_throttled(&self) -> std::time::SystemTime {
+        let unix_millis = self.last_throttled.load(std::sync::atomic::Ordering::Acquire);
+        UNIX_EPOCH + std::time::Duration::from_millis(unix_millis)
+    }
+
+    pub fn latency(&self) -> std::io::Result<std::time::Duration> {
+        get_tcp_rtt_from_fd(self.fd)
     }
 }
 
 pub struct RateLimitedStream<S> {
-    inner: S,
+    pub inner: S,
     write_bucket: TokenBucket,
     sleep: Pin<Box<tokio::time::Sleep>>,
     info: Arc<NetworkInformation>,
@@ -141,10 +158,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for RateLimitedStream<S> {
         }
 
         let until = self.write_bucket.until(estimate);
-
         let deadline = std::time::Instant::now() + until;
         self.sleep.as_mut().reset(deadline.into());
         let _ = self.sleep.as_mut().poll(cx);
+        self.info.set_last_throttled(std::time::SystemTime::now());
         Poll::Pending
     }
 

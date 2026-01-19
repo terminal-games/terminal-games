@@ -4,6 +4,7 @@
 
 use std::{convert::Infallible, io::Write};
 use std::sync::Arc;
+use std::os::fd::AsRawFd;
 
 use axum::extract::connect_info::Connected;
 use axum::extract::{ConnectInfo, Request};
@@ -71,8 +72,9 @@ impl WebServer {
             if let Err(e) = stream.set_nodelay(true) {
                 tracing::warn!("set_nodelay() failed: {e:?}");
             }
-    
-            let network_info = Arc::new(NetworkInformation::new());
+
+            let fd = stream.as_raw_fd();
+            let network_info = Arc::new(NetworkInformation::new(fd));
             let tower_service = unwrap_infallible(make_service.call(MyConnectInfo{network_info: network_info.clone()}).await);
             let wrapped_stream = RateLimitedStream::new(stream, network_info);
 

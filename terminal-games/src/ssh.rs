@@ -3,6 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::sync::Arc;
+use std::os::fd::AsRawFd;
 
 use rand_core::OsRng;
 use russh::keys::ssh_key::{self, PublicKey};
@@ -57,18 +58,17 @@ impl SshServer {
         tracing::info!(addr = %listen_addr, "Running SSH server");
         let socket = tokio::net::TcpListener::bind(listen_addr).await?;
         loop {
-            let (tcp_stream, peer_addr) = socket.accept().await?;
+            let (stream, remote_addr) = socket.accept().await?;
             if config.nodelay {
-                if let Err(e) = tcp_stream.set_nodelay(true) {
+                if let Err(e) = stream.set_nodelay(true) {
                     tracing::warn!("set_nodelay() failed: {e:?}");
                 }
             }
 
-            // let fd = tcp_stream.as_raw_fd();
-
-            let network_info = Arc::new(NetworkInformation::new());
-            let wrapped_stream = RateLimitedStream::new(tcp_stream, network_info.clone());
-            let handler = self.new_client(peer_addr, network_info);
+            let fd = stream.as_raw_fd();
+            let network_info = Arc::new(NetworkInformation::new(fd));
+            let wrapped_stream = RateLimitedStream::new(stream, network_info.clone());
+            let handler = self.new_client(remote_addr, network_info);
 
             tokio::spawn({
                 let config = config.clone();

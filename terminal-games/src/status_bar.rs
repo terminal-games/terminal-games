@@ -38,8 +38,11 @@ impl StatusBar {
     fn content(&self, width: u16) -> Vec<u8> {
         let active_tab = format!(" {} ", self.shortname).bold().black().on_green().to_string();
         let username = format!(" {} ", self.username).white().on_fixed(237).to_string();
-        let net = format!(" ↓ {} kBps ", (self.network_info.bytes_per_sec_out() / 1024.0).ceil() as usize).white().on_fixed(236).to_string();
-        let left = active_tab + &username + &net;
+        let net = format!(" ↓{}kBps ", (self.network_info.bytes_per_sec_out() / 1024.0).ceil() as usize).white().on_fixed(236).to_string();
+        let throttled = format!("{}", if self.network_info.last_throttled().elapsed().unwrap_or_default().as_millis() < 1000 { " THROTTLED" } else { "" }).white().on_fixed(236).to_string();
+        // let latency = format!("{}", if let Ok(latency) = self.network_info.latency() { latency.as_millis().to_string() } else { "".to_string() }).white().on_fixed(236).to_string();
+        let latency = if let Ok(latency) = self.network_info.latency() { format!("{}ms", latency.as_millis()) } else { "".to_string() }.white().on_fixed(236).to_string();
+        let left = active_tab + &username + &net + &latency;
 
         let ssh_callout = " ssh terminal-games.fly.dev ".bold().black().on_green();
         let ticker_index = ((std::time::Instant::now() - self.session_start_time).as_secs() / 10)
