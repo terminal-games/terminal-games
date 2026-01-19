@@ -47,5 +47,11 @@ mod internal {
             total_count_ptr: *mut u32,
         ) -> i32;
         pub(crate) fn region_latency(region_ptr: *const u8) -> i32;
+        pub(crate) fn network_info(
+            bytes_per_sec_in_ptr: *mut f64,
+            bytes_per_sec_out_ptr: *mut f64,
+            last_throttled_ms_ptr: *mut i64,
+            latency_ms_ptr: *mut i32,
+        ) -> i32;
     }
 }

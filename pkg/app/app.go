@@ -5,7 +5,9 @@
 package app
 
 import (
+	"errors"
 	"fmt"
+	"time"
 	"unsafe"
 )
 
@@ -56,4 +58,54 @@ func Ready() bool {
 // before the host forces a hard shutdown.
 func GracefulShutdownPoll() bool {
 	return graceful_shutdown_poll() > 0
+}
+
+//go:wasmimport terminal_games network_info
+//go:noescape
+func network_info(
+	bytesPerSecInPtr unsafe.Pointer,
+	bytesPerSecOutPtr unsafe.Pointer,
+	lastThrottledMsPtr unsafe.Pointer,
+	latencyMsPtr unsafe.Pointer,
+) int32
+
+// NetworkInfo holds network information from the host.
+type NetworkInfo struct {
+	// BytesPerSecIn is the receive rate in bytes per second.
+	BytesPerSecIn float64
+	// BytesPerSecOut is the send rate in bytes per second.
+	BytesPerSecOut float64
+	// LastThrottled is when the connection was last throttled. The zero value
+	// means never throttled.
+	LastThrottled time.Time
+	// LatencyMs is the TCP RTT in milliseconds, or -1 if unavailable.
+	LatencyMs int32
+}
+
+// GetNetworkInfo fetches network information from the host (throughput, throttling, RTT).
+// Returns an error if the host call fails.
+func GetNetworkInfo() (NetworkInfo, error) {
+	var bytesPerSecIn float64
+	var bytesPerSecOut float64
+	var lastThrottledMs int64
+	var latencyMs int32
+	ret := network_info(
+		unsafe.Pointer(&bytesPerSecIn),
+		unsafe.Pointer(&bytesPerSecOut),
+		unsafe.Pointer(&lastThrottledMs),
+		unsafe.Pointer(&latencyMs),
+	)
+	if ret < 0 {
+		return NetworkInfo{}, errors.New("network_info host call failed")
+	}
+	var lastThrottled time.Time
+	if lastThrottledMs > 0 {
+		lastThrottled = time.UnixMilli(lastThrottledMs)
+	}
+	return NetworkInfo{
+		BytesPerSecIn:  bytesPerSecIn,
+		BytesPerSecOut: bytesPerSecOut,
+		LastThrottled:  lastThrottled,
+		LatencyMs:      latencyMs,
+	}, nil
 }

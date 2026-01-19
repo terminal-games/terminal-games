@@ -27,6 +27,8 @@ use tokio_util::{
     task::TaskTracker,
 };
 
+use crate::rate_limiting::get_tcp_rtt_from_fd;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Message {
     Handshake(HandshakeMessage),
@@ -795,27 +797,6 @@ impl MeshInner {
             }
         }
     }
-}
-
-fn get_tcp_rtt_from_fd(fd: RawFd) -> std::io::Result<Duration> {
-    let mut tcp_info: libc::tcp_info = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
-
-    let ret = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::IPPROTO_TCP,
-            libc::TCP_INFO,
-            &mut tcp_info as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(Duration::from_micros(tcp_info.tcpi_rtt as u64))
 }
 
 struct MessageCodec;

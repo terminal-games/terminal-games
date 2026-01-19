@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use rand_core::OsRng;
@@ -11,6 +12,7 @@ use russh::{Channel, ChannelId, Pty};
 use tokio_util::sync::CancellationToken;
 
 use crate::app::{AppInstantiationParams, AppServer};
+use crate::rate_limiting::{NetworkInformation, RateLimitedStream};
 
 pub struct SshSession {
     input_sender: tokio::sync::mpsc::Sender<smallvec::SmallVec<[u8; 16]>>,
@@ -46,29 +48,57 @@ impl SshServer {
             nodelay: true,
             ..Default::default()
         };
+        let config = Arc::new(config);
 
         let listen_addr: std::net::SocketAddr = std::env::var("SSH_LISTEN_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:2222".to_string())
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid SSH_LISTEN_ADDR: {}", e))?;
 
-        let ip_str = listen_addr.ip().to_string();
         tracing::info!(addr = %listen_addr, "Running SSH server");
-        self.run_on_address(Arc::new(config), (ip_str.as_str(), listen_addr.port()))
-            .await?;
-        Ok(())
-    }
-}
+        let socket = tokio::net::TcpListener::bind(listen_addr).await?;
+        loop {
+            let (stream, remote_addr) = socket.accept().await?;
+            if config.nodelay {
+                if let Err(e) = stream.set_nodelay(true) {
+                    tracing::warn!("set_nodelay() failed: {e:?}");
+                }
+            }
 
-impl Drop for SshSession {
-    fn drop(&mut self) {
-        self.cancellation_token.cancel();
-    }
-}
+            let fd = stream.as_raw_fd();
+            let network_info = Arc::new(NetworkInformation::new(fd));
+            let wrapped_stream = RateLimitedStream::new(stream, network_info.clone());
+            let handler = self.new_client(remote_addr, network_info);
 
-impl Server for SshServer {
-    type Handler = SshSession;
-    fn new_client(&mut self, addr: Option<std::net::SocketAddr>) -> SshSession {
+            tokio::spawn({
+                let config = config.clone();
+                async move {
+                    let session =
+                        match russh::server::run_stream(config, wrapped_stream, handler).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::info!("Connection setup failed: {:?}", e);
+                                return;
+                            }
+                        };
+
+                    if let Err(e) = session.await {
+                        tracing::info!("Connection closed with error: {:?}", e);
+                    } else {
+                        tracing::info!("Connection closed");
+                    }
+                }
+            });
+        }
+
+        // Ok(())
+    }
+
+    fn new_client(
+        &self,
+        addr: std::net::SocketAddr,
+        network_info: Arc<NetworkInformation>,
+    ) -> SshSession {
         tracing::info!(addr=?addr, "new_client");
 
         let (username_sender, username_receiver) = tokio::sync::oneshot::channel::<String>();
@@ -123,7 +153,7 @@ impl Server for SshServer {
                 _ => None,
             };
 
-            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(20);
+            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
             let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
                 args,
                 input_receiver: input_rx,
@@ -133,6 +163,7 @@ impl Server for SshServer {
                 username,
                 window_size_receiver: resize_rx,
                 graceful_shutdown_token: token,
+                network_info,
             });
             loop {
                 tokio::select! {
@@ -148,6 +179,7 @@ impl Server for SshServer {
                     data = output_rx.recv() => {
                         let Some(data) = data else { break };
                         let _ = session_handle.data(channel_id, data.into()).await;
+                        // tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
                     }
                 }
             }
@@ -175,6 +207,12 @@ impl Server for SshServer {
             ssh_session: Some(ssh_session_sender),
             server: self.clone(),
         }
+    }
+}
+
+impl Drop for SshSession {
+    fn drop(&mut self) {
+        self.cancellation_token.cancel();
     }
 }
 
@@ -246,12 +284,13 @@ impl Handler for SshSession {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // tracing::info!(
-        //     data = String::from_utf8_lossy(&data).as_ref(),
-        //     len = data.len(),
-        //     "input"
-        // );
-        self.input_sender.send(data.into()).await?;
+        match self.input_sender.try_send(data.into()) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("input channel closed");
+            }
+        }
 
         Ok(())
     }

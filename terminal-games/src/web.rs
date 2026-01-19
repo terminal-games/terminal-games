@@ -2,9 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::{convert::Infallible, io::Write};
 
+use axum::extract::connect_info::Connected;
+use axum::extract::{ConnectInfo, Request};
 use axum::{
     Router,
     extract::{
@@ -19,10 +22,25 @@ use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
 use futures::{SinkExt, StreamExt};
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
+use tower::{Service, ServiceExt};
 
 use crate::app::{AppInstantiationParams, AppServer};
+use crate::rate_limiting::{NetworkInformation, RateLimitedStream};
+
+#[derive(Clone)]
+struct MyConnectInfo {
+    network_info: Arc<NetworkInformation>,
+}
+
+impl Connected<MyConnectInfo> for MyConnectInfo {
+    fn connect_info(this: Self) -> Self {
+        this
+    }
+}
 
 #[derive(Clone)]
 pub struct WebServer {
@@ -47,10 +65,48 @@ impl WebServer {
             .route("/ws", get(websocket_handler))
             .with_state(self.clone());
 
+        let mut make_service = app.into_make_service_with_connect_info::<MyConnectInfo>();
         let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-        axum::serve(listener, app).await?;
+        loop {
+            let (stream, _remote_addr) = listener.accept().await.unwrap();
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::warn!("set_nodelay() failed: {e:?}");
+            }
 
-        Ok(())
+            let fd = stream.as_raw_fd();
+            let network_info = Arc::new(NetworkInformation::new(fd));
+            let tower_service = unwrap_infallible(
+                make_service
+                    .call(MyConnectInfo {
+                        network_info: network_info.clone(),
+                    })
+                    .await,
+            );
+            let wrapped_stream = RateLimitedStream::new(stream, network_info);
+
+            tokio::spawn(async move {
+                let socket = TokioIo::new(wrapped_stream);
+
+                let hyper_service =
+                    hyper::service::service_fn(move |request: Request<Incoming>| {
+                        tower_service.clone().oneshot(request)
+                    });
+
+                if let Err(err) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                    .serve_connection_with_upgrades(socket, hyper_service)
+                    .await
+                {
+                    eprintln!("failed to serve connection: {err:#}");
+                }
+            });
+        }
+    }
+}
+
+fn unwrap_infallible<T>(result: Result<T, Infallible>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(err) => match err {},
     }
 }
 
@@ -68,6 +124,7 @@ async fn websocket_handler(
     headers: HeaderMap,
     Query(query): Query<WebSocketQuery>,
     State(server): State<WebServer>,
+    ConnectInfo(connect_info): ConnectInfo<MyConnectInfo>,
 ) -> Response {
     let user_agent = headers
         .get("user-agent")
@@ -77,7 +134,7 @@ async fn websocket_handler(
 
     let args = query.args.map(|s| s.into_bytes());
 
-    ws.on_upgrade(move |socket| handle_socket(socket, server, user_agent, args))
+    ws.on_upgrade(move |socket| handle_socket(socket, server, user_agent, args, connect_info))
 }
 
 async fn handle_socket(
@@ -85,6 +142,7 @@ async fn handle_socket(
     server: WebServer,
     user_agent: String,
     args: Option<Vec<u8>>,
+    connect_info: MyConnectInfo,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -106,6 +164,7 @@ async fn handle_socket(
         username: username.clone(),
         window_size_receiver: resize_rx,
         graceful_shutdown_token: token,
+        network_info: connect_info.network_info,
     });
 
     tokio::task::spawn(async move {

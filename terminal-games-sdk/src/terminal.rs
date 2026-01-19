@@ -18,7 +18,9 @@ impl Iterator for TerminalReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut buf = [0u8; 512];
-        let written = unsafe { crate::internal::terminal_read(buf.as_mut_ptr() as *mut u8, buf.len() as u32) };
+        let written = unsafe {
+            crate::internal::terminal_read(buf.as_mut_ptr() as *mut u8, buf.len() as u32)
+        };
         if written < 0 {
             return None;
         }

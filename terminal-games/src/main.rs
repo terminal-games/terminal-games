@@ -4,6 +4,7 @@
 
 mod app;
 mod mesh;
+mod rate_limiting;
 mod ssh;
 mod status_bar;
 mod web;
