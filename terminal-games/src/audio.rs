@@ -56,7 +56,8 @@ impl Mixer {
                     let len = buf.len() as i32;
                     match audio_tx.try_send(buf.to_vec()) {
                         Ok(_) => len,
-                        Err(_) => len,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => 0,
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => ffmpeg::ffi::AVERROR(libc::EIO),
                     }
                 }),
             }));
