@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use wasmtime_wasi::I32Exit;
 
 use crate::{
+    audio::Mixer,
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::NetworkInformation,
     status_bar::StatusBar,
@@ -34,6 +35,7 @@ pub struct AppServer {
 pub struct AppInstantiationParams {
     pub input_receiver: tokio::sync::mpsc::Receiver<SmallVec<[u8; 16]>>,
     pub output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub audio_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     pub window_size_receiver: tokio::sync::mpsc::Receiver<(u16, u16)>,
     pub graceful_shutdown_token: CancellationToken,
     pub username: String,
@@ -120,6 +122,7 @@ impl AppServer {
 
             let network_info = params.network_info.clone();
             let hard_shutdown_token = CancellationToken::new();
+            let audio_tx = params.audio_sender;
 
             let (first_app_shortname, _app_args) = match params.args {
                 None => ("menu".to_string(), None),
@@ -134,6 +137,21 @@ impl AppServer {
                     }
                 }
             };
+
+            // {
+            //     // let mixer = Mixer::new().unwrap();
+            //     match Mixer::new() {
+            //         Ok(_) => tracing::info!("created mixer"),
+            //         Err(error) => tracing::info!(?error, "mixer"),
+            //     }
+            // }
+
+            // audio task
+            tokio::task::spawn(async move {
+                let mut mixer = Mixer::new(audio_tx).unwrap();
+                let res = mixer.run().await;
+                tracing::error!(?res, "mixer.run");
+            });
 
             // output task
             tokio::task::spawn({

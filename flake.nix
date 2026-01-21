@@ -35,6 +35,14 @@
             go-task
             flyctl
           ];
+          nativeBuildInputs = with pkgs; [
+            pkg-config
+          ];
+          buildInputs = with pkgs; [
+            ffmpeg
+            clang
+          ];
+          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           GOOS = "wasip1";
           GOARCH = "wasm";
         };

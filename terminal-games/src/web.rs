@@ -155,10 +155,12 @@ async fn handle_socket(
     let token = cancellation_token.clone();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(20);
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
     let exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
         args,
         input_receiver: input_rx,
         output_sender: output_tx,
+        audio_sender: audio_tx,
         remote_sshid,
         term: Some("xterm-256color".to_string()),
         username: username.clone(),
