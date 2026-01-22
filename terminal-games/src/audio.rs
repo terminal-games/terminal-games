@@ -19,6 +19,7 @@ pub struct Mixer {
     packet: *mut ffmpeg::ffi::AVPacket,
     output_stream: *mut ffmpeg::ffi::AVStream,
     pts: usize,
+    audio_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
 unsafe impl Send for Mixer{}
@@ -28,21 +29,28 @@ const ALIGN: libc::c_int = 0;
 impl Mixer {
     pub fn new(audio_tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> anyhow::Result<Self> {
         ffmpeg::init().unwrap();
+        unsafe { ffmpeg::ffi::av_log_set_level(ffmpeg::ffi::AV_LOG_TRACE) };
 
-        let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::AAC)
-            .ok_or(anyhow!("failed to find AAC encoder"))?;
+        let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::OPUS)
+            .ok_or(anyhow!("failed to find Opus encoder"))?;
         let mut encoder = ffmpeg::codec::Context::new_with_codec(codec)
             .encoder()
             .audio()?;
         encoder.set_channel_layout(ffmpeg::ChannelLayout::STEREO);
-        encoder.set_time_base((1, 44100));
+        encoder.set_time_base((1, 48000));
         encoder.set_format(ffmpeg::format::Sample::F32(
-            ffmpeg::format::sample::Type::Planar,
+            ffmpeg::format::sample::Type::Packed,
         ));
-        encoder.set_rate(44100);
-        encoder.set_bit_rate(96000);
+        encoder.set_rate(48000);
+        encoder.set_bit_rate(48000);
+        encoder.set_flags(ffmpeg::codec::Flags::LOW_DELAY);
+        
+        let mut opts = ffmpeg::Dictionary::new();
+        opts.set("application", "lowdelay");
+        opts.set("frame_duration", "10");
+        let encoder = encoder.open_with(opts)?;
 
-        let encoder = encoder.open()?;
+        let audio_tx_clone = audio_tx.clone();
 
         let (fmt_ctx, io) = unsafe {
             let buffer_size = 2048;
@@ -54,9 +62,11 @@ impl Mixer {
             let opaque = Box::into_raw(Box::new(OutputOpaque {
                 write: Box::new(move |buf| {
                     let len = buf.len() as i32;
-                    match audio_tx.try_send(buf.to_vec()) {
+                    // tracing::info!(capacity=audio_tx_clone.capacity());
+                    match audio_tx_clone.try_send(buf.to_vec()) {
                         Ok(_) => len,
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => 0,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => ffmpeg::ffi::AVERROR(libc::EAGAIN),
+                        // Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => 0,
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => ffmpeg::ffi::AVERROR(libc::EIO),
                     }
                 }),
@@ -77,9 +87,10 @@ impl Mixer {
                 anyhow::bail!("failed to allocate avio context");
             }
 
+
             let io = Box::from_raw(opaque);
 
-            let format_name = CString::new("adts")?;
+            let format_name = CString::new("ogg")?;
             let mut fmt_ctx = ptr::null_mut();
             match ffmpeg::ffi::avformat_alloc_output_context2(
                 &mut fmt_ctx,
@@ -89,7 +100,7 @@ impl Mixer {
             ) {
                 0 => {
                     (*fmt_ctx).pb = avio_ctx;
-                    (*fmt_ctx).flags = ffmpeg::ffi::AVFMT_FLAG_CUSTOM_IO;
+                    (*fmt_ctx).flags = ffmpeg::ffi::AVFMT_FLAG_FLUSH_PACKETS | ffmpeg::ffi::AVFMT_FLAG_NOBUFFER;
                     Ok((fmt_ctx, io))
                 }
                 e => {
@@ -110,7 +121,12 @@ impl Mixer {
         }?;
         unsafe { (*output_stream).time_base = encoder.time_base().into() };
 
-        unsafe { ffmpeg::ffi::avformat_write_header(fmt_ctx, ptr::null_mut()) };
+        let mut opts: *mut ffmpeg::ffi::AVDictionary = ptr::null_mut();
+        unsafe {
+            ffmpeg::ffi::av_dict_set(&mut opts, b"page_duration\0".as_ptr() as *const _, b"10000\0".as_ptr() as *const _, 0);
+            ffmpeg::ffi::avformat_write_header(fmt_ctx, &mut opts);
+            ffmpeg::ffi::av_dict_free(&mut opts);
+        }
 
         let packet = unsafe { ffmpeg::ffi::av_packet_alloc() };
         if packet.is_null() {
@@ -139,7 +155,7 @@ impl Mixer {
             e => Err(ffmpeg::Error::from(e)),
         }?;
 
-        Ok(Self { encoder, fmt_ctx, _io: io, frame, packet, output_stream, pts: 0, })
+        Ok(Self { encoder, fmt_ctx, _io: io, frame, packet, output_stream, pts: 0, audio_tx, })
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
@@ -149,38 +165,37 @@ impl Mixer {
         let amplitude = 0.5_f32;
         let start_time = Instant::now();
         let mut prev_semitone_steps: i32 = -1;
+        tracing::info!(num_samples, sample_rate);
 
         loop {
-            // Rise by one semitone every 5 seconds.
             let elapsed = start_time.elapsed().as_secs_f32();
             let semitone_steps = (elapsed / 5.0).floor() as i32;
             let frequency = A4_HZ * 2f32.powf(semitone_steps as f32 / 12.0);
 
-            if semitone_steps != prev_semitone_steps {
-                tracing::info!(%frequency, semitone_steps, "frequency went up a semitone");
-                prev_semitone_steps = semitone_steps;
-            }
-
             unsafe {
                 (*self.frame).pts = self.pts as i64;
 
-                let left = (*self.frame).data[0] as *mut f32;
-                let right = (*self.frame).data[1] as *mut f32;
-
+                let data = (*self.frame).data[0] as *mut f32;
                 for i in 0..num_samples {
                     let t = (self.pts + i) as f32 / sample_rate as f32;
                     let value =
                         amplitude * (2.0 * std::f32::consts::PI * frequency * t).sin();
-                    *left.add(i) = value;
-                    *right.add(i) = value;
+                    *data.add(i*2) = value;
+                    *data.add(i*2+1) = value;
                 }
             }
 
             let expected_time =
                 start_time + Duration::from_secs_f64(self.pts as f64 / sample_rate as f64);
             let sleep_duration = expected_time.saturating_duration_since(Instant::now());
+            // tracing::info!(?sleep_duration);
             if sleep_duration > Duration::ZERO {
                 tokio::time::sleep(sleep_duration).await;
+            }
+
+            if semitone_steps != prev_semitone_steps {
+                tracing::info!(%frequency, semitone_steps, "frequency went up a semitone");
+                prev_semitone_steps = semitone_steps;
             }
 
             self.pts += num_samples;
@@ -201,15 +216,12 @@ impl Mixer {
 
                 unsafe { (*self.packet).stream_index = 0 };
                 unsafe { ffmpeg::ffi::av_packet_rescale_ts(self.packet, (*self.encoder.as_ptr()).time_base, (*self.output_stream).time_base); };
-                match unsafe { ffmpeg::ffi::av_interleaved_write_frame(self.fmt_ctx, self.packet) } {
+                match unsafe { ffmpeg::ffi::av_write_frame(self.fmt_ctx, self.packet) } {
                     e if e < 0 => Err(ffmpeg::Error::from(e)),
                     _ => Ok(()),
                 }?;
-
                 unsafe { ffmpeg::ffi::av_packet_unref(self.packet) };
             }
-
-            // unsafe { ffmpeg::ffi::avio_flush((*self.fmt_ctx).pb) };
         }
     }
 }

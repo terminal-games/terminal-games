@@ -156,7 +156,7 @@ impl SshServer {
             };
 
             let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
-            let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
+            let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(100);
             let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
                 args,
                 input_receiver: input_rx,
@@ -187,6 +187,7 @@ impl SshServer {
 
                     data = audio_rx.recv() => {
                         let Some(data) = data else { break };
+                        // let _ = session_handle.data(channel_id, data.into()).await;
                         let _ = session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, data.into()).await;
                     }
                 }
