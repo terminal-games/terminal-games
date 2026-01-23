@@ -29,7 +29,7 @@ const ALIGN: libc::c_int = 0;
 impl Mixer {
     pub fn new(audio_tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> anyhow::Result<Self> {
         ffmpeg::init().unwrap();
-        unsafe { ffmpeg::ffi::av_log_set_level(ffmpeg::ffi::AV_LOG_TRACE) };
+        unsafe { ffmpeg::ffi::av_log_set_level(ffmpeg::ffi::AV_LOG_WARNING) };
 
         let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::OPUS)
             .ok_or(anyhow!("failed to find Opus encoder"))?;
@@ -47,7 +47,7 @@ impl Mixer {
         
         let mut opts = ffmpeg::Dictionary::new();
         opts.set("application", "lowdelay");
-        opts.set("frame_duration", "10");
+        opts.set("frame_duration", "20");
         let encoder = encoder.open_with(opts)?;
 
         let audio_tx_clone = audio_tx.clone();
@@ -123,7 +123,7 @@ impl Mixer {
 
         let mut opts: *mut ffmpeg::ffi::AVDictionary = ptr::null_mut();
         unsafe {
-            ffmpeg::ffi::av_dict_set(&mut opts, b"page_duration\0".as_ptr() as *const _, b"10000\0".as_ptr() as *const _, 0);
+            ffmpeg::ffi::av_dict_set(&mut opts, b"page_duration\0".as_ptr() as *const _, b"20000\0".as_ptr() as *const _, 0);
             ffmpeg::ffi::avformat_write_header(fmt_ctx, &mut opts);
             ffmpeg::ffi::av_dict_free(&mut opts);
         }

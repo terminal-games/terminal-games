@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+dashmap = "6"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 ffmpeg-next = { version = "8", default-features = false, features = ["codec", "device"] }
