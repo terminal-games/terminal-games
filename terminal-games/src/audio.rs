@@ -19,7 +19,6 @@ pub struct Mixer {
     packet: *mut ffmpeg::ffi::AVPacket,
     output_stream: *mut ffmpeg::ffi::AVStream,
     pts: usize,
-    audio_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
 unsafe impl Send for Mixer{}
@@ -29,8 +28,6 @@ const ALIGN: libc::c_int = 0;
 impl Mixer {
     pub fn new(audio_tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> anyhow::Result<Self> {
         ffmpeg::init().unwrap();
-        unsafe { ffmpeg::ffi::av_log_set_level(ffmpeg::ffi::AV_LOG_WARNING) };
-
         let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::OPUS)
             .ok_or(anyhow!("failed to find Opus encoder"))?;
         let mut encoder = ffmpeg::codec::Context::new_with_codec(codec)
@@ -50,8 +47,6 @@ impl Mixer {
         opts.set("frame_duration", "20");
         let encoder = encoder.open_with(opts)?;
 
-        let audio_tx_clone = audio_tx.clone();
-
         let (fmt_ctx, io) = unsafe {
             let buffer_size = 2048;
             let buffer = ffmpeg::ffi::av_malloc(buffer_size);
@@ -62,8 +57,8 @@ impl Mixer {
             let opaque = Box::into_raw(Box::new(OutputOpaque {
                 write: Box::new(move |buf| {
                     let len = buf.len() as i32;
-                    // tracing::info!(capacity=audio_tx_clone.capacity());
-                    match audio_tx_clone.try_send(buf.to_vec()) {
+                    // tracing::info!(capacity=audio_tx.capacity());
+                    match audio_tx.try_send(buf.to_vec()) {
                         Ok(_) => len,
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => ffmpeg::ffi::AVERROR(libc::EAGAIN),
                         // Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => 0,
@@ -155,7 +150,7 @@ impl Mixer {
             e => Err(ffmpeg::Error::from(e)),
         }?;
 
-        Ok(Self { encoder, fmt_ctx, _io: io, frame, packet, output_stream, pts: 0, audio_tx, })
+        Ok(Self { encoder, fmt_ctx, _io: io, frame, packet, output_stream, pts: 0, })
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
