@@ -9,7 +9,7 @@
 //!
 //! # Audio Model
 //!
-//! The host runs an audio mixer at 48kHz stereo. WASM apps write samples to a
+//! The host runs an audio mixer at 48kHz mono. WASM apps write samples to a
 //! ring buffer, and the mixer consumes them. If the buffer is empty, silence
 //! is output. If the buffer is full, samples are dropped.
 //!
@@ -30,13 +30,12 @@
 //! // Generate a simple sine wave
 //! let frequency = 440.0; // A4
 //! let amplitude = 0.3;
-//! let mut samples = vec![0.0f32; info.frame_size * 2]; // stereo
+//! let mut samples = vec![0.0f32; info.frame_size]; // mono
 //!
 //! for i in 0..info.frame_size {
 //!     let t = (info.pts + i as u64) as f32 / info.sample_rate as f32;
 //!     let value = amplitude * (2.0 * std::f32::consts::PI * frequency * t).sin();
-//!     samples[i * 2] = value;     // left
-//!     samples[i * 2 + 1] = value; // right
+//!     samples[i] = value;
 //! }
 //!
 //! // Write samples to the mixer
@@ -47,7 +46,7 @@ use crate::internal;
 
 pub const SAMPLE_RATE: u32 = 48000;
 pub const FRAME_SIZE: usize = 960;
-pub const CHANNELS: usize = 2;
+pub const CHANNELS: usize = 1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AudioInfo {
@@ -92,30 +91,30 @@ pub fn info() -> Option<AudioInfo> {
     })
 }
 
-/// Write stereo audio samples to the mixer buffer.
+/// Write mono audio samples to the mixer buffer.
 ///
-/// Samples should be interleaved stereo f32 values: `[L0, R0, L1, R1, ...]`.
+/// Samples should be mono f32 values: `[S0, S1, S2, ...]`.
 /// Values should be in the range `[-1.0, 1.0]`.
 ///
 /// This function is non-blocking. If the buffer is full, samples may be
-/// dropped. Check the return value to see how many sample pairs were actually
+/// dropped. Check the return value to see how many samples were actually
 /// written.
 ///
 /// # Arguments
 ///
-/// * `samples` - Interleaved stereo f32 samples. Length must be even.
+/// * `samples` - Mono f32 samples.
 ///
 /// # Returns
 ///
-/// Number of stereo sample pairs written, or -1 on error.
+/// Number of samples written, or -1 on error.
 ///
 /// # Example
 ///
 /// ```no_run
 /// use terminal_games_sdk::audio;
 ///
-/// // Write 100 sample pairs (200 floats)
-/// let samples = vec![0.0f32; 200];
+/// // Write 100 samples
+/// let samples = vec![0.0f32; 100];
 /// let written = audio::write(&samples);
 /// assert!(written >= 0);
 /// ```

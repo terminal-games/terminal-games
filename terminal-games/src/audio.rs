@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 pub const SAMPLE_RATE: u32 = 48000;
 pub const FRAME_SIZE: usize = 960;
-pub const CHANNELS: usize = 2;
+pub const CHANNELS: usize = 1;
 
 pub struct AudioBuffer {
     samples: Vec<f32>,
@@ -39,10 +39,10 @@ impl AudioBuffer {
         }
     }
 
-    /// Write stereo samples to the buffer. Returns number of sample pairs written.
+    /// Write mono samples to the buffer. Returns number of samples written.
     /// This is non-blocking; if buffer is full, samples are dropped.
     pub fn write(&self, samples: &[f32]) -> usize {
-        let sample_pairs = samples.len() / CHANNELS;
+        let sample_count = samples.len();
         let write_pos = self.write_pos.load(Ordering::Acquire);
         let read_pos = self.read_pos.load(Ordering::Acquire);
         
@@ -53,18 +53,16 @@ impl AudioBuffer {
         };
         let available = self.capacity.saturating_sub(used + 1); // Leave one slot empty
         
-        let to_write = sample_pairs.min(available);
+        let to_write = sample_count.min(available);
         if to_write == 0 {
             return 0;
         }
 
         let samples_ptr = self.samples.as_ptr() as *mut f32;
         for i in 0..to_write {
-            let buf_idx = ((write_pos + i) % self.capacity) * CHANNELS;
-            let src_idx = i * CHANNELS;
+            let buf_idx = (write_pos + i) % self.capacity;
             unsafe {
-                *samples_ptr.add(buf_idx) = samples[src_idx];
-                *samples_ptr.add(buf_idx + 1) = samples[src_idx + 1];
+                *samples_ptr.add(buf_idx) = samples[i];
             }
         }
 
@@ -74,8 +72,8 @@ impl AudioBuffer {
         to_write
     }
 
-    /// Read stereo samples from the buffer into the destination.
-    /// Returns number of sample pairs read. Missing samples are filled with silence.
+    /// Read mono samples from the buffer into the destination.
+    /// Returns number of samples read. Missing samples are filled with silence.
     fn read(&self, dest: &mut [f32], count: usize) -> usize {
         let write_pos = self.write_pos.load(Ordering::Acquire);
         let read_pos = self.read_pos.load(Ordering::Acquire);
@@ -89,16 +87,12 @@ impl AudioBuffer {
         let to_read = count.min(available);
         
         for i in 0..to_read {
-            let buf_idx = ((read_pos + i) % self.capacity) * CHANNELS;
-            let dest_idx = i * CHANNELS;
-            dest[dest_idx] = self.samples[buf_idx];
-            dest[dest_idx + 1] = self.samples[buf_idx + 1];
+            let buf_idx = (read_pos + i) % self.capacity;
+            dest[i] = self.samples[buf_idx];
         }
         
         for i in to_read..count {
-            let dest_idx = i * CHANNELS;
-            dest[dest_idx] = 0.0;
-            dest[dest_idx + 1] = 0.0;
+            dest[i] = 0.0;
         }
 
         if to_read > 0 {
@@ -147,13 +141,13 @@ impl Mixer {
         let mut encoder = ffmpeg::codec::Context::new_with_codec(codec)
             .encoder()
             .audio()?;
-        encoder.set_channel_layout(ffmpeg::ChannelLayout::STEREO);
+        encoder.set_channel_layout(ffmpeg::ChannelLayout::MONO);
         encoder.set_time_base((1, 48000));
         encoder.set_format(ffmpeg::format::Sample::F32(
             ffmpeg::format::sample::Type::Packed,
         ));
         encoder.set_rate(48000);
-        encoder.set_bit_rate(48000);
+        encoder.set_bit_rate(32000);
         encoder.set_flags(ffmpeg::codec::Flags::LOW_DELAY);
         
         let mut opts = ffmpeg::Dictionary::new();
@@ -294,8 +288,7 @@ impl Mixer {
                 
                 let data = (*self.frame).data[0] as *mut f32;
                 for i in 0..num_samples {
-                    *data.add(i * 2) = read_buffer[i * 2];
-                    *data.add(i * 2 + 1) = read_buffer[i * 2 + 1];
+                    *data.add(i) = read_buffer[i];
                 }
                 
                 if samples_read > 0 && samples_read < num_samples {

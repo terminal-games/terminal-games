@@ -2,7 +2,6 @@ class JitterBufferProcessor extends AudioWorkletProcessor {
     constructor() {
         super();
         this.sampleRate = 48000;
-        this.channels = 2;
         this.buffer = new Float32Array(this.sampleRate);
         this.writePos = 0;
         this.readPos = 0;
@@ -21,7 +20,7 @@ class JitterBufferProcessor extends AudioWorkletProcessor {
     }
     
     msToSamples(ms) {
-        return Math.floor((ms / 1000) * this.sampleRate * this.channels);
+        return Math.floor((ms / 1000) * this.sampleRate * 2);
     }
     
     pushSamples(left, right) {

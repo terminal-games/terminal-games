@@ -316,14 +316,13 @@ func refreshNetworkInfo(prev app.NetworkInfo) tea.Cmd {
 }
 
 func GenerateSine(frequency, amplitude float32, pts uint64, numSamples int) []float32 {
-	samples := make([]float32, numSamples*audio.Channels)
+	samples := make([]float32, numSamples)
 	twoPiF := 2.0 * math.Pi * float64(frequency)
 
 	for i := 0; i < numSamples; i++ {
 		t := float64(pts+uint64(i)) / audio.SampleRate
 		value := amplitude * float32(math.Sin(twoPiF*t))
-		samples[i*2] = value
-		samples[i*2+1] = value
+		samples[i] = value
 	}
 
 	return samples

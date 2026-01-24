@@ -9,7 +9,7 @@
 //
 // # Audio Model
 //
-// The host runs an audio mixer at 48kHz stereo. WASM apps write samples to a
+// The host runs an audio mixer at 48kHz mono. WASM apps write samples to a
 // ring buffer, and the mixer consumes them. If the buffer is empty, silence
 // is output. If the buffer is full, samples are dropped.
 //
@@ -21,7 +21,7 @@
 // # Example
 //
 //	info, _ := audio.Info()
-//	samples := make([]float32, info.FrameSize*2) // stereo
+//	samples := make([]float32, info.FrameSize)
 //
 //	// Generate a sine wave
 //	frequency := float32(440.0)
@@ -29,8 +29,7 @@
 //	for i := uint32(0); i < info.FrameSize; i++ {
 //	    t := float32(info.PTS+uint64(i)) / float32(info.SampleRate)
 //	    value := amplitude * float32(math.Sin(float64(2*math.Pi*frequency*t)))
-//	    samples[i*2] = value     // left
-//	    samples[i*2+1] = value   // right
+//	    samples[i] = value
 //	}
 //
 //	written := audio.Write(samples)
@@ -44,7 +43,7 @@ import (
 const (
 	SampleRate = 48000
 	FrameSize  = 960
-	Channels   = 2
+	Channels   = 1
 )
 
 //go:wasmimport terminal_games audio_write
@@ -98,16 +97,16 @@ func Info() (AudioInfo, error) {
 	}, nil
 }
 
-// Write writes stereo audio samples to the mixer buffer.
+// Write writes mono audio samples to the mixer buffer.
 //
-// Samples should be interleaved stereo float32 values: [L0, R0, L1, R1, ...].
+// Samples should be mono float32 values: [S0, S1, S2, ...].
 // Values should be in the range [-1.0, 1.0].
 //
 // This function is non-blocking. If the buffer is full, samples may be
-// dropped. Check the return value to see how many sample pairs were actually
+// dropped. Check the return value to see how many samples were actually
 // written.
 //
-// Returns the number of stereo sample pairs written, or a negative value on error.
+// Returns the number of samples written, or a negative value on error.
 func Write(samples []float32) int {
 	if len(samples) == 0 {
 		return 0

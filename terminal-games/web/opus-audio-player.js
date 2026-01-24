@@ -4,7 +4,7 @@ export class OpusAudioPlayer {
         this.workletNode = null;
         this.decoder = null;
         this.sampleRate = 48000;
-        this.channels = 2;
+        this.channels = 1;
         this.preSkip = 0;
         this.preSkipRemaining = 0;
         this.headersParsed = false;
@@ -21,7 +21,8 @@ export class OpusAudioPlayer {
         await this.audioContext.audioWorklet.addModule('./jitter-buffer-processor.js');
         
         this.workletNode = new AudioWorkletNode(this.audioContext, 'jitter-buffer-processor', {
-            outputChannelCount: [this.channels]
+            // Always output stereo (mono is duplicated to both channels)
+            outputChannelCount: [2]
         });
         this.workletNode.connect(this.audioContext.destination);
         
