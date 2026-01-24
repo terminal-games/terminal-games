@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::anyhow;
 use ffmpeg_next as ffmpeg;
+use tokio_util::sync::CancellationToken;
 
 pub const SAMPLE_RATE: u32 = 48000;
 pub const FRAME_SIZE: usize = 960;
@@ -274,7 +275,7 @@ impl Mixer {
         })
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(&mut self, cancellation_token: CancellationToken) -> anyhow::Result<()> {
         let num_samples = self.encoder.frame_size() as usize;
         let sample_rate = self.encoder.rate();
         let start_time = Instant::now();
@@ -306,7 +307,12 @@ impl Mixer {
                 start_time + Duration::from_secs_f64(self.pts as f64 / sample_rate as f64);
             let sleep_duration = expected_time.saturating_duration_since(Instant::now());
             if sleep_duration > Duration::ZERO {
-                tokio::time::sleep(sleep_duration).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_duration) => {}
+                    _ = cancellation_token.cancelled() => {
+                        return Ok(());
+                    }
+                }
             }
 
             self.pts += num_samples;

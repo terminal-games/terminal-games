@@ -145,10 +145,13 @@ impl AppServer {
             // audio task
             tokio::task::spawn({
                 let audio_buffer = audio_buffer.clone();
+                let hard_shutdown_token = hard_shutdown_token.clone();
                 async move {
                     let mut mixer = Mixer::new(audio_tx, audio_buffer).unwrap();
-                    let res = mixer.run().await;
-                    tracing::error!(?res, "mixer.run");
+                    let res = mixer.run(hard_shutdown_token).await;
+                    if let Err(e) = res {
+                        tracing::error!(?e, "mixer.run");
+                    }
                 }
             });
 

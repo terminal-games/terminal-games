@@ -187,7 +187,6 @@ impl SshServer {
 
                     data = audio_rx.recv() => {
                         let Some(data) = data else { break };
-                        // let _ = session_handle.data(channel_id, data.into()).await;
                         let _ = session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, data.into()).await;
                     }
                 }
