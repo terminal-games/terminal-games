@@ -5,11 +5,120 @@
 use std::{
     ffi::CString,
     ptr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::anyhow;
 use ffmpeg_next as ffmpeg;
+
+pub const SAMPLE_RATE: u32 = 48000;
+pub const FRAME_SIZE: usize = 960;
+pub const CHANNELS: usize = 2;
+
+pub struct AudioBuffer {
+    samples: Vec<f32>,
+    write_pos: AtomicUsize,
+    read_pos: AtomicUsize,
+    capacity: usize,
+    pub pts: AtomicUsize,
+}
+
+impl AudioBuffer {
+    pub fn new(capacity_samples: usize) -> Self {
+        Self {
+            samples: vec![0.0; capacity_samples * CHANNELS],
+            write_pos: AtomicUsize::new(0),
+            read_pos: AtomicUsize::new(0),
+            capacity: capacity_samples,
+            pts: AtomicUsize::new(0),
+        }
+    }
+
+    /// Write stereo samples to the buffer. Returns number of sample pairs written.
+    /// This is non-blocking; if buffer is full, samples are dropped.
+    pub fn write(&self, samples: &[f32]) -> usize {
+        let sample_pairs = samples.len() / CHANNELS;
+        let write_pos = self.write_pos.load(Ordering::Acquire);
+        let read_pos = self.read_pos.load(Ordering::Acquire);
+        
+        let used = if write_pos >= read_pos {
+            write_pos - read_pos
+        } else {
+            self.capacity - read_pos + write_pos
+        };
+        let available = self.capacity.saturating_sub(used + 1); // Leave one slot empty
+        
+        let to_write = sample_pairs.min(available);
+        if to_write == 0 {
+            return 0;
+        }
+
+        let samples_ptr = self.samples.as_ptr() as *mut f32;
+        for i in 0..to_write {
+            let buf_idx = ((write_pos + i) % self.capacity) * CHANNELS;
+            let src_idx = i * CHANNELS;
+            unsafe {
+                *samples_ptr.add(buf_idx) = samples[src_idx];
+                *samples_ptr.add(buf_idx + 1) = samples[src_idx + 1];
+            }
+        }
+
+        let new_write_pos = (write_pos + to_write) % self.capacity;
+        self.write_pos.store(new_write_pos, Ordering::Release);
+        
+        to_write
+    }
+
+    /// Read stereo samples from the buffer into the destination.
+    /// Returns number of sample pairs read. Missing samples are filled with silence.
+    fn read(&self, dest: &mut [f32], count: usize) -> usize {
+        let write_pos = self.write_pos.load(Ordering::Acquire);
+        let read_pos = self.read_pos.load(Ordering::Acquire);
+        
+        let available = if write_pos >= read_pos {
+            write_pos - read_pos
+        } else {
+            self.capacity - read_pos + write_pos
+        };
+        
+        let to_read = count.min(available);
+        
+        for i in 0..to_read {
+            let buf_idx = ((read_pos + i) % self.capacity) * CHANNELS;
+            let dest_idx = i * CHANNELS;
+            dest[dest_idx] = self.samples[buf_idx];
+            dest[dest_idx + 1] = self.samples[buf_idx + 1];
+        }
+        
+        for i in to_read..count {
+            let dest_idx = i * CHANNELS;
+            dest[dest_idx] = 0.0;
+            dest[dest_idx + 1] = 0.0;
+        }
+
+        if to_read > 0 {
+            let new_read_pos = (read_pos + to_read) % self.capacity;
+            self.read_pos.store(new_read_pos, Ordering::Release);
+        }
+        
+        to_read
+    }
+
+    pub fn available(&self) -> usize {
+        let write_pos = self.write_pos.load(Ordering::Acquire);
+        let read_pos = self.read_pos.load(Ordering::Acquire);
+        
+        if write_pos >= read_pos {
+            write_pos - read_pos
+        } else {
+            self.capacity - read_pos + write_pos
+        }
+    }
+}
 
 pub struct Mixer {
     encoder: ffmpeg::encoder::Audio,
@@ -19,14 +128,18 @@ pub struct Mixer {
     packet: *mut ffmpeg::ffi::AVPacket,
     output_stream: *mut ffmpeg::ffi::AVStream,
     pts: usize,
+    audio_buffer: Arc<AudioBuffer>,
 }
 
-unsafe impl Send for Mixer{}
+unsafe impl Send for Mixer {}
 
 const ALIGN: libc::c_int = 0;
 
 impl Mixer {
-    pub fn new(audio_tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> anyhow::Result<Self> {
+    pub fn new(
+        audio_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        audio_buffer: Arc<AudioBuffer>,
+    ) -> anyhow::Result<Self> {
         ffmpeg::init().unwrap();
         let codec = ffmpeg::encoder::find(ffmpeg::codec::Id::OPUS)
             .ok_or(anyhow!("failed to find Opus encoder"))?;
@@ -81,7 +194,6 @@ impl Mixer {
                 ffmpeg::ffi::av_free(buffer);
                 anyhow::bail!("failed to allocate avio context");
             }
-
 
             let io = Box::from_raw(opaque);
 
@@ -150,47 +262,51 @@ impl Mixer {
             e => Err(ffmpeg::Error::from(e)),
         }?;
 
-        Ok(Self { encoder, fmt_ctx, _io: io, frame, packet, output_stream, pts: 0, })
+        Ok(Self {
+            encoder,
+            fmt_ctx,
+            _io: io,
+            frame,
+            packet,
+            output_stream,
+            pts: 0,
+            audio_buffer,
+        })
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
         let num_samples = self.encoder.frame_size() as usize;
         let sample_rate = self.encoder.rate();
-        const A4_HZ: f32 = 440.0;
-        let amplitude = 0.5_f32;
         let start_time = Instant::now();
-        let mut prev_semitone_steps: i32 = -1;
-        tracing::info!(num_samples, sample_rate);
+        
+        let mut read_buffer = vec![0.0f32; num_samples * CHANNELS];
+        
+        tracing::info!(num_samples, sample_rate, "mixer started");
 
         loop {
-            let elapsed = start_time.elapsed().as_secs_f32();
-            let semitone_steps = (elapsed / 5.0).floor() as i32;
-            let frequency = A4_HZ * 2f32.powf(semitone_steps as f32 / 12.0);
+            self.audio_buffer.pts.store(self.pts, Ordering::Release);
 
             unsafe {
                 (*self.frame).pts = self.pts as i64;
 
+                let samples_read = self.audio_buffer.read(&mut read_buffer, num_samples);
+                
                 let data = (*self.frame).data[0] as *mut f32;
                 for i in 0..num_samples {
-                    let t = (self.pts + i) as f32 / sample_rate as f32;
-                    let value =
-                        amplitude * (2.0 * std::f32::consts::PI * frequency * t).sin();
-                    *data.add(i*2) = value;
-                    *data.add(i*2+1) = value;
+                    *data.add(i * 2) = read_buffer[i * 2];
+                    *data.add(i * 2 + 1) = read_buffer[i * 2 + 1];
+                }
+                
+                if samples_read > 0 && samples_read < num_samples {
+                    tracing::trace!(samples_read, num_samples, "audio buffer underrun");
                 }
             }
 
             let expected_time =
                 start_time + Duration::from_secs_f64(self.pts as f64 / sample_rate as f64);
             let sleep_duration = expected_time.saturating_duration_since(Instant::now());
-            // tracing::info!(?sleep_duration);
             if sleep_duration > Duration::ZERO {
                 tokio::time::sleep(sleep_duration).await;
-            }
-
-            if semitone_steps != prev_semitone_steps {
-                tracing::info!(%frequency, semitone_steps, "frequency went up a semitone");
-                prev_semitone_steps = semitone_steps;
             }
 
             self.pts += num_samples;

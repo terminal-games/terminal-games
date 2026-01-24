@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use wasmtime_wasi::I32Exit;
 
 use crate::{
-    audio::Mixer,
+    audio::{AudioBuffer, Mixer, CHANNELS, FRAME_SIZE, SAMPLE_RATE},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::NetworkInformation,
     status_bar::StatusBar,
@@ -89,6 +89,8 @@ impl AppServer {
             Self::graceful_shutdown_poll,
         )?;
         linker.func_wrap("terminal_games", "network_info", Self::host_network_info)?;
+        linker.func_wrap("terminal_games", "audio_write", Self::audio_write)?;
+        linker.func_wrap("terminal_games", "audio_info", Self::audio_info)?;
 
         Ok(Self {
             linker: Arc::new(linker),
@@ -124,6 +126,8 @@ impl AppServer {
             let hard_shutdown_token = CancellationToken::new();
             let audio_tx = params.audio_sender;
 
+            let audio_buffer = Arc::new(AudioBuffer::new(SAMPLE_RATE as usize));
+
             let (first_app_shortname, _app_args) = match params.args {
                 None => ("menu".to_string(), None),
                 Some(args_bytes) => {
@@ -138,19 +142,14 @@ impl AppServer {
                 }
             };
 
-            // {
-            //     // let mixer = Mixer::new().unwrap();
-            //     match Mixer::new() {
-            //         Ok(_) => tracing::info!("created mixer"),
-            //         Err(error) => tracing::info!(?error, "mixer"),
-            //     }
-            // }
-
             // audio task
-            tokio::task::spawn(async move {
-                let mut mixer = Mixer::new(audio_tx).unwrap();
-                let res = mixer.run().await;
-                tracing::error!(?res, "mixer.run");
+            tokio::task::spawn({
+                let audio_buffer = audio_buffer.clone();
+                async move {
+                    let mut mixer = Mixer::new(audio_tx, audio_buffer).unwrap();
+                    let res = mixer.run().await;
+                    tracing::error!(?res, "mixer.run");
+                }
             });
 
             // output task
@@ -291,6 +290,7 @@ impl AppServer {
                     has_next_app: has_next_app_shortname.clone(),
                     graceful_shutdown_token,
                     network_info: network_info.clone(),
+                    audio_buffer: audio_buffer.clone(),
                 };
 
                 let mut store = wasmtime::Store::new(&engine, state);
@@ -961,6 +961,96 @@ impl AppServer {
 
         Ok(0)
     }
+
+    fn audio_write(
+        mut caller: wasmtime::Caller<'_, AppState>,
+        ptr: i32,
+        sample_count: u32,
+    ) -> anyhow::Result<i32> {
+        if sample_count == 0 {
+            return Ok(0);
+        }
+
+        let sample_count = sample_count.min(SAMPLE_RATE) as usize;
+        let float_count = sample_count * CHANNELS;
+        let byte_count = float_count * std::mem::size_of::<f32>();
+
+        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+            tracing::error!("audio_write: failed to find host memory");
+            return Ok(-1);
+        };
+
+        let mut buf = vec![0u8; byte_count];
+        let offset = ptr as usize;
+        if let Err(_) = mem.read(&caller, offset, &mut buf) {
+            tracing::error!("audio_write: failed to read from guest memory");
+            return Ok(-1);
+        }
+
+        let samples: Vec<f32> = buf
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+
+        let written = caller.data().audio_buffer.write(&samples);
+        
+        Ok(written as i32)
+    }
+
+    fn audio_info(
+        mut caller: wasmtime::Caller<'_, AppState>,
+        frame_size_ptr: i32,
+        sample_rate_ptr: i32,
+        pts_ptr: i32,
+        buffer_available_ptr: i32,
+    ) -> anyhow::Result<i32> {
+        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+            tracing::error!("audio_info: failed to find host memory");
+            return Ok(-1);
+        };
+
+        let data = caller.data();
+        let pts = data.audio_buffer.pts.load(Ordering::Acquire);
+        let buffer_available = data.audio_buffer.available();
+
+        if let Err(_) = mem.write(
+            &mut caller,
+            frame_size_ptr as usize,
+            &(FRAME_SIZE as u32).to_le_bytes(),
+        ) {
+            tracing::error!("audio_info: failed to write frame_size");
+            return Ok(-1);
+        }
+
+        if let Err(_) = mem.write(
+            &mut caller,
+            sample_rate_ptr as usize,
+            &(SAMPLE_RATE).to_le_bytes(),
+        ) {
+            tracing::error!("audio_info: failed to write sample_rate");
+            return Ok(-1);
+        }
+
+        if let Err(_) = mem.write(
+            &mut caller,
+            pts_ptr as usize,
+            &(pts as u64).to_le_bytes(),
+        ) {
+            tracing::error!("audio_info: failed to write pts");
+            return Ok(-1);
+        }
+
+        if let Err(_) = mem.write(
+            &mut caller,
+            buffer_available_ptr as usize,
+            &(buffer_available as u32).to_le_bytes(),
+        ) {
+            tracing::error!("audio_info: failed to write buffer_available");
+            return Ok(-1);
+        }
+
+        Ok(0)
+    }
 }
 
 pub struct PreloadedAppState {
@@ -990,11 +1080,11 @@ pub struct AppState {
     next_app: Option<
         tokio::sync::oneshot::Receiver<(PreloadedAppState, wasmtime::InstancePre<AppState>)>,
     >,
-    /// Must be kept in sync with [`next_app_shortname`]
     has_next_app: Arc<AtomicBool>,
     input_receiver: tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
     graceful_shutdown_token: CancellationToken,
     network_info: Arc<NetworkInformation>,
+    audio_buffer: Arc<AudioBuffer>,
 }
 
 struct AppLimiter {

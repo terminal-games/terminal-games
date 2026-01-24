@@ -8,15 +8,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
 	"github.com/terminal-games/terminal-games/pkg/app"
+	"github.com/terminal-games/terminal-games/pkg/audio"
 	"github.com/terminal-games/terminal-games/pkg/bubblewrap"
 	_ "github.com/terminal-games/terminal-games/pkg/net/http"
 	"github.com/terminal-games/terminal-games/pkg/peer"
@@ -58,8 +61,22 @@ type peerMessage struct {
 
 type peerMsg peer.Message
 
+var isHoveringAudio = &atomic.Bool{}
+
 func main() {
 	r := bubblewrap.MakeRenderer()
+
+	go func() {
+		for {
+			if isHoveringAudio.Load() {
+				info, _ := audio.Info()
+				if info.BufferAvailable < audio.FrameSize*2 {
+					audio.Write(GenerateSine(440, 0.3, info.PTS, audio.FrameSize))
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
 
 	zone.NewGlobal()
 	p := bubblewrap.NewProgram(model{
@@ -89,6 +106,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.x = msg.X
 		m.y = msg.Y
 		m.isHoveringZone = zone.Get("myId").InBounds(msg)
+		isHoveringAudio.Store(m.isHoveringZone)
 		return m, nil
 	case tea.KeyMsg:
 		m.lastChar = msg.String()
@@ -295,4 +313,18 @@ func refreshNetworkInfo(prev app.NetworkInfo) tea.Cmd {
 		}
 		return networkInfoMsg(info)
 	}
+}
+
+func GenerateSine(frequency, amplitude float32, pts uint64, numSamples int) []float32 {
+	samples := make([]float32, numSamples*audio.Channels)
+	twoPiF := 2.0 * math.Pi * float64(frequency)
+
+	for i := 0; i < numSamples; i++ {
+		t := float64(pts+uint64(i)) / audio.SampleRate
+		value := amplitude * float32(math.Sin(twoPiF*t))
+		samples[i*2] = value
+		samples[i*2+1] = value
+	}
+
+	return samples
 }
