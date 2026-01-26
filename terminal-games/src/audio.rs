@@ -6,8 +6,8 @@ use std::{
     ffi::CString,
     ptr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -45,14 +45,14 @@ impl AudioBuffer {
         let sample_count = samples.len();
         let write_pos = self.write_pos.load(Ordering::Acquire);
         let read_pos = self.read_pos.load(Ordering::Acquire);
-        
+
         let used = if write_pos >= read_pos {
             write_pos - read_pos
         } else {
             self.capacity - read_pos + write_pos
         };
         let available = self.capacity.saturating_sub(used + 1); // Leave one slot empty
-        
+
         let to_write = sample_count.min(available);
         if to_write == 0 {
             return 0;
@@ -68,7 +68,7 @@ impl AudioBuffer {
 
         let new_write_pos = (write_pos + to_write) % self.capacity;
         self.write_pos.store(new_write_pos, Ordering::Release);
-        
+
         to_write
     }
 
@@ -77,20 +77,20 @@ impl AudioBuffer {
     fn read(&self, dest: &mut [f32], count: usize) -> usize {
         let write_pos = self.write_pos.load(Ordering::Acquire);
         let read_pos = self.read_pos.load(Ordering::Acquire);
-        
+
         let available = if write_pos >= read_pos {
             write_pos - read_pos
         } else {
             self.capacity - read_pos + write_pos
         };
-        
+
         let to_read = count.min(available);
-        
+
         for i in 0..to_read {
             let buf_idx = (read_pos + i) % self.capacity;
             dest[i] = self.samples[buf_idx];
         }
-        
+
         for i in to_read..count {
             dest[i] = 0.0;
         }
@@ -99,14 +99,14 @@ impl AudioBuffer {
             let new_read_pos = (read_pos + to_read) % self.capacity;
             self.read_pos.store(new_read_pos, Ordering::Release);
         }
-        
+
         to_read
     }
 
     pub fn available(&self) -> usize {
         let write_pos = self.write_pos.load(Ordering::Acquire);
         let read_pos = self.read_pos.load(Ordering::Acquire);
-        
+
         if write_pos >= read_pos {
             write_pos - read_pos
         } else {
@@ -147,12 +147,12 @@ impl Mixer {
             ffmpeg::format::sample::Type::Packed,
         ));
         encoder.set_rate(48000);
-        encoder.set_bit_rate(32000);
+        encoder.set_bit_rate(48000);
         encoder.set_flags(ffmpeg::codec::Flags::LOW_DELAY);
-        
+
         let mut opts = ffmpeg::Dictionary::new();
         opts.set("application", "lowdelay");
-        opts.set("frame_duration", "20");
+        opts.set("frame_duration", "10");
         let encoder = encoder.open_with(opts)?;
 
         let (fmt_ctx, io) = unsafe {
@@ -168,9 +168,13 @@ impl Mixer {
                     // tracing::info!(capacity=audio_tx.capacity());
                     match audio_tx.try_send(buf.to_vec()) {
                         Ok(_) => len,
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => ffmpeg::ffi::AVERROR(libc::EAGAIN),
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            ffmpeg::ffi::AVERROR(libc::EAGAIN)
+                        }
                         // Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => 0,
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => ffmpeg::ffi::AVERROR(libc::EIO),
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            ffmpeg::ffi::AVERROR(libc::EIO)
+                        }
                     }
                 }),
             }));
@@ -202,7 +206,8 @@ impl Mixer {
             ) {
                 0 => {
                     (*fmt_ctx).pb = avio_ctx;
-                    (*fmt_ctx).flags = ffmpeg::ffi::AVFMT_FLAG_FLUSH_PACKETS | ffmpeg::ffi::AVFMT_FLAG_NOBUFFER;
+                    (*fmt_ctx).flags =
+                        ffmpeg::ffi::AVFMT_FLAG_FLUSH_PACKETS | ffmpeg::ffi::AVFMT_FLAG_NOBUFFER;
                     Ok((fmt_ctx, io))
                 }
                 e => {
@@ -217,7 +222,12 @@ impl Mixer {
             anyhow::bail!("failed to create new output stream");
         }
 
-        match unsafe { ffmpeg::ffi::avcodec_parameters_from_context((*output_stream).codecpar, encoder.as_ptr()) } {
+        match unsafe {
+            ffmpeg::ffi::avcodec_parameters_from_context(
+                (*output_stream).codecpar,
+                encoder.as_ptr(),
+            )
+        } {
             0.. => Ok(()),
             e => Err(ffmpeg::Error::from(e)),
         }?;
@@ -225,7 +235,12 @@ impl Mixer {
 
         let mut opts: *mut ffmpeg::ffi::AVDictionary = ptr::null_mut();
         unsafe {
-            ffmpeg::ffi::av_dict_set(&mut opts, b"page_duration\0".as_ptr() as *const _, b"20000\0".as_ptr() as *const _, 0);
+            ffmpeg::ffi::av_dict_set(
+                &mut opts,
+                b"page_duration\0".as_ptr() as *const _,
+                b"10000\0".as_ptr() as *const _,
+                0,
+            );
             ffmpeg::ffi::avformat_write_header(fmt_ctx, &mut opts);
             ffmpeg::ffi::av_dict_free(&mut opts);
         }
@@ -273,9 +288,9 @@ impl Mixer {
         let num_samples = self.encoder.frame_size() as usize;
         let sample_rate = self.encoder.rate();
         let start_time = Instant::now();
-        
+
         let mut read_buffer = vec![0.0f32; num_samples * CHANNELS];
-        
+
         tracing::info!(num_samples, sample_rate, "mixer started");
 
         loop {
@@ -285,12 +300,12 @@ impl Mixer {
                 (*self.frame).pts = self.pts as i64;
 
                 let samples_read = self.audio_buffer.read(&mut read_buffer, num_samples);
-                
+
                 let data = (*self.frame).data[0] as *mut f32;
                 for i in 0..num_samples {
                     *data.add(i) = read_buffer[i];
                 }
-                
+
                 if samples_read > 0 && samples_read < num_samples {
                     tracing::trace!(samples_read, num_samples, "audio buffer underrun");
                 }
@@ -310,22 +325,34 @@ impl Mixer {
 
             self.pts += num_samples;
 
-            match unsafe { ffmpeg::ffi::avcodec_send_frame(self.encoder.as_mut_ptr(), self.frame) } {
+            match unsafe { ffmpeg::ffi::avcodec_send_frame(self.encoder.as_mut_ptr(), self.frame) }
+            {
                 e if e < 0 => Err(ffmpeg::Error::from(e)),
                 _ => Ok(()),
             }?;
 
             loop {
-                match unsafe { ffmpeg::ffi::avcodec_receive_packet(self.encoder.as_mut_ptr(), self.packet) } {
+                match unsafe {
+                    ffmpeg::ffi::avcodec_receive_packet(self.encoder.as_mut_ptr(), self.packet)
+                } {
                     e if e < 0 => match ffmpeg::Error::from(e) {
-                        ffmpeg::Error::Eof | ffmpeg::Error::Other { errno: libc::EAGAIN } => break,
+                        ffmpeg::Error::Eof
+                        | ffmpeg::Error::Other {
+                            errno: libc::EAGAIN,
+                        } => break,
                         error => Err(error)?,
                     },
-                    _ => {},
+                    _ => {}
                 };
 
                 unsafe { (*self.packet).stream_index = 0 };
-                unsafe { ffmpeg::ffi::av_packet_rescale_ts(self.packet, (*self.encoder.as_ptr()).time_base, (*self.output_stream).time_base); };
+                unsafe {
+                    ffmpeg::ffi::av_packet_rescale_ts(
+                        self.packet,
+                        (*self.encoder.as_ptr()).time_base,
+                        (*self.output_stream).time_base,
+                    );
+                };
                 match unsafe { ffmpeg::ffi::av_write_frame(self.fmt_ctx, self.packet) } {
                     e if e < 0 => Err(ffmpeg::Error::from(e)),
                     _ => Ok(()),

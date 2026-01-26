@@ -4,7 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use http_body_util::{BodyExt, Empty};
@@ -18,11 +18,14 @@ use ratatui::{
 use tachyonfx::{Interpolation, Motion, fx};
 use terminal_games_sdk::{
     app,
+    audio::{OggVorbisResource, Resource, mixer},
     network::Conn,
     peer::{self, PeerId},
     terminal::{TerminalGamesBackend, TerminalReader},
     terminput,
 };
+
+const SONG_DATA: &[u8] = include_bytes!("../../kitchen-sink/Mesmerizing Galaxy Loop.ogg");
 
 fn format_time(time: SystemTime) -> String {
     let duration = time
@@ -33,6 +36,13 @@ fn format_time(time: SystemTime) -> String {
     let minutes = (total_seconds / 60) % 60;
     let hours = (total_seconds / 3600) % 24;
     format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let seconds = total_seconds % 60;
+    let minutes = total_seconds / 60;
+    format!("{}:{:02}", minutes, seconds)
 }
 
 #[derive(Clone)]
@@ -68,6 +78,14 @@ async fn main() -> std::io::Result<()> {
     std::io::stdout().write(b"\x1b[?1003h")?;
 
     let conn_done = Arc::new(AtomicBool::new(false));
+
+    let song_resource =
+        Arc::new(OggVorbisResource::new(SONG_DATA).expect("Failed to decode OGG Vorbis audio"));
+    let song = song_resource.new_instance();
+    song.set_loop(true);
+    song.set_volume(0.8);
+    song.play();
+    let mut audio_volume = 0.8f32;
 
     let peer_id = peer::current_id();
     let target_peer_id = std::env::var("APP_ARGS")
@@ -141,14 +159,8 @@ async fn main() -> std::io::Result<()> {
     let mut effects: tachyonfx::EffectManager<()> = tachyonfx::EffectManager::default();
 
     let c = Color::Green;
-    let timer = (1000, Interpolation::QuadInOut);
-    let fx = fx::repeating(fx::ping_pong(fx::sweep_in(
-        Motion::LeftToRight,
-        10,
-        0,
-        c,
-        timer,
-    )));
+    let timer = (2000, Interpolation::QuadInOut);
+    let fx = fx::sweep_in(Motion::LeftToRight, 10, 0, c, timer);
     effects.add_effect(fx);
 
     let start = Instant::now();
@@ -182,6 +194,31 @@ async fn main() -> std::io::Result<()> {
                             );
                             let _ = target_peer_id.send(message.as_bytes());
                         }
+                    }
+                    terminput::key!(terminput::KeyCode::Char(' ')) => {
+                        if song.is_playing() {
+                            song.pause();
+                        } else {
+                            song.play();
+                        }
+                    }
+                    terminput::key!(terminput::KeyCode::Char('+'))
+                    | terminput::key!(terminput::KeyCode::Char('=')) => {
+                        audio_volume = (audio_volume + 0.1).min(2.0);
+                        song.set_volume(audio_volume);
+                    }
+                    terminput::key!(terminput::KeyCode::Char('-'))
+                    | terminput::key!(terminput::KeyCode::Char('_')) => {
+                        audio_volume = (audio_volume - 0.1).max(0.0);
+                        song.set_volume(audio_volume);
+                    }
+                    terminput::key!(terminput::KeyCode::Char('m')) => {
+                        if audio_volume > 0.0 {
+                            audio_volume = 0.0;
+                        } else {
+                            audio_volume = 0.8;
+                        }
+                        song.set_volume(audio_volume);
                     }
                     _ => {}
                 }
@@ -276,11 +313,28 @@ async fn main() -> std::io::Result<()> {
             })
             .unwrap_or_else(|_| "N/A".into());
 
+        let audio_status = {
+            let play_state = if song.is_playing() {
+                "Playing"
+            } else {
+                "Paused"
+            };
+            let current = format_duration(song.current_time());
+            let total = format_duration(song.duration());
+            format!(
+                "{} | Volume: {:.0}% | Position: {} / {}",
+                play_state,
+                audio_volume * 100.0,
+                current,
+                total
+            )
+        };
+
         terminal.draw(|frame| {
             let area = frame.area();
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}\n\nNetwork: {}\n\nPeer ID: {}\nPress 'p' to send a message to peer {}\n\nConnected Peers ({}):\n{}\n\nRecent Messages:\n{}",
+                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}\n\nAudio: {}\n  [Space]=Play/Pause  [+/-]=Volume  [M]=Mute\n\nNetwork: {}\n\nPeer ID: {}\nPress 'p' to send a message to peer {}\n\nConnected Peers ({}):\n{}\n\nRecent Messages:\n{}",
                     frame_counter,
                     last_event,
                     parts,
@@ -289,6 +343,7 @@ async fn main() -> std::io::Result<()> {
                     frame_counter as f64 / start.elapsed().as_secs_f64(),
                     event_counter,
                     "hello there".red().on_red(),
+                    audio_status,
                     net_info_str,
                     peer_id,
                     target_peer_id.as_ref()
@@ -304,7 +359,11 @@ async fn main() -> std::io::Result<()> {
             effects.process_effects(elapsed.into(), frame.buffer_mut(), area);
         })?;
         frame_counter += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        mixer().tick();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        mixer().tick();
     }
     std::io::stdout().write(b"\x1b[?1003l")?;
     Ok(())

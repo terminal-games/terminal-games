@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use wasmtime_wasi::I32Exit;
 
 use crate::{
-    audio::{AudioBuffer, Mixer, CHANNELS, FRAME_SIZE, SAMPLE_RATE},
+    audio::{AudioBuffer, CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::NetworkInformation,
     status_bar::StatusBar,
@@ -996,7 +996,7 @@ impl AppServer {
             .collect();
 
         let written = caller.data().audio_buffer.write(&samples);
-        
+
         Ok(written as i32)
     }
 
@@ -1034,11 +1034,7 @@ impl AppServer {
             return Ok(-1);
         }
 
-        if let Err(_) = mem.write(
-            &mut caller,
-            pts_ptr as usize,
-            &(pts as u64).to_le_bytes(),
-        ) {
+        if let Err(_) = mem.write(&mut caller, pts_ptr as usize, &(pts as u64).to_le_bytes()) {
             tracing::error!("audio_info: failed to write pts");
             return Ok(-1);
         }

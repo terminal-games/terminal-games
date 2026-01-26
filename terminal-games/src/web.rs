@@ -15,7 +15,7 @@ use axum::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{Html, Response},
     routing::get,
 };
@@ -74,7 +74,10 @@ impl WebServer {
             .route("/main.js", get(serve_main_js))
             .route("/opus-audio-player.js", get(serve_opus_audio_player_js))
             .route("/audio-socket.js", get(serve_audio_socket_js))
-            .route("/jitter-buffer-processor.js", get(serve_jitter_buffer_processor_js))
+            .route(
+                "/jitter-buffer-processor.js",
+                get(serve_jitter_buffer_processor_js),
+            )
             .route("/ws", get(websocket_handler))
             .route("/ws/audio", get(audio_websocket_handler))
             .with_state(self.clone());
@@ -164,7 +167,9 @@ async fn serve_jitter_buffer_processor_js() -> Response {
     Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/javascript")
-        .body(Body::from(include_str!("../web/jitter-buffer-processor.js")))
+        .body(Body::from(include_str!(
+            "../web/jitter-buffer-processor.js"
+        )))
         .unwrap()
 }
 
@@ -201,7 +206,9 @@ async fn websocket_handler(
         hex::encode(bytes)
     });
 
-    ws.on_upgrade(move |socket| handle_socket(socket, server, user_agent, args, connect_info, session_id))
+    ws.on_upgrade(move |socket| {
+        handle_socket(socket, server, user_agent, args, connect_info, session_id)
+    })
 }
 
 async fn audio_websocket_handler(
@@ -293,7 +300,11 @@ async fn handle_socket(
 
     let session_msg = format!("session:{}", session_id);
     let mut sender_for_output = {
-        if sender.send(Message::Text(session_msg.into())).await.is_err() {
+        if sender
+            .send(Message::Text(session_msg.into()))
+            .await
+            .is_err()
+        {
             return;
         }
         sender
