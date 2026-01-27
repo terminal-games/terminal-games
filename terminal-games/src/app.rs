@@ -35,7 +35,7 @@ pub struct AppServer {
 pub struct AppInstantiationParams {
     pub input_receiver: tokio::sync::mpsc::Receiver<SmallVec<[u8; 16]>>,
     pub output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
-    pub audio_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub audio_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     pub window_size_receiver: tokio::sync::mpsc::Receiver<(u16, u16)>,
     pub graceful_shutdown_token: CancellationToken,
     pub username: String,
@@ -142,18 +142,20 @@ impl AppServer {
                 }
             };
 
-            // audio task
-            tokio::task::spawn({
-                let audio_buffer = audio_buffer.clone();
-                let hard_shutdown_token = hard_shutdown_token.clone();
-                async move {
-                    let mut mixer = Mixer::new(audio_tx, audio_buffer).unwrap();
-                    let res = mixer.run(hard_shutdown_token).await;
-                    if let Err(e) = res {
-                        tracing::error!(?e, "mixer.run");
+            let audio_enabled = audio_tx.is_some();
+            if let Some(audio_tx) = audio_tx {
+                tokio::task::spawn({
+                    let audio_buffer = audio_buffer.clone();
+                    let hard_shutdown_token = hard_shutdown_token.clone();
+                    async move {
+                        let mut mixer = Mixer::new(audio_tx, audio_buffer).unwrap();
+                        let res = mixer.run(hard_shutdown_token).await;
+                        if let Err(e) = res {
+                            tracing::error!(?e, "mixer.run");
+                        }
                     }
-                }
-            });
+                });
+            }
 
             // output task
             tokio::task::spawn({
@@ -275,6 +277,7 @@ impl AppServer {
                 remote_sshid: params.remote_sshid,
                 term: params.term,
                 username: params.username,
+                audio_enabled,
             });
             let (mut app, mut instance_pre) = Self::prepare_instantiate(&ctx, first_app_shortname)
                 .await
@@ -394,6 +397,8 @@ impl AppServer {
         envs.push(("REMOTE_SSHID".to_string(), ctx.remote_sshid.clone()));
         envs.push(("USERNAME".to_string(), ctx.username.clone()));
         envs.push(("PEER_ID".to_string(), peer_id.to_bytes().encode_hex()));
+        envs.push(("APP_SHORTNAME".to_string(), shortname.to_string()));
+        envs.push(("AUDIO_ENABLED".to_string(), if ctx.audio_enabled { "1" } else { "0" }.to_string()));
         if let Some(term) = ctx.term.clone() {
             envs.push(("TERM".to_string(), term));
         }
@@ -1065,6 +1070,7 @@ pub struct AppContext {
     mesh: Mesh,
     remote_sshid: String,
     username: String,
+    audio_enabled: bool,
     term: Option<String>,
     linker: Arc<wasmtime::Linker<AppState>>,
     app_output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,

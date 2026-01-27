@@ -287,7 +287,7 @@ async fn handle_socket(
         args,
         input_receiver: input_rx,
         output_sender: output_tx,
-        audio_sender: audio_tx,
+        audio_sender: Some(audio_tx),
         remote_sshid,
         term: Some("xterm-256color".to_string()),
         username: username.clone(),
