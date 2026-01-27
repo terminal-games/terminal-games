@@ -124,6 +124,7 @@ pub struct Mixer {
     output_stream: *mut ffmpeg::ffi::AVStream,
     pts: usize,
     audio_buffer: Arc<AudioBuffer>,
+    audio_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
 unsafe impl Send for Mixer {}
@@ -155,8 +156,9 @@ impl Mixer {
         opts.set("frame_duration", "10");
         let encoder = encoder.open_with(opts)?;
 
+        let audio_tx_clone = audio_tx.clone();
         let (fmt_ctx, io) = unsafe {
-            let buffer_size = 2048;
+            let buffer_size = 4096;
             let buffer = ffmpeg::ffi::av_malloc(buffer_size);
             if buffer.is_null() {
                 anyhow::bail!("failed to allocate buffer");
@@ -165,13 +167,12 @@ impl Mixer {
             let opaque = Box::into_raw(Box::new(OutputOpaque {
                 write: Box::new(move |buf| {
                     let len = buf.len() as i32;
-                    // tracing::info!(capacity=audio_tx.capacity());
-                    match audio_tx.try_send(buf.to_vec()) {
+                    // tracing::info!(capacity=audio_tx_clone.capacity(), len);
+                    match audio_tx_clone.try_send(buf.to_vec()) {
                         Ok(_) => len,
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                             ffmpeg::ffi::AVERROR(libc::EAGAIN)
                         }
-                        // Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => 0,
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                             ffmpeg::ffi::AVERROR(libc::EIO)
                         }
@@ -281,6 +282,7 @@ impl Mixer {
             output_stream,
             pts: 0,
             audio_buffer,
+            audio_tx,
         })
     }
 
@@ -353,6 +355,7 @@ impl Mixer {
                         (*self.output_stream).time_base,
                     );
                 };
+                drop(self.audio_tx.reserve().await);
                 match unsafe { ffmpeg::ffi::av_write_frame(self.fmt_ctx, self.packet) } {
                     e if e < 0 => Err(ffmpeg::Error::from(e)),
                     _ => Ok(()),

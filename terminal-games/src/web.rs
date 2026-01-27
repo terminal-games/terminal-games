@@ -282,7 +282,7 @@ async fn handle_socket(
     let token = cancellation_token.clone();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(20);
-    let (audio_tx, audio_rx) = tokio::sync::mpsc::channel(100);
+    let (audio_tx, audio_rx) = tokio::sync::mpsc::channel(2);
     let exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
         args,
         input_receiver: input_rx,

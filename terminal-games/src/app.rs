@@ -398,7 +398,10 @@ impl AppServer {
         envs.push(("USERNAME".to_string(), ctx.username.clone()));
         envs.push(("PEER_ID".to_string(), peer_id.to_bytes().encode_hex()));
         envs.push(("APP_SHORTNAME".to_string(), shortname.to_string()));
-        envs.push(("AUDIO_ENABLED".to_string(), if ctx.audio_enabled { "1" } else { "0" }.to_string()));
+        envs.push((
+            "AUDIO_ENABLED".to_string(),
+            if ctx.audio_enabled { "1" } else { "0" }.to_string(),
+        ));
         if let Some(term) = ctx.term.clone() {
             envs.push(("TERM".to_string(), term));
         }
