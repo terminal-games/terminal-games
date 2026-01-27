@@ -163,7 +163,7 @@ impl SshServer {
             };
 
             let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
-            let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(2);
+            let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
             let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
                 args,
                 input_receiver: input_rx,

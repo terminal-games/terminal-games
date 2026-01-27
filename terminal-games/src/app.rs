@@ -144,15 +144,13 @@ impl AppServer {
 
             let audio_enabled = audio_tx.is_some();
             if let Some(audio_tx) = audio_tx {
-                tokio::task::spawn({
-                    let audio_buffer = audio_buffer.clone();
-                    let hard_shutdown_token = hard_shutdown_token.clone();
-                    async move {
-                        let mut mixer = Mixer::new(audio_tx, audio_buffer).unwrap();
-                        let res = mixer.run(hard_shutdown_token).await;
-                        if let Err(e) = res {
-                            tracing::error!(?e, "mixer.run");
-                        }
+                let audio_buffer = audio_buffer.clone();
+                let hard_shutdown_token = hard_shutdown_token.clone();
+                std::thread::spawn(move || {
+                    let mut mixer = Mixer::new(audio_tx, audio_buffer).unwrap();
+                    let res = mixer.run(hard_shutdown_token);
+                    if let Err(error) = res {
+                        tracing::error!(?error, "mixer.run");
                     }
                 });
             }

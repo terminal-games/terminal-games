@@ -4,6 +4,7 @@
 
 use std::{
     ffi::CString,
+    pin::Pin,
     ptr,
     sync::{
         Arc,
@@ -118,16 +119,13 @@ impl AudioBuffer {
 pub struct Mixer {
     encoder: ffmpeg::encoder::Audio,
     fmt_ctx: *mut ffmpeg::ffi::AVFormatContext,
-    _io: Box<OutputOpaque>,
+    _io: Pin<Box<OutputOpaque>>,
     frame: *mut ffmpeg::ffi::AVFrame,
     packet: *mut ffmpeg::ffi::AVPacket,
     output_stream: *mut ffmpeg::ffi::AVStream,
     pts: usize,
     audio_buffer: Arc<AudioBuffer>,
-    audio_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
-
-unsafe impl Send for Mixer {}
 
 const ALIGN: libc::c_int = 0;
 
@@ -156,7 +154,6 @@ impl Mixer {
         opts.set("frame_duration", "10");
         let encoder = encoder.open_with(opts)?;
 
-        let audio_tx_clone = audio_tx.clone();
         let (fmt_ctx, io) = unsafe {
             let buffer_size = 4096;
             let buffer = ffmpeg::ffi::av_malloc(buffer_size);
@@ -164,28 +161,25 @@ impl Mixer {
                 anyhow::bail!("failed to allocate buffer");
             }
 
-            let opaque = Box::into_raw(Box::new(OutputOpaque {
+            let io = Box::pin(OutputOpaque {
                 write: Box::new(move |buf| {
                     let len = buf.len() as i32;
                     // tracing::info!(capacity=audio_tx_clone.capacity(), len);
-                    match audio_tx_clone.try_send(buf.to_vec()) {
+                    match audio_tx.blocking_send(buf.to_vec()) {
                         Ok(_) => len,
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            ffmpeg::ffi::AVERROR(libc::EAGAIN)
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        Err(tokio::sync::mpsc::error::SendError(_)) => {
                             ffmpeg::ffi::AVERROR(libc::EIO)
                         }
                     }
                 }),
-            }));
+            });
 
             let write_flag = 1;
             let mut avio_ctx = ffmpeg::ffi::avio_alloc_context(
                 buffer as *mut libc::c_uchar,
                 buffer_size as i32,
                 write_flag,
-                opaque as *mut libc::c_void,
+                io.as_ref().get_ref() as *const _ as *mut libc::c_void,
                 None,
                 Some(write_packet_wrapper),
                 None,
@@ -194,8 +188,6 @@ impl Mixer {
                 ffmpeg::ffi::av_free(buffer);
                 anyhow::bail!("failed to allocate avio context");
             }
-
-            let io = Box::from_raw(opaque);
 
             let format_name = CString::new("ogg")?;
             let mut fmt_ctx = ptr::null_mut();
@@ -282,11 +274,10 @@ impl Mixer {
             output_stream,
             pts: 0,
             audio_buffer,
-            audio_tx,
         })
     }
 
-    pub async fn run(&mut self, cancellation_token: CancellationToken) -> anyhow::Result<()> {
+    pub fn run(&mut self, cancellation_token: CancellationToken) -> anyhow::Result<()> {
         let num_samples = self.encoder.frame_size() as usize;
         let sample_rate = self.encoder.rate();
         let start_time = Instant::now();
@@ -296,6 +287,10 @@ impl Mixer {
         tracing::info!(num_samples, sample_rate, "mixer started");
 
         loop {
+            if cancellation_token.is_cancelled() {
+                return Ok(());
+            }
+
             self.audio_buffer.pts.store(self.pts, Ordering::Release);
 
             unsafe {
@@ -317,12 +312,7 @@ impl Mixer {
                 start_time + Duration::from_secs_f64(self.pts as f64 / sample_rate as f64);
             let sleep_duration = expected_time.saturating_duration_since(Instant::now());
             if sleep_duration > Duration::ZERO {
-                tokio::select! {
-                    _ = tokio::time::sleep(sleep_duration) => {}
-                    _ = cancellation_token.cancelled() => {
-                        return Ok(());
-                    }
-                }
+                std::thread::sleep(sleep_duration);
             }
 
             self.pts += num_samples;
@@ -355,7 +345,6 @@ impl Mixer {
                         (*self.output_stream).time_base,
                     );
                 };
-                drop(self.audio_tx.reserve().await);
                 match unsafe { ffmpeg::ffi::av_write_frame(self.fmt_ctx, self.packet) } {
                     e if e < 0 => Err(ffmpeg::Error::from(e)),
                     _ => Ok(()),
@@ -372,11 +361,22 @@ impl Drop for Mixer {
             return;
         }
         unsafe {
-            if !(*self.fmt_ctx).pb.is_null() {
-                ffmpeg::ffi::avio_context_free(&mut (*self.fmt_ctx).pb);
+            ffmpeg::ffi::avcodec_send_frame(self.encoder.as_mut_ptr(), ptr::null());
+            loop {
+                let ret =
+                    ffmpeg::ffi::avcodec_receive_packet(self.encoder.as_mut_ptr(), self.packet);
+                if ret < 0 {
+                    break;
+                }
+                ffmpeg::ffi::av_packet_unref(self.packet);
             }
+            ffmpeg::ffi::av_frame_free(&mut self.frame);
+            ffmpeg::ffi::av_packet_free(&mut self.packet);
+            let mut pb = (*self.fmt_ctx).pb;
+            let buffer = (*pb).buffer;
             ffmpeg::ffi::avformat_free_context(self.fmt_ctx);
-            self.fmt_ctx = ptr::null_mut();
+            ffmpeg::ffi::avio_context_free(&mut pb);
+            ffmpeg::ffi::av_free(buffer as *mut libc::c_void);
         }
         tracing::info!("dropped mixer");
     }
