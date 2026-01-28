@@ -53,7 +53,7 @@ export class OpusAudioPlayer {
         this.preSkip = opusHead[10] | (opusHead[11] << 8);
         this.preSkipRemaining = this.preSkip;
         
-        console.log(`Opus: ${this.channels} channels, pre-skip: ${this.preSkip} samples`);
+        // console.log(`Opus: ${this.channels} channels, pre-skip: ${this.preSkip} samples`);
         
         this.decoder = new AudioDecoder({
             output: (audioData) => this.handleDecodedAudio(audioData),

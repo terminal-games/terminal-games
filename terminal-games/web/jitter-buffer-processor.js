@@ -14,7 +14,7 @@ class JitterBufferProcessor extends AudioWorkletProcessor {
                 this.pushSamples(e.data.left, e.data.right);
             } else if (e.data.type === 'adjustBufferMs') {
                 this.targetBufferMs += e.data.deltaMs;
-                console.log("adjustBufferMs message targetBufferMs", this.targetBufferMs)
+                // console.log("adjustBufferMs message targetBufferMs", this.targetBufferMs)
             }
         };
     }

@@ -306,7 +306,7 @@ impl Mixer {
 
         let mut read_buffer = vec![0.0f32; frame_size * CHANNELS];
 
-        tracing::info!(frame_size, sample_rate, channels = CHANNELS, "mixer started");
+        // tracing::info!(frame_size, sample_rate, channels = CHANNELS, "mixer started");
 
         loop {
             if cancellation_token.is_cancelled() {
@@ -402,7 +402,6 @@ impl Drop for Mixer {
             ffmpeg::ffi::avio_context_free(&mut pb);
             ffmpeg::ffi::av_free(buffer as *mut libc::c_void);
         }
-        tracing::info!("dropped mixer");
     }
 }
 

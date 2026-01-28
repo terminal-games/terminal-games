@@ -147,11 +147,14 @@ impl AppServer {
                 let audio_buffer = audio_buffer.clone();
                 let hard_shutdown_token = hard_shutdown_token.clone();
                 std::thread::spawn(move || {
-                    let mut mixer = Mixer::new(audio_tx, audio_buffer).unwrap();
-                    let res = mixer.run(hard_shutdown_token);
-                    if let Err(error) = res {
-                        tracing::error!(?error, "mixer.run");
-                    }
+                    let mut mixer = match Mixer::new(audio_tx, audio_buffer) {
+                        Ok(mixer) => mixer,
+                        Err(error) => {
+                            tracing::error!(?error, "Failed to create mixer");
+                            return;
+                        }
+                    };
+                    _ = mixer.run(hard_shutdown_token);
                 });
             }
 
