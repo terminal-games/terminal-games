@@ -20,7 +20,6 @@ use axum::{
     routing::get,
 };
 use bytes::Bytes;
-use dashmap::DashMap;
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
 use futures::{SinkExt, StreamExt};
@@ -32,8 +31,6 @@ use tower::{Service, ServiceExt};
 
 use crate::app::{AppInstantiationParams, AppServer};
 use crate::rate_limiting::{NetworkInformation, RateLimitedStream};
-
-type AudioSessionMap = DashMap<String, tokio::sync::mpsc::Receiver<Vec<u8>>>;
 
 #[derive(Clone)]
 struct MyConnectInfo {
@@ -49,15 +46,11 @@ impl Connected<MyConnectInfo> for MyConnectInfo {
 #[derive(Clone)]
 pub struct WebServer {
     app_server: Arc<AppServer>,
-    audio_sessions: Arc<AudioSessionMap>,
 }
 
 impl WebServer {
     pub fn new(app_server: Arc<AppServer>) -> Self {
-        Self {
-            app_server,
-            audio_sessions: Arc::new(DashMap::new()),
-        }
+        Self { app_server }
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -73,13 +66,11 @@ impl WebServer {
             .route("/styles.css", get(serve_styles))
             .route("/main.js", get(serve_main_js))
             .route("/opus-audio-player.js", get(serve_opus_audio_player_js))
-            .route("/audio-socket.js", get(serve_audio_socket_js))
             .route(
                 "/jitter-buffer-processor.js",
                 get(serve_jitter_buffer_processor_js),
             )
             .route("/ws", get(websocket_handler))
-            .route("/ws/audio", get(audio_websocket_handler))
             .with_state(self.clone());
 
         let mut make_service = app.into_make_service_with_connect_info::<MyConnectInfo>();
@@ -155,14 +146,6 @@ async fn serve_opus_audio_player_js() -> Response {
         .unwrap()
 }
 
-async fn serve_audio_socket_js() -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/javascript")
-        .body(Body::from(include_str!("../web/audio-socket.js")))
-        .unwrap()
-}
-
 async fn serve_jitter_buffer_processor_js() -> Response {
     Response::builder()
         .status(StatusCode::OK)
@@ -176,12 +159,6 @@ async fn serve_jitter_buffer_processor_js() -> Response {
 #[derive(Deserialize)]
 struct WebSocketQuery {
     args: Option<String>,
-    session: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct AudioWebSocketQuery {
-    session: String,
 }
 
 async fn websocket_handler(
@@ -199,68 +176,7 @@ async fn websocket_handler(
 
     let args = query.args.map(|s| s.into_bytes());
 
-    let session_id = query.session.unwrap_or_else(|| {
-        use rand_core::RngCore;
-        let mut bytes = [0u8; 16];
-        rand_core::OsRng.fill_bytes(&mut bytes);
-        hex::encode(bytes)
-    });
-
-    ws.on_upgrade(move |socket| {
-        handle_socket(socket, server, user_agent, args, connect_info, session_id)
-    })
-}
-
-async fn audio_websocket_handler(
-    ws: WebSocketUpgrade,
-    Query(query): Query<AudioWebSocketQuery>,
-    State(server): State<WebServer>,
-) -> Response {
-    ws.on_upgrade(move |socket| handle_audio_socket(socket, server, query.session))
-}
-
-async fn handle_audio_socket(socket: WebSocket, server: WebServer, session_id: String) {
-    let (mut sender, mut receiver) = socket.split();
-
-    let start = std::time::Instant::now();
-    let audio_rx = loop {
-        if let Some((_, rx)) = server.audio_sessions.remove(&session_id) {
-            break Some(rx);
-        }
-        if start.elapsed() > std::time::Duration::from_secs(10) {
-            tracing::warn!(%session_id, "Audio WebSocket timed out waiting for session");
-            break None;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    };
-
-    let Some(mut audio_rx) = audio_rx else {
-        return;
-    };
-
-    loop {
-        tokio::select! {
-            msg = receiver.next() => {
-                match msg {
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) => break,
-                    Some(Ok(Message::Text(text))) => {
-                        let text_str = text.to_string();
-                        if text_str.starts_with("ping:") {
-                            let timestamp = &text_str[5..];
-                            let _ = sender.send(Message::Text(format!("pong:{}", timestamp).into())).await;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            data = audio_rx.recv() => {
-                let Some(data) = data else { break };
-                if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
-                    break;
-                }
-            }
-        }
-    }
+    ws.on_upgrade(move |socket| handle_socket(socket, server, user_agent, args, connect_info))
 }
 
 async fn handle_socket(
@@ -269,7 +185,6 @@ async fn handle_socket(
     user_agent: String,
     args: Option<Vec<u8>>,
     connect_info: MyConnectInfo,
-    session_id: String,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -282,7 +197,7 @@ async fn handle_socket(
     let token = cancellation_token.clone();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(20);
-    let (audio_tx, audio_rx) = tokio::sync::mpsc::channel(1);
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
     let exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
         args,
         input_receiver: input_rx,
@@ -296,65 +211,63 @@ async fn handle_socket(
         network_info: connect_info.network_info,
     });
 
-    server.audio_sessions.insert(session_id.clone(), audio_rx);
-
-    let session_msg = format!("session:{}", session_id);
-    let mut sender_for_output = {
-        if sender
-            .send(Message::Text(session_msg.into()))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        sender
-    };
+    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel(1);
 
     tokio::task::spawn(async move {
-        while let Some(data) = output_rx.recv().await {
-            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-            if encoder.write_all(&data).is_err() {
-                break;
-            }
-            let compressed = match encoder.finish() {
-                Ok(compressed) => compressed,
-                Err(_) => break,
-            };
-
-            if sender_for_output
-                .send(Message::Binary(Bytes::from(compressed)))
-                .await
-                .is_err()
-            {
-                break;
+        loop {
+            tokio::select! {
+                data = output_rx.recv() => {
+                    let Some(data) = data else { break };
+                    let mut msg = Vec::with_capacity(data.len() / 2);
+                    {
+                        let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
+                        if encoder.write_all(&data).is_err() || encoder.finish().is_err() {
+                            break;
+                        }
+                    }
+                    msg.push(0x00);
+                    if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
+                        break;
+                    }
+                }
+                data = audio_rx.recv() => {
+                    let Some(mut data) = data else { break };
+                    data.push(0x01);
+                    if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
+                        break;
+                    }
+                }
+                ts = pong_rx.recv() => {
+                    let Some(ts) = ts else { break };
+                    if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
 
-    let input_tx_clone = input_tx.clone();
     let cancellation_token_clone = cancellation_token.clone();
     tokio::task::spawn(async move {
         while let Some(msg) = receiver.next().await {
             match msg {
                 Ok(Message::Binary(data)) => {
                     let data: smallvec::SmallVec<[u8; 16]> = data.as_ref().into();
-                    if input_tx_clone.send(data).await.is_err() {
+                    if input_tx.send(data).await.is_err() {
                         break;
                     }
                 }
                 Ok(Message::Text(text)) => {
                     let text_str = text.to_string();
-                    if text_str.starts_with("resize:") {
-                        if let Some((w, h)) = parse_resize(&text_str) {
+                    if let Some(rest) = text_str.strip_prefix("resize:") {
+                        if let Some((w, h)) = parse_resize(rest) {
                             let _ = resize_tx.send((w, h)).await;
                         }
+                    } else if let Some(ts) = text_str.strip_prefix("ping:") {
+                        let _ = pong_tx.send(ts.to_string()).await;
                     }
                 }
-                Ok(Message::Close(_)) => {
-                    cancellation_token_clone.cancel();
-                    break;
-                }
-                Err(_) => {
+                Ok(Message::Close(_)) | Err(_) => {
                     cancellation_token_clone.cancel();
                     break;
                 }
@@ -371,13 +284,8 @@ async fn handle_socket(
 }
 
 fn parse_resize(text: &str) -> Option<(u16, u16)> {
-    let parts: Vec<&str> = text.split(':').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let w: u16 = parts[1].parse().ok()?;
-    let h: u16 = parts[2].parse().ok()?;
-    Some((w, h))
+    let (w, h) = text.split_once(':')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
 }
 
 fn sanitize_user_agent(ua: &str) -> String {

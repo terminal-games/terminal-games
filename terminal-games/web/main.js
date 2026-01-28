@@ -1,5 +1,7 @@
 import { OpusAudioPlayer } from './opus-audio-player.js';
-import { connectAudioSocket } from './audio-socket.js';
+
+const MIN_BUFFER_MS = 50;
+const MAX_BUFFER_MS = 1000;
 
 await document.fonts.ready;
 
@@ -27,8 +29,6 @@ fitAddon.fit();
 const audioPlayer = new OpusAudioPlayer();
 await audioPlayer.init();
 
-let audioSocketHandle = null;
-
 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 const queryString = window.location.search;
 const wsUrl = `${protocol}//${window.location.host}/ws${queryString}`;
@@ -36,34 +36,60 @@ const socket = new WebSocket(wsUrl);
 
 socket.binaryType = 'arraybuffer';
 
+let smoothedPeakLatency = 0;
+let lastTargetBufferMs = 0;
+let pingInterval = null;
+
+const measureLatency = () => {
+    if (socket.readyState === WebSocket.OPEN) {
+        socket.send(`ping:${performance.now()}`);
+    }
+};
+
 socket.onopen = () => {
-    const cols = term.cols;
-    const rows = term.rows;
-    socket.send(`resize:${cols}:${rows}`);
+    socket.send(`resize:${term.cols}:${term.rows}`);
+    pingInterval = setInterval(measureLatency, 5000);
+    measureLatency();
 };
 
 socket.onmessage = async (event) => {
     if (typeof event.data === 'string') {
-        if (event.data.startsWith('session:')) {
-            const sessionId = event.data.substring(8);
-            audioSocketHandle = connectAudioSocket(sessionId, audioPlayer);
+        if (event.data.startsWith('pong:')) {
+            const pingTimestamp = parseFloat(event.data.substring(5));
+            const rtt = performance.now() - pingTimestamp;
+
+            const decay = Math.max(0, (smoothedPeakLatency - rtt) * 0.10);
+            smoothedPeakLatency = Math.max(rtt, smoothedPeakLatency - decay);
+
+            const targetBufferMs = Math.max(MIN_BUFFER_MS, Math.min(MAX_BUFFER_MS, smoothedPeakLatency * 1.2));
+            const deltaMs = targetBufferMs - lastTargetBufferMs;
+            lastTargetBufferMs = targetBufferMs;
+
+            if (audioPlayer.workletNode && deltaMs !== 0) {
+                audioPlayer.workletNode.port.postMessage({
+                    type: 'adjustBufferMs',
+                    deltaMs: deltaMs
+                });
+            }
         }
         return;
     }
-    
-    if (event.data instanceof ArrayBuffer) {
+
+    if (!(event.data instanceof ArrayBuffer) || event.data.byteLength < 1) return;
+
+    const data = new Uint8Array(event.data);
+    const type = data[data.length - 1];
+    const payload = data.subarray(0, data.length - 1);
+
+    if (type === 0x00) {
         try {
-            const decompressionStream = new DecompressionStream('deflate-raw');
             const stream = new ReadableStream({
                 start(controller) {
-                    controller.enqueue(new Uint8Array(event.data));
+                    controller.enqueue(payload);
                     controller.close();
                 }
             });
-            
-            const decompressedStream = stream.pipeThrough(decompressionStream);
-            const reader = decompressedStream.getReader();
-            
+            const reader = stream.pipeThrough(new DecompressionStream('deflate-raw')).getReader();
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
@@ -71,9 +97,10 @@ socket.onmessage = async (event) => {
             }
         } catch (error) {
             console.error('Decompression error:', error);
-            const bytes = new Uint8Array(event.data);
-            term.write(bytes);
+            term.write(payload);
         }
+    } else if (type === 0x01) {
+        audioPlayer.onAudioData(payload);
     }
 };
 
@@ -84,17 +111,16 @@ socket.onerror = (error) => {
 
 socket.onclose = () => {
     term.write('\r\n\x1b[31mWebSocket connection closed\x1b[0m\r\n');
-    audioPlayer.close();
-    if (audioSocketHandle) {
-        audioSocketHandle.close();
+    if (pingInterval) {
+        clearInterval(pingInterval);
+        pingInterval = null;
     }
+    audioPlayer.close();
 };
 
 term.onData((data) => {
     if (socket.readyState === WebSocket.OPEN) {
-        const encoder = new TextEncoder();
-        const bytes = encoder.encode(data);
-        socket.send(bytes.buffer);
+        socket.send(new TextEncoder().encode(data).buffer);
     }
 });
 
@@ -114,6 +140,4 @@ term.onResize((size) => {
     }
 });
 
-window.addEventListener('resize', () => {
-    fitAddon.fit();
-});
+window.addEventListener('resize', () => fitAddon.fit());
