@@ -52,15 +52,16 @@ impl Mixer {
         state.instances.push(Arc::downgrade(instance));
     }
 
-    fn mix(&self, num_samples: usize) -> Vec<f32> {
+    fn mix(&self, num_frames: usize) -> Vec<f32> {
         let mut state = self.state.lock().unwrap();
 
-        if state.mix_buffer.len() < num_samples {
-            state.mix_buffer.resize(num_samples, 0.0);
-            state.scratch_buffer.resize(num_samples, 0.0);
+        let num_values = num_frames * super::CHANNELS;
+        if state.mix_buffer.len() < num_values {
+            state.mix_buffer.resize(num_values, 0.0);
+            state.scratch_buffer.resize(num_values, 0.0);
         }
 
-        for sample in &mut state.mix_buffer[..num_samples] {
+        for sample in &mut state.mix_buffer[..num_values] {
             *sample = 0.0;
         }
 
@@ -72,24 +73,24 @@ impl Mixer {
         state.instances.retain(|weak| weak.strong_count() > 0);
 
         for instance in live_instances {
-            for sample in &mut state.scratch_buffer[..num_samples] {
+            for sample in &mut state.scratch_buffer[..num_values] {
                 *sample = 0.0;
             }
 
-            instance.fill_buffer(&mut state.scratch_buffer[..num_samples]);
+            instance.fill_buffer(&mut state.scratch_buffer[..num_values]);
 
-            for i in 0..num_samples {
+            for i in 0..num_values {
                 state.mix_buffer[i] += state.scratch_buffer[i];
             }
         }
 
         let master_volume = state.master_volume;
-        for sample in &mut state.mix_buffer[..num_samples] {
+        for sample in &mut state.mix_buffer[..num_values] {
             *sample *= master_volume;
             *sample = sample.clamp(-1.0, 1.0);
         }
 
-        state.mix_buffer[..num_samples].to_vec()
+        state.mix_buffer[..num_values].to_vec()
     }
 
     /// Performs one tick of mixing and writing to the host.
@@ -101,7 +102,7 @@ impl Mixer {
             return;
         };
 
-        let target_buffer = FRAME_SIZE as u32 * 3;
+        let target_buffer = FRAME_SIZE as u32 * 2;
 
         if audio_info.buffer_available >= target_buffer {
             return;
@@ -109,18 +110,13 @@ impl Mixer {
 
         let needed = (target_buffer - audio_info.buffer_available) as usize;
         let frames = (needed + FRAME_SIZE - 1) / FRAME_SIZE;
-        let num_samples = frames * FRAME_SIZE;
+        let num_frames = frames * FRAME_SIZE;
 
-        if num_samples == 0 {
+        if num_frames == 0 {
             return;
         }
 
-        let mixed = self.mix(num_samples);
+        let mixed = self.mix(num_frames);
         host::write(&mixed);
     }
 }
-
-// SAFETY: The Mixer uses internal Mutex for thread safety.
-// In WASM single-threaded environment, this is primarily for API consistency.
-// unsafe impl Send for Mixer {}
-// unsafe impl Sync for Mixer {}

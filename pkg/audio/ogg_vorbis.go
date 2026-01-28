@@ -4,7 +4,7 @@
 
 // Convert any audio file into OGG Vorbis with an ffmpeg command like the following ahead of time:
 //
-//	ffmpeg -i input.mp3 -af "pan=mono|c0=c1" -c:a libvorbis -qscale:a 2 -ar 48000 output.ogg
+//	ffmpeg -i input.mp3 -c:a libvorbis -qscale:a 2 -ar 48000 output.ogg
 package audio
 
 import (
@@ -16,9 +16,10 @@ import (
 )
 
 type OGGVorbisResource struct {
-	data        []byte
-	sampleRate  int
-	totalLength int
+	data           []byte
+	sampleRate     int
+	sourceChannels int
+	totalLength    int
 }
 
 var _ Resource = (*OGGVorbisResource)(nil)
@@ -30,9 +31,10 @@ func NewResourceFromOGGVorbis(data []byte) (*OGGVorbisResource, error) {
 	}
 
 	return &OGGVorbisResource{
-		data:        data,
-		sampleRate:  r.SampleRate(),
-		totalLength: int(r.Length()),
+		data:           data,
+		sampleRate:     r.SampleRate(),
+		sourceChannels: r.Channels(),
+		totalLength:    int(r.Length()),
 	}, nil
 }
 
@@ -78,17 +80,60 @@ func (d *oggVorbisDecoder) Read(buffer []float32) (int, error) {
 		return 0, io.EOF
 	}
 
-	toRead := min(len(buffer), remaining)
+	maxFrames := len(buffer) / Channels
+	toReadFrames := min(maxFrames, remaining)
+	if toReadFrames == 0 {
+		return 0, nil
+	}
 
+	sourceChannels := d.resource.sourceChannels
 	written := 0
-	for written < toRead {
-		chunkSize := min(toRead-written, len(d.readBuffer))
 
-		n, err := d.reader.Read(d.readBuffer[:chunkSize])
+	for written/Channels < toReadFrames {
+		sourceValuesToRead := min(toReadFrames-written/Channels, len(d.readBuffer)/sourceChannels) * sourceChannels
+		n, err := d.reader.Read(d.readBuffer[:sourceValuesToRead])
+
 		if n > 0 {
-			copy(buffer[written:], d.readBuffer[:n])
-			written += n
-			d.position += n
+			framesRead := n / sourceChannels
+
+			switch sourceChannels {
+			case 1:
+				for i := range framesRead {
+					sample := d.readBuffer[i]
+					buffer[written] = sample
+					buffer[written+1] = sample
+					written += 2
+				}
+			case 2:
+				copy(buffer[written:], d.readBuffer[:n])
+				written += n
+			default:
+				// Multi-channel: mixdown to stereo
+				for i := range framesRead {
+					var left, right float32
+					for ch := range sourceChannels {
+						sample := d.readBuffer[i*sourceChannels+ch]
+						if ch%2 == 0 {
+							left += sample
+						} else {
+							right += sample
+						}
+					}
+					leftChannels := (sourceChannels + 1) / 2
+					rightChannels := sourceChannels / 2
+					if leftChannels > 0 {
+						left /= float32(leftChannels)
+					}
+					if rightChannels > 0 {
+						right /= float32(rightChannels)
+					}
+					buffer[written] = left
+					buffer[written+1] = right
+					written += 2
+				}
+			}
+
+			d.position += framesRead
 		}
 
 		if err == io.EOF {

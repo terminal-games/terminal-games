@@ -23,7 +23,7 @@ use std::time::Duration;
 
 pub const SAMPLE_RATE: u32 = 48000;
 pub const FRAME_SIZE: usize = 480;
-pub const CHANNELS: usize = 1;
+pub const CHANNELS: usize = 2;
 
 /// Resources represent audio data that can be instantiated for playback.
 /// A single Resource can have multiple Instances playing simultaneously.
@@ -31,7 +31,7 @@ pub trait Resource: Send + Sync {
     /// Returns the total duration of the audio.
     fn duration(&self) -> Duration;
 
-    /// Returns the total number of samples.
+    /// Returns the total number of frames (per-channel samples).
     fn sample_count(&self) -> usize;
 
     /// Creates a new playable Instance of this Resource.
@@ -42,17 +42,18 @@ pub trait Resource: Send + Sync {
 }
 
 pub(crate) trait Decoder: Send {
-    /// Fills the buffer with samples and returns the number of samples read.
+    /// Fills the buffer with interleaved stereo samples and returns the number
+    /// of f32 values read (frames * CHANNELS).
     ///
     /// Returns 0 when reaching the end of the audio.
     fn read(&mut self, buffer: &mut [f32]) -> usize;
 
-    /// Sets the playback position in samples.
+    /// Sets the playback position in frames.
     fn seek(&mut self, position: usize);
 
-    /// Returns the current playback position in samples.
+    /// Returns the current playback position in frames.
     fn position(&self) -> usize;
 
-    /// Returns the total number of samples.
+    /// Returns the total number of frames.
     fn length(&self) -> usize;
 }

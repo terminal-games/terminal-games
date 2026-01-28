@@ -60,16 +60,17 @@ func (m *Mixer) removeInstance(inst *Instance) {
 	}
 }
 
-func (m *Mixer) mix(numSamples int) []float32 {
+func (m *Mixer) mix(numFrames int) []float32 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if len(m.mixBuffer) < numSamples {
-		m.mixBuffer = make([]float32, numSamples)
-		m.scratchBuffer = make([]float32, numSamples)
+	numValues := numFrames * Channels
+	if len(m.mixBuffer) < numValues {
+		m.mixBuffer = make([]float32, numValues)
+		m.scratchBuffer = make([]float32, numValues)
 	}
 
-	for i := range numSamples {
+	for i := range numValues {
 		m.mixBuffer[i] = 0
 	}
 
@@ -78,18 +79,18 @@ func (m *Mixer) mix(numSamples int) []float32 {
 			continue
 		}
 
-		for i := range numSamples {
+		for i := range numValues {
 			m.scratchBuffer[i] = 0
 		}
 
-		inst.fillBuffer(m.scratchBuffer[:numSamples])
+		inst.fillBuffer(m.scratchBuffer[:numValues])
 
-		for i := range numSamples {
+		for i := range numValues {
 			m.mixBuffer[i] += m.scratchBuffer[i]
 		}
 	}
 
-	for i := range numSamples {
+	for i := range numValues {
 		sample := m.mixBuffer[i] * m.volume
 		if sample > 1.0 {
 			sample = 1.0
@@ -99,7 +100,7 @@ func (m *Mixer) mix(numSamples int) []float32 {
 		m.mixBuffer[i] = sample
 	}
 
-	return m.mixBuffer[:numSamples]
+	return m.mixBuffer[:numValues]
 }
 
 func startMixer() {
@@ -112,12 +113,12 @@ func startMixer() {
 	globalMixer.mu.Unlock()
 
 	go func() {
-		writer := NewAudioWriter(FrameSize * 3)
+		writer := NewAudioWriter(FrameSize * 2)
 
 		for {
-			needed := writer.ShouldWrite()
-			if needed > 0 {
-				mixed := globalMixer.mix(needed)
+			neededFrames := writer.ShouldWrite()
+			if neededFrames > 0 {
+				mixed := globalMixer.mix(neededFrames)
 				written := Write(mixed)
 				if written > 0 {
 					writer.NextPTS += uint64(written)

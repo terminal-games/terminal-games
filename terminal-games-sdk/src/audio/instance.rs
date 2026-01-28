@@ -83,13 +83,13 @@ impl Instance {
         state.playing
     }
 
-    /// Returns the current playback position in samples.
+    /// Returns the current playback position in frames.
     pub fn position(&self) -> usize {
         let state = self.state.lock().unwrap();
         state.decoder.position()
     }
 
-    /// Sets the playback position in samples.
+    /// Sets the playback position in frames.
     pub fn seek(&self, position: usize) {
         let mut state = self.state.lock().unwrap();
         state.decoder.seek(position);
@@ -97,8 +97,8 @@ impl Instance {
 
     /// Sets the playback position as a duration from the start.
     pub fn seek_duration(&self, duration: Duration) {
-        let samples = (duration.as_secs_f64() * SAMPLE_RATE as f64) as usize;
-        self.seek(samples);
+        let frames = (duration.as_secs_f64() * SAMPLE_RATE as f64) as usize;
+        self.seek(frames);
     }
 
     /// Returns the current playback position as a duration.

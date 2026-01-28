@@ -41,22 +41,23 @@ pub fn info() -> Option<AudioInfo> {
     })
 }
 
-/// Write mono audio samples to the mixer buffer.
+/// Write interleaved stereo audio samples to the mixer buffer.
 ///
-/// Samples should be mono f32 values: `[S0, S1, S2, ...]`.
+/// Samples should be interleaved stereo f32 values: `[L0, R0, L1, R1, ...]`.
 /// Values should be in the range `[-1.0, 1.0]`.
 ///
-/// This function is non-blocking. If the buffer is full, samples may be
-/// dropped. Check the return value to see how many samples were actually
+/// This function is non-blocking. If the buffer is full, frames may be
+/// dropped. Check the return value to see how many frames were actually
 /// written.
 ///
-/// Returns the number of samples written, or a negative value on error.
+/// Returns the number of frames written, or a negative value on error.
 pub fn write(samples: &[f32]) -> i32 {
     if samples.is_empty() {
         return 0;
     }
 
-    unsafe { internal::audio_write(samples.as_ptr(), samples.len() as u32) }
+    let frame_count = samples.len() / super::CHANNELS;
+    unsafe { internal::audio_write(samples.as_ptr(), frame_count as u32) }
 }
 
 /// Helper for continuously writing audio with automatic timing management.
@@ -97,10 +98,10 @@ impl AudioWriter {
 
     /// Calls the provided function to generate samples when needed.
     ///
-    /// The callback receives the PTS and number of samples to generate, and should
-    /// return mono float32 samples.
+    /// The callback receives the PTS and number of frames to generate, and should
+    /// return interleaved stereo float32 samples: `[L0, R0, L1, R1, ...]`.
     ///
-    /// This method updates `next_pts` automatically based on how many samples were
+    /// This method updates `next_pts` automatically based on how many frames were
     /// written.
     pub fn write_callback<F>(&mut self, generate: F) -> i32
     where
@@ -122,6 +123,6 @@ impl AudioWriter {
 
 impl Default for AudioWriter {
     fn default() -> Self {
-        Self::new(FRAME_SIZE as u32 * 3)
+        Self::new(FRAME_SIZE as u32 * 2)
     }
 }

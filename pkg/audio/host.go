@@ -58,27 +58,27 @@ func Info() (AudioInfo, error) {
 	}, nil
 }
 
-// Write writes mono audio samples to the mixer buffer.
+// Write writes interleaved stereo audio samples to the mixer buffer.
 //
-// Samples should be mono float32 values: [S0, S1, S2, ...].
+// Samples should be interleaved stereo float32 values: [L0, R0, L1, R1, ...].
 // Values should be in the range [-1.0, 1.0].
 //
 // This function is non-blocking. If the buffer is full, samples may be
-// dropped. Check the return value to see how many samples were actually
+// dropped. Check the return value to see how many frames were actually
 // written.
 //
-// Returns the number of samples written, or a negative value on error.
+// Returns the number of frames written, or a negative value on error.
 func Write(samples []float32) int {
 	if len(samples) == 0 {
 		return 0
 	}
 
-	samplePairs := len(samples) / Channels
-	if samplePairs == 0 {
+	frameCount := len(samples) / Channels
+	if frameCount == 0 {
 		return 0
 	}
 
-	ret := audio_write(unsafe.Pointer(&samples[0]), uint32(samplePairs))
+	ret := audio_write(unsafe.Pointer(&samples[0]), uint32(frameCount))
 	return int(ret)
 }
 
@@ -122,12 +122,12 @@ func (w *AudioWriter) ShouldWrite() int {
 
 // WriteCallback calls the provided function to generate samples when needed.
 //
-// The callback receives the PTS and number of samples to generate, and should
-// return mono float32 samples.
+// The callback receives the PTS and number of frames to generate, and should
+// return interleaved stereo float32 samples: [L0, R0, L1, R1, ...].
 //
-// This method updates NextPTS automatically based on how many samples were
+// This method updates NextPTS automatically based on how many frames were
 // written.
-func (w *AudioWriter) WriteCallback(generate func(pts uint64, numSamples int) []float32) int {
+func (w *AudioWriter) WriteCallback(generate func(pts uint64, numFrames int) []float32) int {
 	needed := w.ShouldWrite()
 	if needed == 0 {
 		return 0

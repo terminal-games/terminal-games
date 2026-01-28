@@ -15,7 +15,7 @@ func init() {
 const (
 	SampleRate = 48000
 	FrameSize  = 480
-	Channels   = 1
+	Channels   = 2
 )
 
 // Resource represents audio data that can be instantiated for playback.
@@ -33,16 +33,17 @@ type Resource interface {
 }
 
 type decoder interface {
-	// Read fills the buffer with samples and returns the number of samples read.
+	// Read fills the buffer with interleaved stereo samples and returns the
+	// number of f32 values read (frames * Channels).
 	// Returns io.EOF when reaching the end of the audio.
 	Read(buffer []float32) (int, error)
 
-	// Seek sets the playback position in samples.
+	// Seek sets the playback position in frames.
 	Seek(position int)
 
-	// Position returns the current playback position in samples.
+	// Position returns the current playback position in frames.
 	Position() int
 
-	// Length returns the total number of samples.
+	// Length returns the total number of frames.
 	Length() int
 }

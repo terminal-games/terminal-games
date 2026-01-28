@@ -15,6 +15,8 @@ type RawResource struct {
 
 var _ Resource = (*RawResource)(nil)
 
+// NewResourceFromSamples creates a RawResource from interleaved stereo samples.
+// Samples should be in the format: [L0, R0, L1, R1, ...].
 func NewResourceFromSamples(samples []float32) *RawResource {
 	return &RawResource{
 		samples: samples,
@@ -22,11 +24,12 @@ func NewResourceFromSamples(samples []float32) *RawResource {
 }
 
 func (r *RawResource) Duration() time.Duration {
-	return time.Duration(float64(len(r.samples)) / float64(SampleRate) * float64(time.Second))
+	frameCount := len(r.samples) / Channels
+	return time.Duration(float64(frameCount) / float64(SampleRate) * float64(time.Second))
 }
 
 func (r *RawResource) SampleCount() int {
-	return len(r.samples)
+	return len(r.samples) / Channels
 }
 
 func (r *RawResource) NewInstance() *Instance {
@@ -50,26 +53,30 @@ func newRawDecoder(r *RawResource) *rawDecoder {
 
 func (d *rawDecoder) Read(buffer []float32) (int, error) {
 	samples := d.resource.samples
-	remaining := len(samples) - d.position
+	totalFrames := len(samples) / Channels
+	remainingFrames := totalFrames - d.position
 
-	if remaining <= 0 {
+	if remainingFrames <= 0 {
 		return 0, io.EOF
 	}
 
-	toRead := min(len(buffer), remaining)
+	framesToRead := min(len(buffer)/Channels, remainingFrames)
+	valuesToRead := framesToRead * Channels
 
-	copy(buffer[:toRead], samples[d.position:d.position+toRead])
-	d.position += toRead
+	srcOffset := d.position * Channels
+	copy(buffer[:valuesToRead], samples[srcOffset:srcOffset+valuesToRead])
+	d.position += framesToRead
 
-	return toRead, nil
+	return valuesToRead, nil
 }
 
 func (d *rawDecoder) Seek(position int) {
+	totalFrames := len(d.resource.samples) / Channels
 	if position < 0 {
 		position = 0
 	}
-	if position > len(d.resource.samples) {
-		position = len(d.resource.samples)
+	if position > totalFrames {
+		position = totalFrames
 	}
 	d.position = position
 }
@@ -79,5 +86,5 @@ func (d *rawDecoder) Position() int {
 }
 
 func (d *rawDecoder) Length() int {
-	return len(d.resource.samples)
+	return len(d.resource.samples) / Channels
 }

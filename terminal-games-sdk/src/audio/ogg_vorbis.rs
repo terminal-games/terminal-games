@@ -5,7 +5,7 @@
 //! Convert any audio file into OGG Vorbis with an ffmpeg command like the following ahead of time:
 //!
 //! ```
-//! ffmpeg -i input.mp3 -af "pan=mono|c0=c1" -c:a libvorbis -qscale:a 2 -ar 48000 output.ogg
+//! ffmpeg -i input.mp3 -c:a libvorbis -qscale:a 2 -ar 48000 output.ogg
 //! ```
 
 use super::{Decoder, Instance, Resource, SAMPLE_RATE, mixer};
@@ -133,7 +133,8 @@ struct ResampleState {
     source_rate: u32,
     target_rate: u32,
     frac_pos: f64,
-    last_sample: f32,
+    last_left: f32,
+    last_right: f32,
 }
 
 impl OggVorbisDecoder {
@@ -145,7 +146,8 @@ impl OggVorbisDecoder {
                 source_rate: resource.source_sample_rate,
                 target_rate: SAMPLE_RATE,
                 frac_pos: 0.0,
-                last_sample: 0.0,
+                last_left: 0.0,
+                last_right: 0.0,
             })
         } else {
             None
@@ -202,11 +204,34 @@ impl OggVorbisDecoder {
             self.buffer_pos = 0;
 
             if channels == 1 {
+                for &sample in samples {
+                    self.decode_buffer.push(sample);
+                    self.decode_buffer.push(sample);
+                }
+            } else if channels == 2 {
                 self.decode_buffer.extend_from_slice(samples);
             } else {
+                // Multi-channel: mixdown to stereo
                 for chunk in samples.chunks(channels) {
-                    let sum: f32 = chunk.iter().sum();
-                    self.decode_buffer.push(sum / channels as f32);
+                    let mut left: f32 = 0.0;
+                    let mut right: f32 = 0.0;
+                    for (i, &sample) in chunk.iter().enumerate() {
+                        if i % 2 == 0 {
+                            left += sample;
+                        } else {
+                            right += sample;
+                        }
+                    }
+                    let left_channels = (channels + 1) / 2;
+                    let right_channels = channels / 2;
+                    if left_channels > 0 {
+                        left /= left_channels as f32;
+                    }
+                    if right_channels > 0 {
+                        right /= right_channels as f32;
+                    }
+                    self.decode_buffer.push(left);
+                    self.decode_buffer.push(right);
                 }
             }
 
@@ -215,6 +240,7 @@ impl OggVorbisDecoder {
     }
 
     fn read_resampled(&mut self, buffer: &mut [f32]) -> usize {
+        const CHANNELS: usize = 2;
         let mut written = 0;
 
         while written < buffer.len() {
@@ -225,40 +251,47 @@ impl OggVorbisDecoder {
             }
 
             if let Some(ref mut resample) = self.resample_state {
-                // Resample with linear interpolation
+                // Resample stereo with linear interpolation
                 let ratio = resample.source_rate as f64 / resample.target_rate as f64;
+                let decode_frames = self.decode_buffer.len() / CHANNELS;
 
-                while written < buffer.len() && self.buffer_pos < self.decode_buffer.len() {
-                    let src_idx = resample.frac_pos as usize;
-                    let frac = (resample.frac_pos - src_idx as f64) as f32;
+                while written + CHANNELS <= buffer.len()
+                    && self.buffer_pos / CHANNELS < decode_frames
+                {
+                    let src_frame = resample.frac_pos as usize;
+                    let frac = (resample.frac_pos - src_frame as f64) as f32;
 
-                    let current = if src_idx < self.decode_buffer.len() {
-                        self.decode_buffer[src_idx]
+                    let (current_left, current_right) = if src_frame < decode_frames {
+                        let idx = src_frame * CHANNELS;
+                        (self.decode_buffer[idx], self.decode_buffer[idx + 1])
                     } else {
-                        resample.last_sample
+                        (resample.last_left, resample.last_right)
                     };
 
-                    let next = if src_idx + 1 < self.decode_buffer.len() {
-                        self.decode_buffer[src_idx + 1]
+                    let (next_left, next_right) = if src_frame + 1 < decode_frames {
+                        let idx = (src_frame + 1) * CHANNELS;
+                        (self.decode_buffer[idx], self.decode_buffer[idx + 1])
                     } else {
-                        current
+                        (current_left, current_right)
                     };
 
-                    buffer[written] = current + (next - current) * frac;
-                    written += 1;
+                    buffer[written] = current_left + (next_left - current_left) * frac;
+                    buffer[written + 1] = current_right + (next_right - current_right) * frac;
+                    written += CHANNELS;
 
                     resample.frac_pos += ratio;
 
                     while resample.frac_pos >= 1.0 && self.buffer_pos < self.decode_buffer.len() {
-                        resample.last_sample = self.decode_buffer[self.buffer_pos];
-                        self.buffer_pos += 1;
+                        resample.last_left = self.decode_buffer[self.buffer_pos];
+                        resample.last_right = self.decode_buffer[self.buffer_pos + 1];
+                        self.buffer_pos += CHANNELS;
                         resample.frac_pos -= 1.0;
                     }
                 }
             } else {
-                // No resampling needed
                 let available = self.decode_buffer.len() - self.buffer_pos;
                 let to_copy = (buffer.len() - written).min(available);
+                let to_copy = (to_copy / CHANNELS) * CHANNELS;
 
                 buffer[written..written + to_copy].copy_from_slice(
                     &self.decode_buffer[self.buffer_pos..self.buffer_pos + to_copy],
@@ -275,15 +308,21 @@ impl OggVorbisDecoder {
 
 impl Decoder for OggVorbisDecoder {
     fn read(&mut self, buffer: &mut [f32]) -> usize {
-        let remaining = self.resource.total_length.saturating_sub(self.position);
-        if remaining == 0 {
+        const CHANNELS: usize = 2;
+
+        let remaining_frames = self.resource.total_length.saturating_sub(self.position);
+        if remaining_frames == 0 {
             return 0;
         }
 
-        let to_read = buffer.len().min(remaining);
-        let read = self.read_resampled(&mut buffer[..to_read]);
-        self.position += read;
-        read
+        let max_values = remaining_frames * CHANNELS;
+        let to_read = buffer.len().min(max_values);
+
+        let read_values = self.read_resampled(&mut buffer[..to_read]);
+        let read_frames = read_values / CHANNELS;
+        self.position += read_frames;
+
+        read_values
     }
 
     fn seek(&mut self, position: usize) {
@@ -309,10 +348,6 @@ impl Decoder for OggVorbisDecoder {
             self.format = format;
             self.decoder = decoder;
             self.track_id = track_id;
-
-            // For position 0, we're done
-            // For other positions, we'd need to decode and skip, but that's expensive
-            // so we just reset to 0 if seeking fails
         }
 
         self.position = position;
@@ -321,7 +356,8 @@ impl Decoder for OggVorbisDecoder {
 
         if let Some(ref mut resample) = self.resample_state {
             resample.frac_pos = 0.0;
-            resample.last_sample = 0.0;
+            resample.last_left = 0.0;
+            resample.last_right = 0.0;
         }
     }
 

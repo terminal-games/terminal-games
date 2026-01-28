@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     ptr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -18,100 +18,122 @@ use ffmpeg_next as ffmpeg;
 use tokio_util::sync::CancellationToken;
 
 pub const SAMPLE_RATE: u32 = 48000;
-pub const FRAME_SIZE: usize = 960;
-pub const CHANNELS: usize = 1;
+pub const FRAME_SIZE: usize = 480;
+pub const CHANNELS: usize = 2;
+
+struct AudioBufferInner {
+    samples: Vec<f32>,
+    write_pos: usize,
+    read_pos: usize,
+}
 
 pub struct AudioBuffer {
-    samples: Vec<f32>,
-    write_pos: AtomicUsize,
-    read_pos: AtomicUsize,
+    inner: Mutex<AudioBufferInner>,
     capacity: usize,
     pub pts: AtomicUsize,
 }
 
 impl AudioBuffer {
-    pub fn new(capacity_samples: usize) -> Self {
+    pub fn new(capacity_frames: usize) -> Self {
         Self {
-            samples: vec![0.0; capacity_samples * CHANNELS],
-            write_pos: AtomicUsize::new(0),
-            read_pos: AtomicUsize::new(0),
-            capacity: capacity_samples,
+            inner: Mutex::new(AudioBufferInner {
+                samples: vec![0.0; capacity_frames * CHANNELS],
+                write_pos: 0,
+                read_pos: 0,
+            }),
+            capacity: capacity_frames,
             pts: AtomicUsize::new(0),
         }
     }
 
-    /// Write mono samples to the buffer. Returns number of samples written.
-    /// This is non-blocking; if buffer is full, samples are dropped.
+    /// Write interleaved stereo samples to the buffer. Returns number of frames written.
+    /// Input should be interleaved: [L0, R0, L1, R1, ...].
+    /// This is non-blocking; if buffer is full, frames are dropped.
     pub fn write(&self, samples: &[f32]) -> usize {
-        let sample_count = samples.len();
-        let write_pos = self.write_pos.load(Ordering::Acquire);
-        let read_pos = self.read_pos.load(Ordering::Acquire);
+        let frame_count = samples.len() / CHANNELS;
+        if frame_count == 0 {
+            return 0;
+        }
 
-        let used = if write_pos >= read_pos {
-            write_pos - read_pos
+        let mut inner = self.inner.lock().unwrap();
+
+        let used = if inner.write_pos >= inner.read_pos {
+            inner.write_pos - inner.read_pos
         } else {
-            self.capacity - read_pos + write_pos
+            self.capacity - inner.read_pos + inner.write_pos
         };
-        let available = self.capacity.saturating_sub(used + 1); // Leave one slot empty
+        let available = self.capacity.saturating_sub(used + 1);
 
-        let to_write = sample_count.min(available);
+        let to_write = frame_count.min(available);
         if to_write == 0 {
             return 0;
         }
 
-        let samples_ptr = self.samples.as_ptr() as *mut f32;
-        for i in 0..to_write {
-            let buf_idx = (write_pos + i) % self.capacity;
-            unsafe {
-                *samples_ptr.add(buf_idx) = samples[i];
-            }
+        let frames_until_wrap = self.capacity - inner.write_pos;
+        let first_chunk = to_write.min(frames_until_wrap);
+        let second_chunk = to_write - first_chunk;
+
+        let dest_start = inner.write_pos * CHANNELS;
+        inner.samples[dest_start..dest_start + first_chunk * CHANNELS]
+            .copy_from_slice(&samples[..first_chunk * CHANNELS]);
+
+        if second_chunk > 0 {
+            inner.samples[..second_chunk * CHANNELS]
+                .copy_from_slice(&samples[first_chunk * CHANNELS..first_chunk * CHANNELS + second_chunk * CHANNELS]);
         }
 
-        let new_write_pos = (write_pos + to_write) % self.capacity;
-        self.write_pos.store(new_write_pos, Ordering::Release);
+        inner.write_pos = (inner.write_pos + to_write) % self.capacity;
 
         to_write
     }
 
-    /// Read mono samples from the buffer into the destination.
-    /// Returns number of samples read. Missing samples are filled with silence.
-    fn read(&self, dest: &mut [f32], count: usize) -> usize {
-        let write_pos = self.write_pos.load(Ordering::Acquire);
-        let read_pos = self.read_pos.load(Ordering::Acquire);
+    /// Read interleaved stereo samples from the buffer into the destination.
+    /// Returns number of frames read. Missing frames are filled with silence.
+    fn read(&self, dest: &mut [f32], frame_count: usize) -> usize {
+        let mut inner = self.inner.lock().unwrap();
 
-        let available = if write_pos >= read_pos {
-            write_pos - read_pos
+        let available = if inner.write_pos >= inner.read_pos {
+            inner.write_pos - inner.read_pos
         } else {
-            self.capacity - read_pos + write_pos
+            self.capacity - inner.read_pos + inner.write_pos
         };
 
-        let to_read = count.min(available);
-
-        for i in 0..to_read {
-            let buf_idx = (read_pos + i) % self.capacity;
-            dest[i] = self.samples[buf_idx];
-        }
-
-        for i in to_read..count {
-            dest[i] = 0.0;
-        }
+        let to_read = frame_count.min(available);
 
         if to_read > 0 {
-            let new_read_pos = (read_pos + to_read) % self.capacity;
-            self.read_pos.store(new_read_pos, Ordering::Release);
+            let frames_until_wrap = self.capacity - inner.read_pos;
+            let first_chunk = to_read.min(frames_until_wrap);
+            let second_chunk = to_read - first_chunk;
+
+            let src_start = inner.read_pos * CHANNELS;
+            dest[..first_chunk * CHANNELS]
+                .copy_from_slice(&inner.samples[src_start..src_start + first_chunk * CHANNELS]);
+
+            if second_chunk > 0 {
+                let dest_start = first_chunk * CHANNELS;
+                dest[dest_start..dest_start + second_chunk * CHANNELS]
+                    .copy_from_slice(&inner.samples[..second_chunk * CHANNELS]);
+            }
+
+            inner.read_pos = (inner.read_pos + to_read) % self.capacity;
+        }
+
+        if to_read < frame_count {
+            let silence_start = to_read * CHANNELS;
+            let silence_end = frame_count * CHANNELS;
+            dest[silence_start..silence_end].fill(0.0);
         }
 
         to_read
     }
 
     pub fn available(&self) -> usize {
-        let write_pos = self.write_pos.load(Ordering::Acquire);
-        let read_pos = self.read_pos.load(Ordering::Acquire);
+        let inner = self.inner.lock().unwrap();
 
-        if write_pos >= read_pos {
-            write_pos - read_pos
+        if inner.write_pos >= inner.read_pos {
+            inner.write_pos - inner.read_pos
         } else {
-            self.capacity - read_pos + write_pos
+            self.capacity - inner.read_pos + inner.write_pos
         }
     }
 }
@@ -140,7 +162,7 @@ impl Mixer {
         let mut encoder = ffmpeg::codec::Context::new_with_codec(codec)
             .encoder()
             .audio()?;
-        encoder.set_channel_layout(ffmpeg::ChannelLayout::MONO);
+        encoder.set_channel_layout(ffmpeg::ChannelLayout::STEREO);
         encoder.set_time_base((1, 48000));
         encoder.set_format(ffmpeg::format::Sample::F32(
             ffmpeg::format::sample::Type::Packed,
@@ -278,13 +300,13 @@ impl Mixer {
     }
 
     pub fn run(&mut self, cancellation_token: CancellationToken) -> anyhow::Result<()> {
-        let num_samples = self.encoder.frame_size() as usize;
+        let frame_size = self.encoder.frame_size() as usize;
         let sample_rate = self.encoder.rate();
         let start_time = Instant::now();
 
-        let mut read_buffer = vec![0.0f32; num_samples * CHANNELS];
+        let mut read_buffer = vec![0.0f32; frame_size * CHANNELS];
 
-        tracing::info!(num_samples, sample_rate, "mixer started");
+        tracing::info!(frame_size, sample_rate, channels = CHANNELS, "mixer started");
 
         loop {
             if cancellation_token.is_cancelled() {
@@ -296,15 +318,17 @@ impl Mixer {
             unsafe {
                 (*self.frame).pts = self.pts as i64;
 
-                let samples_read = self.audio_buffer.read(&mut read_buffer, num_samples);
+                let frames_read = self.audio_buffer.read(&mut read_buffer, frame_size);
 
                 let data = (*self.frame).data[0] as *mut f32;
-                for i in 0..num_samples {
-                    *data.add(i) = read_buffer[i];
-                }
+                std::ptr::copy_nonoverlapping(
+                    read_buffer.as_ptr(),
+                    data,
+                    frame_size * CHANNELS,
+                );
 
-                if samples_read > 0 && samples_read < num_samples {
-                    tracing::trace!(samples_read, num_samples, "audio buffer underrun");
+                if frames_read > 0 && frames_read < frame_size {
+                    tracing::trace!(frames_read, frame_size, "audio buffer underrun");
                 }
             }
 
@@ -315,7 +339,7 @@ impl Mixer {
                 std::thread::sleep(sleep_duration);
             }
 
-            self.pts += num_samples;
+            self.pts += frame_size;
 
             match unsafe { ffmpeg::ffi::avcodec_send_frame(self.encoder.as_mut_ptr(), self.frame) }
             {
