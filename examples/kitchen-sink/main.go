@@ -5,18 +5,23 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
+
 	"github.com/terminal-games/terminal-games/pkg/app"
+	"github.com/terminal-games/terminal-games/pkg/audio"
 	"github.com/terminal-games/terminal-games/pkg/bubblewrap"
 	_ "github.com/terminal-games/terminal-games/pkg/net/http"
 	"github.com/terminal-games/terminal-games/pkg/peer"
@@ -39,6 +44,8 @@ type model struct {
 	selectedPeerIdx   int
 	recentMessages    []peerMessage
 	networkInfo       app.NetworkInfo
+	audioPlaying      bool
+	audioVolume       float32
 }
 
 type httpBodyMsg string
@@ -58,8 +65,34 @@ type peerMessage struct {
 
 type peerMsg peer.Message
 
+var isHoveringAudio = &atomic.Bool{}
+
+//go:embed "Mesmerizing Galaxy Loop.ogg"
+var songEmbed []byte
+
+var (
+	songResource audio.Resource
+	song         *audio.Instance
+)
+
+func init() {
+	var err error
+	songResource, err = audio.NewResourceFromOGGVorbis(songEmbed)
+	if err != nil {
+		panic(err)
+	}
+}
+
 func main() {
 	r := bubblewrap.MakeRenderer()
+
+	var initialVolume float32 = 0.8
+	var audioPlaying bool = false
+	song = songResource.NewInstance()
+	song.SetVolume(initialVolume)
+	song.SetLoop(true)
+	song.Play()
+	audioPlaying = true
 
 	zone.NewGlobal()
 	p := bubblewrap.NewProgram(model{
@@ -72,6 +105,8 @@ func main() {
 		selectedPeerIdx:   0,
 		recentMessages:    make([]peerMessage, 0),
 		networkInfo:       app.NetworkInfo{},
+		audioPlaying:      audioPlaying,
+		audioVolume:       initialVolume,
 	}, tea.WithAltScreen(), tea.WithMouseAllMotion())
 
 	if _, err := p.Run(); err != nil {
@@ -89,6 +124,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.x = msg.X
 		m.y = msg.Y
 		m.isHoveringZone = zone.Get("myId").InBounds(msg)
+		isHoveringAudio.Store(m.isHoveringZone)
 		return m, nil
 	case tea.KeyMsg:
 		m.lastChar = msg.String()
@@ -132,6 +168,41 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "f":
 			fmt.Fprintf(os.Stdout, "\x1b[%d;%dH%c", m.h+2, 2, 'A')
+			return m, nil
+		case " ":
+			if song != nil {
+				if m.audioPlaying {
+					song.Pause()
+				} else {
+					song.Play()
+				}
+				m.audioPlaying = !m.audioPlaying
+			}
+			return m, nil
+		case "+", "=":
+			if song != nil {
+				m.audioVolume += 0.1
+				song.SetVolume(m.audioVolume)
+			}
+			return m, nil
+		case "-", "_":
+			if song != nil {
+				m.audioVolume -= 0.1
+				if m.audioVolume < 0 {
+					m.audioVolume = 0
+				}
+				song.SetVolume(m.audioVolume)
+			}
+			return m, nil
+		case "m":
+			if song != nil {
+				if m.audioVolume > 0 {
+					m.audioVolume = 0
+				} else {
+					m.audioVolume = 0.8
+				}
+				song.SetVolume(m.audioVolume)
+			}
 			return m, nil
 		}
 	case tickMsg:
@@ -230,15 +301,32 @@ func (m model) View() string {
 		lastThrottledStr = m.networkInfo.LastThrottled.Format("15:04:05")
 	}
 
+	audioStatus := "No audio loaded"
+	if song != nil {
+		playState := "Paused"
+		if m.audioPlaying {
+			playState = "Playing"
+		}
+		audioStatus = fmt.Sprintf("%s | Volume: %.0f%% | Position: %v / %v",
+			playState,
+			m.audioVolume*100,
+			song.CurrentTime().Truncate(time.Second),
+			song.Duration().Truncate(time.Second),
+		)
+	}
+
 	content := m.mainStyle.Render(fmt.Sprintf(
 		"Hi. Last char: %v. Size: %vx%v Mouse: %v %v %v %s This program will exit in %d seconds...\n\n"+
 			"Peer ID: %s\n\n"+
+			"Audio: %s\n"+
+			"  [Space]=Play/Pause  [+/-]=Volume  [M]=Mute\n\n"+
 			"Network: ↑%.0f B/s ↓%.0f B/s RTT %dms throttled: %s\n\n"+
 			"Peers (↑/↓ to select, Enter to send message):\n%s\n\n"+
 			"Recent Messages:\n%s\n\n"+
 			"%v\n\n%+v\nhasDarkBackground=%v",
 		m.lastChar, m.w, m.h, m.x, m.y, markedZone, TerminalOSC8Link("https://example.com", "example"), m.timeLeft,
 		m.peerID.String(),
+		audioStatus,
 		m.networkInfo.BytesPerSecIn, m.networkInfo.BytesPerSecOut, m.networkInfo.LatencyMs, lastThrottledStr,
 		peerListText,
 		peerMessagesText,
@@ -295,4 +383,17 @@ func refreshNetworkInfo(prev app.NetworkInfo) tea.Cmd {
 		}
 		return networkInfoMsg(info)
 	}
+}
+
+func GenerateSine(frequency, amplitude float32, pts uint64, numSamples int) []float32 {
+	samples := make([]float32, numSamples)
+	twoPiF := 2.0 * math.Pi * float64(frequency)
+
+	for i := 0; i < numSamples; i++ {
+		t := float64(pts+uint64(i)) / audio.SampleRate
+		value := amplitude * float32(math.Sin(twoPiF*t))
+		samples[i] = value
+	}
+
+	return samples
 }

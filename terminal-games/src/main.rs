@@ -3,6 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 mod app;
+mod audio;
 mod mesh;
 mod rate_limiting;
 mod ssh;

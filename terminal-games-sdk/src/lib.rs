@@ -4,6 +4,7 @@
 
 pub mod ansi_backend;
 pub mod app;
+pub mod audio;
 pub mod peer;
 pub mod terminal;
 
@@ -52,6 +53,14 @@ mod internal {
             bytes_per_sec_out_ptr: *mut f64,
             last_throttled_ms_ptr: *mut i64,
             latency_ms_ptr: *mut i32,
+        ) -> i32;
+
+        pub(crate) fn audio_write(ptr: *const f32, sample_count: u32) -> i32;
+        pub(crate) fn audio_info(
+            frame_size_ptr: *mut u32,
+            sample_rate_ptr: *mut u32,
+            pts_ptr: *mut u64,
+            buffer_available_ptr: *mut u32,
         ) -> i32;
     }
 }

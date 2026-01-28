@@ -15,5 +15,6 @@ ratatui = { version = "0.30", default-features = false }
 tachyonfx = { version = "0.22", default-features = false, features = ["wasm"] }
 terminal-games-sdk = { path = "../../terminal-games-sdk", features = [
     "network",
+    "ogg-vorbis",
 ] }
 tokio = { version = "1", features = ["macros", "time"] }

@@ -137,7 +137,7 @@ impl<S> RateLimitedStream<S> {
     pub fn new(inner: S, info: Arc<NetworkInformation>) -> Self {
         RateLimitedStream {
             inner,
-            write_bucket: TokenBucket::new(50 * 1024, 100 * 1024),
+            write_bucket: TokenBucket::new(64 * 1024, 128 * 1024),
             sleep: Box::pin(tokio::time::sleep_until(tokio::time::Instant::now())),
             info,
         }

@@ -10,11 +10,12 @@ use axum::extract::connect_info::Connected;
 use axum::extract::{ConnectInfo, Request};
 use axum::{
     Router,
+    body::Body,
     extract::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{Html, Response},
     routing::get,
 };
@@ -62,6 +63,13 @@ impl WebServer {
 
         let app = Router::new()
             .route("/", get(serve_index))
+            .route("/styles.css", get(serve_styles))
+            .route("/main.js", get(serve_main_js))
+            .route("/opus-audio-player.js", get(serve_opus_audio_player_js))
+            .route(
+                "/jitter-buffer-processor.js",
+                get(serve_jitter_buffer_processor_js),
+            )
             .route("/ws", get(websocket_handler))
             .with_state(self.clone());
 
@@ -114,6 +122,40 @@ async fn serve_index() -> Html<&'static str> {
     Html(include_str!("../web/index.html"))
 }
 
+async fn serve_styles() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/css")
+        .body(Body::from(include_str!("../web/styles.css")))
+        .unwrap()
+}
+
+async fn serve_main_js() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/javascript")
+        .body(Body::from(include_str!("../web/main.js")))
+        .unwrap()
+}
+
+async fn serve_opus_audio_player_js() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/javascript")
+        .body(Body::from(include_str!("../web/opus-audio-player.js")))
+        .unwrap()
+}
+
+async fn serve_jitter_buffer_processor_js() -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/javascript")
+        .body(Body::from(include_str!(
+            "../web/jitter-buffer-processor.js"
+        )))
+        .unwrap()
+}
+
 #[derive(Deserialize)]
 struct WebSocketQuery {
     args: Option<String>,
@@ -155,10 +197,12 @@ async fn handle_socket(
     let token = cancellation_token.clone();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(20);
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
     let exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
         args,
         input_receiver: input_rx,
         output_sender: output_tx,
+        audio_sender: Some(audio_tx),
         remote_sshid,
         term: Some("xterm-256color".to_string()),
         username: username.clone(),
@@ -167,51 +211,63 @@ async fn handle_socket(
         network_info: connect_info.network_info,
     });
 
-    tokio::task::spawn(async move {
-        while let Some(data) = output_rx.recv().await {
-            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-            if encoder.write_all(&data).is_err() {
-                break;
-            }
-            let compressed = match encoder.finish() {
-                Ok(compressed) => compressed,
-                Err(_) => break,
-            };
+    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel(1);
 
-            if sender
-                .send(Message::Binary(Bytes::from(compressed)))
-                .await
-                .is_err()
-            {
-                break;
+    tokio::task::spawn(async move {
+        loop {
+            tokio::select! {
+                data = output_rx.recv() => {
+                    let Some(data) = data else { break };
+                    let mut msg = Vec::with_capacity(data.len() / 2);
+                    {
+                        let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
+                        if encoder.write_all(&data).is_err() || encoder.finish().is_err() {
+                            break;
+                        }
+                    }
+                    msg.push(0x00);
+                    if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
+                        break;
+                    }
+                }
+                data = audio_rx.recv() => {
+                    let Some(mut data) = data else { break };
+                    data.push(0x01);
+                    if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
+                        break;
+                    }
+                }
+                ts = pong_rx.recv() => {
+                    let Some(ts) = ts else { break };
+                    if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
 
-    let input_tx_clone = input_tx.clone();
     let cancellation_token_clone = cancellation_token.clone();
     tokio::task::spawn(async move {
         while let Some(msg) = receiver.next().await {
             match msg {
                 Ok(Message::Binary(data)) => {
                     let data: smallvec::SmallVec<[u8; 16]> = data.as_ref().into();
-                    if input_tx_clone.send(data).await.is_err() {
+                    if input_tx.send(data).await.is_err() {
                         break;
                     }
                 }
                 Ok(Message::Text(text)) => {
                     let text_str = text.to_string();
-                    if text_str.starts_with("resize:") {
-                        if let Some((w, h)) = parse_resize(&text_str) {
+                    if let Some(rest) = text_str.strip_prefix("resize:") {
+                        if let Some((w, h)) = parse_resize(rest) {
                             let _ = resize_tx.send((w, h)).await;
                         }
+                    } else if let Some(ts) = text_str.strip_prefix("ping:") {
+                        let _ = pong_tx.send(ts.to_string()).await;
                     }
                 }
-                Ok(Message::Close(_)) => {
-                    cancellation_token_clone.cancel();
-                    break;
-                }
-                Err(_) => {
+                Ok(Message::Close(_)) | Err(_) => {
                     cancellation_token_clone.cancel();
                     break;
                 }
@@ -228,13 +284,8 @@ async fn handle_socket(
 }
 
 fn parse_resize(text: &str) -> Option<(u16, u16)> {
-    let parts: Vec<&str> = text.split(':').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let w: u16 = parts[1].parse().ok()?;
-    let h: u16 = parts[2].parse().ok()?;
-    Some((w, h))
+    let (w, h) = text.split_once(':')?;
+    Some((w.parse().ok()?, h.parse().ok()?))
 }
 
 fn sanitize_user_agent(ua: &str) -> String {

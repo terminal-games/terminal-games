@@ -30,6 +30,8 @@ pub(crate) struct SshServer {
     app_server: Arc<AppServer>,
 }
 
+const SSH_EXTENDED_DATA_STDERR: u32 = 1;
+
 impl SshServer {
     pub async fn new(app_server: Arc<AppServer>) -> anyhow::Result<Self> {
         tracing::info!("Initializing ssh server");
@@ -90,8 +92,6 @@ impl SshServer {
                 }
             });
         }
-
-        // Ok(())
     }
 
     fn new_client(
@@ -143,21 +143,32 @@ impl SshServer {
                     }
                 };
 
-            let args = match tokio::time::timeout(
+            let (args, has_audio) = match tokio::time::timeout(
                 std::time::Duration::from_millis(1),
                 args_receiver,
             )
             .await
             {
-                Ok(Ok(args)) => Some(args),
-                _ => None,
+                Ok(Ok(mut args)) => {
+                    let has_audio = args.starts_with(b"audio");
+                    if has_audio {
+                        args.drain(..5);
+                        while !args.is_empty() && args[0].is_ascii_whitespace() {
+                            args.remove(0);
+                        }
+                    }
+                    (Some(args), has_audio)
+                }
+                _ => (None, false),
             };
 
             let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
+            let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
             let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
                 args,
                 input_receiver: input_rx,
                 output_sender: output_tx,
+                audio_sender: has_audio.then_some(audio_tx),
                 remote_sshid,
                 term,
                 username,
@@ -179,7 +190,11 @@ impl SshServer {
                     data = output_rx.recv() => {
                         let Some(data) = data else { break };
                         let _ = session_handle.data(channel_id, data.into()).await;
-                        // tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                    }
+
+                    data = audio_rx.recv(), if has_audio => {
+                        let Some(data) = data else { break };
+                        let _ = session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, data.into()).await;
                     }
                 }
             }

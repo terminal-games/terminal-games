@@ -1,0 +1,15 @@
+@font-face {
+    font-family: "JetBrainsMonoNL NFM";
+    src: url("https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@3.4.0/patched-fonts/JetBrainsMono/NoLigatures/Regular/JetBrainsMonoNLNerdFontMono-Regular.ttf");
+}
+html, body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    background-color: black;
+}
+#terminal {
+    width: 100%;
+    height: 100%;
+}

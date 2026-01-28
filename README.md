@@ -13,5 +13,5 @@ Your game will be served via SSH to players at low latency across the world 🌎
 - Low latency, global deployment
 - Multiplayer peer messaging SDK
 - Web support with [xterm.js](https://xtermjs.org)
+- Audio (even over SSH!)
 - Built in KV store 🚧
-- Audio (even over SSH!) 🚧
