@@ -3,16 +3,13 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    task::{Context, Poll},
-    time::{Duration, UNIX_EPOCH},
+    net::{IpAddr, ToSocketAddrs}, pin::Pin, sync::{
+        Arc, OnceLock, atomic::{AtomicBool, Ordering}
+    }, task::{Context, Poll}, time::{Duration, UNIX_EPOCH}
 };
 
 use hex::ToHex;
+use ipnet::{Ipv4Net, Ipv6Net};
 use smallvec::SmallVec;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -459,9 +456,22 @@ impl AppServer {
             if let Err(_) = mem.read(&mut caller, offset, &mut buf[..len]) {
                 anyhow::bail!("failed to write to host memory");
             }
-            let address = String::from_utf8_lossy(&buf[..len]);
 
-            let tcp_stream = match tokio::net::TcpStream::connect(address.as_ref()).await {
+            let address = String::from_utf8_lossy(&buf[..len]);
+            let addr_iter = match address.to_socket_addrs() {
+                Ok(addr_iter) => addr_iter,
+                Err(_error) => return Ok(-1),
+            };
+
+            if addr_iter.len() == 0 {
+                return Ok(-1);
+            }
+
+            if !addr_iter.as_slice().iter().map(|addr| is_globally_reachable(addr.ip())).all(|reachable| reachable) {
+                return Ok(-1);
+            }
+
+            let tcp_stream = match tokio::net::TcpStream::connect(addr_iter.as_ref()).await {
                 Ok(stream) => stream,
                 Err(_) => {
                     tracing::error!("tcp_stream");
@@ -1375,3 +1385,115 @@ impl Stream {
 }
 
 pub type Terminal = headless_terminal::Parser;
+
+// fn is_bogon(addr: SocketAddr) -> bool {
+//     match addr.ip() {
+//         std::net::IpAddr::V4(ip) => match ip.octets() {
+//             [0, ..] => true, // 0.0.0.0/8 "This" network
+//             [10, ..] => true, // 10.0.0.0/8 Private-use networks
+//             [100, b, ..] if b >= 64 && b <= 127 => true, // 100.64.0.0/10 Carrier-grade NAT
+//             [127, ..] => true, // 127.0.0.0/8 Loopback
+//             [169, 254, ..] => true, // 169.254.0.0/16 Link local
+//             [172, b, ..] if b >= 16 && b <= 31 => true, // 172.16.0.0/12 Private-use networks
+//             [192, 0, 0, ..] => true, // 192.0.0.0/24 IETF protocol assignments
+//             [192, 0, 2, ..] => true, // 192.0.2.0/24 TEST-NET-1
+//             [192, 168, ..] => true, // 192.168.0.0/16 Private-use networks
+//             [198, b, ..] if b >= 18 && b <= 19 => true, // 198.18.0.0/15 Network interconnect device benchmark testing
+//             [198, 51, 100, ..] => true, // 198.51.100.0/24 TEST-NET-2
+//             [203, 0, 113, ..] => true, // 203.0.113.0/24 TEST-NET-3
+//             [a, ..] if a >= 224 && a <= 239 => true, // 224.0.0.0/4 Multicast
+//             [a, ..] if a >= 240 && a <= 255 => true, // 240.0.0.0/4 Reserved for future use
+//             [255, 255, 255, 255] => true, // 255.255.255.255/32 Limited broadcast
+//             _ => false,
+//         },
+//         std::net::IpAddr::V6(ip) => match ip.segments() {
+//             [0, 0, 0, 0, 0, 0, 0, 0] => true, // ::/128 Node-scope unicast unspecified address
+//             [0, 0, 0, 0, 0, 0, 0, 1] => true, // ::1/128 Node-scope unicast loopback address
+//             [0, 0, 0, 0, 0, 0xffff, ..] => true, // ::ffff:0:0/96 IPv4-mapped addresses
+//             [0, 0, 0, 0, 0, 0, ..] => true, // ::/96 IPv4-compatible addresses
+//             [0x100, 0, 0, 0, ..] => true, // 100::/64 Remotely triggered black hole addresses
+//             [0x2001, b, ..] if b >= 0x20 && b <= 0x2f => true, // 2001:20::/28 Overlay routable cryptographic hash identifiers (ORCHID)
+//             [0x2001, 0xdb8, ..] => true, // 2001:db8::/32 Documentation prefix
+//             [0x3fff, b, ..] if b <= 0xf => true, // 3fff::/20 Documentation prefix
+//             [a, ..] if a >= 0xfc00 && a <= 0xfdff => true, // fc00::/7 Unique local addresses (ULA)
+//             [a, ..] if (a & 0xffc0) == 0xfe80 => true, // fe80::/10 Link-local unicast
+//             [a, ..] if (a & 0xffc0) == 0xfec0 => true, // fec0::/10 Site-local unicast (deprecated)
+//             [a, ..] if a >= 0xff00 => true, // ff00::/8 Multicast (Note: ff0e:/16 is global scope and may appear on the global internet.)
+//             _ => false,
+//         }
+//     }
+// }
+
+pub fn is_globally_reachable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => !IPV4_NON_GLOBAL
+            .get_or_init(init_ipv4_non_global)
+            .iter()
+            .any(|net| net.contains(&addr)),
+        IpAddr::V6(addr) => !IPV6_NON_GLOBAL
+            .get_or_init(init_ipv6_non_global)
+            .iter()
+            .any(|net| net.contains(&addr)),
+    }
+}
+
+static IPV4_NON_GLOBAL: OnceLock<Vec<Ipv4Net>> = OnceLock::new();
+static IPV6_NON_GLOBAL: OnceLock<Vec<Ipv6Net>> = OnceLock::new();
+
+fn init_ipv4_non_global() -> Vec<Ipv4Net> {
+    [
+        // https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml
+        "192.88.99.0/24", // Deprecated (6to4 Relay Anycast)
+        "0.0.0.0/8", // "This network"
+        "0.0.0.0/32", // "This host on this network"
+        "10.0.0.0/8", // Private-Use
+        "100.64.0.0/10", // Shared Address Space
+        "169.254.0.0/16", // Link Local
+        "172.16.0.0/12", // Private-Use
+        "192.0.0.0/24", // IETF Protocol Assignments
+        "192.0.0.0/29", // IPv4 Service Continuity Prefix
+        "192.0.0.8/32", // IPv4 dummy address
+        "192.0.0.170/32", // NAT64/DNS64 Discovery
+        "192.0.0.171/32", // NAT64/DNS64 Discovery
+        "192.0.2.0/24", // Documentation (TEST-NET-1)
+        "192.88.99.2/32", // 6a44-relay anycast address
+        "192.168.0.0/16", // Private-Use
+        "198.18.0.0/15", // Benchmarking
+        "198.51.100.0/24", // Documentation (TEST-NET-2)
+        "203.0.113.0/24", // Documentation (TEST-NET-3)
+        "240.0.0.0/4", // Reserved
+        "255.255.255.255/32", // Limited Broadcast
+        "127.0.0.0/8", // Loopback
+
+        "224.0.0.0/4", // Multicast
+    ]
+    .into_iter()
+    .map(|s| s.parse().expect("valid IPv4 CIDR"))
+    .collect()
+}
+
+fn init_ipv6_non_global() -> Vec<Ipv6Net> {
+    [
+        // https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
+        "::1/128", // Loopback Address
+        "::/128", // Unspecified Address
+        "::ffff:0:0/96", // IPv4-mapped Address
+        "64:ff9b:1::/48", // IPv4-IPv6 Translat.
+        "100::/64", // Discard-Only Address Block
+        "100:0:0:1::/64", // Dummy IPv6 Prefix
+        "2001:2::/48", // Benchmarking
+        "2001:db8::/32", // 2001:db8::/32
+        "3fff::/20", // Documentation
+        "5f00::/16", // Segment Routing (SRv6) SIDs
+        "fe80::/10", // Link-Local Unicast
+        "2001::/23", // IETF Protocol Assignments
+        "fc00::/7", // Unique-Local
+        "2001::/32", // TEREDO
+        "2002::/16", // 6to4
+
+        "ff00::/8", // Multicast
+    ]
+    .into_iter()
+    .map(|s| s.parse().expect("valid IPv6 CIDR"))
+    .collect()
+}
