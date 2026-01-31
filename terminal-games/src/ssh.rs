@@ -157,7 +157,7 @@ impl SshServer {
                             args.remove(0);
                         }
                     }
-                    (Some(args), has_audio)
+                    (if args.is_empty() { None} else { Some(args) }, has_audio)
                 }
                 _ => (None, false),
             };
