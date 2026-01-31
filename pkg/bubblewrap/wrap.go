@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 	"unsafe"
@@ -55,6 +56,8 @@ type dimensions struct {
 var fromHost = &yieldingReadWriter{buf: bytes.NewBuffer(nil)}
 
 func init() {
+	debug.SetMemoryLimit(30 * 1024 * 1024)
+
 	go func() {
 		buffer := make([]byte, 512)
 

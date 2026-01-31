@@ -1,7 +1,7 @@
 use std::{
     io::Write,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -92,63 +92,9 @@ async fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|s| s.parse::<PeerId>().ok());
 
-    let (parts, body) = {
-        let url = "https://example.com".parse::<hyper::Uri>().unwrap();
-
-        let host = url.host().expect("uri has no host");
-        let port = url.port_u16().unwrap_or(443);
-
-        let address = format!("{}:{}", host, port);
-        let stream = Conn::dial(&address, true)?;
-        let io = TokioIo::new(stream);
-        let (mut sender, conn) =
-            match hyper::client::conn::http2::handshake(TokioExecutor, io).await {
-                Ok(result) => result,
-                Err(e) => {
-                    eprintln!("HTTP/2 handshake failed: {:?}", e);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionAborted,
-                        format!("HTTP/2 handshake failed: {}", e),
-                    ));
-                }
-            };
-        let conn_done_clone = conn_done.clone();
-        tokio::task::spawn(async move {
-            if let Err(err) = conn.await {
-                println!("Connection failed: {:?}", err);
-            }
-            conn_done_clone.store(true, Ordering::SeqCst);
-        });
-
-        let req = Request::builder()
-            .version(Version::HTTP_2)
-            .uri(url)
-            .body(Empty::<Bytes>::new())
-            .unwrap();
-
-        let res = match sender.send_request(req).await {
-            Ok(res) => res,
-            Err(e) => {
-                println!("Failed to send request: {:?}", e);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    format!("Failed to send request: {}", e),
-                ));
-            }
-        };
-        let (parts, body) = res.into_parts();
-        let body = match body.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(e) => {
-                println!("Failed to collect body: {:?}", e);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!("Failed to collect body: {}", e),
-                ));
-            }
-        };
-        (parts, body)
-    };
+    let http_response: Arc<Mutex<Option<Result<(hyper::http::response::Parts, Bytes), String>>>> =
+        Arc::new(Mutex::new(None));
+    let http_request_pending = Arc::new(AtomicBool::new(false));
 
     let mut terminal_reader = TerminalReader {};
     let mut peer_messages = peer::MessageReader::new();
@@ -219,6 +165,63 @@ async fn main() -> std::io::Result<()> {
                             audio_volume = 0.8;
                         }
                         song.set_volume(audio_volume);
+                    }
+                    terminput::key!(terminput::KeyCode::Char('r')) => {
+                        if !http_request_pending.load(Ordering::SeqCst) {
+                            http_request_pending.store(true, Ordering::SeqCst);
+                            let http_response_clone = http_response.clone();
+                            let http_request_pending_clone = http_request_pending.clone();
+                            let conn_done_clone = conn_done.clone();
+                            tokio::spawn(async move {
+                                let result = async {
+                                    let url = "https://example.com".parse::<hyper::Uri>().unwrap();
+                                    let host = url.host().expect("uri has no host");
+                                    let port = url.port_u16().unwrap_or(443);
+                                    let address = format!("{}:{}", host, port);
+
+                                    let dial_result = Conn::dial_async(&address, true)
+                                        .await
+                                        .map_err(|e| e.to_string())?;
+                                    let io = TokioIo::new(dial_result.conn);
+
+                                    let (mut sender, conn) =
+                                        hyper::client::conn::http2::handshake(TokioExecutor, io)
+                                            .await
+                                            .map_err(|e| format!("HTTP/2 handshake failed: {}", e))?;
+
+                                    tokio::task::spawn(async move {
+                                        if let Err(err) = conn.await {
+                                            println!("Connection failed: {:?}", err);
+                                        }
+                                        conn_done_clone.store(true, Ordering::SeqCst);
+                                    });
+
+                                    let req = Request::builder()
+                                        .version(Version::HTTP_2)
+                                        .uri(url)
+                                        .body(Empty::<Bytes>::new())
+                                        .unwrap();
+
+                                    let res = sender
+                                        .send_request(req)
+                                        .await
+                                        .map_err(|e| format!("Failed to send request: {}", e))?;
+
+                                    let (parts, body) = res.into_parts();
+                                    let body = body
+                                        .collect()
+                                        .await
+                                        .map_err(|e| format!("Failed to collect body: {}", e))?
+                                        .to_bytes();
+
+                                    Ok::<_, String>((parts, body))
+                                }
+                                .await;
+
+                                *http_response_clone.lock().unwrap() = Some(result);
+                                http_request_pending_clone.store(false, Ordering::SeqCst);
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -330,15 +333,29 @@ async fn main() -> std::io::Result<()> {
             )
         };
 
+        let http_status = {
+            let response = http_response.lock().unwrap();
+            if http_request_pending.load(Ordering::SeqCst) {
+                "HTTP: Loading...".to_string()
+            } else {
+                match response.as_ref() {
+                    None => "HTTP: Press 'r' to make request".to_string(),
+                    Some(Ok((parts, body))) => {
+                        format!("HTTP: {} | Body: {} bytes\n{:#?}", parts.status, body.len(), parts)
+                    }
+                    Some(Err(e)) => format!("HTTP Error: {}", e),
+                }
+            }
+        };
+
         terminal.draw(|frame| {
             let area = frame.area();
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Hello World!\ncounter={}\nlast_event={:#?}\nparts={:#?}\nbody={:#?}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}\n\nAudio: {}\n  [Space]=Play/Pause  [+/-]=Volume  [M]=Mute\n\nNetwork: {}\n\nPeer ID: {}\nPress 'p' to send a message to peer {}\n\nConnected Peers ({}):\n{}\n\nRecent Messages:\n{}",
+                    "Hello World!\ncounter={}\nlast_event={:#?}\n{}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}\n\nAudio: {}\n  [Space]=Play/Pause  [+/-]=Volume  [M]=Mute\n\nNetwork: {}\n\nPeer ID: {}\nPress 'p' to send a message to peer {}\n\nConnected Peers ({}):\n{}\n\nRecent Messages:\n{}",
                     frame_counter,
                     last_event,
-                    parts,
-                    body,
+                    http_status,
                     conn_done,
                     frame_counter as f64 / start.elapsed().as_secs_f64(),
                     event_counter,

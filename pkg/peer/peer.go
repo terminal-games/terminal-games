@@ -17,6 +17,15 @@ import (
 	"unsafe"
 )
 
+const (
+	peerSendErrInvalidPeerCount = -1
+	peerSendErrDataTooLarge     = -2
+	peerSendErrChannelFull      = -3
+	peerSendErrChannelClosed    = -4
+
+	peerRecvErrChannelDisconnected = -1
+)
+
 //go:wasmimport terminal_games peer_send
 //go:noescape
 func peer_send(peer_ids_ptr unsafe.Pointer, peer_ids_count uint32, data_ptr unsafe.Pointer, data_len uint32) int32
@@ -50,7 +59,15 @@ func (r RegionID) String() string {
 	return string(r[:end])
 }
 
-var ErrLatencyUnknown = errors.New("latency unknown")
+var (
+	ErrLatencyUnknown       = errors.New("latency unknown")
+	ErrInvalidPeerCount     = errors.New("invalid peer count (must be 1-1024)")
+	ErrDataTooLarge         = errors.New("data too large: maximum 64KB")
+	ErrChannelFull          = errors.New("send channel full, message dropped")
+	ErrChannelClosed        = errors.New("send channel closed")
+	ErrChannelDisconnected  = errors.New("receive channel disconnected")
+	ErrListFailed           = errors.New("peer_list failed")
+)
 
 // Latency returns the current latency to this region in milliseconds.
 func (r RegionID) Latency() (uint32, error) {
@@ -139,7 +156,7 @@ func listN(length uint32) ([]ID, uint32, error) {
 	if length == 0 {
 		ret := peer_list(nil, 0, unsafe.Pointer(&totalCount))
 		if ret < 0 {
-			return nil, 0, errors.New("peer_list failed")
+			return nil, 0, ErrListFailed
 		}
 		return nil, totalCount, nil
 	}
@@ -147,7 +164,7 @@ func listN(length uint32) ([]ID, uint32, error) {
 	buf := make([]byte, length*16)
 	ret := peer_list(unsafe.Pointer(&buf[0]), length, unsafe.Pointer(&totalCount))
 	if ret < 0 {
-		return nil, totalCount, errors.New("peer_list failed")
+		return nil, totalCount, ErrListFailed
 	}
 
 	count := int(ret)
@@ -178,14 +195,11 @@ func Send(data []byte, peerIDs ...ID) error {
 
 // SendTo sends data to one or more peers
 func SendTo(data []byte, peerIDs []ID) error {
-	if len(peerIDs) == 0 {
-		return errors.New("at least one peer ID is required")
+	if len(peerIDs) == 0 || len(peerIDs) > 1024 {
+		return ErrInvalidPeerCount
 	}
 	if len(data) > 64*1024 {
-		return errors.New("data too large: maximum 64KB")
-	}
-	if len(peerIDs) > 1024 {
-		return errors.New("too many peer IDs: maximum 1024")
+		return ErrDataTooLarge
 	}
 
 	peerIDsBuf := make([]byte, len(peerIDs)*16)
@@ -205,10 +219,25 @@ func SendTo(data []byte, peerIDs []ID) error {
 		uint32(len(data)),
 	)
 	if ret < 0 {
-		return errors.New("peer_send failed")
+		return sendErrorFromCode(ret)
 	}
 
 	return nil
+}
+
+func sendErrorFromCode(code int32) error {
+	switch code {
+	case peerSendErrInvalidPeerCount:
+		return ErrInvalidPeerCount
+	case peerSendErrDataTooLarge:
+		return ErrDataTooLarge
+	case peerSendErrChannelFull:
+		return ErrChannelFull
+	case peerSendErrChannelClosed:
+		return ErrChannelClosed
+	default:
+		return fmt.Errorf("unknown peer_send error: %d", code)
+	}
 }
 
 // Recv waits for a message from any peer
@@ -234,8 +263,17 @@ func Recv() (Message, error) {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		} else {
-			return Message{}, errors.New("peer_recv failed")
+			return Message{}, recvErrorFromCode(ret)
 		}
+	}
+}
+
+func recvErrorFromCode(code int32) error {
+	switch code {
+	case peerRecvErrChannelDisconnected:
+		return ErrChannelDisconnected
+	default:
+		return fmt.Errorf("unknown peer_recv error: %d", code)
 	}
 }
 

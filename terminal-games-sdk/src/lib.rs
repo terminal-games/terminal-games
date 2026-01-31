@@ -27,9 +27,19 @@ mod internal {
         #[cfg(feature = "network")]
         pub(crate) fn dial(address_ptr: *const u8, address_len: u32, mode: u32) -> i32;
         #[cfg(feature = "network")]
-        pub(crate) fn conn_write(conn_id: i32, address_ptr: *const u8, address_len: u32) -> i32;
+        pub(crate) fn poll_dial(
+            dial_id: i32,
+            local_addr_ptr: *mut u8,
+            local_addr_len_ptr: *mut u32,
+            remote_addr_ptr: *mut u8,
+            remote_addr_len_ptr: *mut u32,
+        ) -> i32;
         #[cfg(feature = "network")]
-        pub(crate) fn conn_read(conn_id: i32, address_ptr: *mut u8, address_len: u32) -> i32;
+        pub(crate) fn conn_close(conn_id: i32) -> i32;
+        #[cfg(feature = "network")]
+        pub(crate) fn conn_write(conn_id: i32, data_ptr: *const u8, data_len: u32) -> i32;
+        #[cfg(feature = "network")]
+        pub(crate) fn conn_read(conn_id: i32, buf_ptr: *mut u8, buf_len: u32) -> i32;
 
         pub(crate) fn peer_send(
             peer_ids_ptr: *const u8,
