@@ -3,9 +3,14 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    net::{IpAddr, ToSocketAddrs}, pin::Pin, sync::{
-        Arc, OnceLock, atomic::{AtomicBool, Ordering}
-    }, task::{Context, Poll}, time::{Duration, UNIX_EPOCH}
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
+    task::{Context, Poll},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use hex::ToHex;
@@ -21,6 +26,31 @@ use crate::{
     rate_limiting::NetworkInformation,
     status_bar::StatusBar,
 };
+
+/// Maximum number of concurrent connections per app instance
+const MAX_CONNECTIONS: usize = 8;
+
+/// Maximum outbound bandwidth in bytes per second (20 kBps)
+const MAX_OUTBOUND_BANDWIDTH: u64 = 20 * 1024;
+
+// Dial error codes
+const DIAL_ERR_ADDRESS_TOO_LONG: i32 = -1;
+const DIAL_ERR_TOO_MANY_CONNECTIONS: i32 = -2;
+
+// Poll dial error codes
+const POLL_DIAL_PENDING: i32 = -1;
+const POLL_DIAL_ERR_INVALID_DIAL_ID: i32 = -2;
+const POLL_DIAL_ERR_TASK_FAILED: i32 = -3;
+const POLL_DIAL_ERR_TOO_MANY_CONNECTIONS: i32 = -4;
+const POLL_DIAL_ERR_DNS_RESOLUTION: i32 = -5;
+const POLL_DIAL_ERR_NOT_GLOBALLY_REACHABLE: i32 = -6;
+const POLL_DIAL_ERR_CONNECTION_FAILED: i32 = -7;
+const POLL_DIAL_ERR_INVALID_DNS_NAME: i32 = -8;
+const POLL_DIAL_ERR_TLS_HANDSHAKE: i32 = -9;
+
+// Connection error codes
+const CONN_ERR_INVALID_CONN_ID: i32 = -1;
+const CONN_ERR_CONNECTION_ERROR: i32 = -2;
 
 pub struct AppServer {
     linker: Arc<wasmtime::Linker<AppState>>,
@@ -68,9 +98,11 @@ impl AppServer {
         let mut linker = wasmtime::Linker::<AppState>::new(&engine);
         wasmtime_wasi::p1::add_to_linker_async(&mut linker, |t| &mut t.app.wasi_ctx)?;
 
-        linker.func_wrap_async("terminal_games", "dial", Self::host_dial)?;
-        linker.func_wrap_async("terminal_games", "conn_write", Self::conn_write)?;
-        linker.func_wrap_async("terminal_games", "conn_read", Self::conn_read)?;
+        linker.func_wrap("terminal_games", "dial", Self::host_dial)?;
+        linker.func_wrap("terminal_games", "poll_dial", Self::poll_dial)?;
+        linker.func_wrap("terminal_games", "conn_close", Self::conn_close)?;
+        linker.func_wrap("terminal_games", "conn_write", Self::conn_write)?;
+        linker.func_wrap("terminal_games", "conn_read", Self::conn_read)?;
         linker.func_wrap("terminal_games", "terminal_read", Self::terminal_read)?;
         linker.func_wrap_async("terminal_games", "terminal_size", Self::terminal_size)?;
         linker.func_wrap_async("terminal_games", "terminal_cursor", Self::terminal_cursor)?;
@@ -286,7 +318,7 @@ impl AppServer {
                 let state = AppState {
                     app,
                     ctx,
-                    streams: Vec::default(),
+                    conn_manager: ConnectionManager::default(),
                     limits: AppLimiter::default(),
                     terminal: terminal,
                     next_app: None,
@@ -439,169 +471,313 @@ impl AppServer {
 
     fn host_dial(
         mut caller: wasmtime::Caller<'_, AppState>,
-        (address_ptr, address_len, mode): (i32, u32, u32),
-    ) -> Box<dyn Future<Output = anyhow::Result<i32>> + Send + '_> {
-        Box::new(async move {
-            let mut buf = [0u8; 64];
-            if address_len >= buf.len() as u32 {
-                anyhow::bail!("dial address too long")
+        address_ptr: i32,
+        address_len: u32,
+        mode: u32,
+    ) -> anyhow::Result<i32> {
+        let mut buf = [0u8; 256];
+        if address_len as usize >= buf.len() {
+            return Ok(DIAL_ERR_ADDRESS_TOO_LONG);
+        }
+        let len = address_len as usize;
+        let offset = address_ptr as usize;
+
+        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+            anyhow::bail!("failed to find host memory");
+        };
+
+        mem.read(&caller, offset, &mut buf[..len])?;
+
+        if caller.data().conn_manager.active_connection_count() >= MAX_CONNECTIONS {
+            return Ok(DIAL_ERR_TOO_MANY_CONNECTIONS);
+        }
+
+        let address = String::from_utf8_lossy(&buf[..len]).to_string();
+
+        // Spawn the connection task - DNS resolution happens asynchronously
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let result = Self::do_connect(address, mode).await;
+            let _ = tx.send(result);
+        });
+
+        // Store the pending dial
+        let pending = PendingDial { receiver: rx };
+        let pending_dials = &mut caller.data_mut().conn_manager.pending_dials;
+
+        // Find a free slot or append
+        for (i, slot) in pending_dials.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(pending);
+                return Ok(i as i32);
             }
-            let len = address_len as usize;
-            let offset = address_ptr as usize;
+        }
+        // No free slot found, append
+        let slot_id = pending_dials.len() as i32;
+        pending_dials.push(Some(pending));
+        Ok(slot_id)
+    }
 
-            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                anyhow::bail!("failed to find host memory");
-            };
-
-            if let Err(_) = mem.read(&mut caller, offset, &mut buf[..len]) {
-                anyhow::bail!("failed to write to host memory");
+    async fn do_connect(
+        address: String,
+        mode: u32,
+    ) -> Result<(Stream, SocketAddr, SocketAddr), i32> {
+        let addrs: Vec<SocketAddr> = match tokio::net::lookup_host(&address).await {
+            Ok(iter) => iter.collect(),
+            Err(e) => {
+                tracing::error!("do_connect: DNS resolution failed: {:?}", e);
+                return Err(POLL_DIAL_ERR_DNS_RESOLUTION);
             }
+        };
 
-            let address = String::from_utf8_lossy(&buf[..len]);
-            let addr_iter = match address.to_socket_addrs() {
-                Ok(addr_iter) => addr_iter,
-                Err(_error) => return Ok(-1),
-            };
+        if addrs.is_empty() {
+            return Err(POLL_DIAL_ERR_DNS_RESOLUTION);
+        }
 
-            if addr_iter.len() == 0 {
-                return Ok(-1);
+        if !addrs.iter().all(|addr| is_globally_reachable(addr.ip())) {
+            return Err(POLL_DIAL_ERR_NOT_GLOBALLY_REACHABLE);
+        }
+
+        let tcp_stream = match tokio::net::TcpStream::connect(addrs.as_slice()).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::error!("do_connect: TcpStream::connect failed: {:?}", e);
+                return Err(POLL_DIAL_ERR_CONNECTION_FAILED);
             }
+        };
 
-            if !addr_iter.as_slice().iter().map(|addr| is_globally_reachable(addr.ip())).all(|reachable| reachable) {
-                return Ok(-1);
-            }
+        if let Err(e) = tcp_stream.set_nodelay(true) {
+            tracing::warn!("Failed to set nodelay: {:?}", e);
+        }
 
-            let tcp_stream = match tokio::net::TcpStream::connect(addr_iter.as_ref()).await {
-                Ok(stream) => stream,
+        let local_addr = tcp_stream.local_addr().unwrap_or_else(|_| {
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+        });
+        let remote_addr = tcp_stream.peer_addr().unwrap_or(addrs[0]);
+
+        let stream = if mode == 1 {
+            let hostname: String = address
+                .split(':')
+                .next()
+                .unwrap_or(&address)
+                .to_string();
+
+            let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
+            root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let mut config = tokio_rustls::rustls::ClientConfig::builder()
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth();
+            config.alpn_protocols.push(b"h2".to_vec());
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+            let dnsname = match rustls_pki_types::ServerName::try_from(hostname) {
+                Ok(name) => name,
                 Err(_) => {
-                    tracing::error!("tcp_stream");
-                    return Ok(-1);
+                    tracing::error!("do_connect: invalid DNS name");
+                    return Err(POLL_DIAL_ERR_INVALID_DNS_NAME);
                 }
             };
 
-            if let Err(e) = tcp_stream.set_nodelay(true) {
-                tracing::warn!("Failed to set nodelay: {:?}", e);
-            }
-
-            let stream = if mode == 1 {
-                let hostname: String = address.split(':').next().unwrap_or(&address).to_string();
-
-                let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
-                root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                let mut config = tokio_rustls::rustls::ClientConfig::builder()
-                    .with_root_certificates(root_cert_store)
-                    .with_no_client_auth();
-                config.alpn_protocols.push(b"h2".to_vec());
-                let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-
-                let dnsname = match rustls_pki_types::ServerName::try_from(hostname) {
-                    Ok(name) => name,
-                    Err(_) => {
-                        tracing::error!("dnsname");
-                        return Ok(-1);
-                    }
-                };
-
-                let tls_stream = match connector.connect(dnsname, tcp_stream).await {
-                    Ok(stream) => stream,
-                    Err(_) => {
-                        tracing::error!("tls_stream");
-                        return Ok(-1);
-                    }
-                };
-
-                Stream::Tls(tls_stream)
-            } else {
-                Stream::Tcp(tcp_stream)
+            let tls_stream = match connector.connect(dnsname, tcp_stream).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    tracing::error!("do_connect: TLS handshake failed: {:?}", e);
+                    return Err(POLL_DIAL_ERR_TLS_HANDSHAKE);
+                }
             };
 
-            caller.data_mut().streams.push(stream);
+            Stream::Tls(tls_stream)
+        } else {
+            Stream::Tcp(tcp_stream)
+        };
 
-            tracing::info!(mode, "dial");
+        Ok((stream, local_addr, remote_addr))
+    }
 
-            Ok((caller.data().streams.len() - 1) as i32)
-        })
+    fn poll_dial(
+        mut caller: wasmtime::Caller<'_, AppState>,
+        dial_id: i32,
+        local_addr_ptr: i32,
+        local_addr_len_ptr: i32,
+        remote_addr_ptr: i32,
+        remote_addr_len_ptr: i32,
+    ) -> anyhow::Result<i32> {
+        let dial_id_usize = dial_id as usize;
+
+        {
+            let conn_manager = &caller.data().conn_manager;
+            if dial_id_usize >= conn_manager.pending_dials.len() {
+                return Ok(POLL_DIAL_ERR_INVALID_DIAL_ID);
+            }
+            if conn_manager.pending_dials[dial_id_usize].is_none() {
+                return Ok(POLL_DIAL_ERR_INVALID_DIAL_ID);
+            }
+        }
+
+        let mut pending = caller.data_mut().conn_manager.pending_dials[dial_id_usize]
+            .take()
+            .unwrap();
+
+        match pending.receiver.try_recv() {
+            Ok(Ok((stream, local_addr, remote_addr))) => {
+                let conn_manager = &mut caller.data_mut().conn_manager;
+                let slot = conn_manager.find_free_conn_slot();
+
+                if slot.is_none() {
+                    return Ok(POLL_DIAL_ERR_TOO_MANY_CONNECTIONS);
+                }
+
+                let slot_id = slot.unwrap();
+                let conn = Connection { stream };
+
+                if slot_id < conn_manager.connections.len() {
+                    conn_manager.connections[slot_id] = Some(conn);
+                } else {
+                    conn_manager.connections.push(Some(conn));
+                }
+
+                let local_addr_str = local_addr.to_string();
+                let remote_addr_str = remote_addr.to_string();
+
+                let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                    anyhow::bail!("failed to find host memory");
+                };
+
+                mem.write(&mut caller, local_addr_ptr as usize, local_addr_str.as_bytes())?;
+                mem.write(
+                    &mut caller,
+                    local_addr_len_ptr as usize,
+                    &(local_addr_str.len() as u32).to_le_bytes(),
+                )?;
+                mem.write(&mut caller, remote_addr_ptr as usize, remote_addr_str.as_bytes())?;
+                mem.write(
+                    &mut caller,
+                    remote_addr_len_ptr as usize,
+                    &(remote_addr_str.len() as u32).to_le_bytes(),
+                )?;
+
+                tracing::info!(conn_id = slot_id, %local_addr, %remote_addr, "dial completed");
+                Ok(slot_id as i32)
+            }
+            Ok(Err(error_code)) => Ok(error_code),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                caller.data_mut().conn_manager.pending_dials[dial_id_usize] = Some(pending);
+                Ok(POLL_DIAL_PENDING)
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                Ok(POLL_DIAL_ERR_TASK_FAILED)
+            }
+        }
+    }
+
+    fn conn_close(mut caller: wasmtime::Caller<'_, AppState>, conn_id: i32) -> anyhow::Result<i32> {
+        let conn_id_usize = conn_id as usize;
+        let connections = &mut caller.data_mut().conn_manager.connections;
+
+        if conn_id_usize >= connections.len() || connections[conn_id_usize].is_none() {
+            return Ok(CONN_ERR_INVALID_CONN_ID);
+        }
+
+        connections[conn_id_usize] = None;
+        tracing::info!(conn_id, "connection closed");
+        Ok(0)
     }
 
     fn conn_write(
         mut caller: wasmtime::Caller<'_, AppState>,
-        (conn_id, address_ptr, address_len): (i32, i32, u32),
-    ) -> Box<dyn Future<Output = anyhow::Result<i32>> + Send + '_> {
-        Box::new(async move {
-            let mut buf = [0u8; 4 * 1024];
-            if address_len >= buf.len() as u32 {
-                tracing::error!("conn_write: address too long");
-                return Ok(-1);
-            }
-            let len = address_len as usize;
-            let offset = address_ptr as usize;
+        conn_id: i32,
+        data_ptr: i32,
+        data_len: u32,
+    ) -> anyhow::Result<i32> {
+        let mut buf = [0u8; 4 * 1024];
+        let len = (data_len as usize).min(buf.len());
+        let offset = data_ptr as usize;
 
-            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                tracing::error!("conn_write: failed to find host memory");
-                return Ok(-1);
-            };
+        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+            anyhow::bail!("failed to find host memory");
+        };
 
-            if let Err(_) = mem.read(&caller, offset, &mut buf[..len]) {
-                tracing::error!("conn_write: failed to read from host memory");
-                return Ok(-1);
-            }
+        mem.read(&caller, offset, &mut buf[..len])?;
 
-            let Some(stream) = caller.data_mut().streams.get_mut(conn_id as usize) else {
-                tracing::error!("conn_write: invalid conn_id: {}", conn_id);
-                return Ok(-1);
-            };
+        let conn_manager = &mut caller.data_mut().conn_manager;
 
-            tracing::info!(len, "conn_write");
+        let conn_id_usize = conn_id as usize;
+        if conn_id_usize >= conn_manager.connections.len() {
+            return Ok(CONN_ERR_INVALID_CONN_ID);
+        }
 
-            match stream.write(&buf[..len]).await {
-                Ok(n) => Ok(n as i32),
-                Err(e) => {
-                    tracing::error!("conn_write: stream write failed: {:?}", e);
-                    Ok(-1)
+        let Some(conn) = conn_manager.connections[conn_id_usize].as_mut() else {
+            return Ok(CONN_ERR_INVALID_CONN_ID);
+        };
+
+        let allowed = conn_manager.bandwidth.try_consume(len);
+        if allowed == 0 {
+            return Ok(0);
+        }
+
+        match conn.stream.try_write(&buf[..allowed]) {
+            Ok(n) => {
+                if n > 0 {
+                    tracing::debug!(n, "conn_write");
                 }
+                Ok(n as i32)
             }
-        })
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => {
+                tracing::error!("conn_write: stream write failed: {:?}", e);
+                Ok(CONN_ERR_CONNECTION_ERROR)
+            }
+        }
     }
 
     fn conn_read(
         mut caller: wasmtime::Caller<'_, AppState>,
-        (conn_id, ptr, len): (i32, i32, u32),
-    ) -> Box<dyn Future<Output = anyhow::Result<i32>> + Send + '_> {
-        Box::new(async move {
-            let Some(stream) = caller.data_mut().streams.get_mut(conn_id as usize) else {
-                tracing::error!("conn_read: invalid conn_id: {}", conn_id);
-                return Ok(-1);
+        conn_id: i32,
+        ptr: i32,
+        len: u32,
+    ) -> anyhow::Result<i32> {
+        let conn_id_usize = conn_id as usize;
+
+        {
+            let connections = &caller.data().conn_manager.connections;
+            if conn_id_usize >= connections.len() {
+                return Ok(CONN_ERR_INVALID_CONN_ID);
+            }
+            if connections[conn_id_usize].is_none() {
+                return Ok(CONN_ERR_INVALID_CONN_ID);
             };
+        }
 
-            let mut buf = [0u8; 4 * 1024];
-            let len = std::cmp::min(buf.len(), len as usize);
+        let mut buf = [0u8; 4 * 1024];
+        let read_len = (len as usize).min(buf.len());
 
-            let n = match stream.try_read(&mut buf[..len]) {
+        let n = {
+            let connections = &mut caller.data_mut().conn_manager.connections;
+            let conn = connections[conn_id_usize].as_mut().unwrap();
+
+            match conn.stream.try_read(&mut buf[..read_len]) {
+                Ok(0) => return Ok(CONN_ERR_CONNECTION_ERROR),
                 Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Ok(0);
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
                 Err(e) => {
                     tracing::error!("conn_read: stream read error: {:?}", e);
-                    return Ok(-1);
+                    return Ok(CONN_ERR_CONNECTION_ERROR);
                 }
-            };
-
-            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                tracing::error!("conn_read: failed to find host memory");
-                return Ok(-1);
-            };
-            let offset = ptr as u32 as usize;
-            if let Err(_) = mem.write(&mut caller, offset, &buf[..n]) {
-                tracing::error!("conn_read: failed to write to host memory");
-                return Ok(-1);
             }
-            if n > 0 {
-                tracing::info!(n, "conn_read");
-            }
+        };
 
-            Ok(n as i32)
-        })
+        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+            anyhow::bail!("failed to find host memory");
+        };
+
+        mem.write(&mut caller, ptr as usize, &buf[..n])?;
+
+        if n > 0 {
+            tracing::debug!(n, "conn_read");
+        }
+
+        Ok(n as i32)
     }
 
     fn terminal_read(
@@ -1093,7 +1269,7 @@ pub struct AppContext {
 pub struct AppState {
     app: PreloadedAppState,
     ctx: Arc<AppContext>,
-    streams: Vec<Stream>,
+    conn_manager: ConnectionManager,
     limits: AppLimiter,
     terminal: Arc<Mutex<Terminal>>,
     next_app: Option<
@@ -1104,6 +1280,97 @@ pub struct AppState {
     graceful_shutdown_token: CancellationToken,
     network_info: Arc<NetworkInformation>,
     audio_buffer: Arc<AudioBuffer>,
+}
+
+/// Manages all connections for an app instance with bandwidth limiting
+pub struct ConnectionManager {
+    /// Active connections indexed by conn_id
+    connections: Vec<Option<Connection>>,
+    /// Pending dial operations indexed by dial_id
+    pending_dials: Vec<Option<PendingDial>>,
+    /// Bandwidth tracker for outbound data
+    bandwidth: BandwidthTracker,
+}
+
+impl Default for ConnectionManager {
+    fn default() -> Self {
+        Self {
+            connections: Vec::with_capacity(MAX_CONNECTIONS),
+            pending_dials: Vec::new(),
+            bandwidth: BandwidthTracker::new(MAX_OUTBOUND_BANDWIDTH),
+        }
+    }
+}
+
+impl ConnectionManager {
+    fn active_connection_count(&self) -> usize {
+        self.connections.iter().filter(|c| c.is_some()).count()
+    }
+
+    fn find_free_conn_slot(&self) -> Option<usize> {
+        for (i, slot) in self.connections.iter().enumerate() {
+            if slot.is_none() {
+                return Some(i);
+            }
+        }
+        if self.connections.len() < MAX_CONNECTIONS {
+            return Some(self.connections.len());
+        }
+        None
+    }
+}
+
+/// Tracks bandwidth usage with a sliding window
+pub struct BandwidthTracker {
+    /// Maximum bytes per second allowed
+    max_bps: u64,
+    /// Bytes sent in current window
+    bytes_in_window: AtomicU64,
+    /// Window start time
+    window_start: std::sync::Mutex<Instant>,
+}
+
+impl BandwidthTracker {
+    fn new(max_bps: u64) -> Self {
+        Self {
+            max_bps,
+            bytes_in_window: AtomicU64::new(0),
+            window_start: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Try to consume bandwidth. Returns the number of bytes allowed (may be 0 or less than requested)
+    fn try_consume(&self, bytes: usize) -> usize {
+        let mut window_start = self.window_start.lock().unwrap();
+        let now = Instant::now();
+        let elapsed = now.duration_since(*window_start);
+
+        // Reset window every second
+        if elapsed >= Duration::from_secs(1) {
+            *window_start = now;
+            self.bytes_in_window.store(0, Ordering::Release);
+        }
+
+        let current = self.bytes_in_window.load(Ordering::Acquire);
+        let available = self.max_bps.saturating_sub(current) as usize;
+        let to_send = bytes.min(available);
+
+        if to_send > 0 {
+            self.bytes_in_window
+                .fetch_add(to_send as u64, Ordering::AcqRel);
+        }
+
+        to_send
+    }
+}
+
+/// A pending dial operation
+pub struct PendingDial {
+    receiver: tokio::sync::oneshot::Receiver<Result<(Stream, SocketAddr, SocketAddr), i32>>,
+}
+
+pub struct Connection {
+    stream: Stream,
 }
 
 struct AppLimiter {
@@ -1337,15 +1604,25 @@ pub enum Stream {
 }
 
 impl Stream {
-    pub async fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    pub fn try_write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
-            Stream::Tcp(stream) => {
-                use tokio::io::AsyncWriteExt;
-                stream.write(buf).await
-            }
+            Stream::Tcp(stream) => stream.try_write(buf),
             Stream::Tls(stream) => {
-                use tokio::io::AsyncWriteExt;
-                stream.write(buf).await
+                use std::task::{Context, Poll, Waker};
+                use tokio::io::AsyncWrite;
+
+                struct NoOpWaker;
+                impl std::task::Wake for NoOpWaker {
+                    fn wake(self: Arc<Self>) {}
+                }
+                let waker = Waker::from(Arc::new(NoOpWaker));
+                let mut cx = Context::from_waker(&waker);
+
+                match Pin::new(stream).poll_write(&mut cx, buf) {
+                    Poll::Ready(Ok(n)) => Ok(n),
+                    Poll::Ready(Err(e)) => Err(e),
+                    Poll::Pending => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                }
             }
         }
     }
@@ -1354,7 +1631,6 @@ impl Stream {
         match self {
             Stream::Tcp(stream) => stream.try_read(buf),
             Stream::Tls(stream) => {
-                use std::pin::Pin;
                 use std::task::{Context, Poll, Waker};
                 use tokio::io::AsyncRead;
 

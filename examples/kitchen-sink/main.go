@@ -323,7 +323,7 @@ func (m model) View() string {
 			"Network: ↑%.0f B/s ↓%.0f B/s RTT %dms throttled: %s\n\n"+
 			"Peers (↑/↓ to select, Enter to send message):\n%s\n\n"+
 			"Recent Messages:\n%s\n\n"+
-			"%v\n\n%+v\nhasDarkBackground=%v",
+			"%v\n\n%+v\nhasDarkBackground=%v\n\n%v",
 		m.lastChar, m.w, m.h, m.x, m.y, markedZone, TerminalOSC8Link("https://example.com", "example"), m.timeLeft,
 		m.peerID.String(),
 		audioStatus,
@@ -331,8 +331,19 @@ func (m model) View() string {
 		peerListText,
 		peerMessagesText,
 		m.httpStyle.Render(m.httpBody), os.Environ(), m.hasDarkBackground,
+		StringWithCharset(100),
 	))
+	// runtime.GC()
 	return zone.Scan(lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, content))
+}
+
+func StringWithCharset(length int) string {
+	charset := "abcdefghijklmnopqrstuvwxyz"
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[rand.IntN(len(charset))]
+	}
+	return string(b)
 }
 
 func TerminalOSC8Link(link, text string) string {

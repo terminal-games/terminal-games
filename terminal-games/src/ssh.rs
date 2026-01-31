@@ -187,14 +187,14 @@ impl SshServer {
                         break;
                     }
 
-                    data = output_rx.recv() => {
-                        let Some(data) = data else { break };
-                        let _ = session_handle.data(channel_id, data.into()).await;
-                    }
-
                     data = audio_rx.recv(), if has_audio => {
                         let Some(data) = data else { break };
                         let _ = session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, data.into()).await;
+                    }
+
+                    data = output_rx.recv() => {
+                        let Some(data) = data else { break };
+                        let _ = session_handle.data(channel_id, data.into()).await;
                     }
                 }
             }
