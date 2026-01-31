@@ -6,11 +6,11 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, OnceLock,
     },
     task::{Context, Poll},
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use hex::ToHex;
@@ -23,7 +23,7 @@ use wasmtime_wasi::I32Exit;
 use crate::{
     audio::{AudioBuffer, CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
-    rate_limiting::NetworkInformation,
+    rate_limiting::{NetworkInformation, TokenBucket},
     status_bar::StatusBar,
 };
 
@@ -494,7 +494,6 @@ impl AppServer {
 
         let address = String::from_utf8_lossy(&buf[..len]).to_string();
 
-        // Spawn the connection task - DNS resolution happens asynchronously
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         tokio::spawn(async move {
@@ -502,18 +501,15 @@ impl AppServer {
             let _ = tx.send(result);
         });
 
-        // Store the pending dial
         let pending = PendingDial { receiver: rx };
         let pending_dials = &mut caller.data_mut().conn_manager.pending_dials;
 
-        // Find a free slot or append
         for (i, slot) in pending_dials.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(pending);
                 return Ok(i as i32);
             }
         }
-        // No free slot found, append
         let slot_id = pending_dials.len() as i32;
         pending_dials.push(Some(pending));
         Ok(slot_id)
@@ -711,12 +707,12 @@ impl AppServer {
             return Ok(CONN_ERR_INVALID_CONN_ID);
         };
 
-        let allowed = conn_manager.bandwidth.try_consume(len);
-        if allowed == 0 {
+        if conn_manager.bandwidth.tokens() < len {
             return Ok(0);
         }
+        conn_manager.bandwidth.consume(len);
 
-        match conn.stream.try_write(&buf[..allowed]) {
+        match conn.stream.try_write(&buf[..len]) {
             Ok(n) => {
                 if n > 0 {
                     tracing::debug!(n, "conn_write");
@@ -1282,14 +1278,10 @@ pub struct AppState {
     audio_buffer: Arc<AudioBuffer>,
 }
 
-/// Manages all connections for an app instance with bandwidth limiting
 pub struct ConnectionManager {
-    /// Active connections indexed by conn_id
     connections: Vec<Option<Connection>>,
-    /// Pending dial operations indexed by dial_id
     pending_dials: Vec<Option<PendingDial>>,
-    /// Bandwidth tracker for outbound data
-    bandwidth: BandwidthTracker,
+    bandwidth: TokenBucket,
 }
 
 impl Default for ConnectionManager {
@@ -1297,7 +1289,7 @@ impl Default for ConnectionManager {
         Self {
             connections: Vec::with_capacity(MAX_CONNECTIONS),
             pending_dials: Vec::new(),
-            bandwidth: BandwidthTracker::new(MAX_OUTBOUND_BANDWIDTH),
+            bandwidth: TokenBucket::new(MAX_OUTBOUND_BANDWIDTH, MAX_OUTBOUND_BANDWIDTH * 2),
         }
     }
 }
@@ -1320,51 +1312,6 @@ impl ConnectionManager {
     }
 }
 
-/// Tracks bandwidth usage with a sliding window
-pub struct BandwidthTracker {
-    /// Maximum bytes per second allowed
-    max_bps: u64,
-    /// Bytes sent in current window
-    bytes_in_window: AtomicU64,
-    /// Window start time
-    window_start: std::sync::Mutex<Instant>,
-}
-
-impl BandwidthTracker {
-    fn new(max_bps: u64) -> Self {
-        Self {
-            max_bps,
-            bytes_in_window: AtomicU64::new(0),
-            window_start: std::sync::Mutex::new(Instant::now()),
-        }
-    }
-
-    /// Try to consume bandwidth. Returns the number of bytes allowed (may be 0 or less than requested)
-    fn try_consume(&self, bytes: usize) -> usize {
-        let mut window_start = self.window_start.lock().unwrap();
-        let now = Instant::now();
-        let elapsed = now.duration_since(*window_start);
-
-        // Reset window every second
-        if elapsed >= Duration::from_secs(1) {
-            *window_start = now;
-            self.bytes_in_window.store(0, Ordering::Release);
-        }
-
-        let current = self.bytes_in_window.load(Ordering::Acquire);
-        let available = self.max_bps.saturating_sub(current) as usize;
-        let to_send = bytes.min(available);
-
-        if to_send > 0 {
-            self.bytes_in_window
-                .fetch_add(to_send as u64, Ordering::AcqRel);
-        }
-
-        to_send
-    }
-}
-
-/// A pending dial operation
 pub struct PendingDial {
     receiver: tokio::sync::oneshot::Receiver<Result<(Stream, SocketAddr, SocketAddr), i32>>,
 }
@@ -1661,44 +1608,6 @@ impl Stream {
 }
 
 pub type Terminal = headless_terminal::Parser;
-
-// fn is_bogon(addr: SocketAddr) -> bool {
-//     match addr.ip() {
-//         std::net::IpAddr::V4(ip) => match ip.octets() {
-//             [0, ..] => true, // 0.0.0.0/8 "This" network
-//             [10, ..] => true, // 10.0.0.0/8 Private-use networks
-//             [100, b, ..] if b >= 64 && b <= 127 => true, // 100.64.0.0/10 Carrier-grade NAT
-//             [127, ..] => true, // 127.0.0.0/8 Loopback
-//             [169, 254, ..] => true, // 169.254.0.0/16 Link local
-//             [172, b, ..] if b >= 16 && b <= 31 => true, // 172.16.0.0/12 Private-use networks
-//             [192, 0, 0, ..] => true, // 192.0.0.0/24 IETF protocol assignments
-//             [192, 0, 2, ..] => true, // 192.0.2.0/24 TEST-NET-1
-//             [192, 168, ..] => true, // 192.168.0.0/16 Private-use networks
-//             [198, b, ..] if b >= 18 && b <= 19 => true, // 198.18.0.0/15 Network interconnect device benchmark testing
-//             [198, 51, 100, ..] => true, // 198.51.100.0/24 TEST-NET-2
-//             [203, 0, 113, ..] => true, // 203.0.113.0/24 TEST-NET-3
-//             [a, ..] if a >= 224 && a <= 239 => true, // 224.0.0.0/4 Multicast
-//             [a, ..] if a >= 240 && a <= 255 => true, // 240.0.0.0/4 Reserved for future use
-//             [255, 255, 255, 255] => true, // 255.255.255.255/32 Limited broadcast
-//             _ => false,
-//         },
-//         std::net::IpAddr::V6(ip) => match ip.segments() {
-//             [0, 0, 0, 0, 0, 0, 0, 0] => true, // ::/128 Node-scope unicast unspecified address
-//             [0, 0, 0, 0, 0, 0, 0, 1] => true, // ::1/128 Node-scope unicast loopback address
-//             [0, 0, 0, 0, 0, 0xffff, ..] => true, // ::ffff:0:0/96 IPv4-mapped addresses
-//             [0, 0, 0, 0, 0, 0, ..] => true, // ::/96 IPv4-compatible addresses
-//             [0x100, 0, 0, 0, ..] => true, // 100::/64 Remotely triggered black hole addresses
-//             [0x2001, b, ..] if b >= 0x20 && b <= 0x2f => true, // 2001:20::/28 Overlay routable cryptographic hash identifiers (ORCHID)
-//             [0x2001, 0xdb8, ..] => true, // 2001:db8::/32 Documentation prefix
-//             [0x3fff, b, ..] if b <= 0xf => true, // 3fff::/20 Documentation prefix
-//             [a, ..] if a >= 0xfc00 && a <= 0xfdff => true, // fc00::/7 Unique local addresses (ULA)
-//             [a, ..] if (a & 0xffc0) == 0xfe80 => true, // fe80::/10 Link-local unicast
-//             [a, ..] if (a & 0xffc0) == 0xfec0 => true, // fec0::/10 Site-local unicast (deprecated)
-//             [a, ..] if a >= 0xff00 => true, // ff00::/8 Multicast (Note: ff0e:/16 is global scope and may appear on the global internet.)
-//             _ => false,
-//         }
-//     }
-// }
 
 pub fn is_globally_reachable(ip: IpAddr) -> bool {
     match ip {
