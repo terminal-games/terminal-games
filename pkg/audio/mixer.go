@@ -113,7 +113,7 @@ func startMixer() {
 	globalMixer.mu.Unlock()
 
 	go func() {
-		writer := NewAudioWriter(FrameSize * 5)
+		writer := NewAudioWriter(FrameSize * 4)
 
 		for {
 			neededFrames := writer.ShouldWrite()
