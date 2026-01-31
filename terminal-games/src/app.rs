@@ -52,6 +52,14 @@ const POLL_DIAL_ERR_TLS_HANDSHAKE: i32 = -9;
 const CONN_ERR_INVALID_CONN_ID: i32 = -1;
 const CONN_ERR_CONNECTION_ERROR: i32 = -2;
 
+// Peer error codes
+const PEER_SEND_ERR_INVALID_PEER_COUNT: i32 = -1;
+const PEER_SEND_ERR_DATA_TOO_LARGE: i32 = -2;
+const PEER_SEND_ERR_CHANNEL_FULL: i32 = -3;
+const PEER_SEND_ERR_CHANNEL_CLOSED: i32 = -4;
+
+const PEER_RECV_ERR_CHANNEL_DISCONNECTED: i32 = -1;
+
 pub struct AppServer {
     linker: Arc<wasmtime::Linker<AppState>>,
     engine: wasmtime::Engine,
@@ -483,7 +491,7 @@ impl AppServer {
         let offset = address_ptr as usize;
 
         let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            anyhow::bail!("failed to find host memory");
+            anyhow::bail!("dial: failed to find host memory");
         };
 
         mem.read(&caller, offset, &mut buf[..len])?;
@@ -542,10 +550,6 @@ impl AppServer {
                 return Err(POLL_DIAL_ERR_CONNECTION_FAILED);
             }
         };
-
-        if let Err(e) = tcp_stream.set_nodelay(true) {
-            tracing::warn!("Failed to set nodelay: {:?}", e);
-        }
 
         let local_addr = tcp_stream.local_addr().unwrap_or_else(|_| {
             SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
@@ -784,12 +788,10 @@ impl AppServer {
         match caller.data_mut().input_receiver.try_recv() {
             Ok(buf) => {
                 let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                    anyhow::bail!("failed to find host memory");
+                    anyhow::bail!("terminal_read: failed to find host memory");
                 };
                 let offset = ptr as u32 as usize;
-                if let Err(_) = mem.write(&mut caller, offset, buf.as_ref()) {
-                    anyhow::bail!("failed to write to host memory");
-                }
+                mem.write(&mut caller, offset, buf.as_ref())?;
                 Ok(buf.len() as i32)
             }
             Err(_) => Ok(0),
@@ -802,20 +804,16 @@ impl AppServer {
     ) -> Box<dyn Future<Output = anyhow::Result<()>> + Send + '_> {
         Box::new(async move {
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                anyhow::bail!("failed to find host memory");
+                anyhow::bail!("terminal_size: failed to find host memory");
             };
             let (height, width) = caller.data().terminal.lock().await.screen().size();
             let effective_height = if height > 0 { height - 1 } else { 0 };
 
             let width_offset = width_ptr as u32 as usize;
-            if let Err(_) = mem.write(&mut caller, width_offset, &width.to_le_bytes()) {
-                anyhow::bail!("failed to write to host memory");
-            }
+            mem.write(&mut caller, width_offset, &width.to_le_bytes())?;
 
             let height_offset = height_ptr as u32 as usize;
-            if let Err(_) = mem.write(&mut caller, height_offset, &effective_height.to_le_bytes()) {
-                anyhow::bail!("failed to write to host memory");
-            }
+            mem.write(&mut caller, height_offset, &effective_height.to_le_bytes())?;
 
             Ok(())
         })
@@ -827,7 +825,7 @@ impl AppServer {
     ) -> Box<dyn Future<Output = anyhow::Result<()>> + Send + '_> {
         Box::new(async move {
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                anyhow::bail!("failed to find host memory");
+                anyhow::bail!("terminal_cursor: failed to find host memory");
             };
             let (y, x) = caller
                 .data()
@@ -838,14 +836,10 @@ impl AppServer {
                 .cursor_position();
 
             let x_offset = x_ptr as u32 as usize;
-            if let Err(_) = mem.write(&mut caller, x_offset, &x.to_le_bytes()) {
-                anyhow::bail!("failed to write to host memory");
-            }
+            mem.write(&mut caller, x_offset, &x.to_le_bytes())?;
 
             let y_offset = y_ptr as u32 as usize;
-            if let Err(_) = mem.write(&mut caller, y_offset, &y.to_le_bytes()) {
-                anyhow::bail!("failed to write to host memory");
-            }
+            mem.write(&mut caller, y_offset, &y.to_le_bytes())?;
 
             Ok(())
         })
@@ -862,14 +856,12 @@ impl AppServer {
             }
 
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                anyhow::bail!("failed to find host memory");
+                anyhow::bail!("change_app: failed to find host memory");
             };
 
             let mut buf = vec![0u8; len];
             let offset = ptr as usize;
-            if let Err(_) = mem.read(&caller, offset, &mut buf) {
-                anyhow::bail!("failed to read from guest memory");
-            }
+            mem.read(&caller, offset, &mut buf)?;
 
             let shortname = match String::from_utf8(buf) {
                 Ok(s) => s,
@@ -911,13 +903,11 @@ impl AppServer {
         data_len: u32,
     ) -> anyhow::Result<i32> {
         let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            tracing::error!("peer_send: failed to find host memory");
-            return Ok(-1);
+            anyhow::bail!("peer_send: failed to find host memory");
         };
 
         if peer_ids_count == 0 || peer_ids_count > 1024 {
-            tracing::error!("peer_send: invalid peer_ids_count: {}", peer_ids_count);
-            return Ok(-1);
+            return Ok(PEER_SEND_ERR_INVALID_PEER_COUNT);
         }
 
         if data_len == 0 {
@@ -926,8 +916,7 @@ impl AppServer {
         }
 
         if data_len > 64 * 1024 {
-            tracing::error!("peer_send: data_len too large: {}", data_len);
-            return Ok(-1);
+            return Ok(PEER_SEND_ERR_DATA_TOO_LARGE);
         }
         const PEER_ID_SIZE: usize = std::mem::size_of::<PeerId>();
         let peer_ids_offset = peer_ids_ptr as usize;
@@ -935,19 +924,11 @@ impl AppServer {
         let total_peer_ids_size = peer_ids_count * std::mem::size_of::<PeerId>();
 
         let mut peer_ids_buf = vec![0u8; total_peer_ids_size];
-        if let Err(_) = mem.read(&caller, peer_ids_offset, &mut peer_ids_buf) {
-            tracing::error!("peer_send: failed to read peer IDs from memory");
-            return Ok(-1);
-        }
+        mem.read(&caller, peer_ids_offset, &mut peer_ids_buf)?;
 
         let mut peer_ids = Vec::with_capacity(peer_ids_count);
         for i in 0..peer_ids_count {
             let offset = i * PEER_ID_SIZE;
-            if offset + PEER_ID_SIZE > peer_ids_buf.len() {
-                tracing::error!("peer_send: peer ID buffer overflow");
-                return Ok(-1);
-            }
-
             let mut peer_id_bytes = [0u8; PEER_ID_SIZE];
             peer_id_bytes.copy_from_slice(&peer_ids_buf[offset..offset + PEER_ID_SIZE]);
             peer_ids.push(crate::mesh::PeerId::from_bytes(peer_id_bytes));
@@ -956,10 +937,7 @@ impl AppServer {
         let data_offset = data_ptr as usize;
         let data_len = data_len as usize;
         let mut data_buf = vec![0u8; data_len];
-        if let Err(_) = mem.read(&caller, data_offset, &mut data_buf) {
-            tracing::error!("peer_send: failed to read data from memory");
-            return Ok(-1);
-        }
+        mem.read(&caller, data_offset, &mut data_buf)?;
 
         match caller.data_mut().app.peer_tx.try_send((peer_ids, data_buf)) {
             Ok(_) => {
@@ -968,11 +946,11 @@ impl AppServer {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 tracing::warn!("peer_send: channel full, message dropped");
-                Ok(-1)
+                Ok(PEER_SEND_ERR_CHANNEL_FULL)
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 tracing::error!("peer_send: channel closed");
-                Ok(-1)
+                Ok(PEER_SEND_ERR_CHANNEL_CLOSED)
             }
         }
     }
@@ -984,8 +962,7 @@ impl AppServer {
         data_max_len: u32,
     ) -> anyhow::Result<i32> {
         let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            tracing::error!("peer_recv: failed to find host memory");
-            return Ok(-1);
+            anyhow::bail!("peer_recv: failed to find host memory");
         };
 
         let msg = match caller.data_mut().app.peer_rx.try_recv() {
@@ -994,28 +971,21 @@ impl AppServer {
                 return Ok(0);
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                tracing::error!("peer_recv: channel disconnected");
-                return Ok(-1);
+                return Ok(PEER_RECV_ERR_CHANNEL_DISCONNECTED);
             }
         };
 
         let from_peer_offset = from_peer_ptr as usize;
         let peer_id_buf = msg.from_peer().to_bytes();
 
-        if let Err(_) = mem.write(&mut caller, from_peer_offset, &peer_id_buf) {
-            tracing::error!("peer_recv: failed to write from_peer to memory");
-            return Ok(-1);
-        }
+        mem.write(&mut caller, from_peer_offset, &peer_id_buf)?;
 
         let data_offset = data_ptr as usize;
         let data_max_len = data_max_len as usize;
         let data = msg.data();
         let data_to_write = std::cmp::min(data.len(), data_max_len);
 
-        if let Err(_) = mem.write(&mut caller, data_offset, &data[..data_to_write]) {
-            tracing::error!("peer_recv: failed to write data to memory");
-            return Ok(-1);
-        }
+        mem.write(&mut caller, data_offset, &data[..data_to_write])?;
 
         tracing::debug!("peer_recv: received message of {} bytes", data_to_write);
         Ok(data_to_write as i32)
@@ -1027,23 +997,19 @@ impl AppServer {
     ) -> Box<dyn Future<Output = anyhow::Result<i32>> + Send + '_> {
         Box::new(async move {
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                tracing::error!("region_latency: failed to find host memory");
-                return Ok(-1i32);
+                anyhow::bail!("region_latency: failed to find host memory");
             };
 
             let region_offset = region_ptr as usize;
             let mut region_bytes = [0u8; 4];
-            if let Err(_) = mem.read(&caller, region_offset, &mut region_bytes) {
-                tracing::error!("region_latency: failed to read region from memory");
-                return Ok(-1);
-            }
+            mem.read(&caller, region_offset, &mut region_bytes)?;
 
             let region_id = RegionId::from_bytes(region_bytes);
 
             let mesh = &caller.data().ctx.mesh;
             match mesh.get_region_latency(region_id).await {
                 Some(latency) => Ok(latency.as_millis() as i32),
-                None => Ok(-1),
+                None => Ok(-1), // Unknown latency is a valid semantic response
             }
         })
     }
@@ -1054,8 +1020,7 @@ impl AppServer {
     ) -> Box<dyn Future<Output = anyhow::Result<i32>> + Send + '_> {
         Box::new(async move {
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                tracing::error!("peer_list: failed to find host memory");
-                return Ok(-1i32);
+                anyhow::bail!("peer_list: failed to find host memory");
             };
 
             let app_id = caller.data().app.app_id;
@@ -1066,14 +1031,11 @@ impl AppServer {
             let length = std::cmp::min(length as usize, 65536);
 
             let total_count_offset = total_count_ptr as usize;
-            if let Err(_) = mem.write(
+            mem.write(
                 &mut caller,
                 total_count_offset,
                 &(total_count as u32).to_le_bytes(),
-            ) {
-                tracing::error!("peer_list: failed to write total count to memory");
-                return Ok(-1);
-            }
+            )?;
 
             const PEER_ID_SIZE: usize = 16;
             let ptr_offset = peer_ids_ptr as usize;
@@ -1081,10 +1043,7 @@ impl AppServer {
             for (i, peer_id) in peers.iter().take(length).enumerate() {
                 let write_offset = ptr_offset + (i * PEER_ID_SIZE);
                 let peer_id_bytes = peer_id.to_bytes();
-                if let Err(_) = mem.write(&mut caller, write_offset, &peer_id_bytes) {
-                    tracing::error!("peer_list: failed to write peer ID to memory");
-                    return Ok(-1);
-                }
+                mem.write(&mut caller, write_offset, &peer_id_bytes)?;
             }
 
             tracing::debug!("peer_list: returned {} of {} peers", length, total_count);
@@ -1105,8 +1064,7 @@ impl AppServer {
         latency_ms_ptr: i32,
     ) -> anyhow::Result<i32> {
         let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            tracing::error!("network_info: failed to find host memory");
-            return Ok(-1);
+            anyhow::bail!("network_info: failed to find host memory");
         };
 
         let info = &caller.data().network_info;
@@ -1120,38 +1078,26 @@ impl AppServer {
             .unwrap_or(0);
         let latency_ms = info.latency().map(|d| d.as_millis() as i32).unwrap_or(-1);
 
-        if let Err(_) = mem.write(
+        mem.write(
             &mut caller,
             bytes_per_sec_in_ptr as usize,
             &bytes_per_sec_in.to_le_bytes(),
-        ) {
-            tracing::error!("network_info: failed to write bytes_per_sec_in");
-            return Ok(-1);
-        }
-        if let Err(_) = mem.write(
+        )?;
+        mem.write(
             &mut caller,
             bytes_per_sec_out_ptr as usize,
             &bytes_per_sec_out.to_le_bytes(),
-        ) {
-            tracing::error!("network_info: failed to write bytes_per_sec_out");
-            return Ok(-1);
-        }
-        if let Err(_) = mem.write(
+        )?;
+        mem.write(
             &mut caller,
             last_throttled_ms_ptr as usize,
             &last_throttled_ms.to_le_bytes(),
-        ) {
-            tracing::error!("network_info: failed to write last_throttled_ms");
-            return Ok(-1);
-        }
-        if let Err(_) = mem.write(
+        )?;
+        mem.write(
             &mut caller,
             latency_ms_ptr as usize,
             &latency_ms.to_le_bytes(),
-        ) {
-            tracing::error!("network_info: failed to write latency_ms");
-            return Ok(-1);
-        }
+        )?;
 
         Ok(0)
     }
@@ -1170,16 +1116,12 @@ impl AppServer {
         let byte_count = float_count * std::mem::size_of::<f32>();
 
         let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            tracing::error!("audio_write: failed to find host memory");
-            return Ok(-1);
+            anyhow::bail!("audio_write: failed to find host memory");
         };
 
         let mut buf = vec![0u8; byte_count];
         let offset = ptr as usize;
-        if let Err(_) = mem.read(&caller, offset, &mut buf) {
-            tracing::error!("audio_write: failed to read from guest memory");
-            return Ok(-1);
-        }
+        mem.read(&caller, offset, &mut buf)?;
 
         let samples: Vec<f32> = buf
             .chunks_exact(4)
@@ -1199,45 +1141,32 @@ impl AppServer {
         buffer_available_ptr: i32,
     ) -> anyhow::Result<i32> {
         let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            tracing::error!("audio_info: failed to find host memory");
-            return Ok(-1);
+            anyhow::bail!("audio_info: failed to find host memory");
         };
 
         let data = caller.data();
         let pts = data.audio_buffer.pts.load(Ordering::Acquire);
         let buffer_available = data.audio_buffer.available();
 
-        if let Err(_) = mem.write(
+        mem.write(
             &mut caller,
             frame_size_ptr as usize,
             &(FRAME_SIZE as u32).to_le_bytes(),
-        ) {
-            tracing::error!("audio_info: failed to write frame_size");
-            return Ok(-1);
-        }
+        )?;
 
-        if let Err(_) = mem.write(
+        mem.write(
             &mut caller,
             sample_rate_ptr as usize,
             &(SAMPLE_RATE).to_le_bytes(),
-        ) {
-            tracing::error!("audio_info: failed to write sample_rate");
-            return Ok(-1);
-        }
+        )?;
 
-        if let Err(_) = mem.write(&mut caller, pts_ptr as usize, &(pts as u64).to_le_bytes()) {
-            tracing::error!("audio_info: failed to write pts");
-            return Ok(-1);
-        }
+        mem.write(&mut caller, pts_ptr as usize, &(pts as u64).to_le_bytes())?;
 
-        if let Err(_) = mem.write(
+        mem.write(
             &mut caller,
             buffer_available_ptr as usize,
             &(buffer_available as u32).to_le_bytes(),
-        ) {
-            tracing::error!("audio_info: failed to write buffer_available");
-            return Ok(-1);
-        }
+        )?;
 
         Ok(0)
     }

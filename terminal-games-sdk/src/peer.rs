@@ -5,6 +5,13 @@
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const PEER_SEND_ERR_INVALID_PEER_COUNT: i32 = -1;
+const PEER_SEND_ERR_DATA_TOO_LARGE: i32 = -2;
+const PEER_SEND_ERR_CHANNEL_FULL: i32 = -3;
+const PEER_SEND_ERR_CHANNEL_CLOSED: i32 = -4;
+
+const PEER_RECV_ERR_CHANNEL_DISCONNECTED: i32 = -1;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RegionId([u8; 4]);
 
@@ -92,22 +99,18 @@ impl FromStr for PeerId {
 /// Parses a hex-encoded string into a peer ID
 pub fn parse_id(s: &str) -> Result<PeerId, PeerError> {
     if s.len() != 32 {
-        return Err(PeerError::InvalidId(format!(
-            "invalid ID length: expected 32 hex characters, got {}",
-            s.len()
-        )));
+        return Err(PeerError::InvalidId("expected 32 hex characters"));
     }
     let mut id = [0u8; 16];
     for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
         if chunk.len() != 2 {
-            return Err(PeerError::InvalidId("invalid hex string".to_string()));
+            return Err(PeerError::InvalidId("invalid hex string"));
         }
         let byte = u8::from_str_radix(
-            std::str::from_utf8(chunk)
-                .map_err(|e| PeerError::InvalidId(format!("invalid UTF-8: {}", e)))?,
+            std::str::from_utf8(chunk).map_err(|_| PeerError::InvalidId("invalid UTF-8"))?,
             16,
         )
-        .map_err(|e| PeerError::InvalidId(format!("failed to decode hex: {}", e)))?;
+        .map_err(|_| PeerError::InvalidId("failed to decode hex"))?;
         id[i] = byte;
     }
     Ok(PeerId(id))
@@ -179,27 +182,49 @@ pub struct Message {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerError {
-    InvalidId(String),
-    NoPeerIds,
+    InvalidId(&'static str),
+    InvalidPeerCount,
     DataTooLarge,
-    TooManyPeerIds,
-    SendFailed,
-    RecvFailed,
+    ChannelFull,
+    ChannelClosed,
+    ChannelDisconnected,
     ListFailed,
+    Unknown(i32),
+}
+
+impl PeerError {
+    fn from_send_code(code: i32) -> Self {
+        match code {
+            PEER_SEND_ERR_INVALID_PEER_COUNT => PeerError::InvalidPeerCount,
+            PEER_SEND_ERR_DATA_TOO_LARGE => PeerError::DataTooLarge,
+            PEER_SEND_ERR_CHANNEL_FULL => PeerError::ChannelFull,
+            PEER_SEND_ERR_CHANNEL_CLOSED => PeerError::ChannelClosed,
+            _ => PeerError::Unknown(code),
+        }
+    }
+
+    #[allow(unused)]
+    fn from_recv_code(code: i32) -> Self {
+        match code {
+            PEER_RECV_ERR_CHANNEL_DISCONNECTED => PeerError::ChannelDisconnected,
+            _ => PeerError::Unknown(code),
+        }
+    }
 }
 
 impl std::fmt::Display for PeerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PeerError::InvalidId(msg) => write!(f, "invalid peer ID: {}", msg),
-            PeerError::NoPeerIds => write!(f, "at least one peer ID is required"),
+            PeerError::InvalidPeerCount => write!(f, "invalid peer count (must be 1-1024)"),
             PeerError::DataTooLarge => write!(f, "data too large: maximum 64KB"),
-            PeerError::TooManyPeerIds => write!(f, "too many peer IDs: maximum 1024"),
-            PeerError::SendFailed => write!(f, "peer_send failed"),
-            PeerError::RecvFailed => write!(f, "peer_recv failed"),
+            PeerError::ChannelFull => write!(f, "send channel full, message dropped"),
+            PeerError::ChannelClosed => write!(f, "send channel closed"),
+            PeerError::ChannelDisconnected => write!(f, "receive channel disconnected"),
             PeerError::ListFailed => write!(f, "peer_list failed"),
+            PeerError::Unknown(code) => write!(f, "unknown error: {}", code),
         }
     }
 }
@@ -208,14 +233,11 @@ impl std::error::Error for PeerError {}
 
 /// Sends data to one or more peers
 pub fn send(data: &[u8], peer_ids: &[PeerId]) -> Result<(), PeerError> {
-    if peer_ids.is_empty() {
-        return Err(PeerError::NoPeerIds);
+    if peer_ids.is_empty() || peer_ids.len() > 1024 {
+        return Err(PeerError::InvalidPeerCount);
     }
     if data.len() > 64 * 1024 {
         return Err(PeerError::DataTooLarge);
-    }
-    if peer_ids.len() > 1024 {
-        return Err(PeerError::TooManyPeerIds);
     }
 
     let mut peer_ids_buf = Vec::with_capacity(peer_ids.len() * 16);
@@ -239,7 +261,7 @@ pub fn send(data: &[u8], peer_ids: &[PeerId]) -> Result<(), PeerError> {
     };
 
     if ret < 0 {
-        return Err(PeerError::SendFailed);
+        return Err(PeerError::from_send_code(ret));
     }
 
     Ok(())
