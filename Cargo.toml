@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "terminal-games",
     "terminal-games-sdk",
+    "terminal-games-server",
     "examples/rust-kitchen-sink",
     "examples/rust-simple",
     "headless-terminal",

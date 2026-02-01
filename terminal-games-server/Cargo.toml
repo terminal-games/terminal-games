@@ -1,0 +1,25 @@
+[package]
+name = "terminal-games-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
+flate2 = "1"
+futures = "0.3"
+headless-terminal = { path = "../headless-terminal" }
+hyper = "1"
+hyper-util = "0.1"
+libsql = "0.9"
+rand_core = "0.6"
+russh = "0.57"
+serde = { version = "1", features = ["derive"] }
+smallvec = "1"
+terminal-games = { path = "../terminal-games" }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = "0.3"

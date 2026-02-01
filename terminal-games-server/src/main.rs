@@ -2,19 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-mod app;
-mod audio;
-mod mesh;
-mod rate_limiting;
 mod ssh;
-mod status_bar;
 mod web;
 
 use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::{
+use terminal_games::{
     app::AppServer,
     mesh::{EnvDiscovery, Mesh},
 };
@@ -37,7 +32,7 @@ async fn main() -> Result<()> {
     let conn = db.connect().unwrap();
 
     let tx = conn.transaction().await.unwrap();
-    tx.execute_batch(include_str!("../libsql/migrate-001.sql"))
+    tx.execute_batch(include_str!("../../terminal-games/libsql/migrate-001.sql"))
         .await
         .unwrap();
     tx.commit().await.unwrap();

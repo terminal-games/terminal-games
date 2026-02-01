@@ -11,8 +11,8 @@ use russh::server::*;
 use russh::{Channel, ChannelId, Pty};
 use tokio_util::sync::CancellationToken;
 
-use crate::app::{AppInstantiationParams, AppServer};
-use crate::rate_limiting::{NetworkInformation, RateLimitedStream};
+use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream};
 
 pub struct SshSession {
     input_sender: tokio::sync::mpsc::Sender<smallvec::SmallVec<[u8; 16]>>,

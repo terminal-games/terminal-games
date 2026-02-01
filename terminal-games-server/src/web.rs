@@ -29,8 +29,8 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
-use crate::app::{AppInstantiationParams, AppServer};
-use crate::rate_limiting::{NetworkInformation, RateLimitedStream};
+use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream};
 
 #[derive(Clone)]
 struct MyConnectInfo {
