@@ -1,5 +1,5 @@
 [package]
-name = "terminal-games-server"
+name = "terminal-games-cli"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,6 +7,8 @@ edition = "2024"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
+clap = "4"
+crossterm = "0.29"
 flate2 = "1"
 futures = "0.3"
 hyper = "1"
