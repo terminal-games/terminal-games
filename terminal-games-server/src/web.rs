@@ -174,15 +174,27 @@ async fn websocket_handler(
         .unwrap_or("unknown")
         .to_string();
 
-    let args = query.args.map(|s| s.into_bytes());
+    let (first_app_shortname, args) = match query.args.map(|s| s.into_bytes()) {
+        Some(args) if !args.is_empty() => {
+            if let Some(pos) = args.iter().position(|&b| b.is_ascii_whitespace()) {
+                let shortname = String::from_utf8_lossy(&args[..pos]).into();
+                let rest: Vec<u8> = args[pos..].iter().copied().skip_while(|b| b.is_ascii_whitespace()).collect();
+                (shortname, (!rest.is_empty()).then_some(rest))
+            } else {
+                (String::from_utf8_lossy(&args).into(), None)
+            }
+        }
+        _ => ("menu".into(), None),
+    };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, server, user_agent, args, connect_info))
+    ws.on_upgrade(move |socket| handle_socket(socket, server, user_agent, first_app_shortname, args, connect_info))
 }
 
 async fn handle_socket(
     socket: WebSocket,
     server: WebServer,
     user_agent: String,
+    first_app_shortname: String,
     args: Option<Vec<u8>>,
     connect_info: MyConnectInfo,
 ) {
@@ -192,13 +204,14 @@ async fn handle_socket(
     let username = "web".to_string();
 
     let (input_tx, input_rx) = tokio::sync::mpsc::channel(20);
-    let (resize_tx, resize_rx) = tokio::sync::mpsc::channel(10);
+    let (resize_tx, resize_rx) = tokio::sync::watch::channel((0, 0));
     let cancellation_token = CancellationToken::new();
     let token = cancellation_token.clone();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(20);
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
     let exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
+        first_app_shortname,
         args,
         input_receiver: input_rx,
         output_sender: output_tx,
@@ -261,7 +274,7 @@ async fn handle_socket(
                     let text_str = text.to_string();
                     if let Some(rest) = text_str.strip_prefix("resize:") {
                         if let Some((w, h)) = parse_resize(rest) {
-                            let _ = resize_tx.send((w, h)).await;
+                            let _ = resize_tx.send((w, h));
                         }
                     } else if let Some(ts) = text_str.strip_prefix("ping:") {
                         let _ = pong_tx.send(ts.to_string()).await;

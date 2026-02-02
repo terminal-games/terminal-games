@@ -2,26 +2,43 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{io::Write, sync::Arc};
+use std::{io::Write, path::Path, sync::Arc};
 
 use anyhow::Result;
+use clap::Parser;
+use crossterm::event::{Event, EventStream};
+use futures::StreamExt;
 use smallvec::SmallVec;
 use tokio::io::AsyncReadExt;
 
 use terminal_games::{
     app::{AppInstantiationParams, AppServer},
-    mesh::{EnvDiscovery, Mesh}, rate_limiting::NetworkInformation,
+    mesh::{EnvDiscovery, Mesh},
+    rate_limiting::NetworkInformation,
 };
 use tokio_util::sync::CancellationToken;
 
+#[derive(Parser)]
+#[command(about = "Run a terminal game from a wasm file")]
+struct Args {
+    /// Path to the wasm file to run
+    wasm_file: String,
+
+    /// Additional games in shortname=path format
+    #[arg(short, long = "game", value_name = "SHORTNAME=PATH")]
+    games: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
     let subscriber = tracing_subscriber::fmt()
         // .with_max_level(tracing::Level::TRACE)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let db = libsql::Builder::new_local("./terminal-games.db")
+    let db = libsql::Builder::new_local(":memory:")
         .build()
         .await
         .unwrap();
@@ -34,39 +51,29 @@ async fn main() -> Result<()> {
         .unwrap();
     tx.commit().await.unwrap();
 
-    let _ = conn
-        .execute(
-            "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-            libsql::params!("kitchen-sink", "examples/kitchen-sink/main.wasm"),
-        )
-        .await;
+    let first_app_shortname = Path::new(&args.wasm_file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("app")
+        .to_string();
 
     let _ = conn
         .execute(
             "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-            libsql::params!("menu", "cmd/menu/main.wasm"),
+            libsql::params!(first_app_shortname.as_str(), args.wasm_file.as_str()),
         )
         .await;
 
-    let _ = conn
-        .execute(
-            "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-            libsql::params!(
-                "rust-simple",
-                "target/wasm32-wasip1/release/rust-simple.wasm"
-            ),
-        )
-        .await;
-
-    let _ = conn
-        .execute(
-            "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-            libsql::params!(
-                "rust-kitchen-sink",
-                "target/wasm32-wasip1/release/rust-kitchen-sink.wasm"
-            ),
-        )
-        .await;
+    for game in &args.games {
+        if let Some((shortname, path)) = game.split_once('=') {
+            let _ = conn
+                .execute(
+                    "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
+                    libsql::params!(shortname, path),
+                )
+                .await;
+        }
+    }
 
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
     mesh.start_discovery().await.unwrap();
@@ -76,14 +83,14 @@ async fn main() -> Result<()> {
 
     let (input_tx, input_rx) = tokio::sync::mpsc::channel(1);
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
-    let (resize_tx, resize_rx) = tokio::sync::mpsc::channel(1);
+    let (resize_tx, resize_rx) = tokio::sync::watch::channel((0, 0));
 
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen, crossterm::cursor::Hide)?;
 
     let (cols, rows) = crossterm::terminal::size()?;
-    resize_tx.send((cols, rows)).await?;
+    resize_tx.send((cols, rows))?;
 
     let cancel_token = CancellationToken::new();
     let network_info = Arc::new(NetworkInformation::new(1));
@@ -99,10 +106,12 @@ async fn main() -> Result<()> {
         window_size_receiver: resize_rx,
         graceful_shutdown_token: cancel_token.clone(),
         network_info: network_info.clone(),
+        first_app_shortname,
     });
 
     let mut stdin = tokio::io::stdin();
     let mut stdin_buf = [0u8; 4096];
+    let mut event_stream = EventStream::new();
 
     loop {
         tokio::select! {
@@ -120,6 +129,9 @@ async fn main() -> Result<()> {
                 if let Err(_) = stdout.write_all(&data) {
                     break;
                 }
+                if let Err(_) = stdout.flush() {
+                    break;
+                }
             }
 
             result = stdin.read(&mut stdin_buf) => {
@@ -127,12 +139,18 @@ async fn main() -> Result<()> {
                     Ok(0) => break,
                     Ok(n) => {
                         let data: SmallVec<[u8; 16]> = SmallVec::from(&stdin_buf[..n]);
-                        if let Err(_) = input_tx.send(data).await {
-                            break;
+                        match input_tx.try_send(data) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                         }
                     }
                     Err(_) => break,
                 }
+            }
+
+            Some(Ok(Event::Resize(cols, rows))) = event_stream.next() => {
+                let _ = resize_tx.send((cols, rows));
             }
         }
     }

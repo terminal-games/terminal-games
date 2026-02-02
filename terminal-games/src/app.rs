@@ -71,13 +71,14 @@ pub struct AppInstantiationParams {
     pub input_receiver: tokio::sync::mpsc::Receiver<SmallVec<[u8; 16]>>,
     pub output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     pub audio_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    pub window_size_receiver: tokio::sync::mpsc::Receiver<(u16, u16)>,
+    pub window_size_receiver: tokio::sync::watch::Receiver<(u16, u16)>,
     pub graceful_shutdown_token: CancellationToken,
     pub username: String,
     pub remote_sshid: String,
     pub term: Option<String>,
     pub args: Option<Vec<u8>>,
     pub network_info: Arc<NetworkInformation>,
+    pub first_app_shortname: String,
 }
 
 impl AppServer {
@@ -162,22 +163,9 @@ impl AppServer {
             let network_info = params.network_info.clone();
             let hard_shutdown_token = CancellationToken::new();
             let audio_tx = params.audio_sender;
+            let first_app_shortname = params.first_app_shortname;
 
             let audio_buffer = Arc::new(AudioBuffer::new(SAMPLE_RATE as usize));
-
-            let (first_app_shortname, _app_args) = match params.args {
-                None => ("menu".to_string(), None),
-                Some(args_bytes) => {
-                    let args_str = String::from_utf8_lossy(&args_bytes);
-                    if let Some(space_idx) = args_str.find(' ') {
-                        let shortname = args_str[..space_idx].to_string();
-                        let remaining_args = args_str[space_idx + 1..].to_string();
-                        (shortname, Some(remaining_args))
-                    } else {
-                        (args_str.to_string(), None)
-                    }
-                }
-            };
 
             let audio_enabled = audio_tx.is_some();
             if let Some(audio_tx) = audio_tx {
@@ -273,8 +261,9 @@ impl AppServer {
                                 let _ = output_sender.send(output).await;
                             }
 
-                            result = window_size_receiver.recv() => {
-                                let Some((width, height)) = result else { continue };
+                            result = window_size_receiver.changed() => {
+                                if let Err(_) = result { break };
+                                let (width, height) = *window_size_receiver.borrow();
 
                                 let mut output = Vec::new();
                                 {
