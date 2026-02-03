@@ -151,8 +151,11 @@ impl AppServer {
         let linker = self.linker.clone();
         tokio::task::spawn(async move {
             let engine = engine;
+            
             let mut window_size_receiver = params.window_size_receiver;
-            let mut terminal = Arc::new(Mutex::new(headless_terminal::Parser::new(0, 0, 0)));
+            let (first_cols, first_rows) = *window_size_receiver.borrow();
+            let mut terminal = Arc::new(Mutex::new(headless_terminal::Parser::new(first_rows, first_cols, 0)));
+
             let (app_output_sender, mut app_output_receiver) =
                 tokio::sync::mpsc::channel::<Vec<u8>>(1);
             let mut input_receiver = params.input_receiver;

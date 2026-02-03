@@ -204,6 +204,152 @@ impl Discovery for EnvDiscovery {
     }
 }
 
+pub struct LocalDiscovery {
+    registry_path: std::path::PathBuf,
+    self_entry: Mutex<Option<LocalRegistryEntry>>,
+}
+
+#[derive(Clone)]
+struct LocalRegistryEntry {
+    region: RegionId,
+    port: u16,
+    pid: u32,
+}
+
+impl LocalDiscovery {
+    pub fn new() -> Self {
+        let uid = unsafe { libc::getuid() };
+        let registry_path =
+            std::path::PathBuf::from(format!("/tmp/terminal-games-mesh-{}.registry", uid));
+        Self {
+            registry_path,
+            self_entry: Mutex::new(None),
+        }
+    }
+
+    pub fn allocate_region(&self) -> anyhow::Result<RegionId> {
+        let entries = self.read_entries();
+        let used: std::collections::HashSet<RegionId> =
+            entries.into_iter().map(|e| e.region).collect();
+
+        for i in 0..=9u8 {
+            let region = RegionId::from_bytes([b'l', b'o', b'c', b'0' + i]);
+            if !used.contains(&region) {
+                return Ok(region);
+            }
+        }
+        Err(anyhow::anyhow!("No available region slots (loc0-loc9 all in use)"))
+    }
+
+    pub async fn register(&self, region: RegionId, port: u16) -> anyhow::Result<()> {
+        let pid = std::process::id();
+        let entry = LocalRegistryEntry { region, port, pid };
+        *self.self_entry.lock().await = Some(entry.clone());
+        self.write_entry(&entry).await
+    }
+
+    pub async fn unregister(&self) -> anyhow::Result<()> {
+        let entry = self.self_entry.lock().await.take();
+        if let Some(entry) = entry {
+            self.remove_entry(&entry).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_entry(&self, entry: &LocalRegistryEntry) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.registry_path)?;
+        writeln!(
+            file,
+            "{}:{}:{}",
+            hex::encode(entry.region.as_bytes()),
+            entry.port,
+            entry.pid
+        )?;
+        Ok(())
+    }
+
+    async fn remove_entry(&self, entry: &LocalRegistryEntry) -> anyhow::Result<()> {
+        let contents = match std::fs::read_to_string(&self.registry_path) {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        let filtered: Vec<&str> = contents
+            .lines()
+            .filter(|line| {
+                if let Some((_, rest)) = line.split_once(':') {
+                    if let Some((port_str, pid_str)) = rest.split_once(':') {
+                        let port_match = port_str.parse::<u16>().ok() == Some(entry.port);
+                        let pid_match = pid_str.parse::<u32>().ok() == Some(entry.pid);
+                        return !(port_match && pid_match);
+                    }
+                }
+                true
+            })
+            .collect();
+        std::fs::write(&self.registry_path, filtered.join("\n") + "\n")?;
+        Ok(())
+    }
+
+    fn read_entries(&self) -> Vec<LocalRegistryEntry> {
+        let contents = match std::fs::read_to_string(&self.registry_path) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        contents
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.splitn(3, ':').collect();
+                if parts.len() != 3 {
+                    return None;
+                }
+                let region_hex = parts[0];
+                let port = parts[1].parse::<u16>().ok()?;
+                let pid = parts[2].parse::<u32>().ok()?;
+
+                let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+                if !alive {
+                    return None;
+                }
+
+                let region_bytes: [u8; 4] = hex::decode(region_hex).ok()?.try_into().ok()?;
+                let region = RegionId::from_bytes(region_bytes);
+
+                Some(LocalRegistryEntry { region, port, pid })
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl Discovery for LocalDiscovery {
+    async fn discover_peers(&self) -> anyhow::Result<HashSet<(RegionId, SocketAddr)>> {
+        let self_entry = self.self_entry.lock().await.clone();
+        let entries = self.read_entries();
+
+        let peers = entries
+            .into_iter()
+            .filter(|e| {
+                if let Some(ref self_e) = self_entry {
+                    e.pid != self_e.pid
+                } else {
+                    true
+                }
+            })
+            .map(|e| {
+                let addr: SocketAddr = ([127, 0, 0, 1], e.port).into();
+                (e.region, addr)
+            })
+            .collect();
+
+        Ok(peers)
+    }
+}
+
 struct ActiveConnection {
     tx: tokio::sync::mpsc::Sender<Message>,
     conn_fd: RawFd,
@@ -245,10 +391,13 @@ impl Mesh {
         let region_id_bytes = region_id_str.as_bytes();
         let copy_len = region_id_bytes.len().min(4);
         region_bytes[..copy_len].copy_from_slice(&region_id_bytes[..copy_len]);
+        Self::with_region(discovery, RegionId::from_bytes(region_bytes))
+    }
 
+    pub fn with_region(discovery: Arc<dyn Discovery>, region: RegionId) -> Self {
         Self {
             inner: Arc::new(MeshInner {
-                region: RegionId::from_bytes(region_bytes),
+                region,
                 regions: Default::default(),
                 peers: Default::default(),
                 global_peers: Default::default(),
@@ -257,6 +406,10 @@ impl Mesh {
                 tasks: TaskTracker::new(),
             }),
         }
+    }
+
+    pub fn region(&self) -> RegionId {
+        self.inner.region
     }
 
     pub async fn new_peer(
@@ -339,12 +492,17 @@ impl Mesh {
             .unwrap_or_default()
     }
 
-    pub async fn serve(&self) -> anyhow::Result<()> {
+    pub async fn serve(&self) -> anyhow::Result<SocketAddr> {
         let listen_addr: SocketAddr = std::env::var("PEER_LISTEN_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:3001".to_string())
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid PEER_LISTEN_ADDR: {}", e))?;
+        self.serve_on(listen_addr).await
+    }
+
+    pub async fn serve_on(&self, listen_addr: SocketAddr) -> anyhow::Result<SocketAddr> {
         let listener = TcpListener::bind(listen_addr).await?;
+        let local_addr = listener.local_addr()?;
 
         let inner = self.inner.clone();
         self.inner.tasks.spawn(async move {
@@ -369,7 +527,7 @@ impl Mesh {
             }
         });
 
-        Ok(())
+        Ok(local_addr)
     }
 
     pub async fn start_discovery(&self) -> anyhow::Result<()> {
