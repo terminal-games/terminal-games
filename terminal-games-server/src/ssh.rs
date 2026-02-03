@@ -12,7 +12,7 @@ use russh::{Channel, ChannelId, Pty};
 use tokio_util::sync::CancellationToken;
 
 use terminal_games::app::{AppInstantiationParams, AppServer};
-use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream};
+use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 
 pub struct SshSession {
     input_sender: tokio::sync::mpsc::Sender<smallvec::SmallVec<[u8; 16]>>,
@@ -97,7 +97,7 @@ impl SshServer {
     fn new_client(
         &self,
         addr: std::net::SocketAddr,
-        network_info: Arc<NetworkInformation>,
+        network_info: Arc<NetworkInformation<TcpLatencyProvider>>,
     ) -> SshSession {
         tracing::info!(addr=?addr, "new_client");
 

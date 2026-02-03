@@ -30,11 +30,11 @@ use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
 use terminal_games::app::{AppInstantiationParams, AppServer};
-use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream};
+use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 
 #[derive(Clone)]
 struct MyConnectInfo {
-    network_info: Arc<NetworkInformation>,
+    network_info: Arc<NetworkInformation<TcpLatencyProvider>>,
 }
 
 impl Connected<MyConnectInfo> for MyConnectInfo {

@@ -4716,6 +4716,7 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "libsql",
+ "rand 0.9.2",
  "rand_core 0.6.4",
  "russh",
  "serde",

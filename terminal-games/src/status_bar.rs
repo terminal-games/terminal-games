@@ -6,7 +6,7 @@ use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
 use yansi::Paint;
 
-use crate::rate_limiting::NetworkInformation;
+use crate::rate_limiting::NetworkInfo;
 
 fn terminal_width(str: &str) -> usize {
     strip_ansi_escapes::strip_str(str).width()
@@ -19,11 +19,11 @@ pub struct StatusBar {
     session_start_time: std::time::Instant,
     prev_size: (u16, u16),
     prev_status_bar_content: Vec<u8>,
-    network_info: Arc<NetworkInformation>,
+    network_info: Arc<dyn NetworkInfo>,
 }
 
 impl StatusBar {
-    pub fn new(shortname: String, username: String, network_info: Arc<NetworkInformation>) -> Self {
+    pub fn new(shortname: String, username: String, network_info: Arc<dyn NetworkInfo>) -> Self {
         Self {
             shortname,
             username,

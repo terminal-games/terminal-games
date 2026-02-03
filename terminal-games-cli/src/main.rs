@@ -2,16 +2,27 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{io::Read, io::Write, path::Path, sync::Arc, thread};
+use std::{
+    io::{Read, Write},
+    path::Path,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    thread,
+    time::Duration,
+};
 
 use anyhow::Result;
 use clap::Parser;
+use flate2::{write::DeflateEncoder, Compression};
+use rand::Rng;
 use smallvec::SmallVec;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use terminal_games::{
     app::{AppInstantiationParams, AppServer},
     mesh::{LocalDiscovery, Mesh},
-    rate_limiting::NetworkInformation,
+    rate_limiting::{NetworkInformation, RateLimitedStream},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -24,16 +35,65 @@ struct Args {
     /// Additional games in shortname=path format
     #[arg(short, long = "game", value_name = "SHORTNAME=PATH")]
     games: Vec<String>,
+
+    /// Enable flate2 compression on output
+    #[arg(short = 'C', long)]
+    compress: bool,
+
+    /// Simulated network latency in milliseconds
+    #[arg(long, default_value = "0")]
+    latency: u64,
+
+    /// Simulated latency jitter in milliseconds (±)
+    #[arg(long, default_value = "0")]
+    jitter: u64,
+
+    /// Bandwidth token bucket refill rate in bytes per second (default: 50000)
+    #[arg(long, default_value = "50000")]
+    bandwidth: u64,
+
+    /// Bandwidth token bucket capacity in bytes (default: 100000)
+    #[arg(long, default_value = "100000")]
+    bandwidth_capacity: u64,
+}
+
+/// A sink that discards all data but reports successful writes.
+struct NullSink;
+
+impl AsyncWrite for NullSink {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn compute_jittered_latency(latency_ms: u64, jitter_ms: u64) -> Duration {
+    if latency_ms == 0 && jitter_ms == 0 {
+        return Duration::ZERO;
+    }
+    let jitter = if jitter_ms > 0 {
+        let mut rng = rand::rng();
+        rng.random_range(0..=jitter_ms * 2) as i64 - jitter_ms as i64
+    } else {
+        0
+    };
+    Duration::from_millis((latency_ms as i64 + jitter).max(0) as u64)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-
-    // let subscriber = tracing_subscriber::fmt()
-    //     // .with_max_level(tracing::Level::ERROR)
-    //     .finish();
-    // tracing::subscriber::set_global_default(subscriber)?;
 
     let db = libsql::Builder::new_local(":memory:")
         .build()
@@ -88,17 +148,26 @@ async fn main() -> Result<()> {
     mesh.start_discovery().await.unwrap();
 
     let app_server = Arc::new(AppServer::new(mesh.clone(), conn).unwrap());
-    
+
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen, crossterm::cursor::Hide)?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::cursor::Hide
+    )?;
 
     let (input_tx, input_rx) = tokio::sync::mpsc::channel(1);
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(crossterm::terminal::size()?);
 
     let graceful_shutdown_token = CancellationToken::new();
-    let network_info = Arc::new(NetworkInformation::new(1));
+    let network_info = Arc::new(NetworkInformation::new_simulated(args.latency));
+    let compress = args.compress;
+    let bandwidth = args.bandwidth;
+    let bandwidth_capacity = args.bandwidth_capacity;
+    let latency = args.latency;
+    let jitter = args.jitter;
 
     let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
         args: None,
@@ -114,7 +183,6 @@ async fn main() -> Result<()> {
         first_app_shortname,
     });
 
-    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<SmallVec<[u8; 16]>>(1);
     thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut buf = [0u8; 4096];
@@ -122,7 +190,7 @@ async fn main() -> Result<()> {
             match stdin.lock().read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if stdin_tx.blocking_send(SmallVec::from(&buf[..n])).is_err() {
+                    if input_tx.blocking_send(SmallVec::from(&buf[..n])).is_err() {
                         break;
                     }
                 }
@@ -130,7 +198,28 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut sigwinch = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
+    let mut sigwinch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
+
+    let (delayed_tx, mut delayed_rx) =
+        tokio::sync::mpsc::channel::<(Vec<u8>, Vec<u8>, tokio::time::Instant, u64)>(100);
+
+    tokio::spawn(async move {
+        let mut rate_limited = RateLimitedStream::with_rate(NullSink, network_info.clone(), bandwidth, bandwidth_capacity);
+        let mut stdout = std::io::stdout();
+
+        while let Some((raw_data, metered_data, deliver_at, delay_ms)) = delayed_rx.recv().await {
+            tokio::time::sleep_until(deliver_at).await;
+            network_info.set_simulated_latency(delay_ms);
+
+            if rate_limited.write_all(&metered_data).await.is_err() {
+                break;
+            }
+            if stdout.write_all(&raw_data).is_err() || stdout.flush().is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
         tokio::select! {
@@ -145,13 +234,20 @@ async fn main() -> Result<()> {
 
             data = output_rx.recv() => {
                 let Some(data) = data else { break };
-                if stdout.write_all(&data).is_err() || stdout.flush().is_err() {
-                    break;
-                }
-            }
 
-            Some(data) = stdin_rx.recv() => {
-                let _ = input_tx.send(data).await;
+                let delay = compute_jittered_latency(latency, jitter);
+                let delay_ms = delay.as_millis() as u64;
+                let deliver_at = tokio::time::Instant::now() + delay;
+
+                let metered_data = if compress {
+                    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+                    encoder.write_all(&data).ok();
+                    encoder.finish().unwrap_or_default()
+                } else {
+                    data.clone()
+                };
+
+                let _ = delayed_tx.send((data, metered_data, deliver_at, delay_ms)).await;
             }
 
             _ = sigwinch.recv() => {

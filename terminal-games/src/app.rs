@@ -23,7 +23,7 @@ use wasmtime_wasi::I32Exit;
 use crate::{
     audio::{AudioBuffer, CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
-    rate_limiting::{NetworkInformation, TokenBucket},
+    rate_limiting::{NetworkInfo, TokenBucket},
     status_bar::StatusBar,
 };
 
@@ -77,7 +77,7 @@ pub struct AppInstantiationParams {
     pub remote_sshid: String,
     pub term: Option<String>,
     pub args: Option<Vec<u8>>,
-    pub network_info: Arc<NetworkInformation>,
+    pub network_info: Arc<dyn NetworkInfo>,
     pub first_app_shortname: String,
 }
 
@@ -1195,7 +1195,7 @@ pub struct AppState {
     has_next_app: Arc<AtomicBool>,
     input_receiver: tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
     graceful_shutdown_token: CancellationToken,
-    network_info: Arc<NetworkInformation>,
+    network_info: Arc<dyn NetworkInfo>,
     audio_buffer: Arc<AudioBuffer>,
 }
 
