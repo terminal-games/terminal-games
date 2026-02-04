@@ -169,18 +169,36 @@ impl AppServer {
             let first_app_shortname = params.first_app_shortname;
 
             let replay_buffer = Arc::new(Mutex::new(ReplayBuffer::new(first_cols, first_rows, first_app_shortname.clone(), params.term.clone())));
-            let (save_replay_tx, mut save_replay_rx) = tokio::sync::mpsc::channel::<()>(1);
+            let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(1);
 
             let (filtered_input_tx, filtered_input_rx) =
                 tokio::sync::mpsc::channel::<SmallVec<[u8; 16]>>(16);
             let mut input_receiver = params.input_receiver;
             tokio::task::spawn({
-                let save_replay_tx = save_replay_tx.clone();
+                let replay_buffer = replay_buffer.clone();
+                let notification_tx = notification_tx.clone();
+                let username = params.username.clone();
                 async move {
                     while let Some(data) = input_receiver.recv().await {
                         if data.contains(&0x12) {
                             // CTRL+R found, save replay and filter it out
-                            let _ = save_replay_tx.send(()).await;
+                            let asciicast = replay_buffer.lock().await.serialize_asciicast();
+                            let _ = notification_tx.send(" \x1b[3mUploading recording... ".to_string()).await;
+                            let username = username.clone();
+                            let notification_tx = notification_tx.clone();
+                            tokio::spawn(async move {
+                                let notification = match upload_asciicast(&username, &asciicast).await {
+                                    Ok(url) => {
+                                        tracing::info!(%url, "Uploaded replay");
+                                        format!(" \x1b[3mRecording saved: \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ", url, url)
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "Failed to upload replay");
+                                        format!(" Upload failed: {} ", e)
+                                    }
+                                };
+                                let _ = notification_tx.send(notification).await;
+                            });
                             let filtered: SmallVec<[u8; 16]> =
                                 data.iter().copied().filter(|&b| b != 0x12).collect();
                             if !filtered.is_empty() {
@@ -227,7 +245,7 @@ impl AppServer {
                     let mut escape_buffer = EscapeSequenceBuffer::new();
                     let mut status_bar_interval = tokio::time::interval(Duration::from_secs(1));
                     let mut status_bar =
-                        StatusBar::new(first_app_shortname, username.clone(), network_info);
+                        StatusBar::new(first_app_shortname, username.clone(), network_info, notification_rx);
 
                     loop {
                         tokio::select! {
@@ -324,22 +342,6 @@ impl AppServer {
                                 if let Some(ref shortname) = shortname {
                                     replay_buffer.lock().await.push_app_switch(shortname.clone());
                                     status_bar.shortname = shortname.clone();
-                                }
-                            }
-
-                            _ = save_replay_rx.recv() => {
-                                let asciicast = replay_buffer.lock().await.serialize_asciicast();
-                                let filename = format!(
-                                    "replay_{}_{}.cast",
-                                    username,
-                                    std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs()
-                                );
-                                match std::fs::write(&filename, &asciicast) {
-                                    Ok(_) => tracing::info!(%filename, "Saved replay"),
-                                    Err(e) => tracing::error!(%filename, error = %e, "Failed to save replay"),
                                 }
                             }
                         }
@@ -1577,6 +1579,45 @@ impl Stream {
 }
 
 pub type Terminal = headless_terminal::Parser;
+
+fn get_install_id() -> &'static str {
+    static INSTALL_ID: OnceLock<String> = OnceLock::new();
+    INSTALL_ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+async fn upload_asciicast(username: &str, data: &[u8]) -> Result<String, String> {
+    let install_id = get_install_id();
+    let client = reqwest::Client::new();
+
+    let part = reqwest::multipart::Part::bytes(data.to_vec())
+        .file_name("recording.cast")
+        .mime_str("application/x-asciicast")
+        .map_err(|e| e.to_string())?;
+
+    let form = reqwest::multipart::Form::new().part("asciicast", part);
+
+    let response = client
+        .post("https://asciinema.org/api/v1/recordings")
+        .basic_auth(username, Some(install_id))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("{}: {}", status, body));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct UploadResponse {
+        url: String,
+    }
+
+    let upload_response: UploadResponse = response.json().await.map_err(|e| e.to_string())?;
+    Ok(upload_response.url)
+}
 
 pub fn is_globally_reachable(ip: IpAddr) -> bool {
     match ip {

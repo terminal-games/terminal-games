@@ -17,6 +17,7 @@ libc = "0.2"
 libsql = "0.9"
 postcard = { version = "1", default-features = false }
 rand_core = "0.6"
+reqwest = { version = "0.13", features = ["multipart", "json"] }
 rustls = "0.23"
 rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +33,7 @@ tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 unicode-width = "0.2"
+uuid = { version = "1", features = ["v4"] }
 wasmtime = "40"
 wasmtime-wasi = { version = "40", default-features = false, features = ["p1"] }
 webpki-roots = "1"
