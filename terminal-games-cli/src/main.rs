@@ -58,9 +58,9 @@ struct Args {
     #[arg(long, default_value = "100000")]
     bandwidth_capacity: u64,
 
-    /// Enable audio playback
+    /// Disable audio playback
     #[arg(long)]
-    audio: bool,
+    no_audio: bool,
 }
 
 /// A sink that discards all data but reports successful writes.
@@ -180,7 +180,7 @@ async fn main() -> Result<()> {
     let bandwidth_capacity = args.bandwidth_capacity;
     let latency = args.latency;
     let jitter = args.jitter;
-    let audio_enabled = args.audio;
+    let audio_enabled = !args.no_audio;
 
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
     let audio_player = if audio_enabled {
