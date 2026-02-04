@@ -242,6 +242,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "avt"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa0f99f7bcce0e99d842c94947f8d0ab5f6f3abc08424e1a4b58a8a7ae30f7c7"
+dependencies = [
+ "rgb",
+ "unicode-width 0.1.14",
+]
+
+[[package]]
 name = "aws-lc-rs"
 version = "1.15.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2096,7 +2106,7 @@ name = "headless-terminal"
 version = "0.1.0"
 dependencies = [
  "itoa",
- "unicode-width",
+ "unicode-width 0.2.0",
  "vte 0.15.0",
 ]
 
@@ -3959,7 +3969,7 @@ dependencies = [
  "thiserror 2.0.17",
  "unicode-segmentation",
  "unicode-truncate",
- "unicode-width",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
@@ -3978,7 +3988,7 @@ dependencies = [
  "strum",
  "time",
  "unicode-segmentation",
- "unicode-width",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]
@@ -4083,6 +4093,15 @@ checksum = "f8dd2a808d456c4a54e300a23e9f5a67e122c3024119acbfd73e3bf664491cb2"
 dependencies = [
  "hmac",
  "subtle",
+]
+
+[[package]]
+name = "rgb"
+version = "0.8.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c6a884d2998352bb4daf0183589aec883f16a6da1f4dde84d8e2e9a5409a1ce"
+dependencies = [
+ "bytemuck",
 ]
 
 [[package]]
@@ -4981,7 +5000,7 @@ dependencies = [
  "micromath",
  "ratatui",
  "thiserror 2.0.17",
- "unicode-width",
+ "unicode-width 0.2.0",
  "web-time",
 ]
 
@@ -5019,6 +5038,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "avt",
  "bytes",
  "ffmpeg-next",
  "futures",
@@ -5032,6 +5052,7 @@ dependencies = [
  "rustls 0.23.36",
  "rustls-pki-types",
  "serde",
+ "serde_json",
  "smallvec",
  "strip-ansi-escapes",
  "tokio",
@@ -5040,7 +5061,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
- "unicode-width",
+ "unicode-width 0.2.0",
  "wasmtime",
  "wasmtime-wasi",
  "webpki-roots 1.0.5",
@@ -5597,8 +5618,14 @@ checksum = "8fbf03860ff438702f3910ca5f28f8dac63c1c11e7efb5012b8b175493606330"
 dependencies = [
  "itertools 0.13.0",
  "unicode-segmentation",
- "unicode-width",
+ "unicode-width 0.2.0",
 ]
+
+[[package]]
+name = "unicode-width"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
 
 [[package]]
 name = "unicode-width"
@@ -6212,7 +6239,7 @@ dependencies = [
  "bumpalo",
  "leb128fmt",
  "memchr",
- "unicode-width",
+ "unicode-width 0.2.0",
  "wasm-encoder 0.244.0",
 ]
 

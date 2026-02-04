@@ -24,6 +24,7 @@ use crate::{
     audio::{AudioBuffer, CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
+    replay::ReplayBuffer,
     status_bar::StatusBar,
 };
 
@@ -158,7 +159,6 @@ impl AppServer {
 
             let (app_output_sender, mut app_output_receiver) =
                 tokio::sync::mpsc::channel::<Vec<u8>>(1);
-            let mut input_receiver = params.input_receiver;
             let has_next_app_shortname = Arc::new(AtomicBool::new(false));
             let (shortname_sender, mut shortname_receiver) =
                 tokio::sync::mpsc::channel::<String>(1);
@@ -167,6 +167,32 @@ impl AppServer {
             let hard_shutdown_token = CancellationToken::new();
             let audio_tx = params.audio_sender;
             let first_app_shortname = params.first_app_shortname;
+
+            let replay_buffer = Arc::new(Mutex::new(ReplayBuffer::new(first_cols, first_rows, first_app_shortname.clone(), params.term.clone())));
+            let (save_replay_tx, mut save_replay_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+            let (filtered_input_tx, filtered_input_rx) =
+                tokio::sync::mpsc::channel::<SmallVec<[u8; 16]>>(16);
+            let mut input_receiver = params.input_receiver;
+            tokio::task::spawn({
+                let save_replay_tx = save_replay_tx.clone();
+                async move {
+                    while let Some(data) = input_receiver.recv().await {
+                        if data.contains(&0x12) {
+                            // CTRL+R found, save replay and filter it out
+                            let _ = save_replay_tx.send(()).await;
+                            let filtered: SmallVec<[u8; 16]> =
+                                data.iter().copied().filter(|&b| b != 0x12).collect();
+                            if !filtered.is_empty() {
+                                let _ = filtered_input_tx.send(filtered).await;
+                            }
+                        } else {
+                            let _ = filtered_input_tx.send(data).await;
+                        }
+                    }
+                }
+            });
+            let mut input_receiver = filtered_input_rx;
 
             let audio_buffer = Arc::new(AudioBuffer::new(SAMPLE_RATE as usize));
 
@@ -196,11 +222,12 @@ impl AppServer {
                 let has_next_app_shortname = has_next_app_shortname.clone();
                 let terminal = terminal.clone();
                 let network_info = network_info.clone();
+                let replay_buffer = replay_buffer.clone();
                 async move {
                     let mut escape_buffer = EscapeSequenceBuffer::new();
                     let mut status_bar_interval = tokio::time::interval(Duration::from_secs(1));
                     let mut status_bar =
-                        StatusBar::new(first_app_shortname, username, network_info);
+                        StatusBar::new(first_app_shortname, username.clone(), network_info);
 
                     loop {
                         tokio::select! {
@@ -261,12 +288,15 @@ impl AppServer {
                                     }
                                 }
 
+                                replay_buffer.lock().await.push_output(output.clone());
                                 let _ = output_sender.send(output).await;
                             }
 
                             result = window_size_receiver.changed() => {
                                 if let Err(_) = result { break };
                                 let (width, height) = *window_size_receiver.borrow();
+
+                                replay_buffer.lock().await.push_resize(width, height);
 
                                 let mut output = Vec::new();
                                 {
@@ -276,6 +306,7 @@ impl AppServer {
                                     status_bar.maybe_render_into(screen, &mut output, true);
                                 }
                                 if !output.is_empty() {
+                                    replay_buffer.lock().await.push_output(output.clone());
                                     let _ = output_sender.send(output).await;
                                 }
                             }
@@ -284,13 +315,31 @@ impl AppServer {
                                 let mut output = Vec::new();
                                 status_bar.maybe_render_into(terminal.lock().await.screen(), &mut output, false);
                                 if !output.is_empty() {
+                                    replay_buffer.lock().await.push_output(output.clone());
                                     let _ = output_sender.send(output).await;
                                 }
                             }
 
                             shortname = shortname_receiver.recv() => {
-                                if let Some(shortname) = shortname {
-                                    status_bar.shortname = shortname;
+                                if let Some(ref shortname) = shortname {
+                                    replay_buffer.lock().await.push_app_switch(shortname.clone());
+                                    status_bar.shortname = shortname.clone();
+                                }
+                            }
+
+                            _ = save_replay_rx.recv() => {
+                                let asciicast = replay_buffer.lock().await.serialize_asciicast();
+                                let filename = format!(
+                                    "replay_{}_{}.cast",
+                                    username,
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs()
+                                );
+                                match std::fs::write(&filename, &asciicast) {
+                                    Ok(_) => tracing::info!(%filename, "Saved replay"),
+                                    Err(e) => tracing::error!(%filename, error = %e, "Failed to save replay"),
                                 }
                             }
                         }

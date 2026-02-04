@@ -6,4 +6,5 @@ pub mod app;
 mod audio;
 pub mod mesh;
 pub mod rate_limiting;
+mod replay;
 mod status_bar;
