@@ -131,7 +131,13 @@ async fn main() -> Result<()> {
     );
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let db = libsql::Builder::new_local(":memory:")
+    let data_dir = dirs::data_dir()
+        .expect("Failed to determine data directory")
+        .join("terminal-games");
+    std::fs::create_dir_all(&data_dir)?;
+    let db_path = data_dir.join("terminal-games.db");
+
+    let db = libsql::Builder::new_local(&db_path)
         .build()
         .await
         .unwrap();
