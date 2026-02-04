@@ -141,6 +141,7 @@ fn decode_ogg_opus(
 
         if (*fmt_ctx).nb_streams > 0 {
             let stream = *(*fmt_ctx).streams;
+            (*codec_ctx).pkt_timebase = (*stream).time_base;
             let params = (*stream).codecpar;
             if !(*params).extradata.is_null() {
                 let size = (*params).extradata_size as usize;

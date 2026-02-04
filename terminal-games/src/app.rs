@@ -1038,7 +1038,6 @@ impl AppServer {
                 mem.write(&mut caller, write_offset, &peer_id_bytes)?;
             }
 
-            tracing::debug!("peer_list: returned {} of {} peers", length, total_count);
             Ok(length as i32)
         })
     }
