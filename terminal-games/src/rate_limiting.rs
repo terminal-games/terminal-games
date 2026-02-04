@@ -1,9 +1,9 @@
 use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::Poll;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -32,32 +32,22 @@ impl EwmaRate {
 
     fn update(&self, bytes: usize) {
         let now_ns = Self::now_ns();
-        let old_last_update_ns = self
-            .last_update_ns
-            .swap(now_ns, std::sync::atomic::Ordering::Relaxed);
-        let old_bytes_per_sec = f64::from_bits(
-            self.bytes_per_sec
-                .load(std::sync::atomic::Ordering::Relaxed),
-        );
+        let old_last_update_ns = self.last_update_ns.swap(now_ns, Ordering::Relaxed);
+        let old_bytes_per_sec = f64::from_bits(self.bytes_per_sec.load(Ordering::Relaxed));
         let delta_t_sec =
             (now_ns.saturating_sub(old_last_update_ns) as f64 / 1_000_000_000.0).max(0.001);
         let instant = bytes as f64 / delta_t_sec;
         let alpha = 1.0 - (-delta_t_sec / self.tau_seconds).exp();
         self.bytes_per_sec.store(
             (alpha * instant + (1.0 - alpha) * old_bytes_per_sec).to_bits(),
-            std::sync::atomic::Ordering::Relaxed,
+            Ordering::Relaxed,
         );
     }
 
     fn get(&self) -> f64 {
         let now_ns = Self::now_ns();
-        let last_update_ns = self
-            .last_update_ns
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let bytes_per_sec = f64::from_bits(
-            self.bytes_per_sec
-                .load(std::sync::atomic::Ordering::Relaxed),
-        );
+        let last_update_ns = self.last_update_ns.load(Ordering::Relaxed);
+        let bytes_per_sec = f64::from_bits(self.bytes_per_sec.load(Ordering::Relaxed));
         let delta_t_sec =
             (now_ns.saturating_sub(last_update_ns) as f64 / 1_000_000_000.0).max(0.001);
         let alpha = 1.0 - (-delta_t_sec / self.tau_seconds).exp();
@@ -65,17 +55,58 @@ impl EwmaRate {
     }
 }
 
-pub struct NetworkInformation {
+pub trait LatencyProvider: Send + Sync + 'static {
+    fn latency(&self) -> std::io::Result<Duration>;
+}
+
+pub struct TcpLatencyProvider {
+    fd: RawFd,
+}
+
+impl TcpLatencyProvider {
+    pub fn new(fd: RawFd) -> Self {
+        Self { fd }
+    }
+}
+
+impl LatencyProvider for TcpLatencyProvider {
+    fn latency(&self) -> std::io::Result<Duration> {
+        get_tcp_rtt_from_fd(self.fd)
+    }
+}
+
+pub struct SimulatedLatencyProvider {
+    latency_ms: AtomicU64,
+}
+
+impl SimulatedLatencyProvider {
+    pub fn new(latency_ms: u64) -> Self {
+        Self {
+            latency_ms: AtomicU64::new(latency_ms),
+        }
+    }
+
+    pub fn set_latency(&self, ms: u64) {
+        self.latency_ms.store(ms, Ordering::Relaxed);
+    }
+}
+
+impl LatencyProvider for SimulatedLatencyProvider {
+    fn latency(&self) -> std::io::Result<Duration> {
+        Ok(Duration::from_millis(self.latency_ms.load(Ordering::Relaxed)))
+    }
+}
+
+pub struct NetworkInformation<L: LatencyProvider> {
     bytes_in: AtomicUsize,
     bytes_out: AtomicUsize,
     send_rate: EwmaRate,
     recv_rate: EwmaRate,
     last_throttled: AtomicU64,
-
-    fd: RawFd,
+    latency_provider: L,
 }
 
-impl NetworkInformation {
+impl NetworkInformation<TcpLatencyProvider> {
     pub fn new(fd: RawFd) -> Self {
         Self {
             bytes_in: AtomicUsize::new(0),
@@ -83,68 +114,115 @@ impl NetworkInformation {
             send_rate: EwmaRate::new(1.0),
             recv_rate: EwmaRate::new(1.0),
             last_throttled: AtomicU64::new(0),
-            fd,
+            latency_provider: TcpLatencyProvider::new(fd),
+        }
+    }
+}
+
+impl NetworkInformation<SimulatedLatencyProvider> {
+    pub fn new_simulated(latency_ms: u64) -> Self {
+        Self {
+            bytes_in: AtomicUsize::new(0),
+            bytes_out: AtomicUsize::new(0),
+            send_rate: EwmaRate::new(1.0),
+            recv_rate: EwmaRate::new(1.0),
+            last_throttled: AtomicU64::new(0),
+            latency_provider: SimulatedLatencyProvider::new(latency_ms),
         }
     }
 
-    fn send(&self, bytes: usize) {
-        self.bytes_out
-            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    pub fn set_simulated_latency(&self, ms: u64) {
+        self.latency_provider.set_latency(ms);
+    }
+}
+
+pub trait NetworkInfo: Send + Sync {
+    fn bytes_per_sec_out(&self) -> f64;
+    fn bytes_per_sec_in(&self) -> f64;
+    fn last_throttled(&self) -> SystemTime;
+    fn latency(&self) -> std::io::Result<Duration>;
+}
+
+impl<L: LatencyProvider> NetworkInformation<L> {
+    pub fn record_send(&self, bytes: usize) {
+        self.bytes_out.fetch_add(bytes, Ordering::Relaxed);
         self.send_rate.update(bytes);
     }
 
-    fn recv(&self, bytes: usize) {
-        self.bytes_in
-            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+    pub fn record_recv(&self, bytes: usize) {
+        self.bytes_in.fetch_add(bytes, Ordering::Relaxed);
         self.recv_rate.update(bytes);
     }
 
-    fn set_last_throttled(&self, time: std::time::SystemTime) {
-        self.last_throttled.store(
-            time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
-            std::sync::atomic::Ordering::Release,
-        );
+    pub fn record_throttled(&self) {
+        self.last_throttled
+            .store(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+                Ordering::Release,
+            );
     }
 
-    pub fn bytes_per_sec_out(&self) -> f64 {
+    fn send(&self, bytes: usize) {
+        self.record_send(bytes);
+    }
+
+    fn recv(&self, bytes: usize) {
+        self.record_recv(bytes);
+    }
+
+    fn set_last_throttled(&self, time: SystemTime) {
+        self.last_throttled.store(
+            time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            Ordering::Release,
+        );
+    }
+}
+
+impl<L: LatencyProvider> NetworkInfo for NetworkInformation<L> {
+    fn bytes_per_sec_out(&self) -> f64 {
         self.send_rate.get()
     }
 
-    pub fn bytes_per_sec_in(&self) -> f64 {
+    fn bytes_per_sec_in(&self) -> f64 {
         self.recv_rate.get()
     }
 
-    pub fn last_throttled(&self) -> std::time::SystemTime {
-        let unix_millis = self
-            .last_throttled
-            .load(std::sync::atomic::Ordering::Acquire);
-        UNIX_EPOCH + std::time::Duration::from_millis(unix_millis)
+    fn last_throttled(&self) -> SystemTime {
+        let unix_millis = self.last_throttled.load(Ordering::Acquire);
+        UNIX_EPOCH + Duration::from_millis(unix_millis)
     }
 
-    pub fn latency(&self) -> std::io::Result<std::time::Duration> {
-        get_tcp_rtt_from_fd(self.fd)
+    fn latency(&self) -> std::io::Result<Duration> {
+        self.latency_provider.latency()
     }
 }
 
-pub struct RateLimitedStream<S> {
+pub struct RateLimitedStream<S, L: LatencyProvider> {
     pub inner: S,
     write_bucket: TokenBucket,
     sleep: Pin<Box<tokio::time::Sleep>>,
-    info: Arc<NetworkInformation>,
+    info: Arc<NetworkInformation<L>>,
 }
 
-impl<S> RateLimitedStream<S> {
-    pub fn new(inner: S, info: Arc<NetworkInformation>) -> Self {
+impl<S, L: LatencyProvider> RateLimitedStream<S, L> {
+    pub fn new(inner: S, info: Arc<NetworkInformation<L>>) -> Self {
+        Self::with_rate(inner, info, 64 * 1024, 128 * 1024)
+    }
+
+    pub fn with_rate(inner: S, info: Arc<NetworkInformation<L>>, rate: u64, capacity: u64) -> Self {
         RateLimitedStream {
             inner,
-            write_bucket: TokenBucket::new(64 * 1024, 128 * 1024),
+            write_bucket: TokenBucket::new(rate, capacity),
             sleep: Box::pin(tokio::time::sleep_until(tokio::time::Instant::now())),
             info,
         }
     }
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for RateLimitedStream<S> {
+impl<S: AsyncRead + Unpin, L: LatencyProvider> AsyncRead for RateLimitedStream<S, L> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -162,7 +240,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for RateLimitedStream<S> {
     }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for RateLimitedStream<S> {
+impl<S: AsyncWrite + Unpin, L: LatencyProvider> AsyncWrite for RateLimitedStream<S, L> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -185,7 +263,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for RateLimitedStream<S> {
         let deadline = std::time::Instant::now() + until;
         self.sleep.as_mut().reset(deadline.into());
         let _ = self.sleep.as_mut().poll(cx);
-        self.info.set_last_throttled(std::time::SystemTime::now());
+        self.info.set_last_throttled(SystemTime::now());
         Poll::Pending
     }
 

@@ -41,6 +41,7 @@
           buildInputs = with pkgs; [
             ffmpeg
             clang
+            alsa-lib
           ];
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           GOOS = "wasip1";

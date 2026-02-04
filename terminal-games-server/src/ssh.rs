@@ -11,12 +11,12 @@ use russh::server::*;
 use russh::{Channel, ChannelId, Pty};
 use tokio_util::sync::CancellationToken;
 
-use crate::app::{AppInstantiationParams, AppServer};
-use crate::rate_limiting::{NetworkInformation, RateLimitedStream};
+use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 
 pub struct SshSession {
     input_sender: tokio::sync::mpsc::Sender<smallvec::SmallVec<[u8; 16]>>,
-    resize_tx: tokio::sync::mpsc::Sender<(u16, u16)>,
+    resize_tx: tokio::sync::watch::Sender<(u16, u16)>,
     username: Option<tokio::sync::oneshot::Sender<String>>,
     term: Option<tokio::sync::oneshot::Sender<String>>,
     args: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
@@ -97,7 +97,7 @@ impl SshServer {
     fn new_client(
         &self,
         addr: std::net::SocketAddr,
-        network_info: Arc<NetworkInformation>,
+        network_info: Arc<NetworkInformation<TcpLatencyProvider>>,
     ) -> SshSession {
         tracing::info!(addr=?addr, "new_client");
 
@@ -108,7 +108,7 @@ impl SshServer {
             tokio::sync::oneshot::channel::<(Handle, ChannelId, String)>();
 
         let (input_tx, input_rx) = tokio::sync::mpsc::channel(20);
-        let (resize_tx, resize_rx) = tokio::sync::mpsc::channel(1);
+        let (resize_tx, resize_rx) = tokio::sync::watch::channel((0, 0));
         let cancellation_token = CancellationToken::new();
         let token = cancellation_token.clone();
         let app_server = self.app_server.clone();
@@ -143,7 +143,7 @@ impl SshServer {
                     }
                 };
 
-            let (args, has_audio) = match tokio::time::timeout(
+            let (first_app_shortname, args, has_audio) = match tokio::time::timeout(
                 std::time::Duration::from_millis(1),
                 args_receiver,
             )
@@ -157,14 +157,23 @@ impl SshServer {
                             args.remove(0);
                         }
                     }
-                    (if args.is_empty() { None} else { Some(args) }, has_audio)
+                    if args.is_empty() {
+                        ("menu".into(), None, has_audio)
+                    } else if let Some(pos) = args.iter().position(|&b| b.is_ascii_whitespace()) {
+                        let shortname = String::from_utf8_lossy(&args[..pos]).into();
+                        let rest: Vec<u8> = args[pos..].iter().copied().skip_while(|b| b.is_ascii_whitespace()).collect();
+                        (shortname, (!rest.is_empty()).then_some(rest), has_audio)
+                    } else {
+                        (String::from_utf8_lossy(&args).into(), None, has_audio)
+                    }
                 }
-                _ => (None, false),
+                _ => ("menu".into(), None, false),
             };
 
             let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
             let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
             let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
+                first_app_shortname,
                 args,
                 input_receiver: input_rx,
                 output_sender: output_tx,
@@ -321,8 +330,7 @@ impl Handler for SshSession {
     ) -> Result<(), Self::Error> {
         let _ = self
             .resize_tx
-            .send((col_width as u16, row_height as u16))
-            .await;
+            .send((col_width as u16, row_height as u16));
         session.channel_success(channel)?;
         Ok(())
     }
@@ -353,8 +361,7 @@ impl Handler for SshSession {
     ) -> Result<(), Self::Error> {
         let _ = self
             .resize_tx
-            .send((col_width as u16, row_height as u16))
-            .await;
+            .send((col_width as u16, row_height as u16));
         if let Some(term_sender) = self.term.take() {
             let _ = term_sender.send(term.to_string());
         }

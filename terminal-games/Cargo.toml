@@ -6,21 +6,16 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
-axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 ffmpeg-next = { version = "8", default-features = false, features = ["codec", "device"] }
-flate2 = "1"
 futures = "0.3"
 headless-terminal = { path = "../headless-terminal" }
 hex = "0.4"
-hyper = "1"
-hyper-util = "0.1"
 ipnet = "2"
 libc = "0.2"
 libsql = "0.9"
 postcard = { version = "1", default-features = false }
 rand_core = "0.6"
-russh = "0.56"
 rustls = "0.23"
 rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
@@ -30,7 +25,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = [
     "tls12",
 ] }
-tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"

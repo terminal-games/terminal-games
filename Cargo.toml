@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "terminal-games",
-    "terminal-games-sdk",
     "examples/rust-kitchen-sink",
     "examples/rust-simple",
     "headless-terminal",
+    "terminal-games-cli",
+    "terminal-games-sdk",
+    "terminal-games-server",
+    "terminal-games",
 ]

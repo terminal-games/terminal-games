@@ -1,0 +1,31 @@
+[package]
+name = "terminal-games-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+cpal = "0.17"
+crossterm = { version = "0.29", features = ["event-stream"] }
+ffmpeg-next = { version = "8", default-features = false, features = ["codec", "format"] }
+flate2 = "1"
+libc = "0.2"
+futures = "0.3"
+hyper = "1"
+hyper-util = "0.1"
+libsql = "0.9"
+rand = "0.9"
+rand_core = "0.6"
+russh = "0.57"
+serde = { version = "1", features = ["derive"] }
+smallvec = "1"
+terminal-games = { path = "../terminal-games" }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = "0.3"
