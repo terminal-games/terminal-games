@@ -2,6 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+mod audio;
+
 use std::{
     io::{Read, Write},
     path::Path,
@@ -55,6 +57,10 @@ struct Args {
     /// Bandwidth token bucket capacity in bytes (default: 100000)
     #[arg(long, default_value = "100000")]
     bandwidth_capacity: u64,
+
+    /// Enable audio playback
+    #[arg(long)]
+    audio: bool,
 }
 
 /// A sink that discards all data but reports successful writes.
@@ -94,6 +100,12 @@ fn compute_jittered_latency(latency_ms: u64, jitter_ms: u64) -> Duration {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
 
     let db = libsql::Builder::new_local(":memory:")
         .build()
@@ -168,12 +180,30 @@ async fn main() -> Result<()> {
     let bandwidth_capacity = args.bandwidth_capacity;
     let latency = args.latency;
     let jitter = args.jitter;
+    let audio_enabled = args.audio;
+
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let audio_player = if audio_enabled {
+        tracing::debug!("Audio enabled, initializing player");
+        match audio::spawn_audio_player() {
+            Ok(player) => {
+                tracing::debug!("Audio player initialized");
+                Some(player)
+            }
+            Err(e) => {
+                tracing::error!(?e, "Failed to initialize audio");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
         args: None,
         input_receiver: input_rx,
         output_sender: output_tx,
-        audio_sender: None,
+        audio_sender: audio_player.as_ref().map(|_| audio_tx),
         remote_sshid: "cli".to_string(),
         term: Some(std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string())),
         username: std::env::var("USER").unwrap_or_else(|_| "cli".to_string()),
@@ -201,22 +231,39 @@ async fn main() -> Result<()> {
     let mut sigwinch =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
 
+    enum DelayedData {
+        Terminal { raw: Vec<u8>, metered: Vec<u8> },
+        Audio(Vec<u8>),
+    }
+
     let (delayed_tx, mut delayed_rx) =
-        tokio::sync::mpsc::channel::<(Vec<u8>, Vec<u8>, tokio::time::Instant, u64)>(100);
+        tokio::sync::mpsc::channel::<(DelayedData, tokio::time::Instant, u64)>(100);
 
     tokio::spawn(async move {
         let mut rate_limited = RateLimitedStream::with_rate(NullSink, network_info.clone(), bandwidth, bandwidth_capacity);
         let mut stdout = std::io::stdout();
 
-        while let Some((raw_data, metered_data, deliver_at, delay_ms)) = delayed_rx.recv().await {
+        while let Some((data, deliver_at, delay_ms)) = delayed_rx.recv().await {
             tokio::time::sleep_until(deliver_at).await;
             network_info.set_simulated_latency(delay_ms);
 
-            if rate_limited.write_all(&metered_data).await.is_err() {
-                break;
-            }
-            if stdout.write_all(&raw_data).is_err() || stdout.flush().is_err() {
-                break;
+            match data {
+                DelayedData::Terminal { raw, metered } => {
+                    if rate_limited.write_all(&metered).await.is_err() {
+                        break;
+                    }
+                    if stdout.write_all(&raw).is_err() || stdout.flush().is_err() {
+                        break;
+                    }
+                }
+                DelayedData::Audio(audio_data) => {
+                    if rate_limited.write_all(&audio_data).await.is_err() {
+                        break;
+                    }
+                    if let Some(ref player) = audio_player {
+                        player.push_audio(audio_data);
+                    }
+                }
             }
         }
     });
@@ -230,6 +277,16 @@ async fn main() -> Result<()> {
                     tracing::info!(?exit_code, "App exited");
                 }
                 break;
+            }
+
+            data = audio_rx.recv(), if audio_enabled => {
+                let Some(data) = data else { break };
+
+                let delay = compute_jittered_latency(latency, jitter);
+                let delay_ms = delay.as_millis() as u64;
+                let deliver_at = tokio::time::Instant::now() + delay;
+
+                let _ = delayed_tx.send((DelayedData::Audio(data), deliver_at, delay_ms)).await;
             }
 
             data = output_rx.recv() => {
@@ -247,7 +304,7 @@ async fn main() -> Result<()> {
                     data.clone()
                 };
 
-                let _ = delayed_tx.send((data, metered_data, deliver_at, delay_ms)).await;
+                let _ = delayed_tx.send((DelayedData::Terminal { raw: data, metered: metered_data }, deliver_at, delay_ms)).await;
             }
 
             _ = sigwinch.recv() => {
