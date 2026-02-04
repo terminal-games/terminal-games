@@ -8,7 +8,7 @@ use std::{
     io::{Read, Write},
     path::Path,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     thread,
     time::Duration,
@@ -61,6 +61,22 @@ struct Args {
     /// Disable audio playback
     #[arg(long)]
     no_audio: bool,
+
+    /// Log verbosity level (off, error, warn, info, debug, trace)
+    #[arg(long, default_value = "debug")]
+    log_level: tracing::Level,
+}
+
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A sink that discards all data but reports successful writes.
@@ -101,10 +117,18 @@ fn compute_jittered_latency(latency_ms: u64, jitter_ms: u64) -> Duration {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::DEBUG)
-        .finish();
+    let log_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_buffer_writer = log_buffer.clone();
+    let filter = tracing_subscriber::filter::Targets::new()
+        .with_target("terminal_games", args.log_level)
+        .with_target("terminal_games_cli", args.log_level)
+        .with_default(tracing::Level::WARN);
+    use tracing_subscriber::{layer::SubscriberExt, Layer};
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(move || LogBuffer(log_buffer_writer.clone()))
+            .with_filter(filter),
+    );
     tracing::subscriber::set_global_default(subscriber)?;
 
     let db = libsql::Builder::new_local(":memory:")
@@ -324,6 +348,8 @@ async fn main() -> Result<()> {
 
     let _ = local_discovery.unregister().await;
     mesh.graceful_shutdown().await;
+
+    std::io::stderr().write_all(&log_buffer.lock().unwrap())?;
 
     Ok(())
 }
