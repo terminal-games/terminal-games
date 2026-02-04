@@ -200,6 +200,14 @@ fn decode_ogg_opus(
             {
                 let mut buf = samples.lock().unwrap();
                 buf.extend(decoded);
+
+                const MAX_BUFFER_MS: usize = 40;
+                let max_buffer_samples = SAMPLE_RATE as usize * CHANNELS * MAX_BUFFER_MS / 1000;
+                let excess = buf.len().saturating_sub(max_buffer_samples);
+                if excess > 0 {
+                    buf.drain(..excess);
+                }
+
                 if !started && buf.len() >= prebuffer_samples {
                     stream.play()?;
                     tracing::debug!("Audio started with {} samples buffered", buf.len());

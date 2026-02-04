@@ -260,8 +260,7 @@ async fn main() -> Result<()> {
         Audio(Vec<u8>),
     }
 
-    let (delayed_tx, mut delayed_rx) =
-        tokio::sync::mpsc::channel::<(DelayedData, tokio::time::Instant, u64)>(100);
+    let (delayed_tx, mut delayed_rx) = tokio::sync::mpsc::channel(1);
 
     tokio::spawn(async move {
         let mut rate_limited = RateLimitedStream::with_rate(NullSink, network_info.clone(), bandwidth, bandwidth_capacity);
