@@ -200,11 +200,15 @@ async fn handle_socket(
 ) {
     let (mut sender, mut receiver) = socket.split();
 
+    let Some(initial_size) = recv_initial_resize(&mut receiver).await else {
+        return;
+    };
+
     let remote_sshid = sanitize_user_agent(&user_agent);
     let username = "web".to_string();
 
     let (input_tx, input_rx) = tokio::sync::mpsc::channel(20);
-    let (resize_tx, resize_rx) = tokio::sync::watch::channel((0, 0));
+    let (resize_tx, resize_rx) = tokio::sync::watch::channel(initial_size);
     let cancellation_token = CancellationToken::new();
     let token = cancellation_token.clone();
 
@@ -294,6 +298,14 @@ async fn handle_socket(
     }
 
     cancellation_token.cancel();
+}
+
+async fn recv_initial_resize(
+    receiver: &mut futures::stream::SplitStream<WebSocket>,
+) -> Option<(u16, u16)> {
+    let msg = receiver.next().await?.ok()?;
+    let Message::Text(text) = msg else { return None };
+    parse_resize(text.strip_prefix("resize:")?)
 }
 
 fn parse_resize(text: &str) -> Option<(u16, u16)> {

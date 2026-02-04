@@ -58,7 +58,7 @@ impl ReplayBuffer {
     pub fn new(cols: u16, rows: u16, shortname: String, term_type: Option<String>) -> Self {
         Self {
             events: VecDeque::with_capacity(1024),
-            vt: avt::Vt::new(cols as usize, rows as usize),
+            vt: avt::Vt::new((cols as usize).max(1), (rows as usize).max(1)),
             vt_timestamp: None,
             initial_cols: cols,
             initial_rows: rows,
@@ -116,7 +116,7 @@ impl ReplayBuffer {
                     self.vt.feed_str(&String::from_utf8_lossy(data));
                 }
                 ReplayEvent::Resize { cols, rows } => {
-                    self.vt.resize(*cols as usize, *rows as usize);
+                    self.vt.resize((*cols as usize).max(1), (*rows as usize).max(1));
                     self.initial_cols = *cols;
                     self.initial_rows = *rows;
                 }
@@ -143,11 +143,26 @@ impl ReplayBuffer {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
+        // Find valid terminal size: prefer initial, fall back to first resize event, then current
+        let (cols, rows) = if self.initial_cols > 0 && self.initial_rows > 0 {
+            (self.initial_cols, self.initial_rows)
+        } else {
+            self.events
+                .iter()
+                .find_map(|e| match &e.event {
+                    ReplayEvent::Resize { cols, rows } if *cols > 0 && *rows > 0 => {
+                        Some((*cols, *rows))
+                    }
+                    _ => None,
+                })
+                .unwrap_or((self.current_cols.max(80), self.current_rows.max(24)))
+        };
+
         let header = AsciicastHeader {
             version: 3,
             term: AsciicastTerm {
-                cols: self.initial_cols,
-                rows: self.initial_rows,
+                cols,
+                rows,
                 term_type: self.term_type.as_deref(),
             },
             timestamp,
