@@ -171,15 +171,19 @@ impl AppServer {
             let replay_buffer = Arc::new(Mutex::new(ReplayBuffer::new(first_cols, first_rows, first_app_shortname.clone(), params.term.clone())));
             let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(1);
 
-            let (filtered_input_tx, filtered_input_rx) =
-                tokio::sync::mpsc::channel::<SmallVec<[u8; 16]>>(16);
-            let mut input_receiver = params.input_receiver;
+            let (filtered_input_tx, filtered_input_rx) = tokio::sync::mpsc::channel(1);
             tokio::task::spawn({
+                let mut input_receiver = params.input_receiver;
+                let graceful_shutdown_token = params.graceful_shutdown_token.clone();
                 let replay_buffer = replay_buffer.clone();
                 let notification_tx = notification_tx.clone();
                 let username = params.username.clone();
                 async move {
                     while let Some(data) = input_receiver.recv().await {
+                        if data.contains(&0x03) {
+                            // CTRL+C found, start graceful shutdown
+                            graceful_shutdown_token.cancel();
+                        }
                         if data.contains(&0x12) {
                             // CTRL+R found, save replay and filter it out
                             let asciicast = replay_buffer.lock().await.serialize_asciicast();
