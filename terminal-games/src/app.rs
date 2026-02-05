@@ -24,6 +24,7 @@ use crate::{
     audio::{AudioBuffer, CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
+    replay::ReplayBuffer,
     status_bar::StatusBar,
 };
 
@@ -158,7 +159,6 @@ impl AppServer {
 
             let (app_output_sender, mut app_output_receiver) =
                 tokio::sync::mpsc::channel::<Vec<u8>>(1);
-            let mut input_receiver = params.input_receiver;
             let has_next_app_shortname = Arc::new(AtomicBool::new(false));
             let (shortname_sender, mut shortname_receiver) =
                 tokio::sync::mpsc::channel::<String>(1);
@@ -167,6 +167,54 @@ impl AppServer {
             let hard_shutdown_token = CancellationToken::new();
             let audio_tx = params.audio_sender;
             let first_app_shortname = params.first_app_shortname;
+
+            let replay_buffer = Arc::new(Mutex::new(ReplayBuffer::new(first_cols, first_rows, first_app_shortname.clone(), params.term.clone())));
+            let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(1);
+
+            let (filtered_input_tx, filtered_input_rx) = tokio::sync::mpsc::channel(1);
+            tokio::task::spawn({
+                let mut input_receiver = params.input_receiver;
+                let graceful_shutdown_token = params.graceful_shutdown_token.clone();
+                let replay_buffer = replay_buffer.clone();
+                let notification_tx = notification_tx.clone();
+                let username = params.username.clone();
+                async move {
+                    while let Some(data) = input_receiver.recv().await {
+                        if data.contains(&0x03) {
+                            // CTRL+C found, start graceful shutdown
+                            graceful_shutdown_token.cancel();
+                        }
+                        if data.contains(&0x12) {
+                            // CTRL+R found, save replay and filter it out
+                            let asciicast = replay_buffer.lock().await.serialize_asciicast();
+                            let _ = notification_tx.send(" \x1b[3mUploading replay... ".to_string()).await;
+                            let username = username.clone();
+                            let notification_tx = notification_tx.clone();
+                            tokio::spawn(async move {
+                                let notification = match upload_asciicast(&username, &asciicast).await {
+                                    Ok(url) => {
+                                        tracing::info!(%url, "Uploaded replay");
+                                        format!(" \x1b[3mReplay saved: \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ", url, url)
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "Failed to upload replay");
+                                        format!(" Upload failed: {} ", e)
+                                    }
+                                };
+                                let _ = notification_tx.send(notification).await;
+                            });
+                            let filtered: SmallVec<[u8; 16]> =
+                                data.iter().copied().filter(|&b| b != 0x12).collect();
+                            if !filtered.is_empty() {
+                                let _ = filtered_input_tx.send(filtered).await;
+                            }
+                        } else {
+                            let _ = filtered_input_tx.send(data).await;
+                        }
+                    }
+                }
+            });
+            let mut input_receiver = filtered_input_rx;
 
             let audio_buffer = Arc::new(AudioBuffer::new(SAMPLE_RATE as usize));
 
@@ -196,11 +244,12 @@ impl AppServer {
                 let has_next_app_shortname = has_next_app_shortname.clone();
                 let terminal = terminal.clone();
                 let network_info = network_info.clone();
+                let replay_buffer = replay_buffer.clone();
                 async move {
                     let mut escape_buffer = EscapeSequenceBuffer::new();
                     let mut status_bar_interval = tokio::time::interval(Duration::from_secs(1));
                     let mut status_bar =
-                        StatusBar::new(first_app_shortname, username, network_info);
+                        StatusBar::new(first_app_shortname, username.clone(), network_info, notification_rx);
 
                     loop {
                         tokio::select! {
@@ -261,12 +310,15 @@ impl AppServer {
                                     }
                                 }
 
+                                replay_buffer.lock().await.push_output(output.clone());
                                 let _ = output_sender.send(output).await;
                             }
 
                             result = window_size_receiver.changed() => {
                                 if let Err(_) = result { break };
                                 let (width, height) = *window_size_receiver.borrow();
+
+                                replay_buffer.lock().await.push_resize(width, height);
 
                                 let mut output = Vec::new();
                                 {
@@ -276,6 +328,7 @@ impl AppServer {
                                     status_bar.maybe_render_into(screen, &mut output, true);
                                 }
                                 if !output.is_empty() {
+                                    replay_buffer.lock().await.push_output(output.clone());
                                     let _ = output_sender.send(output).await;
                                 }
                             }
@@ -284,13 +337,15 @@ impl AppServer {
                                 let mut output = Vec::new();
                                 status_bar.maybe_render_into(terminal.lock().await.screen(), &mut output, false);
                                 if !output.is_empty() {
+                                    replay_buffer.lock().await.push_output(output.clone());
                                     let _ = output_sender.send(output).await;
                                 }
                             }
 
                             shortname = shortname_receiver.recv() => {
-                                if let Some(shortname) = shortname {
-                                    status_bar.shortname = shortname;
+                                if let Some(ref shortname) = shortname {
+                                    replay_buffer.lock().await.push_app_switch(shortname.clone());
+                                    status_bar.shortname = shortname.clone();
                                 }
                             }
                         }
@@ -1528,6 +1583,45 @@ impl Stream {
 }
 
 pub type Terminal = headless_terminal::Parser;
+
+fn get_install_id() -> &'static str {
+    static INSTALL_ID: OnceLock<String> = OnceLock::new();
+    INSTALL_ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+async fn upload_asciicast(username: &str, data: &[u8]) -> Result<String, String> {
+    let install_id = get_install_id();
+    let client = reqwest::Client::new();
+
+    let part = reqwest::multipart::Part::bytes(data.to_vec())
+        .file_name("replay.cast")
+        .mime_str("application/octet-stream")
+        .map_err(|e| e.to_string())?;
+
+    let form = reqwest::multipart::Form::new().part("asciicast", part);
+
+    let response = client
+        .post("https://asciinema.org/api/v1/recordings")
+        .basic_auth(username, Some(install_id))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("{}: {}", status, body));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct UploadResponse {
+        url: String,
+    }
+
+    let upload_response: UploadResponse = response.json().await.map_err(|e| e.to_string())?;
+    Ok(upload_response.url)
+}
 
 pub fn is_globally_reachable(ip: IpAddr) -> bool {
     match ip {

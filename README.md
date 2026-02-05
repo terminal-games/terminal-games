@@ -14,4 +14,5 @@ Your game will be served via SSH to players at low latency across the world 🌎
 - Multiplayer peer messaging SDK
 - Web support with [xterm.js](https://xtermjs.org)
 - Audio (even over SSH!)
+- Instant replay asciinema recording
 - Built in KV store 🚧

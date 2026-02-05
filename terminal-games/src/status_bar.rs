@@ -1,8 +1,11 @@
-use std::sync::Arc;
-
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 use yansi::Paint;
 
@@ -10,6 +13,13 @@ use crate::rate_limiting::NetworkInfo;
 
 fn terminal_width(str: &str) -> usize {
     strip_ansi_escapes::strip_str(str).width()
+}
+
+const NOTIFICATION_DURATION: Duration = Duration::from_secs(10);
+
+struct Notification {
+    content: String,
+    expires: Instant,
 }
 
 pub struct StatusBar {
@@ -20,10 +30,17 @@ pub struct StatusBar {
     prev_size: (u16, u16),
     prev_status_bar_content: Vec<u8>,
     network_info: Arc<dyn NetworkInfo>,
+    notification: Option<Notification>,
+    notification_rx: mpsc::Receiver<String>,
 }
 
 impl StatusBar {
-    pub fn new(shortname: String, username: String, network_info: Arc<dyn NetworkInfo>) -> Self {
+    pub fn new(
+        shortname: String,
+        username: String,
+        network_info: Arc<dyn NetworkInfo>,
+        notification_rx: mpsc::Receiver<String>,
+    ) -> Self {
         Self {
             shortname,
             username,
@@ -32,6 +49,8 @@ impl StatusBar {
             prev_size: (0, 0),
             prev_status_bar_content: Vec::new(),
             network_info,
+            notification: None,
+            notification_rx,
         }
     }
 
@@ -60,7 +79,15 @@ impl StatusBar {
         .white()
         .on_fixed(236)
         .to_string();
-        let left = active_tab + &username + &net + &latency;
+
+        let notification = match &self.notification {
+            Some(notif) if Instant::now() < notif.expires => {
+                format!("\x1b[48;5;236m{}", notif.content)
+            }
+            _ => String::new(),
+        };
+
+        let left = active_tab + &username + &net + &latency + &notification;
 
         let ssh_callout = " ssh -C terminal-games.fly.dev ".bold().black().on_green();
         let ticker_index = ((std::time::Instant::now() - self.session_start_time).as_secs() / 10)
@@ -86,8 +113,7 @@ impl StatusBar {
             .to_string();
 
         let content_str = left + &padding + &right;
-        let content_bytes = content_str.as_bytes().to_vec();
-        content_bytes
+        content_str.into_bytes()
     }
 
     pub fn maybe_render_into(
@@ -97,6 +123,16 @@ impl StatusBar {
         force: bool,
     ) -> bool {
         let (height, width) = screen.size();
+
+        match self.notification_rx.try_recv() {
+            Ok(content) => {
+                self.notification = Some(Notification {
+                    content,
+                    expires: Instant::now() + NOTIFICATION_DURATION,
+                });
+            }
+            Err(_) => {},
+        }
 
         let content = self.content(width);
         let size_changed = self.prev_size != (height, width);
