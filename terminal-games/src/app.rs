@@ -183,14 +183,14 @@ impl AppServer {
                         if data.contains(&0x12) {
                             // CTRL+R found, save replay and filter it out
                             let asciicast = replay_buffer.lock().await.serialize_asciicast();
-                            let _ = notification_tx.send(" \x1b[3mUploading recording... ".to_string()).await;
+                            let _ = notification_tx.send(" \x1b[3mUploading replay... ".to_string()).await;
                             let username = username.clone();
                             let notification_tx = notification_tx.clone();
                             tokio::spawn(async move {
                                 let notification = match upload_asciicast(&username, &asciicast).await {
                                     Ok(url) => {
                                         tracing::info!(%url, "Uploaded replay");
-                                        format!(" \x1b[3mRecording saved: \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ", url, url)
+                                        format!(" \x1b[3mReplay saved: \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ", url, url)
                                     }
                                     Err(e) => {
                                         tracing::error!(error = %e, "Failed to upload replay");
@@ -1590,8 +1590,8 @@ async fn upload_asciicast(username: &str, data: &[u8]) -> Result<String, String>
     let client = reqwest::Client::new();
 
     let part = reqwest::multipart::Part::bytes(data.to_vec())
-        .file_name("recording.cast")
-        .mime_str("application/x-asciicast")
+        .file_name("replay.cast")
+        .mime_str("application/octet-stream")
         .map_err(|e| e.to_string())?;
 
     let form = reqwest::multipart::Form::new().part("asciicast", part);
