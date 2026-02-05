@@ -27,10 +27,6 @@ pub struct ReplayBuffer {
     events: VecDeque<TimestampedEvent>,
     vt: avt::Vt,
     vt_timestamp: Option<Instant>,
-    initial_cols: u16,
-    initial_rows: u16,
-    current_cols: u16,
-    current_rows: u16,
     initial_shortname: String,
     current_shortname: String,
     term_type: Option<String>,
@@ -48,8 +44,8 @@ struct AsciicastHeader<'a> {
 
 #[derive(Serialize)]
 struct AsciicastTerm<'a> {
-    cols: u16,
-    rows: u16,
+    cols: usize,
+    rows: usize,
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     term_type: Option<&'a str>,
 }
@@ -60,10 +56,6 @@ impl ReplayBuffer {
             events: VecDeque::with_capacity(1024),
             vt: avt::Vt::new((cols as usize).max(1), (rows as usize).max(1)),
             vt_timestamp: None,
-            initial_cols: cols,
-            initial_rows: rows,
-            current_cols: cols,
-            current_rows: rows,
             initial_shortname: shortname.clone(),
             current_shortname: shortname,
             term_type,
@@ -80,11 +72,6 @@ impl ReplayBuffer {
     }
 
     pub fn push_resize(&mut self, cols: u16, rows: u16) {
-        if cols == self.current_cols && rows == self.current_rows {
-            return;
-        }
-        self.current_cols = cols;
-        self.current_rows = rows;
         let now = Instant::now();
         self.prune(now);
         self.events.push_back(TimestampedEvent {
@@ -117,8 +104,6 @@ impl ReplayBuffer {
                 }
                 ReplayEvent::Resize { cols, rows } => {
                     self.vt.resize((*cols as usize).max(1), (*rows as usize).max(1));
-                    self.initial_cols = *cols;
-                    self.initial_rows = *rows;
                 }
                 ReplayEvent::AppSwitch { shortname } => {
                     self.initial_shortname = shortname.clone();
@@ -143,20 +128,7 @@ impl ReplayBuffer {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        // Find valid terminal size: prefer initial, fall back to first resize event, then current
-        let (cols, rows) = if self.initial_cols > 0 && self.initial_rows > 0 {
-            (self.initial_cols, self.initial_rows)
-        } else {
-            self.events
-                .iter()
-                .find_map(|e| match &e.event {
-                    ReplayEvent::Resize { cols, rows } if *cols > 0 && *rows > 0 => {
-                        Some((*cols, *rows))
-                    }
-                    _ => None,
-                })
-                .unwrap_or((self.current_cols.max(80), self.current_rows.max(24)))
-        };
+        let (cols, rows) = self.vt.size();
 
         let header = AsciicastHeader {
             version: 3,
