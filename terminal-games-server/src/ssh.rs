@@ -273,7 +273,7 @@ impl Handler for SshSession {
             .db
             .query(
                 "
-                INSERT INTO users (pubkey_fingerprint, username) VALUES (?1, ?2)
+                INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (?1, ?2, 'en_US')
                 ON CONFLICT DO UPDATE SET username = ?2
                 RETURNING id
             ",

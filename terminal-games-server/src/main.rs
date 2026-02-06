@@ -40,14 +40,14 @@ async fn main() -> Result<()> {
     let _ = conn
         .execute(
             "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-            libsql::params!("kitchen-sink", "examples/kitchen-sink/main.wasm"),
+            libsql::params!("kitchen-sink", "examples/kitchen-sink/kitchen-sink.wasm"),
         )
         .await;
 
     let _ = conn
         .execute(
             "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-            libsql::params!("menu", "cmd/menu/main.wasm"),
+            libsql::params!("menu", "cmd/menu/menu.wasm"),
         )
         .await;
 

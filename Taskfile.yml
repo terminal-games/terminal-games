@@ -7,9 +7,9 @@ version: "3"
 tasks:
   build:
     cmds:
-      - CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -o ./examples/kitchen-sink/main.wasm ./examples/kitchen-sink
-      - CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -o ./examples/net/main.wasm ./examples/net
-      - CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -o ./cmd/menu/main.wasm ./cmd/menu
+      - CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -o ./examples/kitchen-sink/kitchen-sink.wasm ./examples/kitchen-sink
+      - CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -o ./examples/net/net.wasm ./examples/net
+      - CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -o ./cmd/menu/menu.wasm ./cmd/menu
       - cargo build --manifest-path examples/rust-kitchen-sink/Cargo.toml --target wasm32-wasip1 --release
       - cargo build --manifest-path examples/rust-simple/Cargo.toml --target wasm32-wasip1 --release
       - cargo build --release -p terminal-games-server
@@ -18,6 +18,11 @@ tasks:
       - build
     cmds:
       - mold -run cargo run --release -p terminal-games-server
+
+  menu:
+    cmds:
+      - CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -o ./cmd/menu/menu.wasm ./cmd/menu
+      - cargo run --release -p terminal-games-cli -- -C ./cmd/menu/menu.wasm
 # PEER_LISTEN_ADDR=0.0.0.0:3001 SSH_LISTEN_ADDR=0.0.0.0:2222 REGION_ID=aaaa PEER_NODES=bbbb:127.0.0.1:3002,cccc:127.0.0.1:3003 cargo run --release -p terminal-games-server
 # PEER_LISTEN_ADDR=0.0.0.0:3002 SSH_LISTEN_ADDR=0.0.0.0:2223 REGION_ID=bbbb PEER_NODES=aaaa:127.0.0.1:3001,cccc:127.0.0.1:3003 cargo run --release -p terminal-games-server
 # PEER_LISTEN_ADDR=0.0.0.0:3003 SSH_LISTEN_ADDR=0.0.0.0:2224 REGION_ID=cccc PEER_NODES=aaaa:127.0.0.1:3001,bbbb:127.0.0.1:3002 cargo run --release -p terminal-games-server
