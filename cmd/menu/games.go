@@ -5,14 +5,39 @@
 package main
 
 import (
+	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 type gamesModel struct {
+	keys gamesKeyMap
+}
+
+type gamesKeyMap struct {
 }
 
 func newGamesModel() gamesModel {
-	return gamesModel{}
+	return gamesModel{keys: newGamesKeyMap()}
+}
+
+func newGamesKeyMap() gamesKeyMap {
+	return gamesKeyMap{}
+}
+
+func (m gamesModel) ShortHelp() []key.Binding {
+	return m.keys.ShortHelp()
+}
+
+func (m gamesModel) FullHelp() [][]key.Binding {
+	return m.keys.FullHelp()
+}
+
+func (k gamesKeyMap) ShortHelp() []key.Binding {
+	return nil
+}
+
+func (k gamesKeyMap) FullHelp() [][]key.Binding {
+	return nil
 }
 
 func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {

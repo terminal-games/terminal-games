@@ -8,6 +8,8 @@ import (
 	"log"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
@@ -29,8 +31,79 @@ type model struct {
 	tabs        tabs.Model
 	contentArea lipgloss.Style
 	barStyle    lipgloss.Style
+	keys        keyMap
+	help        help.Model
 	games       gamesModel
 	profile     profileModel
+}
+
+type helpKeyMap interface {
+	ShortHelp() []key.Binding
+	FullHelp() [][]key.Binding
+}
+
+type keyMap struct {
+	Quit    key.Binding
+	NextTab key.Binding
+	PrevTab key.Binding
+}
+
+func newKeyMap() keyMap {
+	return keyMap{
+		Quit: key.NewBinding(
+			key.WithKeys("q", "ctrl+c"),
+			key.WithHelp("q", "quit"),
+		),
+		NextTab: key.NewBinding(
+			key.WithKeys("tab"),
+			key.WithHelp("tab", "next tab"),
+		),
+		PrevTab: key.NewBinding(
+			key.WithKeys("shift+tab"),
+			key.WithHelp("shift+tab", "prev tab"),
+		),
+	}
+}
+
+func (k keyMap) ShortHelp() []key.Binding {
+	return []key.Binding{k.NextTab, k.PrevTab, k.Quit}
+}
+
+func (k keyMap) FullHelp() [][]key.Binding {
+	return [][]key.Binding{{k.NextTab, k.PrevTab}, {k.Quit}}
+}
+
+type combinedKeyMap struct {
+	base  helpKeyMap
+	extra helpKeyMap
+}
+
+func (c combinedKeyMap) ShortHelp() []key.Binding {
+	if c.extra == nil {
+		return c.base.ShortHelp()
+	}
+	return append(c.base.ShortHelp(), c.extra.ShortHelp()...)
+}
+
+func (c combinedKeyMap) FullHelp() [][]key.Binding {
+	if c.extra == nil {
+		return c.base.FullHelp()
+	}
+	return append(c.base.FullHelp(), c.extra.FullHelp()...)
+}
+
+func (m model) activeKeyMap() helpKeyMap {
+	var extra helpKeyMap
+	switch m.tabs.ActiveTab().ID {
+	case "games":
+		extra = m.games
+	case "profile":
+		extra = m.profile
+	}
+	return combinedKeyMap{
+		base:  m.keys,
+		extra: extra,
+	}
 }
 
 func main() {
@@ -47,6 +120,8 @@ func main() {
 		tabs:        tabs.New(menuTabs, zoneManager, "menu-tab-"),
 		contentArea: lipgloss.NewStyle().Padding(1, 2),
 		barStyle:    lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")),
+		keys:        newKeyMap(),
+		help:        help.New(),
 		games:       newGamesModel(),
 		profile:     newProfileModel(),
 	}, tea.WithAltScreen(), tea.WithMouseAllMotion())
@@ -65,14 +140,14 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := message.(type) {
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "ctrl+c":
+		switch {
+		case key.Matches(msg, m.keys.Quit):
 			return m, tea.Quit
-		case "tab":
+		case key.Matches(msg, m.keys.NextTab):
 			next := (m.tabs.Active + 1) % len(m.tabs.Tabs)
 			cmd := m.tabs.SetActive(next)
 			return m, cmd
-		case "shift+tab":
+		case key.Matches(msg, m.keys.PrevTab):
 			prev := m.tabs.Active - 1
 			if prev < 0 {
 				prev = len(m.tabs.Tabs) - 1
@@ -159,7 +234,12 @@ func (m model) View() string {
 
 	centeredTabsView := lipgloss.NewStyle().Width(viewportWidth).Render(centeredTabs.String())
 
-	contentHeight := m.h - lipgloss.Height(centeredTabsView)
+	keyMap := m.activeKeyMap()
+	m.help.Width = viewportWidth
+	helpView := lipgloss.NewStyle().Width(viewportWidth).Render(m.help.View(keyMap))
+	helpHeight := lipgloss.Height(helpView)
+
+	contentHeight := m.h - lipgloss.Height(centeredTabsView) - helpHeight
 	if contentHeight < 0 {
 		contentHeight = 0
 	}
@@ -198,6 +278,6 @@ func (m model) View() string {
 		Height(contentHeight).
 		Render(content)
 
-	fullView := lipgloss.JoinVertical(lipgloss.Left, centeredTabsView, styledContent)
+	fullView := lipgloss.JoinVertical(lipgloss.Left, centeredTabsView, styledContent, helpView)
 	return m.zone.Scan(lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Top, fullView))
 }

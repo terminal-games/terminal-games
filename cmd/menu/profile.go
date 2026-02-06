@@ -5,14 +5,39 @@
 package main
 
 import (
+	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 type profileModel struct {
+	keys profileKeyMap
+}
+
+type profileKeyMap struct {
 }
 
 func newProfileModel() profileModel {
-	return profileModel{}
+	return profileModel{keys: newProfileKeyMap()}
+}
+
+func newProfileKeyMap() profileKeyMap {
+	return profileKeyMap{}
+}
+
+func (m profileModel) ShortHelp() []key.Binding {
+	return m.keys.ShortHelp()
+}
+
+func (m profileModel) FullHelp() [][]key.Binding {
+	return m.keys.FullHelp()
+}
+
+func (k profileKeyMap) ShortHelp() []key.Binding {
+	return nil
+}
+
+func (k profileKeyMap) FullHelp() [][]key.Binding {
+	return nil
 }
 
 func (m profileModel) Update(msg tea.Msg) (profileModel, tea.Cmd) {
