@@ -132,7 +132,7 @@ func main() {
 }
 
 func (m *model) Init() tea.Cmd {
-	return m.tabs.Init()
+	return tea.Batch(m.tabs.Init(), m.games.Init())
 }
 
 func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
