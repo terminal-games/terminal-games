@@ -144,10 +144,16 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Quit):
 			return m, tea.Quit
 		case key.Matches(msg, m.keys.NextTab):
+			if m.games.carouselModal {
+				return m, nil
+			}
 			next := (m.tabs.Active + 1) % len(m.tabs.Tabs)
 			cmd := m.tabs.SetActive(next)
 			return m, cmd
 		case key.Matches(msg, m.keys.PrevTab):
+			if m.games.carouselModal {
+				return m, nil
+			}
 			prev := m.tabs.Active - 1
 			if prev < 0 {
 				prev = len(m.tabs.Tabs) - 1
@@ -159,6 +165,11 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.w = msg.Width
 		m.h = msg.Height
+		m.games.termW = msg.Width
+		m.games.termH = msg.Height
+		if m.games.carouselModal && (msg.Width < screenshotWidth || msg.Height < carouselModalMinH) {
+			m.games.carouselModal = false
+		}
 		return m, nil
 
 	case tabs.TabChangedMsg:
@@ -186,6 +197,10 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) View() string {
+	if m.games.carouselModal {
+		return m.zone.Scan(m.games.renderCarouselModal(m.w, m.h))
+	}
+
 	tabsView := m.tabs.View()
 	tabsWidth := m.tabs.TotalWidth()
 	title := " Terminal Games"

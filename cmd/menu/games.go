@@ -51,6 +51,9 @@ type gamesModel struct {
 	carouselAnimTargetX float64
 	carouselAnimStart   time.Time
 	carouselAutoGen     int
+	carouselModal       bool
+	termW               int
+	termH               int
 }
 
 type gamesKeyMap struct {
@@ -88,9 +91,10 @@ type gamesStyles struct {
 	DetailsTitle  lipgloss.Style
 	DetailsBody   lipgloss.Style
 	DetailsSubtle lipgloss.Style
-	DotActive     lipgloss.Style
-	DotInactive   lipgloss.Style
-	Caption       lipgloss.Style
+	DotActive      lipgloss.Style
+	DotInactive    lipgloss.Style
+	Caption        lipgloss.Style
+	ScreenshotBtn lipgloss.Style
 }
 
 type gamesListLayout struct {
@@ -116,6 +120,9 @@ const (
 	carouselSnapDuration = 150 * time.Millisecond
 	carouselDragElastic  = 0.3
 	carouselFrameZoneID  = "carousel-frame"
+	carouselBtnZoneID    = "carousel-btn"
+	carouselMinInlineH   = screenshotHeight + 6
+	carouselModalMinH    = screenshotHeight + 3
 )
 
 func defaultGamesStyles() gamesStyles {
@@ -138,6 +145,7 @@ func defaultGamesStyles() gamesStyles {
 		DotActive:     lipgloss.NewStyle().Foreground(lipgloss.Color("#d766ff")),
 		DotInactive:   lipgloss.NewStyle().Foreground(lipgloss.Color("#555555")),
 		Caption:       lipgloss.NewStyle().Foreground(lipgloss.Color("#999999")),
+		ScreenshotBtn: lipgloss.NewStyle().Foreground(lipgloss.Color("#d766ff")).Bold(true),
 	}
 }
 
@@ -231,6 +239,12 @@ func (k gamesKeyMap) FullHelp() [][]key.Binding {
 func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.carouselModal {
+			if msg.Type == tea.KeyEsc {
+				m.carouselModal = false
+			}
+			return m, nil
+		}
 		if m.filtering {
 			switch msg.Type {
 			case tea.KeyEnter:
@@ -275,82 +289,37 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
+		if m.carouselModal {
+			updated, cmd, handled := m.updateCarouselMouse(msg)
+			if handled {
+				return updated, cmd
+			}
+			if msg.Action == tea.MouseActionRelease {
+				m.carouselModal = false
+			}
+			return m, nil
+		}
+
 		switch msg.Type {
 		case tea.MouseWheelUp:
 			return m.moveSelection(-1)
 		case tea.MouseWheelDown:
 			return m.moveSelection(1)
 		}
-		switch msg.Action {
-		case tea.MouseActionPress:
-			if m.zone != nil && m.zone.Get(carouselFrameZoneID).InBounds(msg) {
-				m.carouselDragging = true
-				m.carouselDragStartMX = msg.X
-				m.carouselDragStartSX = m.carouselScrollX
-				m.carouselLastMX = msg.X
-				m.carouselLastMT = time.Now()
-				m.carouselVelocity = 0
-				m.carouselMomentum = false
-				m.carouselAnimating = false
-				m.carouselAutoGen++
-			}
-			return m, nil
-		case tea.MouseActionMotion:
-			if m.carouselDragging {
-				n := len(m.selectedScreenshots())
-				maxX := m.carouselMaxScrollX(n)
-				rawX := m.carouselDragStartSX + float64(m.carouselDragStartMX-msg.X)
-				m.carouselScrollX = clampWithResistance(rawX, 0, maxX, carouselDragElastic)
 
-				dt := time.Since(m.carouselLastMT).Seconds()
-				if dt > 0 && dt < 0.1 {
-					instantV := float64(m.carouselLastMX-msg.X) / dt
-					m.carouselVelocity = 0.6*m.carouselVelocity + 0.4*instantV
-				}
-				m.carouselLastMX = msg.X
-				m.carouselLastMT = time.Now()
-				return m, nil
-			}
+		updated, cmd, handled := m.updateCarouselMouse(msg)
+		if handled {
+			return updated, cmd
+		}
+
+		switch msg.Action {
+		case tea.MouseActionMotion:
 			m.hovered = m.indexAtMouse(msg)
 			return m, nil
 		case tea.MouseActionRelease:
-			if m.carouselDragging {
-				m.carouselDragging = false
-				n := len(m.selectedScreenshots())
-
-				if time.Since(m.carouselLastMT) > 80*time.Millisecond {
-					m.carouselVelocity = 0
-				}
-
-				maxX := m.carouselMaxScrollX(n)
-				projected := math.Max(0, math.Min(m.carouselScrollX+m.carouselVelocity*0.15, maxX))
-				targetPage := int(math.Round(projected / screenshotWidth))
-				if targetPage < 0 {
-					targetPage = 0
-				}
-				if targetPage >= n {
-					targetPage = n - 1
-				}
-				targetX := float64(targetPage * screenshotWidth)
-				m.carouselAnimStartX = m.carouselScrollX
-				m.carouselAnimTargetX = targetX
-				m.carouselAnimStart = time.Now()
-				m.carouselAnimating = true
-				m.carouselAutoGen++
-				return m, gamesTickCmd()
-			}
-			if m.zone != nil {
-				screenshots := m.selectedScreenshots()
-				n := len(screenshots)
-				currentPage := m.carouselCurrentPage(n)
-				for i := range screenshots {
-					if m.zone.Get(m.carouselDotZoneID(i)).InBounds(msg) {
-						if i != currentPage {
-							return m.goToCarouselPage(i)
-						}
-						return m, nil
-					}
-				}
+			if m.zone != nil && m.zone.Get(carouselBtnZoneID).InBounds(msg) {
+				m.carouselModal = true
+				return m, nil
 			}
 			index := m.indexAtMouse(msg)
 			if index >= 0 && index < len(m.filtered) && index != m.selected {
@@ -521,6 +490,7 @@ func (m *gamesModel) applyFilter() {
 		m.carouselDragging = false
 		m.carouselMomentum = false
 		m.carouselAnimating = false
+		m.carouselModal = false
 		return
 	}
 
@@ -533,6 +503,7 @@ func (m *gamesModel) applyFilter() {
 	m.carouselDragging = false
 	m.carouselMomentum = false
 	m.carouselAnimating = false
+	m.carouselModal = false
 	m.syncBarToSelection()
 }
 
@@ -846,7 +817,17 @@ func (m *gamesModel) renderGameDetails(width, height int) string {
 
 	parts := []string{title, desc, "", body}
 	if len(item.Screenshots) > 0 {
-		parts = append(parts, "\n"+m.renderCarousel(item.Screenshots, width))
+		canFitInline := width >= screenshotWidth && height >= carouselMinInlineH
+		canFitModal := m.termW >= screenshotWidth && m.termH >= carouselModalMinH
+		if canFitInline {
+			parts = append(parts, "\n"+m.renderCarousel(item.Screenshots, width))
+		} else if canFitModal {
+			btn := m.styles.ScreenshotBtn.Render(fmt.Sprintf("▶ Screenshots (%d)", len(item.Screenshots)))
+			if m.zone != nil {
+				btn = m.zone.Mark(carouselBtnZoneID, btn)
+			}
+			parts = append(parts, "", btn)
+		}
 	}
 
 	content := strings.Join(parts, "\n")
@@ -873,11 +854,111 @@ func (m *gamesModel) resetCarousel() tea.Cmd {
 	m.carouselDragging = false
 	m.carouselMomentum = false
 	m.carouselAnimating = false
+	m.carouselModal = false
 	m.carouselAutoGen++
 	if screenshots := m.selectedScreenshots(); len(screenshots) > 1 {
 		return carouselAutoAdvanceCmd(m.carouselAutoGen)
 	}
 	return nil
+}
+
+func (m *gamesModel) updateCarouselMouse(msg tea.MouseMsg) (gamesModel, tea.Cmd, bool) {
+	switch msg.Action {
+	case tea.MouseActionPress:
+		if m.zone != nil && m.zone.Get(carouselFrameZoneID).InBounds(msg) {
+			m.carouselDragging = true
+			m.carouselDragStartMX = msg.X
+			m.carouselDragStartSX = m.carouselScrollX
+			m.carouselLastMX = msg.X
+			m.carouselLastMT = time.Now()
+			m.carouselVelocity = 0
+			m.carouselMomentum = false
+			m.carouselAnimating = false
+			m.carouselAutoGen++
+			return *m, nil, true
+		}
+	case tea.MouseActionMotion:
+		if m.carouselDragging {
+			n := len(m.selectedScreenshots())
+			maxX := m.carouselMaxScrollX(n)
+			rawX := m.carouselDragStartSX + float64(m.carouselDragStartMX-msg.X)
+			m.carouselScrollX = clampWithResistance(rawX, 0, maxX, carouselDragElastic)
+			dt := time.Since(m.carouselLastMT).Seconds()
+			if dt > 0 && dt < 0.1 {
+				instantV := float64(m.carouselLastMX-msg.X) / dt
+				m.carouselVelocity = 0.6*m.carouselVelocity + 0.4*instantV
+			}
+			m.carouselLastMX = msg.X
+			m.carouselLastMT = time.Now()
+			return *m, nil, true
+		}
+	case tea.MouseActionRelease:
+		if m.carouselDragging {
+			m.carouselDragging = false
+			n := len(m.selectedScreenshots())
+			if time.Since(m.carouselLastMT) > 80*time.Millisecond {
+				m.carouselVelocity = 0
+			}
+			maxX := m.carouselMaxScrollX(n)
+			projected := math.Max(0, math.Min(m.carouselScrollX+m.carouselVelocity*0.15, maxX))
+			targetPage := int(math.Round(projected / screenshotWidth))
+			if targetPage < 0 {
+				targetPage = 0
+			}
+			if targetPage >= n {
+				targetPage = n - 1
+			}
+			targetX := float64(targetPage * screenshotWidth)
+			m.carouselAnimStartX = m.carouselScrollX
+			m.carouselAnimTargetX = targetX
+			m.carouselAnimStart = time.Now()
+			m.carouselAnimating = true
+			m.carouselAutoGen++
+			return *m, gamesTickCmd(), true
+		}
+		if m.zone != nil {
+			screenshots := m.selectedScreenshots()
+			n := len(screenshots)
+			currentPage := m.carouselCurrentPage(n)
+			for i := range screenshots {
+				if m.zone.Get(m.carouselDotZoneID(i)).InBounds(msg) {
+					if i != currentPage {
+						result, cmd := m.goToCarouselPage(i)
+						return result, cmd, true
+					}
+					return *m, nil, true
+				}
+			}
+		}
+	}
+	return *m, nil, false
+}
+
+func (m *gamesModel) renderCarouselModal(width, height int) string {
+	if len(m.filtered) == 0 || m.selected < 0 || m.selected >= len(m.filtered) {
+		return ""
+	}
+	item := m.items[m.filtered[m.selected]]
+	if len(item.Screenshots) == 0 {
+		return ""
+	}
+
+	cw := screenshotWidth
+	if cw > width {
+		cw = width
+	}
+
+	titleStr := m.styles.DetailsTitle.Render(item.Name)
+	hintStr := m.styles.DetailsSubtle.Render("ESC to close")
+	gap := cw - lipgloss.Width(titleStr) - lipgloss.Width(hintStr)
+	if gap < 1 {
+		gap = 1
+	}
+	header := titleStr + strings.Repeat(" ", gap) + hintStr
+
+	carousel := m.renderCarousel(item.Screenshots, cw)
+	content := header + "\n" + carousel
+	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, content)
 }
 
 func (m *gamesModel) goToCarouselPage(page int) (gamesModel, tea.Cmd) {
