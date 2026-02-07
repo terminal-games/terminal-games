@@ -48,6 +48,6 @@ func (m profileModel) renderProfileTab(width, height int) string {
 	return "Profile"
 }
 
-func (m model) renderProfileTab(width, height int) string {
+func (m *model) renderProfileTab(width, height int) string {
 	return m.profile.renderProfileTab(width, height)
 }

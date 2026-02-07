@@ -115,14 +115,14 @@ func main() {
 		{ID: "about", Title: "About"},
 	}
 
-	p := bubblewrap.NewProgram(model{
+	p := bubblewrap.NewProgram(&model{
 		zone:        zoneManager,
 		tabs:        tabs.New(menuTabs, zoneManager, "menu-tab-"),
 		contentArea: lipgloss.NewStyle().Padding(1, 2),
 		barStyle:    lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")),
 		keys:        newKeyMap(),
 		help:        help.New(),
-		games:       newGamesModel(),
+		games:       newGamesModel(zoneManager),
 		profile:     newProfileModel(),
 	}, tea.WithAltScreen(), tea.WithMouseAllMotion())
 
@@ -131,11 +131,11 @@ func main() {
 	}
 }
 
-func (m model) Init() tea.Cmd {
+func (m *model) Init() tea.Cmd {
 	return m.tabs.Init()
 }
 
-func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
+func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := message.(type) {
@@ -185,7 +185,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m model) View() string {
+func (m *model) View() string {
 	tabsView := m.tabs.View()
 	tabsWidth := m.tabs.TotalWidth()
 	title := " Terminal Games"
