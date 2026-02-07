@@ -42,6 +42,7 @@ func DefaultStyles() Styles {
 			Foreground(lipgloss.Color("#888888")).
 			Padding(0, 1),
 		HoverTab: lipgloss.NewStyle().
+			Background(lipgloss.Color("#3a3a3a")).
 			Foreground(lipgloss.Color("#ffffff")).
 			Padding(0, 1),
 		ActiveBar: lipgloss.NewStyle().
