@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
+	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
 	"github.com/terminal-games/terminal-games/cmd/menu/tabs"
 	"github.com/terminal-games/terminal-games/pkg/bubblewrap"
 )
@@ -144,14 +145,14 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Quit):
 			return m, tea.Quit
 		case key.Matches(msg, m.keys.NextTab):
-			if m.games.carouselModal {
+			if m.games.carousel.Modal {
 				return m, nil
 			}
 			next := (m.tabs.Active + 1) % len(m.tabs.Tabs)
 			cmd := m.tabs.SetActive(next)
 			return m, cmd
 		case key.Matches(msg, m.keys.PrevTab):
-			if m.games.carouselModal {
+			if m.games.carousel.Modal {
 				return m, nil
 			}
 			prev := m.tabs.Active - 1
@@ -167,8 +168,8 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.h = msg.Height
 		m.games.termW = msg.Width
 		m.games.termH = msg.Height
-		if m.games.carouselModal && (msg.Width < screenshotWidth || msg.Height < carouselModalMinH) {
-			m.games.carouselModal = false
+		if m.games.carousel.Modal && !carousel.CanFitModal(msg.Width, msg.Height) {
+			m.games.carousel.Modal = false
 		}
 		return m, nil
 
@@ -197,8 +198,9 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) View() string {
-	if m.games.carouselModal {
-		return m.zone.Scan(m.games.renderCarouselModal(m.w, m.h))
+	if m.games.carousel.Modal {
+		item := m.games.selectedItem()
+		return m.zone.Scan(m.games.carousel.ViewModal(item.Name, m.w, m.h))
 	}
 
 	tabsView := m.tabs.View()

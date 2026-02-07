@@ -6,54 +6,39 @@ package main
 
 import (
 	"fmt"
-	"math"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
 	zone "github.com/lrstanley/bubblezone"
+	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
 )
 
 type gamesModel struct {
-	keys         gamesKeyMap
-	zone         *zone.Manager
-	items        []gameItem
-	filtered     []int
-	selected     int
-	hovered      int
-	filterValue  string
-	filterDraft  string
-	filtering    bool
-	styles       gamesStyles
-	duration     time.Duration
-	layout       gamesListLayout
-	startTop     float64
-	startBottom  float64
-	targetTop    float64
+	keys        gamesKeyMap
+	zone        *zone.Manager
+	items       []gameItem
+	filtered    []int
+	selected    int
+	hovered     int
+	filterValue string
+	filterDraft string
+	filtering   bool
+	styles      gamesStyles
+	duration    time.Duration
+	layout      gamesListLayout
+	startTop    float64
+	startBottom float64
+	targetTop   float64
 	targetBottom float64
-	animStart    time.Time
-	animating    bool
-	initialized  bool
-
-	carouselScrollX     float64
-	carouselVelocity    float64
-	carouselDragging    bool
-	carouselDragStartMX int
-	carouselDragStartSX float64
-	carouselLastMX      int
-	carouselLastMT      time.Time
-	carouselMomentum    bool
-	carouselAnimating   bool
-	carouselAnimStartX  float64
-	carouselAnimTargetX float64
-	carouselAnimStart   time.Time
-	carouselAutoGen     int
-	carouselModal       bool
-	termW               int
-	termH               int
+	animStart   time.Time
+	animating   bool
+	initialized bool
+	carousel    carousel.Model
+	termW       int
+	termH       int
 }
 
 type gamesKeyMap struct {
@@ -67,12 +52,7 @@ type gameItem struct {
 	Name        string
 	Description string
 	Details     string
-	Screenshots []gameScreenshot
-}
-
-type gameScreenshot struct {
-	Content string
-	Caption string
+	Screenshots []carousel.Screenshot
 }
 
 type gamesStyles struct {
@@ -91,10 +71,6 @@ type gamesStyles struct {
 	DetailsTitle  lipgloss.Style
 	DetailsBody   lipgloss.Style
 	DetailsSubtle lipgloss.Style
-	DotActive      lipgloss.Style
-	DotInactive    lipgloss.Style
-	Caption        lipgloss.Style
-	ScreenshotBtn lipgloss.Style
 }
 
 type gamesListLayout struct {
@@ -112,17 +88,6 @@ const (
 	gamesBarBottom   = "╹"
 	gamesItemHeight  = 2
 	gamesItemGap     = 1
-
-	screenshotWidth      = 80
-	screenshotHeight     = 24
-	carouselAutoInterval = 10 * time.Second
-	carouselAnimDuration = 400 * time.Millisecond
-	carouselSnapDuration = 150 * time.Millisecond
-	carouselDragElastic  = 0.3
-	carouselFrameZoneID  = "carousel-frame"
-	carouselBtnZoneID    = "carousel-btn"
-	carouselMinInlineH   = screenshotHeight + 6
-	carouselModalMinH    = screenshotHeight + 3
 )
 
 func defaultGamesStyles() gamesStyles {
@@ -142,10 +107,6 @@ func defaultGamesStyles() gamesStyles {
 		DetailsTitle:  lipgloss.NewStyle().Foreground(lipgloss.Color("#ffffff")).Bold(true),
 		DetailsBody:   lipgloss.NewStyle().Foreground(lipgloss.Color("#cccccc")),
 		DetailsSubtle: lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")),
-		DotActive:     lipgloss.NewStyle().Foreground(lipgloss.Color("#d766ff")),
-		DotInactive:   lipgloss.NewStyle().Foreground(lipgloss.Color("#555555")),
-		Caption:       lipgloss.NewStyle().Foreground(lipgloss.Color("#999999")),
-		ScreenshotBtn: lipgloss.NewStyle().Foreground(lipgloss.Color("#d766ff")).Bold(true),
 	}
 }
 
@@ -155,27 +116,27 @@ func newGamesModel(zoneManager *zone.Manager) gamesModel {
 			Name:        "Terminal Ninja",
 			Description: "Slice fast while dodging bombs",
 			Details:     "Get the high score",
-			Screenshots: []gameScreenshot{
-				{Content: placeholderScreenshot("TERMINAL NINJA", "#ff6644", "#1a0a08"), Caption: "Title Screen"},
-				{Content: placeholderScreenshot("Score: 9001  Combo: x42", "#44ff66", "#081a08"), Caption: "Gameplay"},
-				{Content: placeholderScreenshot("HIGH SCORES", "#ffcc00", "#1a1a08"), Caption: "High Scores"},
+			Screenshots: []carousel.Screenshot{
+				{Content: carousel.PlaceholderScreenshot("TERMINAL NINJA", "#ff6644", "#1a0a08"), Caption: "Title Screen"},
+				{Content: carousel.PlaceholderScreenshot("Score: 9001  Combo: x42", "#44ff66", "#081a08"), Caption: "Gameplay"},
+				{Content: carousel.PlaceholderScreenshot("HIGH SCORES", "#ffcc00", "#1a1a08"), Caption: "High Scores"},
 			},
 		},
 		{
 			Name:        "Terminal Typer",
 			Description: "Test your typing skills",
 			Details:     "A singleplayer and multiplayer typing experience.",
-			Screenshots: []gameScreenshot{
-				{Content: placeholderScreenshot("TERMINAL TYPER", "#66aaff", "#080e1a"), Caption: "Ready to type"},
-				{Content: placeholderScreenshot("WPM: 120  Accuracy: 98%", "#ff66aa", "#1a0812"), Caption: "Results"},
+			Screenshots: []carousel.Screenshot{
+				{Content: carousel.PlaceholderScreenshot("TERMINAL TYPER", "#66aaff", "#080e1a"), Caption: "Ready to type"},
+				{Content: carousel.PlaceholderScreenshot("WPM: 120  Accuracy: 98%", "#ff66aa", "#1a0812"), Caption: "Results"},
 			},
 		},
 		{
 			Name:        "Placeholder 1",
 			Description: "Placeholder 2",
 			Details:     "Placeholder 3",
-			Screenshots: []gameScreenshot{
-				{Content: placeholderScreenshot("PLACEHOLDER 4", "#66aaff", "#080e1a"), Caption: "Placeholder 5"},
+			Screenshots: []carousel.Screenshot{
+				{Content: carousel.PlaceholderScreenshot("PLACEHOLDER 4", "#66aaff", "#080e1a"), Caption: "Placeholder 5"},
 			},
 		},
 	}
@@ -183,6 +144,11 @@ func newGamesModel(zoneManager *zone.Manager) gamesModel {
 	filtered := make([]int, 0, len(items))
 	for i := range items {
 		filtered = append(filtered, i)
+	}
+
+	c := carousel.New(zoneManager)
+	if len(filtered) > 0 {
+		c.Screenshots = items[filtered[0]].Screenshots
 	}
 
 	model := gamesModel{
@@ -194,6 +160,7 @@ func newGamesModel(zoneManager *zone.Manager) gamesModel {
 		hovered:  -1,
 		styles:   defaultGamesStyles(),
 		duration: 120 * time.Millisecond,
+		carousel: c,
 	}
 	model.syncBarToSelection()
 	return model
@@ -236,12 +203,16 @@ func (k gamesKeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{{k.Up, k.Down}, {k.Filter, k.Clear}}
 }
 
+func (m gamesModel) Init() tea.Cmd {
+	return m.carousel.Init()
+}
+
 func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if m.carouselModal {
+		if m.carousel.Modal {
 			if msg.Type == tea.KeyEsc {
-				m.carouselModal = false
+				m.carousel.Modal = false
 			}
 			return m, nil
 		}
@@ -289,13 +260,14 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
-		if m.carouselModal {
-			updated, cmd, handled := m.updateCarouselMouse(msg)
+		if m.carousel.Modal {
+			result, cmd, handled := m.carousel.HandleMouse(msg)
+			m.carousel = result
 			if handled {
-				return updated, cmd
+				return m, cmd
 			}
 			if msg.Action == tea.MouseActionRelease {
-				m.carouselModal = false
+				m.carousel.Modal = false
 			}
 			return m, nil
 		}
@@ -307,9 +279,10 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 			return m.moveSelection(1)
 		}
 
-		updated, cmd, handled := m.updateCarouselMouse(msg)
+		result, cmd, handled := m.carousel.HandleMouse(msg)
+		m.carousel = result
 		if handled {
-			return updated, cmd
+			return m, cmd
 		}
 
 		switch msg.Action {
@@ -317,110 +290,37 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 			m.hovered = m.indexAtMouse(msg)
 			return m, nil
 		case tea.MouseActionRelease:
-			if m.zone != nil && m.zone.Get(carouselBtnZoneID).InBounds(msg) {
-				m.carouselModal = true
+			if m.carousel.BtnClicked(msg) {
+				m.carousel.Modal = true
 				return m, nil
 			}
 			index := m.indexAtMouse(msg)
 			if index >= 0 && index < len(m.filtered) && index != m.selected {
 				m.selected = index
-				cmd := m.resetCarousel()
+				m.carousel.Screenshots = m.items[m.filtered[index]].Screenshots
+				cmd := m.carousel.Reset()
 				return m, tea.Batch(m.startAnim(index), cmd)
 			}
 			return m, nil
 		}
 
 	case gamesTickMsg:
-		var cmds []tea.Cmd
-		needsTick := false
-
 		if m.animating {
 			if m.animProgress() >= 1.0 {
 				m.startTop = m.targetTop
 				m.startBottom = m.targetBottom
 				m.animating = false
 			} else {
-				needsTick = true
+				return m, gamesTickCmd()
 			}
-		}
-
-		if m.carouselAnimating {
-			p := m.carouselAnimProgress()
-			if p >= 1.0 {
-				m.carouselScrollX = m.carouselAnimTargetX
-				m.carouselAnimating = false
-				if n := len(m.selectedScreenshots()); n > 1 {
-					m.carouselAutoGen++
-					cmds = append(cmds, carouselAutoAdvanceCmd(m.carouselAutoGen))
-				}
-			} else {
-				t := easeOutCubic(p)
-				m.carouselScrollX = m.carouselAnimStartX + (m.carouselAnimTargetX-m.carouselAnimStartX)*t
-				needsTick = true
-			}
-		}
-
-		if needsTick {
-			cmds = append(cmds, gamesTickCmd())
-		}
-		if len(cmds) > 0 {
-			return m, tea.Batch(cmds...)
 		}
 		return m, nil
-
-	case carouselAutoAdvanceMsg:
-		if msg.gen != m.carouselAutoGen {
-			return m, nil
-		}
-		if m.carouselDragging || m.carouselMomentum {
-			return m, nil
-		}
-		screenshots := m.selectedScreenshots()
-		n := len(screenshots)
-		if n <= 1 {
-			return m, nil
-		}
-		currentPage := m.carouselCurrentPage(n)
-		nextPage := (currentPage + 1) % n
-		return m.goToCarouselPage(nextPage)
-	}
-	return m, nil
-}
-
-func (m *gamesModel) renderGamesTab(width, height int) string {
-	if width <= 0 || height <= 0 {
-		return ""
 	}
 
-	gap := 2
-	leftWidth := int(float64(width) * 0.3)
-	if leftWidth < 18 {
-		leftWidth = 18
-	}
-	if leftWidth > width-gap-10 {
-		leftWidth = width - gap - 10
-	}
-	if leftWidth < 0 {
-		leftWidth = 0
-	}
-	rightWidth := width - leftWidth - gap
-	if rightWidth < 0 {
-		rightWidth = 0
-	}
-
-	listView := m.renderGamesList(leftWidth, height)
-	detailsView := m.renderGameDetails(rightWidth, height)
-
-	return lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		lipgloss.NewStyle().Width(leftWidth).Height(height).Render(listView),
-		strings.Repeat(" ", gap),
-		lipgloss.NewStyle().Width(rightWidth).Height(height).Render(detailsView),
-	)
-}
-
-func (m *model) renderGamesTab(width, height int) string {
-	return m.games.renderGamesTab(width, height)
+	// Carousel internal messages (tick, auto-advance) fall through here
+	var carouselCmd tea.Cmd
+	m.carousel, carouselCmd = m.carousel.Update(msg)
+	return m, carouselCmd
 }
 
 type gamesTickMsg time.Time
@@ -428,14 +328,6 @@ type gamesTickMsg time.Time
 func gamesTickCmd() tea.Cmd {
 	return tea.Tick(16*time.Millisecond, func(t time.Time) tea.Msg {
 		return gamesTickMsg(t)
-	})
-}
-
-type carouselAutoAdvanceMsg struct{ gen int }
-
-func carouselAutoAdvanceCmd(gen int) tea.Cmd {
-	return tea.Tick(carouselAutoInterval, func(time.Time) tea.Msg {
-		return carouselAutoAdvanceMsg{gen}
 	})
 }
 
@@ -458,7 +350,8 @@ func (m gamesModel) moveSelection(delta int) (gamesModel, tea.Cmd) {
 		return m, nil
 	}
 	m.selected = next
-	cmd := m.resetCarousel()
+	m.carousel.Screenshots = m.items[m.filtered[next]].Screenshots
+	cmd := m.carousel.Reset()
 	return m, tea.Batch(m.startAnim(next), cmd)
 }
 
@@ -485,12 +378,8 @@ func (m *gamesModel) applyFilter() {
 		m.hovered = -1
 		m.animating = false
 		m.initialized = false
-		m.carouselScrollX = 0
-		m.carouselVelocity = 0
-		m.carouselDragging = false
-		m.carouselMomentum = false
-		m.carouselAnimating = false
-		m.carouselModal = false
+		m.carousel.Screenshots = nil
+		m.carousel.Reset()
 		return
 	}
 
@@ -498,12 +387,8 @@ func (m *gamesModel) applyFilter() {
 		m.selected = 0
 	}
 	m.hovered = -1
-	m.carouselScrollX = 0
-	m.carouselVelocity = 0
-	m.carouselDragging = false
-	m.carouselMomentum = false
-	m.carouselAnimating = false
-	m.carouselModal = false
+	m.carousel.Screenshots = m.items[m.filtered[m.selected]].Screenshots
+	m.carousel.Reset()
 	m.syncBarToSelection()
 }
 
@@ -638,6 +523,42 @@ func (m gamesModel) buildListLayout(contentWidth int) gamesListLayout {
 	}
 	layout.totalHeight = total
 	return layout
+}
+
+func (m *gamesModel) renderGamesTab(width, height int) string {
+	if width <= 0 || height <= 0 {
+		return ""
+	}
+
+	gap := 2
+	leftWidth := int(float64(width) * 0.3)
+	if leftWidth < 18 {
+		leftWidth = 18
+	}
+	if leftWidth > width-gap-10 {
+		leftWidth = width - gap - 10
+	}
+	if leftWidth < 0 {
+		leftWidth = 0
+	}
+	rightWidth := width - leftWidth - gap
+	if rightWidth < 0 {
+		rightWidth = 0
+	}
+
+	listView := m.renderGamesList(leftWidth, height)
+	detailsView := m.renderGameDetails(rightWidth, height)
+
+	return lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		lipgloss.NewStyle().Width(leftWidth).Height(height).Render(listView),
+		strings.Repeat(" ", gap),
+		lipgloss.NewStyle().Width(rightWidth).Height(height).Render(detailsView),
+	)
+}
+
+func (m *model) renderGamesTab(width, height int) string {
+	return m.games.renderGamesTab(width, height)
 }
 
 func (m *gamesModel) renderGamesList(width, height int) string {
@@ -817,288 +738,15 @@ func (m *gamesModel) renderGameDetails(width, height int) string {
 
 	parts := []string{title, desc, "", body}
 	if len(item.Screenshots) > 0 {
-		canFitInline := width >= screenshotWidth && height >= carouselMinInlineH
-		canFitModal := m.termW >= screenshotWidth && m.termH >= carouselModalMinH
-		if canFitInline {
-			parts = append(parts, "\n"+m.renderCarousel(item.Screenshots, width))
-		} else if canFitModal {
-			btn := m.styles.ScreenshotBtn.Render(fmt.Sprintf("▶ Screenshots (%d)", len(item.Screenshots)))
-			if m.zone != nil {
-				btn = m.zone.Mark(carouselBtnZoneID, btn)
-			}
-			parts = append(parts, "", btn)
+		if carousel.CanFitInline(width, height) {
+			parts = append(parts, "\n"+m.carousel.View(width))
+		} else if carousel.CanFitModal(m.termW, m.termH) {
+			parts = append(parts, "", m.carousel.ViewButton())
 		}
 	}
 
 	content := strings.Join(parts, "\n")
 	return lipgloss.NewStyle().Width(width).Height(height).Render(content)
-}
-
-func (m gamesModel) Init() tea.Cmd {
-	if screenshots := m.selectedScreenshots(); len(screenshots) > 1 {
-		return carouselAutoAdvanceCmd(m.carouselAutoGen)
-	}
-	return nil
-}
-
-func (m gamesModel) selectedScreenshots() []gameScreenshot {
-	if len(m.filtered) == 0 || m.selected < 0 || m.selected >= len(m.filtered) {
-		return nil
-	}
-	return m.items[m.filtered[m.selected]].Screenshots
-}
-
-func (m *gamesModel) resetCarousel() tea.Cmd {
-	m.carouselScrollX = 0
-	m.carouselVelocity = 0
-	m.carouselDragging = false
-	m.carouselMomentum = false
-	m.carouselAnimating = false
-	m.carouselModal = false
-	m.carouselAutoGen++
-	if screenshots := m.selectedScreenshots(); len(screenshots) > 1 {
-		return carouselAutoAdvanceCmd(m.carouselAutoGen)
-	}
-	return nil
-}
-
-func (m *gamesModel) updateCarouselMouse(msg tea.MouseMsg) (gamesModel, tea.Cmd, bool) {
-	switch msg.Action {
-	case tea.MouseActionPress:
-		if m.zone != nil && m.zone.Get(carouselFrameZoneID).InBounds(msg) {
-			m.carouselDragging = true
-			m.carouselDragStartMX = msg.X
-			m.carouselDragStartSX = m.carouselScrollX
-			m.carouselLastMX = msg.X
-			m.carouselLastMT = time.Now()
-			m.carouselVelocity = 0
-			m.carouselMomentum = false
-			m.carouselAnimating = false
-			m.carouselAutoGen++
-			return *m, nil, true
-		}
-	case tea.MouseActionMotion:
-		if m.carouselDragging {
-			n := len(m.selectedScreenshots())
-			maxX := m.carouselMaxScrollX(n)
-			rawX := m.carouselDragStartSX + float64(m.carouselDragStartMX-msg.X)
-			m.carouselScrollX = clampWithResistance(rawX, 0, maxX, carouselDragElastic)
-			dt := time.Since(m.carouselLastMT).Seconds()
-			if dt > 0 && dt < 0.1 {
-				instantV := float64(m.carouselLastMX-msg.X) / dt
-				m.carouselVelocity = 0.6*m.carouselVelocity + 0.4*instantV
-			}
-			m.carouselLastMX = msg.X
-			m.carouselLastMT = time.Now()
-			return *m, nil, true
-		}
-	case tea.MouseActionRelease:
-		if m.carouselDragging {
-			m.carouselDragging = false
-			n := len(m.selectedScreenshots())
-			if time.Since(m.carouselLastMT) > 80*time.Millisecond {
-				m.carouselVelocity = 0
-			}
-			maxX := m.carouselMaxScrollX(n)
-			projected := math.Max(0, math.Min(m.carouselScrollX+m.carouselVelocity*0.15, maxX))
-			targetPage := int(math.Round(projected / screenshotWidth))
-			if targetPage < 0 {
-				targetPage = 0
-			}
-			if targetPage >= n {
-				targetPage = n - 1
-			}
-			targetX := float64(targetPage * screenshotWidth)
-			m.carouselAnimStartX = m.carouselScrollX
-			m.carouselAnimTargetX = targetX
-			m.carouselAnimStart = time.Now()
-			m.carouselAnimating = true
-			m.carouselAutoGen++
-			return *m, gamesTickCmd(), true
-		}
-		if m.zone != nil {
-			screenshots := m.selectedScreenshots()
-			n := len(screenshots)
-			currentPage := m.carouselCurrentPage(n)
-			for i := range screenshots {
-				if m.zone.Get(m.carouselDotZoneID(i)).InBounds(msg) {
-					if i != currentPage {
-						result, cmd := m.goToCarouselPage(i)
-						return result, cmd, true
-					}
-					return *m, nil, true
-				}
-			}
-		}
-	}
-	return *m, nil, false
-}
-
-func (m *gamesModel) renderCarouselModal(width, height int) string {
-	if len(m.filtered) == 0 || m.selected < 0 || m.selected >= len(m.filtered) {
-		return ""
-	}
-	item := m.items[m.filtered[m.selected]]
-	if len(item.Screenshots) == 0 {
-		return ""
-	}
-
-	cw := screenshotWidth
-	if cw > width {
-		cw = width
-	}
-
-	titleStr := m.styles.DetailsTitle.Render(item.Name)
-	hintStr := m.styles.DetailsSubtle.Render("ESC to close")
-	gap := cw - lipgloss.Width(titleStr) - lipgloss.Width(hintStr)
-	if gap < 1 {
-		gap = 1
-	}
-	header := titleStr + strings.Repeat(" ", gap) + hintStr
-
-	carousel := m.renderCarousel(item.Screenshots, cw)
-	content := header + "\n" + carousel
-	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, content)
-}
-
-func (m *gamesModel) goToCarouselPage(page int) (gamesModel, tea.Cmd) {
-	screenshots := m.selectedScreenshots()
-	n := len(screenshots)
-	if n <= 1 {
-		return *m, nil
-	}
-	targetX := float64(page * screenshotWidth)
-	m.carouselAnimStartX = m.carouselScrollX
-	m.carouselAnimTargetX = targetX
-	m.carouselAnimStart = time.Now()
-	m.carouselAnimating = true
-	m.carouselMomentum = false
-	m.carouselDragging = false
-	m.carouselAutoGen++
-	return *m, tea.Batch(gamesTickCmd(), carouselAutoAdvanceCmd(m.carouselAutoGen))
-}
-
-func (m gamesModel) carouselAnimProgress() float64 {
-	if !m.carouselAnimating {
-		return 1.0
-	}
-	dist := math.Abs(m.carouselAnimTargetX - m.carouselAnimStartX)
-	dur := carouselSnapDuration
-	if dist > float64(screenshotWidth)/2 {
-		dur = carouselAnimDuration
-	}
-	p := float64(time.Since(m.carouselAnimStart)) / float64(dur)
-	if p > 1.0 {
-		return 1.0
-	}
-	return p
-}
-
-func (m gamesModel) carouselCurrentPage(count int) int {
-	if count <= 0 {
-		return 0
-	}
-	page := int(math.Round(m.carouselScrollX / screenshotWidth))
-	if page < 0 {
-		page = 0
-	}
-	if page >= count {
-		page = count - 1
-	}
-	return page
-}
-
-func (m gamesModel) carouselMaxScrollX(count int) float64 {
-	if count <= 1 {
-		return 0
-	}
-	return float64((count - 1) * screenshotWidth)
-}
-
-func (m *gamesModel) renderCarousel(screenshots []gameScreenshot, viewWidth int) string {
-	n := len(screenshots)
-	if n == 0 {
-		return ""
-	}
-
-	sw := screenshotWidth
-	if sw > viewWidth {
-		sw = viewWidth
-	}
-
-	scrollX := m.carouselScrollX
-	leftIdx := int(math.Floor(scrollX / screenshotWidth))
-	pixelOff := scrollX - float64(leftIdx*screenshotWidth)
-	intOff := int(math.Round(pixelOff))
-
-	if leftIdx < 0 {
-		leftIdx = 0
-		intOff = 0
-	}
-	if leftIdx >= n {
-		leftIdx = n - 1
-		intOff = 0
-	}
-	rightIdx := leftIdx + 1
-	if rightIdx >= n {
-		rightIdx = leftIdx
-	}
-
-	var frame string
-	if intOff > 0 && leftIdx != rightIdx {
-		fromLines := strings.Split(screenshots[leftIdx].Content, "\n")
-		toLines := strings.Split(screenshots[rightIdx].Content, "\n")
-		rows := make([]string, screenshotHeight)
-		for i := range rows {
-			from := padToScreenWidth(getLineOrEmpty(fromLines, i))
-			to := padToScreenWidth(getLineOrEmpty(toLines, i))
-			combined := from + "\x1b[0m" + to
-			rows[i] = ansi.Cut(combined, intOff, intOff+sw)
-		}
-		frame = strings.Join(rows, "\n")
-	} else {
-		lines := strings.Split(screenshots[leftIdx].Content, "\n")
-		rows := make([]string, screenshotHeight)
-		for i := range rows {
-			rows[i] = ansi.Truncate(padToScreenWidth(getLineOrEmpty(lines, i)), sw, "")
-		}
-		frame = strings.Join(rows, "\n")
-	}
-
-	if m.zone != nil {
-		frame = m.zone.Mark(carouselFrameZoneID, frame)
-	}
-
-	currentPage := m.carouselCurrentPage(n)
-	parts := []string{frame}
-	if caption := screenshots[currentPage].Caption; caption != "" {
-		parts = append(parts, m.styles.Caption.Render(caption))
-	}
-	if n > 1 {
-		parts = append(parts, m.renderPaginatorDots(n, currentPage))
-	}
-	return strings.Join(parts, "\n")
-}
-
-func (m *gamesModel) renderPaginatorDots(count, currentPage int) string {
-	dots := make([]string, count)
-	for i := range dots {
-		var dot string
-		if i == currentPage {
-			dot = m.styles.DotActive.Render("●")
-		} else {
-			dot = m.styles.DotInactive.Render("○")
-		}
-		if m.zone != nil {
-			dot = m.zone.Mark(m.carouselDotZoneID(i), dot)
-		}
-		dots[i] = dot
-	}
-	return strings.Join(dots, " ")
-}
-
-func (m gamesModel) carouselDotZoneID(page int) string {
-	return fmt.Sprintf("carousel-dot-%d", page)
 }
 
 func (m gamesModel) indexAtMouse(msg tea.MouseMsg) int {
@@ -1119,54 +767,13 @@ func (m gamesModel) indexAtMouse(msg tea.MouseMsg) int {
 	return -1
 }
 
+func (m gamesModel) selectedItem() gameItem {
+	if len(m.filtered) == 0 || m.selected < 0 || m.selected >= len(m.filtered) {
+		return gameItem{}
+	}
+	return m.items[m.filtered[m.selected]]
+}
+
 func (m gamesModel) zoneID(itemIndex, line int) string {
 	return fmt.Sprintf("games-item-%d-%d", itemIndex, line)
-}
-
-func getLineOrEmpty(lines []string, i int) string {
-	if i < len(lines) {
-		return lines[i]
-	}
-	return ""
-}
-
-func padToScreenWidth(line string) string {
-	w := lipgloss.Width(line)
-	if w >= screenshotWidth {
-		return ansi.Truncate(line, screenshotWidth, "")
-	}
-	return line + strings.Repeat(" ", screenshotWidth-w)
-}
-
-func clampWithResistance(x, min, max, resistance float64) float64 {
-	if x < min {
-		return min + (x-min)*resistance
-	}
-	if x > max {
-		return max + (x-max)*resistance
-	}
-	return x
-}
-
-func placeholderScreenshot(title, fg, bg string) string {
-	titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(fg)).Background(lipgloss.Color(bg)).Bold(true)
-	bgStyle := lipgloss.NewStyle().Background(lipgloss.Color(bg))
-	lines := make([]string, screenshotHeight)
-	for i := range lines {
-		if i == screenshotHeight/2 {
-			tw := lipgloss.Width(title)
-			pad := (screenshotWidth - tw) / 2
-			if pad < 0 {
-				pad = 0
-			}
-			right := screenshotWidth - tw - pad
-			if right < 0 {
-				right = 0
-			}
-			lines[i] = bgStyle.Render(strings.Repeat(" ", pad)) + titleStyle.Render(title) + bgStyle.Render(strings.Repeat(" ", right))
-		} else {
-			lines[i] = bgStyle.Render(strings.Repeat(" ", screenshotWidth))
-		}
-	}
-	return strings.Join(lines, "\n")
 }
