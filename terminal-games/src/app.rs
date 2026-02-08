@@ -174,7 +174,7 @@ impl AppServer {
             let replay_buffer = Arc::new(Mutex::new(ReplayBuffer::new(first_cols, first_rows, first_app_shortname.clone(), params.term.clone())));
             let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(1);
 
-            let (filtered_input_tx, filtered_input_rx) = tokio::sync::mpsc::channel(1);
+            let (filtered_input_tx, filtered_input_rx) = tokio::sync::mpsc::channel(20);
             tokio::task::spawn({
                 let mut input_receiver = params.input_receiver;
                 let graceful_shutdown_token = params.graceful_shutdown_token.clone();
