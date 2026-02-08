@@ -21,7 +21,23 @@ CREATE TABLE IF NOT EXISTS envs (
 );
 
 CREATE TABLE IF NOT EXISTS replays (
-    asciinema_id TEXT PRIMARY KEY,
+    asciinema_url TEXT,
     user_id INTEGER,
-    FOREIGN KEY(user_id) REFERENCES users(id)
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    FOREIGN KEY(user_id) REFERENCES users(id),
+    PRIMARY KEY(user_id, created_at)
 );
+
+CREATE TRIGGER IF NOT EXISTS limit_replays_per_user
+AFTER INSERT ON replays
+BEGIN
+    DELETE FROM replays
+    WHERE user_id = NEW.user_id
+      AND created_at NOT IN (
+          SELECT created_at
+          FROM replays
+          WHERE user_id = NEW.user_id
+          ORDER BY created_at DESC
+          LIMIT 10
+      );
+END;

@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	zone "github.com/lrstanley/bubblezone"
 )
 
 type profileModel struct {
@@ -19,7 +20,7 @@ type profileModel struct {
 type profileKeyMap struct {
 }
 
-func newProfileModel() profileModel {
+func newProfileModel(zoneManager *zone.Manager) profileModel {
 	return profileModel{keys: newProfileKeyMap()}
 }
 

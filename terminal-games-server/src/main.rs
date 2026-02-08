@@ -21,13 +21,10 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let db = libsql::Builder::new_remote(
-        std::env::var("LIBSQL_URL").unwrap(),
-        std::env::var("LIBSQL_AUTH_TOKEN").unwrap(),
-    )
-    .build()
-    .await
-    .unwrap();
+    let libsql_url = std::env::var("LIBSQL_URL").unwrap();
+    let libsql_auth_token = std::env::var("LIBSQL_AUTH_TOKEN").unwrap();
+
+    let db = libsql::Builder::new_remote(libsql_url.clone(), libsql_auth_token.clone()).build().await.unwrap();
 
     let conn = db.connect().unwrap();
 
@@ -44,10 +41,24 @@ async fn main() -> Result<()> {
         )
         .await;
 
-    let _ = conn
-        .execute(
-            "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
+    let menu_game_id = conn
+        .query(
+            "INSERT INTO games (shortname, path) VALUES (?1, ?2) ON CONFLICT(shortname) DO UPDATE SET path = excluded.path RETURNING id",
             libsql::params!("menu", "cmd/menu/menu.wasm"),
+        )
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<u64>(0)
+        .unwrap();
+
+    let _ = conn
+        .query(
+            "INSERT INTO envs (game_id, name, value) VALUES (?1, ?2, ?3)",
+            libsql::params!(menu_game_id, "TURSO_URL", format!("{}?authToken={}", libsql_url, libsql_auth_token)),
         )
         .await;
 

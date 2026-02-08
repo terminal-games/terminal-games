@@ -5,7 +5,9 @@
 package main
 
 import (
+	"database/sql"
 	"log"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/help"
@@ -13,9 +15,12 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
+	_ "github.com/tursodatabase/libsql-client-go/libsql"
+
 	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
 	"github.com/terminal-games/terminal-games/cmd/menu/tabs"
 	"github.com/terminal-games/terminal-games/pkg/bubblewrap"
+	_ "github.com/terminal-games/terminal-games/pkg/net/http"
 )
 
 const (
@@ -110,6 +115,12 @@ func (m model) activeKeyMap() helpKeyMap {
 func main() {
 	zoneManager := zone.New()
 
+	db, err := sql.Open("libsql", os.Getenv("TURSO_URL"))
+	if err != nil {
+		os.Exit(1)
+	}
+	_ = db
+
 	menuTabs := []tabs.Tab{
 		{ID: "games", Title: "Games"},
 		{ID: "profile", Title: "Profile"},
@@ -124,7 +135,7 @@ func main() {
 		keys:        newKeyMap(),
 		help:        help.New(),
 		games:       newGamesModel(zoneManager),
-		profile:     newProfileModel(),
+		profile:     newProfileModel(zoneManager),
 	}, tea.WithAltScreen(), tea.WithMouseAllMotion())
 
 	if _, err := p.Run(); err != nil {

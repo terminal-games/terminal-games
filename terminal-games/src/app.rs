@@ -34,6 +34,8 @@ const MAX_CONNECTIONS: usize = 8;
 /// Maximum outbound bandwidth in bytes per second (20 kBps)
 const MAX_OUTBOUND_BANDWIDTH: u64 = 20 * 1024;
 
+const REPLAY_RATE_LIMIT_SECS: u64 = 10;
+
 // Dial error codes
 const DIAL_ERR_ADDRESS_TOO_LONG: i32 = -1;
 const DIAL_ERR_TOO_MANY_CONNECTIONS: i32 = -2;
@@ -179,38 +181,42 @@ impl AppServer {
                 let replay_buffer = replay_buffer.clone();
                 let notification_tx = notification_tx.clone();
                 let username = params.username.clone();
+                let db = db.clone();
+                let user_id = params.user_id;
                 async move {
+                    let mut replay_last_at = Duration::ZERO;
                     while let Some(data) = input_receiver.recv().await {
                         if data.contains(&0x03) {
-                            // CTRL+C found, start graceful shutdown
                             graceful_shutdown_token.cancel();
                         }
                         if data.contains(&0x12) {
-                            // CTRL+R found, save replay and filter it out
-                            let asciicast = replay_buffer.lock().await.serialize_asciicast();
-                            let _ = notification_tx.send(" \x1b[3mUploading replay... ".to_string()).await;
-                            let username = username.clone();
-                            let notification_tx = notification_tx.clone();
-                            tokio::spawn(async move {
-                                let notification = match upload_asciicast(&username, &asciicast).await {
-                                    Ok(url) => {
-                                        tracing::info!(%url, "Uploaded replay");
-                                        format!(" \x1b[3mReplay saved: \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ", url, url)
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "Failed to upload replay");
-                                        format!(" Upload failed: {} ", e)
-                                    }
-                                };
-                                let _ = notification_tx.send(notification).await;
-                            });
-                            let filtered: SmallVec<[u8; 16]> =
-                                data.iter().copied().filter(|&b| b != 0x12).collect();
-                            if !filtered.is_empty() {
-                                let _ = filtered_input_tx.send(filtered).await;
+                            let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+                            if now.saturating_sub(replay_last_at) < Duration::from_secs(REPLAY_RATE_LIMIT_SECS) {
+                                let _ = notification_tx.send(" Please wait 10 seconds between replays. ".to_string()).await;
+                            } else {
+                                replay_last_at = now;
+                                let _ = notification_tx.send(" \x1b[3mUploading replay... ".to_string()).await;
+                                let db = db.clone();
+                                let username = username.clone();
+                                let notification_tx = notification_tx.clone();
+                                let replay_buffer = replay_buffer.clone();
+                                tokio::spawn(async move {
+                                    let asciicast = replay_buffer.lock().await.serialize_asciicast();
+                                    let notification = match save_replay(&db, user_id, &username, &asciicast).await {
+                                        Ok(url) => {
+                                            tracing::info!(%url, "Uploaded replay");
+                                            format!(" \x1b[3mReplay saved: \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ", url, url)
+                                        }
+                                        Err(e) => format!(" {} ", e),
+                                    };
+                                    let _ = notification_tx.send(notification).await;
+                                });
                             }
-                        } else {
-                            let _ = filtered_input_tx.send(data).await;
+                        }
+                        let filtered: SmallVec<[u8; 16]> =
+                            data.into_iter().filter(|&b| b != 0x12).collect();
+                        if !filtered.is_empty() {
+                            let _ = filtered_input_tx.send(filtered).await;
                         }
                     }
                 }
@@ -1593,6 +1599,28 @@ pub type Terminal = headless_terminal::Parser;
 fn get_install_id() -> &'static str {
     static INSTALL_ID: OnceLock<String> = OnceLock::new();
     INSTALL_ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+async fn save_replay(
+    db: &libsql::Connection,
+    user_id: Option<u64>,
+    username: &str,
+    asciicast: &[u8],
+) -> Result<String, String> {
+    let url = upload_asciicast(username, asciicast).await?;
+    if let Some(uid) = user_id {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let _ = db
+            .execute(
+                "INSERT INTO replays (asciinema_url, user_id, created_at) VALUES (?1, ?2, ?3)",
+                libsql::params!(url.as_str(), uid, now),
+            )
+            .await;
+    }
+    Ok(url)
 }
 
 async fn upload_asciicast(username: &str, data: &[u8]) -> Result<String, String> {
