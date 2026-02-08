@@ -80,6 +80,7 @@ pub struct AppInstantiationParams {
     pub args: Option<Vec<u8>>,
     pub network_info: Arc<dyn NetworkInfo>,
     pub first_app_shortname: String,
+    pub user_id: Option<u64>,
 }
 
 impl AppServer {
@@ -363,6 +364,7 @@ impl AppServer {
                 term: params.term,
                 username: params.username,
                 audio_enabled,
+                user_id: params.user_id,
             });
             let (mut app, mut instance_pre) = Self::prepare_instantiate(&ctx, first_app_shortname)
                 .await
@@ -489,6 +491,9 @@ impl AppServer {
         ));
         if let Some(term) = ctx.term.clone() {
             envs.push(("TERM".to_string(), term));
+        }
+        if let Some(user_id) = ctx.user_id {
+            envs.push(("USER_ID".to_string(), user_id.to_string()));
         }
 
         let wasi_ctx = wasmtime_wasi::WasiCtx::builder()
@@ -1235,6 +1240,7 @@ pub struct AppContext {
     term: Option<String>,
     linker: Arc<wasmtime::Linker<AppState>>,
     app_output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    user_id: Option<u64>,
 }
 
 pub struct AppState {

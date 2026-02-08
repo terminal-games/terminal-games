@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
-    pubkey_fingerprint BLOB UNIQUE NOT NULL,
+    pubkey_fingerprint BLOB UNIQUE,
     username TEXT NOT NULL,
     locale TEXT NOT NULL,
     session_time INTEGER NOT NULL DEFAULT(0)

@@ -5,8 +5,11 @@
 package main
 
 import (
+	"os"
+
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 type profileModel struct {
@@ -44,8 +47,27 @@ func (m profileModel) Update(msg tea.Msg) (profileModel, tea.Cmd) {
 	return m, nil
 }
 
+var (
+	profileTitle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffffff")).Bold(true)
+	profileBody   = lipgloss.NewStyle().Foreground(lipgloss.Color("#cccccc"))
+	profileSubtle = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
+)
+
 func (m profileModel) renderProfileTab(width, height int) string {
-	return "Profile"
+	userID := os.Getenv("USER_ID")
+	username := os.Getenv("USERNAME")
+	if userID == "" {
+		return lipgloss.NewStyle().Width(width).Height(height).Render(
+			profileSubtle.Render("You are not signed in."),
+		)
+	}
+	if username == "" {
+		username = "—"
+	}
+	content := profileTitle.Render("Signed in") + "\n\n" +
+		profileBody.Render("Username: "+username) + "\n" +
+		profileBody.Render("User ID: "+userID)
+	return lipgloss.NewStyle().Width(width).Height(height).Render(content)
 }
 
 func (m *model) renderProfileTab(width, height int) string {

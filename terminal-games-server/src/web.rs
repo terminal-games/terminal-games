@@ -226,6 +226,7 @@ async fn handle_socket(
         window_size_receiver: resize_rx,
         graceful_shutdown_token: token,
         network_info: connect_info.network_info,
+        user_id: None,
     });
 
     let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel(1);

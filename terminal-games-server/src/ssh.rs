@@ -17,7 +17,7 @@ use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLa
 pub struct SshSession {
     input_sender: tokio::sync::mpsc::Sender<smallvec::SmallVec<[u8; 16]>>,
     resize_tx: tokio::sync::watch::Sender<(u16, u16)>,
-    username: Option<tokio::sync::oneshot::Sender<String>>,
+    auth: Option<tokio::sync::oneshot::Sender<(String, Option<u64>)>>,
     term: Option<tokio::sync::oneshot::Sender<String>>,
     args: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
     ssh_session: Option<tokio::sync::oneshot::Sender<(Handle, ChannelId, String)>>,
@@ -101,7 +101,8 @@ impl SshServer {
     ) -> SshSession {
         tracing::info!(addr=?addr, "new_client");
 
-        let (username_sender, username_receiver) = tokio::sync::oneshot::channel::<String>();
+        let (auth_sender, auth_receiver) =
+            tokio::sync::oneshot::channel::<(String, Option<u64>)>();
         let (term_sender, term_receiver) = tokio::sync::oneshot::channel::<String>();
         let (args_sender, args_receiver) = tokio::sync::oneshot::channel::<Vec<u8>>();
         let (ssh_session_sender, ssh_session_receiver) =
@@ -115,7 +116,7 @@ impl SshServer {
 
         tokio::task::spawn(async move {
             let (session_handle, channel_id, remote_sshid) = ssh_session_receiver.await.unwrap();
-            let username = username_receiver.await.unwrap();
+            let (username, user_id) = auth_receiver.await.unwrap();
 
             // enter the alternate screen so that we aren't moving the cursor
             // around and overwriting the original terminal
@@ -184,6 +185,7 @@ impl SshServer {
                 window_size_receiver: resize_rx,
                 graceful_shutdown_token: token,
                 network_info,
+                user_id,
             });
             loop {
                 tokio::select! {
@@ -225,7 +227,7 @@ impl SshServer {
             cancellation_token,
             input_sender: input_tx,
             resize_tx,
-            username: Some(username_sender),
+            auth: Some(auth_sender),
             term: Some(term_sender),
             args: Some(args_sender),
             ssh_session: Some(ssh_session_sender),
@@ -262,43 +264,36 @@ impl Handler for SshSession {
         pubkey: &PublicKey,
     ) -> Result<Auth, Self::Error> {
         tracing::info!(user, "auth_publickey");
-        if let Some(username_sender) = self.username.take() {
-            tracing::info!(user, "auth_publickey send");
-            let _ = username_sender.send(user.to_string());
-        }
-
-        let mut rows = self
+        let user_id = if let Ok(mut rows) = self
             .server
             .app_server
             .db
             .query(
-                "
-                INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (?1, ?2, 'en_US')
-                ON CONFLICT DO UPDATE SET username = ?2
-                RETURNING id
-            ",
+                "INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (?1, ?2, 'en_US')
+                 ON CONFLICT(pubkey_fingerprint) DO UPDATE SET username = excluded.username
+                 RETURNING id",
                 libsql::params!(pubkey.fingerprint(Default::default()).as_bytes(), user),
             )
             .await
-            .unwrap();
-        let user_id: u64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        _ = user_id;
+        {
+            if let Ok(Some(row)) = rows.next().await {
+                row.get::<u64>(0).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(auth_sender) = self.auth.take() {
+            let _ = auth_sender.send((user.to_string(), user_id));
+        }
+        Ok(Auth::Accept)
+    }
 
-        // let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        // self.drop_sender = Some(tx);
-        // let db = self.db.clone();
-        // tokio::task::spawn(async move {
-        //     if let Ok(_) = rx.await {
-        //         let _ = db
-        //             .execute(
-        //                 "UPDATE users SET session_time = session_time + 1 WHERE id = ?1",
-        //                 [user_id],
-        //             )
-        //             .await
-        //             .unwrap();
-        //     }
-        // });
-
+    async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> {
+        if let Some(auth_sender) = self.auth.take() {
+            let _ = auth_sender.send((user.to_string(), None));
+        }
         Ok(Auth::Accept)
     }
 
