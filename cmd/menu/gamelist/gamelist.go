@@ -115,19 +115,19 @@ type Model struct {
 	Keys     KeyMap
 	Duration time.Duration
 
-	zone        *zone.Manager
-	zonePrefix  string
-	filterValue string
-	filterDraft string
-	filtering   bool
-	layout      listLayout
-	startTop    float64
-	startBottom float64
-	targetTop   float64
+	zone         *zone.Manager
+	zonePrefix   string
+	filterValue  string
+	filterDraft  string
+	filtering    bool
+	layout       listLayout
+	startTop     float64
+	startBottom  float64
+	targetTop    float64
 	targetBottom float64
-	animStart   time.Time
-	animating   bool
-	initialized bool
+	animStart    time.Time
+	animating    bool
+	initialized  bool
 }
 
 func New(title string, items []Item, zoneManager *zone.Manager, zonePrefix string) Model {
@@ -170,8 +170,6 @@ func (m Model) FullHelp() [][]key.Binding {
 	return m.Keys.FullHelp()
 }
 
-// --- Messages ---
-
 type tickMsg time.Time
 
 func tickCmd() tea.Cmd {
@@ -179,8 +177,6 @@ func tickCmd() tea.Cmd {
 		return tickMsg(t)
 	})
 }
-
-// --- Update ---
 
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -244,7 +240,6 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// HandleMouse processes mouse events for the list (wheel, hover, clicks).
 func (m Model) HandleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.MouseWheelUp:
@@ -267,8 +262,6 @@ func (m Model) HandleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
 	}
 	return m, nil
 }
-
-// --- View ---
 
 func (m *Model) View(width, height int) string {
 	if width <= 0 || height <= 0 {
@@ -312,8 +305,6 @@ func (m *Model) View(width, height int) string {
 
 	return strings.Join(lines, "\n")
 }
-
-// --- Internal ---
 
 func (m Model) moveSelection(delta int) (Model, tea.Cmd) {
 	if len(m.Filtered) == 0 {
@@ -600,8 +591,6 @@ func (m Model) indexAtMouse(msg tea.MouseMsg) int {
 	}
 	return -1
 }
-
-// --- Helpers ---
 
 func barCharForRow(row int, top, bottom float64) string {
 	fRow := float64(row)
