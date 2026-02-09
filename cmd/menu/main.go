@@ -119,7 +119,6 @@ func main() {
 	if err != nil {
 		os.Exit(1)
 	}
-	_ = db
 
 	menuTabs := []tabs.Tab{
 		{ID: "games", Title: "Games"},
@@ -135,7 +134,7 @@ func main() {
 		keys:        newKeyMap(),
 		help:        help.New(),
 		games:       newGamesModel(zoneManager),
-		profile:     newProfileModel(zoneManager),
+		profile:     newProfileModel(zoneManager, db),
 	}, tea.WithAltScreen(), tea.WithMouseAllMotion())
 
 	if _, err := p.Run(); err != nil {
@@ -144,7 +143,7 @@ func main() {
 }
 
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(m.tabs.Init(), m.games.Init())
+	return tea.Batch(m.tabs.Init(), m.games.Init(), m.profile.Init())
 }
 
 func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -154,6 +153,9 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, m.keys.Quit):
+			if msg.String() == "q" && m.tabs.ActiveTab().ID == "profile" && m.profile.Capturing() {
+				break
+			}
 			return m, tea.Quit
 		case key.Matches(msg, m.keys.NextTab):
 			if m.games.carousel.Modal {
@@ -186,6 +188,14 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tabs.TabChangedMsg:
 		return m, nil
+
+	case profileDataMsg, profileSavedMsg, replayDeletedMsg:
+		var cmd tea.Cmd
+		m.profile, cmd = m.profile.Update(message)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
 	}
 
 	var cmd tea.Cmd

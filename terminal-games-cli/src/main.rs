@@ -162,8 +162,8 @@ async fn main() -> Result<()> {
 
     let _ = conn
         .execute(
-            "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-            libsql::params!(first_app_shortname.as_str(), args.wasm_file.as_str()),
+            "INSERT INTO games (shortname, title, path) VALUES (?1, ?2, ?3)",
+            libsql::params!(first_app_shortname.as_str(), first_app_shortname.as_str(), args.wasm_file.as_str()),
         )
         .await;
 
@@ -171,8 +171,8 @@ async fn main() -> Result<()> {
         if let Some((shortname, path)) = game.split_once('=') {
             let _ = conn
                 .execute(
-                    "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-                    libsql::params!(shortname, path),
+                    "INSERT INTO games (shortname, title, path) VALUES (?1, ?2, ?3)",
+                    libsql::params!(shortname, shortname, path),
                 )
                 .await;
         }
@@ -198,7 +198,7 @@ async fn main() -> Result<()> {
     let user_id = if user_id.is_none() {
         match conn
             .query(
-                "INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (NULL, ?1, 'en_US') RETURNING id",
+                "INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (NULL, ?1, 'en') RETURNING id",
                 libsql::params!(username.as_str()),
             )
             .await

@@ -36,15 +36,15 @@ async fn main() -> Result<()> {
 
     let _ = conn
         .execute(
-            "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-            libsql::params!("kitchen-sink", "examples/kitchen-sink/kitchen-sink.wasm"),
+            "INSERT INTO games (shortname, title, path) VALUES (?1, ?2, ?3)",
+            libsql::params!("kitchen-sink", "Kitchen Sink", "examples/kitchen-sink/kitchen-sink.wasm"),
         )
         .await;
 
     let menu_game_id = conn
         .query(
-            "INSERT INTO games (shortname, path) VALUES (?1, ?2) ON CONFLICT(shortname) DO UPDATE SET path = excluded.path RETURNING id",
-            libsql::params!("menu", "cmd/menu/menu.wasm"),
+            "INSERT INTO games (shortname, title, path) VALUES (?1, ?2, ?3) ON CONFLICT(shortname) DO UPDATE SET path = excluded.path RETURNING id",
+            libsql::params!("menu", "Menu", "cmd/menu/menu.wasm"),
         )
         .await
         .unwrap()
@@ -64,9 +64,10 @@ async fn main() -> Result<()> {
 
     let _ = conn
         .execute(
-            "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
+            "INSERT INTO games (shortname, title, path) VALUES (?1, ?2, ?3)",
             libsql::params!(
                 "rust-simple",
+                "Rust Simple",
                 "target/wasm32-wasip1/release/rust-simple.wasm"
             ),
         )
@@ -74,9 +75,10 @@ async fn main() -> Result<()> {
 
     let _ = conn
         .execute(
-            "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
+            "INSERT INTO games (shortname, title, path) VALUES (?1, ?2, ?3)",
             libsql::params!(
                 "rust-kitchen-sink",
+                "Rust Kitchen Sink",
                 "target/wasm32-wasip1/release/rust-kitchen-sink.wasm"
             ),
         )

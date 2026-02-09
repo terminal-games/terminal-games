@@ -269,7 +269,7 @@ impl Handler for SshSession {
             .app_server
             .db
             .query(
-                "INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (?1, ?2, 'en_US')
+                "INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (?1, ?2, 'en')
                  ON CONFLICT(pubkey_fingerprint) DO UPDATE SET username = excluded.username
                  RETURNING id",
                 libsql::params!(pubkey.fingerprint(Default::default()).as_bytes(), user),

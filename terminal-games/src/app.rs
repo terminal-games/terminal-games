@@ -153,6 +153,7 @@ impl AppServer {
         let db = self.db.clone();
         let engine = self.engine.clone();
         let linker = self.linker.clone();
+        
         tokio::task::spawn(async move {
             let engine = engine;
             
@@ -164,14 +165,50 @@ impl AppServer {
                 tokio::sync::mpsc::channel::<Vec<u8>>(1);
             let has_next_app_shortname = Arc::new(AtomicBool::new(false));
             let (shortname_sender, mut shortname_receiver) =
-                tokio::sync::mpsc::channel::<String>(1);
+                tokio::sync::mpsc::channel::<(AppId, String)>(1);
 
             let network_info = params.network_info.clone();
             let hard_shutdown_token = CancellationToken::new();
             let audio_tx = params.audio_sender;
             let first_app_shortname = params.first_app_shortname;
 
-            let replay_buffer = Arc::new(Mutex::new(ReplayBuffer::new(first_cols, first_rows, first_app_shortname.clone(), params.term.clone())));
+            let audio_buffer = Arc::new(AudioBuffer::new(SAMPLE_RATE as usize));
+
+            let audio_enabled = audio_tx.is_some();
+            if let Some(audio_tx) = audio_tx {
+                let audio_buffer = audio_buffer.clone();
+                let hard_shutdown_token = hard_shutdown_token.clone();
+                std::thread::spawn(move || {
+                    let mut mixer = match Mixer::new(audio_tx, audio_buffer) {
+                        Ok(mixer) => mixer,
+                        Err(error) => {
+                            tracing::error!(?error, "Failed to create mixer");
+                            return;
+                        }
+                    };
+                    _ = mixer.run(hard_shutdown_token);
+                });
+            }
+
+            let mut exit_code = I32Exit(0);
+            let mut ctx = Arc::new(AppContext {
+                db: db.clone(),
+                linker,
+                mesh,
+                app_output_sender,
+                remote_sshid: params.remote_sshid,
+                term: params.term.clone(),
+                username: params.username.clone(),
+                audio_enabled,
+                user_id: params.user_id,
+            });
+            let (mut app, mut instance_pre) = Self::prepare_instantiate(&ctx, first_app_shortname)
+                .await
+                .unwrap();
+            let first_app_shortname = app.shortname.clone();
+            let first_app_id = app.app_id;
+
+            let replay_buffer = Arc::new(Mutex::new(ReplayBuffer::new(first_cols, first_rows, first_app_shortname.clone(), first_app_id, params.term.clone())));
             let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(1);
 
             let (filtered_input_tx, filtered_input_rx) = tokio::sync::mpsc::channel(20);
@@ -201,8 +238,8 @@ impl AppServer {
                                 let notification_tx = notification_tx.clone();
                                 let replay_buffer = replay_buffer.clone();
                                 tokio::spawn(async move {
-                                    let asciicast = replay_buffer.lock().await.serialize_asciicast();
-                                    let notification = match save_replay(&db, user_id, &username, &asciicast).await {
+                                    let (initial_app_id, asciicast) = replay_buffer.lock().await.serialize_asciicast();
+                                    let notification = match save_replay(&db, user_id, initial_app_id, &username, &asciicast).await {
                                         Ok(url) => {
                                             tracing::info!(%url, "Uploaded replay");
                                             format!(" \x1b[3mReplay saved: \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ", url, url)
@@ -222,24 +259,6 @@ impl AppServer {
                 }
             });
             let mut input_receiver = filtered_input_rx;
-
-            let audio_buffer = Arc::new(AudioBuffer::new(SAMPLE_RATE as usize));
-
-            let audio_enabled = audio_tx.is_some();
-            if let Some(audio_tx) = audio_tx {
-                let audio_buffer = audio_buffer.clone();
-                let hard_shutdown_token = hard_shutdown_token.clone();
-                std::thread::spawn(move || {
-                    let mut mixer = match Mixer::new(audio_tx, audio_buffer) {
-                        Ok(mixer) => mixer,
-                        Err(error) => {
-                            tracing::error!(?error, "Failed to create mixer");
-                            return;
-                        }
-                    };
-                    _ = mixer.run(hard_shutdown_token);
-                });
-            }
 
             // output task
             tokio::task::spawn({
@@ -350,31 +369,15 @@ impl AppServer {
                             }
 
                             shortname = shortname_receiver.recv() => {
-                                if let Some(ref shortname) = shortname {
-                                    replay_buffer.lock().await.push_app_switch(shortname.clone());
-                                    status_bar.shortname = shortname.clone();
+                                if let Some((app_id, shortname)) = shortname {
+                                    replay_buffer.lock().await.push_app_switch(app_id, shortname.clone());
+                                    status_bar.shortname = shortname;
                                 }
                             }
                         }
                     }
                 }
             });
-
-            let mut exit_code = I32Exit(0);
-            let mut ctx = Arc::new(AppContext {
-                db,
-                linker,
-                mesh,
-                app_output_sender,
-                remote_sshid: params.remote_sshid,
-                term: params.term,
-                username: params.username,
-                audio_enabled,
-                user_id: params.user_id,
-            });
-            let (mut app, mut instance_pre) = Self::prepare_instantiate(&ctx, first_app_shortname)
-                .await
-                .unwrap();
 
             let mut graceful_shutdown_token = params.graceful_shutdown_token;
             loop {
@@ -437,7 +440,7 @@ impl AppServer {
                 if let Some(next_app) = state.next_app.take() {
                     let (next_app, next_instance_pre) = next_app.await.unwrap();
                     shortname_sender
-                        .send(next_app.shortname.clone())
+                        .send((next_app.app_id, next_app.shortname.clone()))
                         .await
                         .unwrap();
                     app = next_app;
@@ -1604,6 +1607,7 @@ fn get_install_id() -> &'static str {
 async fn save_replay(
     db: &libsql::Connection,
     user_id: Option<u64>,
+    app_id: AppId,
     username: &str,
     asciicast: &[u8],
 ) -> Result<String, String> {
@@ -1615,8 +1619,8 @@ async fn save_replay(
             .as_secs() as i64;
         let _ = db
             .execute(
-                "INSERT INTO replays (asciinema_url, user_id, created_at) VALUES (?1, ?2, ?3)",
-                libsql::params!(url.as_str(), uid, now),
+                "INSERT INTO replays (asciinema_url, user_id, game_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                libsql::params!(url.as_str(), uid, app_id.0, now),
             )
             .await;
     }

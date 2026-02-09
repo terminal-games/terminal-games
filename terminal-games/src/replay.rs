@@ -9,13 +9,15 @@ use std::{
 
 use serde::Serialize;
 
+use crate::mesh::AppId;
+
 const REPLAY_DURATION: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub enum ReplayEvent {
     Output(Vec<u8>),
     Resize { cols: u16, rows: u16 },
-    AppSwitch { shortname: String },
+    AppSwitch { app_id: AppId, shortname: String },
 }
 
 struct TimestampedEvent {
@@ -28,7 +30,7 @@ pub struct ReplayBuffer {
     vt: avt::Vt,
     vt_timestamp: Option<Instant>,
     initial_shortname: String,
-    current_shortname: String,
+    initial_app_id: AppId,
     term_type: Option<String>,
 }
 
@@ -51,13 +53,13 @@ struct AsciicastTerm<'a> {
 }
 
 impl ReplayBuffer {
-    pub fn new(cols: u16, rows: u16, shortname: String, term_type: Option<String>) -> Self {
+    pub fn new(cols: u16, rows: u16, shortname: String, app_id: AppId, term_type: Option<String>) -> Self {
         Self {
             events: VecDeque::with_capacity(1024),
             vt: avt::Vt::new((cols as usize).max(1), (rows as usize).max(1)),
             vt_timestamp: None,
             initial_shortname: shortname.clone(),
-            current_shortname: shortname,
+            initial_app_id: app_id,
             term_type,
         }
     }
@@ -80,13 +82,12 @@ impl ReplayBuffer {
         });
     }
 
-    pub fn push_app_switch(&mut self, shortname: String) {
-        self.current_shortname = shortname.clone();
+    pub fn push_app_switch(&mut self, app_id: AppId, shortname: String) {
         let now = Instant::now();
         self.prune(now);
         self.events.push_back(TimestampedEvent {
             timestamp: now,
-            event: ReplayEvent::AppSwitch { shortname },
+            event: ReplayEvent::AppSwitch { app_id, shortname },
         });
     }
 
@@ -98,22 +99,23 @@ impl ReplayBuffer {
                 break;
             }
             let event = self.events.pop_front().unwrap();
-            match &event.event {
+            match event.event {
                 ReplayEvent::Output(data) => {
-                    self.vt.feed_str(&String::from_utf8_lossy(data));
+                    self.vt.feed_str(&String::from_utf8_lossy(&data));
                 }
                 ReplayEvent::Resize { cols, rows } => {
-                    self.vt.resize((*cols as usize).max(1), (*rows as usize).max(1));
+                    self.vt.resize((cols as usize).max(1), (rows as usize).max(1));
                 }
-                ReplayEvent::AppSwitch { shortname } => {
-                    self.initial_shortname = shortname.clone();
+                ReplayEvent::AppSwitch { app_id, shortname } => {
+                    self.initial_shortname = shortname;
+                    self.initial_app_id = app_id;
                 }
             }
             self.vt_timestamp = Some(event.timestamp);
         }
     }
 
-    pub fn serialize_asciicast(&self) -> Vec<u8> {
+    pub fn serialize_asciicast(&self) -> (AppId, Vec<u8>) {
         let mut output = Vec::with_capacity(16 * 1024);
         let now = Instant::now();
 
@@ -169,13 +171,13 @@ impl ReplayBuffer {
                 ReplayEvent::Resize { cols, rows } => {
                     write_event(&mut output, interval_secs, "r", &format!("{}x{}", cols, rows));
                 }
-                ReplayEvent::AppSwitch { shortname } => {
+                ReplayEvent::AppSwitch { app_id: _, shortname } => {
                     write_event(&mut output, interval_secs, "m", &format!("app:{}", shortname));
                 }
             }
         }
 
-        output
+        (self.initial_app_id, output)
     }
 }
 

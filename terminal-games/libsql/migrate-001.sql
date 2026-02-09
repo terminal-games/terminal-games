@@ -8,24 +8,27 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE TABLE IF NOT EXISTS games (
     id INTEGER PRIMARY KEY,
-    shortname TEXT UNIQUE,
+    shortname TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
     path TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS envs (
-    game_id INTEGER,
-    name TEXT,
+    game_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY(game_id, name),
     FOREIGN KEY(game_id) REFERENCES games(id)
 );
 
 CREATE TABLE IF NOT EXISTS replays (
-    asciinema_url TEXT,
-    user_id INTEGER,
+    asciinema_url TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    game_id INTEGER NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     FOREIGN KEY(user_id) REFERENCES users(id),
-    PRIMARY KEY(user_id, created_at)
+    FOREIGN KEY(game_id) REFERENCES games(id),
+    PRIMARY KEY(user_id, created_at DESC)
 );
 
 CREATE TRIGGER IF NOT EXISTS limit_replays_per_user
@@ -38,6 +41,6 @@ BEGIN
           FROM replays
           WHERE user_id = NEW.user_id
           ORDER BY created_at DESC
-          LIMIT 10
+          LIMIT 50
       );
 END;
