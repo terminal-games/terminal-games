@@ -376,6 +376,12 @@ func CanFitModal(termW, termH int) bool {
 	return termW >= ScreenshotWidth && termH >= ModalMinHeight
 }
 
+func (m *Model) HandleWindowSize(termW, termH int) {
+	if m.Modal && !CanFitModal(termW, termH) {
+		m.Modal = false
+	}
+}
+
 func (m Model) animProgress() float64 {
 	if !m.animating {
 		return 1.0

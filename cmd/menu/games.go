@@ -9,25 +9,23 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
 	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
 	"github.com/terminal-games/terminal-games/cmd/menu/gamelist"
+	"github.com/terminal-games/terminal-games/cmd/menu/tabs"
 	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 	"github.com/terminal-games/terminal-games/pkg/app"
 	"golang.org/x/text/language"
 )
 
 const (
-	playZoneID       = "games-play"
-	playSpinnerDelay = 120 * time.Millisecond
+	playZoneID = "games-play"
 )
-
-var playSpinnerFrames = []string{"|", "/", "-", "\\"}
 
 type localizedString struct {
 	Default string
@@ -67,8 +65,6 @@ type gamesDataMsg struct {
 	err   error
 }
 
-type playLoadingTickMsg struct{}
-
 type gamesModel struct {
 	zone      *zone.Manager
 	db        *sql.DB
@@ -85,7 +81,7 @@ type gamesModel struct {
 	loaded    bool
 	playKey   key.Binding
 	playBusy  bool
-	playSpin  int
+	spin      spinner.Model
 	playError string
 	preferred []language.Tag
 }
@@ -121,6 +117,7 @@ func newGamesModel(zoneManager *zone.Manager, db *sql.DB) gamesModel {
 		localizer: newLocalizer(),
 		preferred: []language.Tag{language.English},
 	}
+	m.spin = spinner.New(spinner.WithSpinner(spinner.Dot))
 	m.applyLocalization(m.localizer, m.preferred)
 	return m
 }
@@ -134,8 +131,10 @@ func (m gamesModel) ShortHelp() []key.Binding {
 }
 
 func (m gamesModel) FullHelp() [][]key.Binding { return [][]key.Binding{m.ShortHelp()} }
-func (m gamesModel) Capturing() bool           { return m.list.Filtering() || m.playBusy }
-func (m gamesModel) Init() tea.Cmd             { return tea.Batch(m.carousel.Init(), m.fetchGamesData()) }
+func (m gamesModel) Capturing() bool {
+	return m.list.Filtering() || m.playBusy || m.carousel.Modal
+}
+func (m gamesModel) Init() tea.Cmd { return tea.Batch(m.carousel.Init(), m.fetchGamesData()) }
 
 func (m gamesModel) fetchGamesData() tea.Cmd {
 	return func() tea.Msg {
@@ -207,10 +206,6 @@ func (m gamesModel) fetchGamesData() tea.Cmd {
 	}
 }
 
-func playLoadingTickCmd() tea.Cmd {
-	return tea.Tick(playSpinnerDelay, func(time.Time) tea.Msg { return playLoadingTickMsg{} })
-}
-
 func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case gamesDataMsg:
@@ -221,15 +216,33 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		}
 		m.applyLocalization(m.localizer, m.preferred)
 		return m, m.carousel.RestartAuto()
-	case playLoadingTickMsg:
+	case localizationChangedMsg:
+		localizerChanged := m.localizer.SetPreferred(msg.preferred)
+		preferredChanged := !sameLanguageTags(m.preferred, msg.preferred)
+		if localizerChanged || preferredChanged {
+			m.applyLocalization(m.localizer, msg.preferred)
+		}
+		return m, nil
+	case spinner.TickMsg:
 		if !m.playBusy {
 			return m, nil
 		}
 		if app.Ready() {
 			return m, tea.Quit
 		}
-		m.playSpin = (m.playSpin + 1) % len(playSpinnerFrames)
-		return m, playLoadingTickCmd()
+		var cmd tea.Cmd
+		m.spin, cmd = m.spin.Update(msg)
+		return m, cmd
+	case tabs.TabChangedMsg:
+		if msg.Tab.ID == "games" {
+			return m, m.onActivated()
+		}
+		return m, nil
+	case tea.WindowSizeMsg:
+		m.termW = msg.Width
+		m.termH = msg.Height
+		m.carousel.HandleWindowSize(msg.Width, msg.Height)
+		return m, nil
 	case tea.KeyMsg:
 		if m.playBusy {
 			return m, nil
@@ -302,8 +315,7 @@ func (m gamesModel) startPlaySelected() (gamesModel, tea.Cmd) {
 	}
 	m.playError = ""
 	m.playBusy = true
-	m.playSpin = 0
-	return m, playLoadingTickCmd()
+	return m, m.spin.Tick
 }
 
 func (m *gamesModel) syncCarouselToSelection() tea.Cmd {
@@ -474,7 +486,7 @@ func (m *gamesModel) renderGameDetails(width, height int) string {
 	body := m.styles.Body.Render(item.Details)
 	play := m.renderPlayButton(width, m.localizer.Text(textPlayButton))
 	if m.playBusy {
-		play = m.renderPlayButton(width, playSpinnerFrames[m.playSpin]+" "+m.localizer.Text(textPlayLoading))
+		play = m.renderPlayButton(width, m.spin.View()+" "+m.localizer.Text(textPlayLoading))
 	}
 	if m.zone != nil {
 		play = m.zone.Mark(playZoneID, play)

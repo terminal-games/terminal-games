@@ -85,6 +85,29 @@ func New(tabs []Tab, zoneManager *zone.Manager, zonePrefix string) Model {
 	return m
 }
 
+func NewWithActive(tabs []Tab, zoneManager *zone.Manager, zonePrefix, activeID string) Model {
+	m := New(tabs, zoneManager, zonePrefix)
+	if len(m.Tabs) == 0 {
+		return m
+	}
+	active := 0
+	for i, tab := range m.Tabs {
+		if tab.ID == activeID {
+			active = i
+			break
+		}
+	}
+	m.Active = active
+	m.calculatePositions()
+	left, right := m.edgesFor(m.Active)
+	m.startLeft = left
+	m.startRight = right
+	m.targetLeft = left
+	m.targetRight = right
+	m.animating = false
+	return m
+}
+
 func (m Model) TotalWidth() int {
 	total := 0
 	for _, w := range m.tabWidths {

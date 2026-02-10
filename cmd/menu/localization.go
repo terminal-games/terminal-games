@@ -5,10 +5,34 @@
 package main
 
 import (
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
 	"github.com/terminal-games/terminal-games/cmd/menu/gamelist"
 	"golang.org/x/text/language"
 )
+
+type localizationChangedMsg struct {
+	preferred []language.Tag
+}
+
+func localizationChanged(preferred []language.Tag) tea.Cmd {
+	next := append([]language.Tag(nil), preferred...)
+	return func() tea.Msg {
+		return localizationChangedMsg{preferred: next}
+	}
+}
+
+func sameLanguageTags(a, b []language.Tag) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
 type textKey string
 

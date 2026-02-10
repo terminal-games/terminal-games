@@ -17,7 +17,6 @@ import (
 	zone "github.com/lrstanley/bubblezone"
 	_ "github.com/tursodatabase/libsql-client-go/libsql"
 
-	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
 	"github.com/terminal-games/terminal-games/cmd/menu/tabs"
 	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 	"github.com/terminal-games/terminal-games/pkg/bubblewrap"
@@ -116,7 +115,7 @@ func (m model) inputCaptured() bool {
 }
 
 func (m model) globalHelpKeyMap() helpKeyMap {
-	if m.inputCaptured() || m.games.carousel.Modal {
+	if m.inputCaptured() {
 		return nil
 	}
 	return helpBindings{
@@ -145,7 +144,7 @@ func main() {
 		games:       newGamesModel(zoneManager, db),
 		profile:     newProfileModel(zoneManager, db),
 	}
-	menuModel.applyLocalization()
+	menuModel.applyMenuLocalization()
 
 	p := bubblewrap.NewProgram(menuModel, tea.WithAltScreen(), tea.WithMouseAllMotion())
 
@@ -158,9 +157,19 @@ func (m *model) Init() tea.Cmd {
 	return tea.Batch(m.tabs.Init(), m.games.Init(), m.profile.Init())
 }
 
+func (m *model) setActiveTab(index int) tea.Cmd {
+	cmd := m.tabs.SetActive(index)
+	if index < 0 || index >= len(m.tabs.Tabs) {
+		return cmd
+	}
+	tab := m.tabs.Tabs[index]
+	return tea.Batch(cmd, func() tea.Msg {
+		return tabs.TabChangedMsg{Index: index, Tab: tab}
+	})
+}
+
 func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
-
 	switch msg := message.(type) {
 	case tea.KeyMsg:
 		switch {
@@ -170,82 +179,54 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Quit
 		case key.Matches(msg, m.keys.NextTab):
-			if m.games.carousel.Modal || m.inputCaptured() {
+			if m.inputCaptured() {
 				return m, nil
 			}
 			next := (m.tabs.Active + 1) % len(m.tabs.Tabs)
-			cmd := m.tabs.SetActive(next)
-			if m.tabs.ActiveTab().ID == "games" {
-				cmd = tea.Batch(cmd, m.games.onActivated())
-			}
-			return m, cmd
+			return m, m.setActiveTab(next)
 		case key.Matches(msg, m.keys.PrevTab):
-			if m.games.carousel.Modal || m.inputCaptured() {
+			if m.inputCaptured() {
 				return m, nil
 			}
 			prev := m.tabs.Active - 1
 			if prev < 0 {
 				prev = len(m.tabs.Tabs) - 1
 			}
-			cmd := m.tabs.SetActive(prev)
+			return m, m.setActiveTab(prev)
+		default:
+			var cmd tea.Cmd
 			if m.tabs.ActiveTab().ID == "games" {
-				cmd = tea.Batch(cmd, m.games.onActivated())
+				m.games, cmd = m.games.Update(message)
+				if cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			} else if m.tabs.ActiveTab().ID == "profile" {
+				m.profile, cmd = m.profile.Update(message)
+				if cmd != nil {
+					cmds = append(cmds, cmd)
+				}
 			}
 			return m, cmd
 		}
-
 	case tea.WindowSizeMsg:
 		m.w = msg.Width
 		m.h = msg.Height
-		m.games.termW = msg.Width
-		m.games.termH = msg.Height
-		if m.games.carousel.Modal && !carousel.CanFitModal(msg.Width, msg.Height) {
-			m.games.carousel.Modal = false
+	case localizationChangedMsg:
+		if m.localizer.SetPreferred(msg.preferred) {
+			m.applyMenuLocalization()
 		}
-		return m, nil
-
-	case tabs.TabChangedMsg:
-		if msg.Tab.ID == "games" {
-			return m, m.games.onActivated()
-		}
-		return m, nil
-
-	case profileDataMsg:
-		var cmd tea.Cmd
-		m.profile, cmd = m.profile.Update(message)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		m.syncLocalizationFromProfile()
-		return m, tea.Batch(cmds...)
-
-	case profileSavedMsg, replayDeletedMsg:
-		var cmd tea.Cmd
-		m.profile, cmd = m.profile.Update(message)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		m.syncLocalizationFromProfile()
-		return m, tea.Batch(cmds...)
 	}
 
 	var cmd tea.Cmd
-	if m.tabs.ActiveTab().ID == "games" {
-		m.games, cmd = m.games.Update(message)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-	} else if m.tabs.ActiveTab().ID == "profile" {
-		m.profile, cmd = m.profile.Update(message)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		m.syncLocalizationFromProfile()
-	}
+
+	m.games, cmd = m.games.Update(message)
+	cmds = append(cmds, cmd)
+
+	m.profile, cmd = m.profile.Update(message)
+	cmds = append(cmds, cmd)
+
 	m.tabs, cmd = m.tabs.Update(message)
-	if cmd != nil {
-		cmds = append(cmds, cmd)
-	}
+	cmds = append(cmds, cmd)
 
 	return m, tea.Batch(cmds...)
 }
@@ -312,8 +293,7 @@ func (m *model) View() string {
 	if keyMap := m.globalHelpKeyMap(); keyMap != nil {
 		helpLines = append(helpLines, lipgloss.NewStyle().Width(viewportWidth).Render(m.help.View(keyMap)))
 	}
-	helpLines = append(helpLines, strings.Repeat(" ", viewportWidth))
-	helpView := strings.Join(helpLines, "\n")
+	helpView := lipgloss.NewStyle().Padding(1, 2).Render(strings.Join(helpLines, "\n"))
 	helpHeight := lipgloss.Height(helpView)
 
 	contentHeight := m.h - lipgloss.Height(centeredTabsView) - helpHeight
@@ -359,23 +339,12 @@ func (m *model) View() string {
 	return m.zone.Scan(lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Top, fullView))
 }
 
-func (m *model) syncLocalizationFromProfile() {
-	if m.localizer.SetPreferred(m.profile.languages) {
-		m.applyLocalization()
-	}
-}
-
-func (m *model) applyLocalization() {
+func (m *model) applyMenuLocalization() {
 	activeID := m.tabs.ActiveTab().ID
 	m.keys = newKeyMap(m.localizer)
-	m.tabs = tabs.New([]tabs.Tab{
+	m.tabs = tabs.NewWithActive([]tabs.Tab{
 		{ID: "games", Title: m.localizer.Text(textTabGames)},
 		{ID: "profile", Title: m.localizer.Text(textTabProfile)},
 		{ID: "about", Title: m.localizer.Text(textTabAbout)},
-	}, m.zone, "menu-tab-")
-	m.games.applyLocalization(m.localizer, m.profile.languages)
-	m.profile.applyLocalization(m.localizer)
-	if activeID != "" {
-		m.tabs.SetActiveByID(activeID)
-	}
+	}, m.zone, "menu-tab-", activeID)
 }

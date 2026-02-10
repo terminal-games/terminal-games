@@ -273,10 +273,9 @@ type profileModel struct {
 
 type profileKeyMap struct {
 	Up, Down, Edit, Delete, MoveUp, MoveDown key.Binding
-}
-
-func newProfileKeyMap() profileKeyMap {
-	return newProfileKeyMapWithLocalizer(newLocalizer())
+	Save, Cancel, Done                       key.Binding
+	DropdownNav, Select, Back                key.Binding
+	Confirm, Reject                          key.Binding
 }
 
 func newProfileKeyMapWithLocalizer(localizer localizer) profileKeyMap {
@@ -287,6 +286,17 @@ func newProfileKeyMapWithLocalizer(localizer localizer) profileKeyMap {
 		Delete:   key.NewBinding(key.WithKeys("d", "x"), key.WithHelp("d", localizer.Text(textHelpDelete))),
 		MoveUp:   key.NewBinding(key.WithKeys("K"), key.WithHelp("shift+k", localizer.Text(textHelpMoveUp))),
 		MoveDown: key.NewBinding(key.WithKeys("J"), key.WithHelp("shift+j", localizer.Text(textHelpMoveDown))),
+		Save:     key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", localizer.Text(textHelpSave))),
+		Cancel:   key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", localizer.Text(textHelpCancel))),
+		Done:     key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", localizer.Text(textHelpDone))),
+		DropdownNav: key.NewBinding(
+			key.WithKeys("up", "down"),
+			key.WithHelp("↑↓", localizer.Text(textHelpNavigate)),
+		),
+		Select:  key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", localizer.Text(textHelpSelect))),
+		Back:    key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", localizer.Text(textHelpBack))),
+		Confirm: key.NewBinding(key.WithKeys("y"), key.WithHelp("y", localizer.Text(textHelpConfirm))),
+		Reject:  key.NewBinding(key.WithKeys("n", "esc"), key.WithHelp("n/esc", localizer.Text(textHelpCancel))),
 	}
 }
 
@@ -294,7 +304,7 @@ func newProfileModel(zoneManager *zone.Manager, db *sql.DB) profileModel {
 	return profileModel{
 		db:     db,
 		zone:   zoneManager,
-		keys:   newProfileKeyMap(),
+		keys:   newProfileKeyMapWithLocalizer(newLocalizer()),
 		styles: defaultProfileStyles(),
 		userID: os.Getenv("USER_ID"),
 		tr:     newLocalizer(),
@@ -364,27 +374,17 @@ func (m profileModel) deleteReplay(createdAt int64) tea.Cmd {
 func (m profileModel) ShortHelp() []key.Binding {
 	switch m.state {
 	case stateEditName:
-		return []key.Binding{
-			key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", m.tr.Text(textHelpSave))),
-			key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", m.tr.Text(textHelpCancel))),
-		}
+		return []key.Binding{m.keys.Save, m.keys.Cancel}
 	case stateEditLangs:
 		b := []key.Binding{m.keys.Up, m.keys.Down}
 		if m.langCursor < len(m.languages) {
 			b = append(b, m.keys.MoveUp, m.keys.MoveDown, m.keys.Delete)
 		}
-		return append(b, m.keys.Edit, key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", m.tr.Text(textHelpDone))))
+		return append(b, m.keys.Edit, m.keys.Done)
 	case stateLangDropdown:
-		return []key.Binding{
-			key.NewBinding(key.WithKeys("up", "down"), key.WithHelp("↑↓", m.tr.Text(textHelpNavigate))),
-			key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", m.tr.Text(textHelpSelect))),
-			key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", m.tr.Text(textHelpBack))),
-		}
+		return []key.Binding{m.keys.DropdownNav, m.keys.Select, m.keys.Back}
 	case stateConfirmDelete:
-		return []key.Binding{
-			key.NewBinding(key.WithKeys("y"), key.WithHelp("y", m.tr.Text(textHelpConfirm))),
-			key.NewBinding(key.WithKeys("n"), key.WithHelp("n/esc", m.tr.Text(textHelpCancel))),
-		}
+		return []key.Binding{m.keys.Confirm, m.keys.Reject}
 	}
 	switch m.section {
 	case sectionUsername:
@@ -406,6 +406,7 @@ func (m profileModel) FullHelp() [][]key.Binding { return [][]key.Binding{m.Shor
 func (m profileModel) Update(msg tea.Msg) (profileModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case profileDataMsg:
+		prevLanguages := append([]language.Tag(nil), m.languages...)
 		m.loaded = true
 		if msg.err != nil {
 			m.loadErr = msg.err
@@ -424,6 +425,9 @@ func (m profileModel) Update(msg tea.Msg) (profileModel, tea.Cmd) {
 		}
 		m.replayCursor = min(m.replayCursor, max(0, len(m.replays)-1))
 		m.langCursor = min(m.langCursor, len(m.languages))
+		if !sameLanguageTags(prevLanguages, m.languages) {
+			return m, localizationChanged(m.languages)
+		}
 		return m, nil
 
 	case profileSavedMsg:
@@ -432,6 +436,12 @@ func (m profileModel) Update(msg tea.Msg) (profileModel, tea.Cmd) {
 	case replayDeletedMsg:
 		if msg.err == nil {
 			return m, m.fetchProfileData()
+		}
+		return m, nil
+
+	case localizationChangedMsg:
+		if m.tr.SetPreferred(msg.preferred) {
+			m.applyLocalization(m.tr)
 		}
 		return m, nil
 
@@ -456,24 +466,24 @@ func (m profileModel) Update(msg tea.Msg) (profileModel, tea.Cmd) {
 }
 
 func (m profileModel) handleEditKey(msg tea.KeyMsg) (profileModel, tea.Cmd) {
-	switch msg.String() {
-	case "enter":
+	switch {
+	case key.Matches(msg, m.keys.Save):
 		m.state = stateNormal
 		m.username = m.editor.Value()
 		return m, m.saveUsername(m.username)
-	case "esc":
+	case key.Matches(msg, m.keys.Cancel):
 		m.state = stateNormal
-	case "left":
+	case msg.String() == "left":
 		m.editor.Left()
-	case "right":
+	case msg.String() == "right":
 		m.editor.Right()
-	case "home", "ctrl+a":
+	case msg.String() == "home" || msg.String() == "ctrl+a":
 		m.editor.Home()
-	case "end", "ctrl+e":
+	case msg.String() == "end" || msg.String() == "ctrl+e":
 		m.editor.End()
-	case "backspace":
+	case msg.String() == "backspace":
 		m.editor.Backspace()
-	case "delete":
+	case msg.String() == "delete":
 		m.editor.Delete()
 	default:
 		if r := []rune(msg.String()); len(r) == 1 && unicode.IsPrint(r[0]) {
@@ -484,11 +494,10 @@ func (m profileModel) handleEditKey(msg tea.KeyMsg) (profileModel, tea.Cmd) {
 }
 
 func (m profileModel) handleLangsKey(msg tea.KeyMsg) (profileModel, tea.Cmd) {
-	if msg.String() == "esc" {
-		m.state = stateNormal
-		return m, nil
-	}
 	switch {
+	case key.Matches(msg, m.keys.Done):
+		m.state = stateNormal
+		return m, localizationChanged(m.languages)
 	case key.Matches(msg, m.keys.Down):
 		m.langCursor = min(m.langCursor+1, len(m.languages))
 	case key.Matches(msg, m.keys.Up):
@@ -519,24 +528,26 @@ func (m profileModel) handleLangsKey(msg tea.KeyMsg) (profileModel, tea.Cmd) {
 }
 
 func (m profileModel) handleDropdownKey(msg tea.KeyMsg) (profileModel, tea.Cmd) {
-	switch msg.String() {
-	case "enter":
+	switch {
+	case key.Matches(msg, m.keys.Select):
 		if opt, ok := m.dropdown.Selected(); ok {
 			if tag, err := language.Parse(opt.value); err == nil {
 				m.languages = append(m.languages, tag)
 				m.langCursor = len(m.languages)
 			}
 			m.state = stateEditLangs
-			return m, m.saveLanguages()
+			return m, tea.Batch(m.saveLanguages(), localizationChanged(m.languages))
 		}
 		m.state = stateEditLangs
-	case "esc":
+	case key.Matches(msg, m.keys.Back):
 		m.state = stateEditLangs
-	case "up":
-		m.dropdown.MoveUp()
-	case "down":
-		m.dropdown.MoveDown()
-	case "backspace", "delete":
+	case key.Matches(msg, m.keys.DropdownNav):
+		if msg.String() == "up" {
+			m.dropdown.MoveUp()
+		} else if msg.String() == "down" {
+			m.dropdown.MoveDown()
+		}
+	case msg.String() == "backspace" || msg.String() == "delete":
 		m.dropdown.Backspace()
 	default:
 		if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && unicode.IsPrint(msg.Runes[0]) {
@@ -547,8 +558,8 @@ func (m profileModel) handleDropdownKey(msg tea.KeyMsg) (profileModel, tea.Cmd) 
 }
 
 func (m profileModel) handleDeleteConfirm(msg tea.KeyMsg) (profileModel, tea.Cmd) {
-	switch msg.String() {
-	case "y":
+	switch {
+	case key.Matches(msg, m.keys.Confirm):
 		m.state = stateNormal
 		if m.replayCursor < len(m.replays) {
 			r := m.replays[m.replayCursor]
@@ -557,7 +568,7 @@ func (m profileModel) handleDeleteConfirm(msg tea.KeyMsg) (profileModel, tea.Cmd
 			}
 			return m, m.deleteReplay(r.createdAt)
 		}
-	case "n", "esc":
+	case key.Matches(msg, m.keys.Reject):
 		m.state = stateNormal
 	}
 	return m, nil
@@ -672,7 +683,7 @@ func (m profileModel) handleClick(id string) (profileModel, tea.Cmd) {
 				m.langCursor = len(m.languages)
 			}
 			m.state = stateEditLangs
-			return m, m.saveLanguages()
+			return m, tea.Batch(m.saveLanguages(), localizationChanged(m.languages))
 		}
 
 	case strings.HasPrefix(id, "pf-replay-"):
