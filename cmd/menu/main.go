@@ -81,37 +81,14 @@ func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{{k.NextTab, k.PrevTab}, {k.Quit}}
 }
 
-type combinedKeyMap struct {
-	base  helpKeyMap
-	extra helpKeyMap
-}
-
-func (c combinedKeyMap) ShortHelp() []key.Binding {
-	if c.extra == nil {
-		return c.base.ShortHelp()
-	}
-	return append(c.base.ShortHelp(), c.extra.ShortHelp()...)
-}
-
-func (c combinedKeyMap) FullHelp() [][]key.Binding {
-	if c.extra == nil {
-		return c.base.FullHelp()
-	}
-	return append(c.base.FullHelp(), c.extra.FullHelp()...)
-}
-
-func (m model) activeKeyMap() helpKeyMap {
-	var extra helpKeyMap
+func (m model) contextualKeyMap() helpKeyMap {
 	switch m.tabs.ActiveTab().ID {
 	case "games":
-		extra = m.games
+		return m.games
 	case "profile":
-		extra = m.profile
+		return m.profile
 	}
-	return combinedKeyMap{
-		base:  m.keys,
-		extra: extra,
-	}
+	return nil
 }
 
 func main() {
@@ -277,9 +254,14 @@ func (m *model) View() string {
 
 	centeredTabsView := lipgloss.NewStyle().Width(viewportWidth).Render(centeredTabs.String())
 
-	keyMap := m.activeKeyMap()
 	m.help.Width = viewportWidth
-	helpView := lipgloss.NewStyle().Width(viewportWidth).Render(m.help.View(keyMap))
+	var helpLines []string
+	if keyMap := m.contextualKeyMap(); keyMap != nil {
+		helpLines = append(helpLines, lipgloss.NewStyle().Width(viewportWidth).Render(m.help.View(keyMap)))
+	}
+	helpLines = append(helpLines, lipgloss.NewStyle().Width(viewportWidth).Render(m.help.View(m.keys)))
+	helpLines = append(helpLines, strings.Repeat(" ", viewportWidth))
+	helpView := strings.Join(helpLines, "\n")
 	helpHeight := lipgloss.Height(helpView)
 
 	contentHeight := m.h - lipgloss.Height(centeredTabsView) - helpHeight
