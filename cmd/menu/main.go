@@ -144,7 +144,7 @@ func main() {
 		tabs:        tabs.New(menuTabs, zoneManager, "menu-tab-"),
 		contentArea: lipgloss.NewStyle().Padding(1, 2),
 		barStyle:    lipgloss.NewStyle().Foreground(theme.Line),
-		titleStyle:  lipgloss.NewStyle().Foreground(theme.Primary).Bold(true),
+		titleStyle:  lipgloss.NewStyle().Bold(true),
 		keys:        newKeyMap(),
 		help:        help.New(),
 		games:       newGamesModel(zoneManager),
