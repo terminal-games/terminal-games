@@ -50,6 +50,18 @@ type helpKeyMap interface {
 	FullHelp() [][]key.Binding
 }
 
+type helpBindings struct {
+	short []key.Binding
+}
+
+func (h helpBindings) ShortHelp() []key.Binding {
+	return h.short
+}
+
+func (h helpBindings) FullHelp() [][]key.Binding {
+	return [][]key.Binding{h.short}
+}
+
 type keyMap struct {
 	Quit    key.Binding
 	NextTab key.Binding
@@ -89,6 +101,26 @@ func (m model) contextualKeyMap() helpKeyMap {
 		return m.profile
 	}
 	return nil
+}
+
+func (m model) inputCaptured() bool {
+	switch m.tabs.ActiveTab().ID {
+	case "games":
+		return m.games.Capturing()
+	case "profile":
+		return m.profile.Capturing()
+	default:
+		return false
+	}
+}
+
+func (m model) globalHelpKeyMap() helpKeyMap {
+	if m.inputCaptured() || m.games.carousel.Modal {
+		return nil
+	}
+	return helpBindings{
+		short: []key.Binding{m.keys.NextTab, m.keys.PrevTab, m.keys.Quit},
+	}
 }
 
 func main() {
@@ -135,19 +167,19 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, m.keys.Quit):
-			if msg.String() == "q" && m.tabs.ActiveTab().ID == "profile" && m.profile.Capturing() {
+			if msg.String() == "q" && m.inputCaptured() {
 				break
 			}
 			return m, tea.Quit
 		case key.Matches(msg, m.keys.NextTab):
-			if m.games.carousel.Modal {
+			if m.games.carousel.Modal || m.inputCaptured() {
 				return m, nil
 			}
 			next := (m.tabs.Active + 1) % len(m.tabs.Tabs)
 			cmd := m.tabs.SetActive(next)
 			return m, cmd
 		case key.Matches(msg, m.keys.PrevTab):
-			if m.games.carousel.Modal {
+			if m.games.carousel.Modal || m.inputCaptured() {
 				return m, nil
 			}
 			prev := m.tabs.Active - 1
@@ -259,7 +291,9 @@ func (m *model) View() string {
 	if keyMap := m.contextualKeyMap(); keyMap != nil {
 		helpLines = append(helpLines, lipgloss.NewStyle().Width(viewportWidth).Render(m.help.View(keyMap)))
 	}
-	helpLines = append(helpLines, lipgloss.NewStyle().Width(viewportWidth).Render(m.help.View(m.keys)))
+	if keyMap := m.globalHelpKeyMap(); keyMap != nil {
+		helpLines = append(helpLines, lipgloss.NewStyle().Width(viewportWidth).Render(m.help.View(keyMap)))
+	}
 	helpLines = append(helpLines, strings.Repeat(" ", viewportWidth))
 	helpView := strings.Join(helpLines, "\n")
 	helpHeight := lipgloss.Height(helpView)

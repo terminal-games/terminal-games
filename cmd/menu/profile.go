@@ -526,15 +526,15 @@ func (m profileModel) handleDropdownKey(msg tea.KeyMsg) (profileModel, tea.Cmd) 
 		m.state = stateEditLangs
 	case "esc":
 		m.state = stateEditLangs
-	case "up", "k":
+	case "up":
 		m.dropdown.MoveUp()
-	case "down", "j":
+	case "down":
 		m.dropdown.MoveDown()
-	case "backspace":
+	case "backspace", "delete":
 		m.dropdown.Backspace()
 	default:
-		if r := []rune(msg.String()); len(r) == 1 && unicode.IsPrint(r[0]) {
-			m.dropdown.TypeRune(r[0])
+		if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && unicode.IsPrint(msg.Runes[0]) {
+			m.dropdown.TypeRune(msg.Runes[0])
 		}
 	}
 	return m, nil

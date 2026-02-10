@@ -109,6 +109,10 @@ func (m gamesModel) FullHelp() [][]key.Binding {
 	return m.list.FullHelp()
 }
 
+func (m gamesModel) Capturing() bool {
+	return m.list.Filtering()
+}
+
 func (m gamesModel) Init() tea.Cmd {
 	return m.carousel.Init()
 }

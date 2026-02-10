@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
@@ -164,11 +165,25 @@ func (m Model) Filtering() bool {
 }
 
 func (m Model) ShortHelp() []key.Binding {
-	return m.Keys.ShortHelp()
+	bindings := []key.Binding{m.Keys.Up, m.Keys.Down}
+	if m.filtering {
+		bindings = append(
+			bindings,
+			key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "apply filter")),
+			key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "cancel")),
+		)
+		return bindings
+	}
+	if m.filterValue != "" {
+		bindings = append(bindings, m.Keys.Clear)
+		return bindings
+	}
+	bindings = append(bindings, m.Keys.Filter)
+	return bindings
 }
 
 func (m Model) FullHelp() [][]key.Binding {
-	return m.Keys.FullHelp()
+	return [][]key.Binding{m.ShortHelp()}
 }
 
 type tickMsg time.Time
@@ -199,8 +214,8 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 				}
 				return m, nil
 			case tea.KeyRunes:
-				if len(m.filterDraft) < 32 {
-					m.filterDraft += string(msg.Runes)
+				if len(msg.Runes) == 1 && unicode.IsPrint(msg.Runes[0]) && len(m.filterDraft) < 32 {
+					m.filterDraft += string(msg.Runes[0])
 				}
 				return m, nil
 			}
