@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
+	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 )
 
 const (
@@ -45,18 +46,18 @@ type Styles struct {
 
 func DefaultStyles() Styles {
 	return Styles{
-		Title:        lipgloss.NewStyle().Foreground(lipgloss.Color("#2bb673")).Bold(true),
-		Count:        lipgloss.NewStyle().Foreground(lipgloss.Color("#666666")),
-		Name:         lipgloss.NewStyle().Foreground(lipgloss.Color("#dddddd")).Bold(true),
-		Description:  lipgloss.NewStyle().Foreground(lipgloss.Color("#777777")),
-		NameSelected: lipgloss.NewStyle().Foreground(lipgloss.Color("#d766ff")).Bold(true),
-		DescSelected: lipgloss.NewStyle().Foreground(lipgloss.Color("#b777ff")),
-		NameHover:    lipgloss.NewStyle().Foreground(lipgloss.Color("#ffffff")).Bold(true),
-		DescHover:    lipgloss.NewStyle().Foreground(lipgloss.Color("#aaaaaa")),
-		FilterPrompt: lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")),
-		FilterText:   lipgloss.NewStyle().Foreground(lipgloss.Color("#bbbbbb")),
-		Bar:          lipgloss.NewStyle().Foreground(lipgloss.Color("#d766ff")),
-		BarHover:     lipgloss.NewStyle().Foreground(lipgloss.Color("#ffffff")),
+		Title:        lipgloss.NewStyle().Foreground(theme.Primary).Bold(true),
+		Count:        lipgloss.NewStyle().Foreground(theme.TextMuted),
+		Name:         lipgloss.NewStyle().Bold(true),
+		Description:  lipgloss.NewStyle().Foreground(theme.TextMuted),
+		NameSelected: lipgloss.NewStyle().Foreground(theme.Primary).Bold(true),
+		DescSelected: lipgloss.NewStyle().Foreground(theme.TextMuted),
+		NameHover:    lipgloss.NewStyle().Bold(true),
+		DescHover:    lipgloss.NewStyle().Foreground(theme.TextMuted),
+		FilterPrompt: lipgloss.NewStyle().Foreground(theme.TextMuted),
+		FilterText:   lipgloss.NewStyle(),
+		Bar:          lipgloss.NewStyle().Foreground(theme.Primary),
+		BarHover:     lipgloss.NewStyle(),
 	}
 }
 

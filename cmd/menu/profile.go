@@ -17,6 +17,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
+	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 	"golang.org/x/text/language"
 )
 
@@ -154,15 +155,15 @@ func (e *inlineEditor) End()   { e.pos = len(e.runes) }
 
 var editorCursor = lipgloss.NewStyle().Reverse(true)
 
-func (e inlineEditor) View() string {
+func (e inlineEditor) View(valueStyle, hintStyle lipgloss.Style) string {
 	if len(e.runes) == 0 {
-		return editorCursor.Render(" ") + pfHint.Render(e.placeholder)
+		return editorCursor.Render(" ") + hintStyle.Render(e.placeholder)
 	}
 	var b strings.Builder
-	b.WriteString(pfValue.Render(string(e.runes[:e.pos])))
+	b.WriteString(valueStyle.Render(string(e.runes[:e.pos])))
 	if e.pos < len(e.runes) {
 		b.WriteString(editorCursor.Render(string(e.runes[e.pos : e.pos+1])))
-		b.WriteString(pfValue.Render(string(e.runes[e.pos+1:])))
+		b.WriteString(valueStyle.Render(string(e.runes[e.pos+1:])))
 	} else {
 		b.WriteString(editorCursor.Render(" "))
 	}
@@ -256,6 +257,7 @@ type profileModel struct {
 	db     *sql.DB
 	zone   *zone.Manager
 	keys   profileKeyMap
+	styles profileStyles
 	userID string
 
 	loaded  bool
@@ -295,6 +297,7 @@ func newProfileModel(zoneManager *zone.Manager, db *sql.DB) profileModel {
 		db:     db,
 		zone:   zoneManager,
 		keys:   newProfileKeyMap(),
+		styles: defaultProfileStyles(),
 		userID: os.Getenv("USER_ID"),
 		editor: inlineEditor{placeholder: "enter username", maxLen: 32},
 	}
@@ -708,19 +711,37 @@ func (m profileModel) zoneAt(msg tea.MouseMsg) string {
 	return ""
 }
 
-var (
-	pfActiveLabel = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffffff")).Bold(true)
-	pfLabel       = lipgloss.NewStyle().Foreground(lipgloss.Color("#666666"))
-	pfValue       = lipgloss.NewStyle().Foreground(lipgloss.Color("#cccccc"))
-	pfHint        = lipgloss.NewStyle().Foreground(lipgloss.Color("#555555")).Italic(true)
-	pfSelectedRow = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffffff")).Bold(true)
-	pfHoverRow    = lipgloss.NewStyle().Foreground(lipgloss.Color("#bbbbbb"))
-	pfRow         = lipgloss.NewStyle().Foreground(lipgloss.Color("#999999"))
-	pfDanger      = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff5555")).Bold(true)
-	pfDivider     = lipgloss.NewStyle().Foreground(lipgloss.Color("#444444"))
-	pfLangNum     = lipgloss.NewStyle().Foreground(lipgloss.Color("#777777"))
-	pfURL         = lipgloss.NewStyle().Foreground(lipgloss.Color("#6688aa"))
-)
+type profileStyles struct {
+	ActiveLabel lipgloss.Style
+	Label       lipgloss.Style
+	Value       lipgloss.Style
+	Hint        lipgloss.Style
+	SelectedRow lipgloss.Style
+	HoverRow    lipgloss.Style
+	Row         lipgloss.Style
+	Danger      lipgloss.Style
+	Divider     lipgloss.Style
+	LangNum     lipgloss.Style
+	URL         lipgloss.Style
+}
+
+func defaultProfileStyles() profileStyles {
+	profileStrong := lipgloss.AdaptiveColor{Light: "235", Dark: "255"}
+	profileMuted := lipgloss.AdaptiveColor{Light: "240", Dark: "250"}
+	return profileStyles{
+		ActiveLabel: lipgloss.NewStyle().Foreground(profileStrong).Bold(true),
+		Label:       lipgloss.NewStyle().Foreground(profileMuted),
+		Value:       lipgloss.NewStyle().Foreground(profileStrong),
+		Hint:        lipgloss.NewStyle().Foreground(profileMuted).Italic(true),
+		SelectedRow: lipgloss.NewStyle().Foreground(profileStrong).Bold(true),
+		HoverRow:    lipgloss.NewStyle().Foreground(profileStrong),
+		Row:         lipgloss.NewStyle().Foreground(profileStrong),
+		Danger:      lipgloss.NewStyle().Foreground(theme.Danger).Bold(true),
+		Divider:     lipgloss.NewStyle().Foreground(profileMuted),
+		LangNum:     lipgloss.NewStyle().Foreground(profileMuted),
+		URL:         lipgloss.NewStyle().Foreground(theme.Accent),
+	}
+}
 
 func (m profileModel) mark(id, s string) string {
 	if m.zone != nil {
@@ -731,20 +752,20 @@ func (m profileModel) mark(id, s string) string {
 
 func (m profileModel) rowStyle(zoneID string, selected bool) lipgloss.Style {
 	if selected {
-		return pfSelectedRow
+		return m.styles.SelectedRow
 	}
 	if m.hovered == zoneID {
-		return pfHoverRow
+		return m.styles.HoverRow
 	}
-	return pfRow
+	return m.styles.Row
 }
 
-func styledLabel(text string, w int, active bool) string {
+func (m profileModel) styledLabel(text string, w int, active bool) string {
 	s := padRight(text, w)
 	if active {
-		return pfActiveLabel.Render(s)
+		return m.styles.ActiveLabel.Render(s)
 	}
-	return pfLabel.Render(s)
+	return m.styles.Label.Render(s)
 }
 
 func cursor(selected bool) string {
@@ -756,13 +777,13 @@ func cursor(selected bool) string {
 
 func (m profileModel) renderProfileTab(width, height int) string {
 	if m.userID == "" {
-		return pfLabel.Render("You are not signed in.")
+		return m.styles.Label.Render("You are not signed in.")
 	}
 	if !m.loaded {
-		return pfLabel.Render("Loading...")
+		return m.styles.Label.Render("Loading...")
 	}
 	if m.loadErr != nil {
-		return pfLabel.Render("Failed to load profile.")
+		return m.styles.Label.Render("Failed to load profile.")
 	}
 
 	const labelW = 12
@@ -771,31 +792,31 @@ func (m profileModel) renderProfileTab(width, height int) string {
 
 	// Username
 	active := m.state == stateEditName || (m.section == sectionUsername && m.state == stateNormal)
-	lbl := styledLabel("Username", labelW, active)
+	lbl := m.styledLabel("Username", labelW, active)
 	if m.state == stateEditName {
-		lines = append(lines, m.mark("pf-username", lbl+m.editor.View()))
+		lines = append(lines, m.mark("pf-username", lbl+m.editor.View(m.styles.Value, m.styles.Hint)))
 	} else {
-		style := pfValue
+		style := m.styles.Value
 		if m.hovered == "pf-username" && !active {
-			style = pfHoverRow
+			style = m.styles.HoverRow
 		}
 		val := style.Render(m.username)
 		if active {
-			val += pfHint.Render("  enter to edit")
+			val += m.styles.Hint.Render("  enter to edit")
 		}
 		lines = append(lines, m.mark("pf-username", lbl+val))
 	}
 
 	// Languages
 	langExpanded := m.state == stateEditLangs || m.state == stateLangDropdown
-	lbl = styledLabel("Languages", labelW, langExpanded || (m.section == sectionLanguages && m.state == stateNormal))
+	lbl = m.styledLabel("Languages", labelW, langExpanded || (m.section == sectionLanguages && m.state == stateNormal))
 
 	if langExpanded {
 		for i, tag := range m.languages {
 			zid := fmt.Sprintf("pf-lang-%d", i)
 			sel := m.langCursor == i && m.state == stateEditLangs
 			style := m.rowStyle(zid, sel)
-			text := cursor(sel) + pfLangNum.Render(fmt.Sprintf("%d. ", i+1)) + style.Render(langLabel(tag))
+			text := style.Render(cursor(sel) + fmt.Sprintf("%d. %s", i+1, langLabel(tag)))
 			if i == 0 {
 				text = lbl + text
 			} else {
@@ -809,17 +830,17 @@ func (m profileModel) renderProfileTab(width, height int) string {
 
 		// Add/search row
 		if m.state == stateLangDropdown {
-			display := editorCursor.Render(" ") + pfHint.Render("search...")
+			display := editorCursor.Render(" ") + m.styles.Hint.Render("search...")
 			if len(m.dropdown.searchBuf) > 0 {
-				display = pfValue.Render(string(m.dropdown.searchBuf)) + editorCursor.Render(" ")
+				display = m.styles.Value.Render(string(m.dropdown.searchBuf)) + editorCursor.Render(" ")
 			}
-			lines = append(lines, m.mark("pf-lang-add", indent+pfRow.Render("+ ")+display))
+			lines = append(lines, m.mark("pf-lang-add", indent+m.styles.Row.Render("+ ")+display))
 		} else {
 			sel := m.langCursor == len(m.languages) && m.state == stateEditLangs
 			style := m.rowStyle("pf-lang-add", sel)
 			text := cursor(sel) + style.Render("+ add language")
 			if sel {
-				text += pfHint.Render("  enter to add")
+				text += m.styles.Hint.Render("  enter to add")
 			}
 			lines = append(lines, m.mark("pf-lang-add", indent+text))
 		}
@@ -827,7 +848,7 @@ func (m profileModel) renderProfileTab(width, height int) string {
 		// Dropdown results
 		if m.state == stateLangDropdown {
 			if len(m.dropdown.filtered) == 0 {
-				lines = append(lines, indent+"    "+pfHint.Render("no matches"))
+				lines = append(lines, indent+"    "+m.styles.Hint.Render("no matches"))
 			} else {
 				end := min(m.dropdown.scroll+m.dropdown.maxVisible, len(m.dropdown.filtered))
 				for i := m.dropdown.scroll; i < end; i++ {
@@ -845,13 +866,13 @@ func (m profileModel) renderProfileTab(width, height int) string {
 			names[i] = langName(tag)
 		}
 		active := m.section == sectionLanguages && m.state == stateNormal
-		style := pfValue
+		style := m.styles.Value
 		if m.hovered == "pf-languages" && !active {
-			style = pfHoverRow
+			style = m.styles.HoverRow
 		}
 		summary := style.Render(strings.Join(names, ", "))
 		if active {
-			summary += pfHint.Render("  enter to edit")
+			summary += m.styles.Hint.Render("  enter to edit")
 		}
 		lines = append(lines, m.mark("pf-languages", lbl+summary))
 	}
@@ -863,13 +884,13 @@ func (m profileModel) renderProfileTab(width, height int) string {
 	if len(m.replays) > 0 {
 		title = fmt.Sprintf("Replays (%d)", len(m.replays))
 	}
-	title = styledLabel(title, 0, replaysActive)
+	title = m.styledLabel(title, 0, replaysActive)
 	divW := max(0, width-lipgloss.Width(title)-1)
-	lines = append(lines, title+" "+pfDivider.Render(strings.Repeat("─", divW)))
+	lines = append(lines, title+" "+m.styles.Divider.Render(strings.Repeat("─", divW)))
 
 	availRows := max(1, height-len(lines))
 	if len(m.replays) == 0 {
-		lines = append(lines, pfLabel.Render("  No replays yet."))
+		lines = append(lines, m.styles.Label.Render("  No replays yet."))
 	} else {
 		offset := scrollOffset(m.replayCursor, len(m.replays), availRows)
 		end := min(offset+availRows, len(m.replays))
@@ -897,16 +918,16 @@ func (m profileModel) renderReplayRow(idx, width int) string {
 	pad := strings.Repeat(" ", max(0, nameCol-len([]rune(name))))
 	ts := time.Unix(r.createdAt, 0).UTC().Format("Jan 2, 2006  3:04 PM")
 
-	nameStyle, timeStyle, urlStyle := pfRow, pfLabel, pfURL
+	nameStyle, timeStyle, urlStyle := m.styles.Row, m.styles.Label, m.styles.URL
 	if selected {
-		nameStyle, timeStyle, urlStyle = pfSelectedRow, pfValue, pfValue
+		nameStyle, timeStyle, urlStyle = m.styles.SelectedRow, m.styles.Value, m.styles.Value
 	} else if m.hovered == zid {
-		nameStyle, timeStyle, urlStyle = pfHoverRow, pfHoverRow, pfHoverRow
+		nameStyle, timeStyle, urlStyle = m.styles.HoverRow.Bold(true), m.styles.HoverRow, m.styles.HoverRow
 	}
 
-	row := nameStyle.Render(cursor(selected)+osc8Link(r.asciinemaURL, name)) + pad + timeStyle.Render(ts)
+	row := nameStyle.Render(cursor(selected)+name) + pad + timeStyle.Render(ts)
 	if m.state == stateConfirmDelete && selected {
-		return row + "  " + pfDanger.Render("delete? y/n")
+		return row + "  " + m.styles.Danger.Render("delete? y/n")
 	}
 	if r.asciinemaURL != "" {
 		row += "  " + urlStyle.Render(osc8Link(r.asciinemaURL, r.asciinemaURL))

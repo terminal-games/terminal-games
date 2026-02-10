@@ -13,6 +13,7 @@ import (
 	zone "github.com/lrstanley/bubblezone"
 	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
 	"github.com/terminal-games/terminal-games/cmd/menu/gamelist"
+	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 )
 
 type gameItem struct {
@@ -40,9 +41,9 @@ type gamesDetailsStyles struct {
 
 func defaultDetailsStyles() gamesDetailsStyles {
 	return gamesDetailsStyles{
-		Title:  lipgloss.NewStyle().Foreground(lipgloss.Color("#ffffff")).Bold(true),
-		Body:   lipgloss.NewStyle().Foreground(lipgloss.Color("#cccccc")),
-		Subtle: lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")),
+		Title:  lipgloss.NewStyle().Bold(true),
+		Body:   lipgloss.NewStyle(),
+		Subtle: lipgloss.NewStyle().Foreground(theme.TextMuted),
 	}
 }
 
@@ -53,9 +54,9 @@ func newGamesModel(zoneManager *zone.Manager) gamesModel {
 			Description: "Slice fast while dodging bombs",
 			Details:     "Get the high score",
 			Screenshots: []carousel.Screenshot{
-				{Content: carousel.PlaceholderScreenshot("TERMINAL NINJA", "#ff6644", "#1a0a08"), Caption: "Title Screen"},
-				{Content: carousel.PlaceholderScreenshot("Score: 9001  Combo: x42", "#44ff66", "#081a08"), Caption: "Gameplay"},
-				{Content: carousel.PlaceholderScreenshot("HIGH SCORES", "#ffcc00", "#1a1a08"), Caption: "High Scores"},
+				{Content: carousel.PlaceholderScreenshot("TERMINAL NINJA", "203", "52"), Caption: "Title Screen"},
+				{Content: carousel.PlaceholderScreenshot("Score: 9001  Combo: x42", "84", "22"), Caption: "Gameplay"},
+				{Content: carousel.PlaceholderScreenshot("HIGH SCORES", "220", "58"), Caption: "High Scores"},
 			},
 		},
 		{
@@ -63,8 +64,8 @@ func newGamesModel(zoneManager *zone.Manager) gamesModel {
 			Description: "Test your typing skills",
 			Details:     "A singleplayer and multiplayer typing experience.",
 			Screenshots: []carousel.Screenshot{
-				{Content: carousel.PlaceholderScreenshot("TERMINAL TYPER", "#66aaff", "#080e1a"), Caption: "Ready to type"},
-				{Content: carousel.PlaceholderScreenshot("WPM: 120  Accuracy: 98%", "#ff66aa", "#1a0812"), Caption: "Results"},
+				{Content: carousel.PlaceholderScreenshot("TERMINAL TYPER", "117", "17"), Caption: "Ready to type"},
+				{Content: carousel.PlaceholderScreenshot("WPM: 120  Accuracy: 98%", "212", "53"), Caption: "Results"},
 			},
 		},
 		{
@@ -72,7 +73,7 @@ func newGamesModel(zoneManager *zone.Manager) gamesModel {
 			Description: "Placeholder 2",
 			Details:     "Placeholder 3",
 			Screenshots: []carousel.Screenshot{
-				{Content: carousel.PlaceholderScreenshot("PLACEHOLDER 4", "#66aaff", "#080e1a"), Caption: "Placeholder 5"},
+				{Content: carousel.PlaceholderScreenshot("PLACEHOLDER 4", "117", "17"), Caption: "Placeholder 5"},
 			},
 		},
 	}
@@ -94,7 +95,7 @@ func newGamesModel(zoneManager *zone.Manager) gamesModel {
 	return gamesModel{
 		zone:     zoneManager,
 		items:    items,
-		list:     gamelist.New("Games", listItems, zoneManager, "games-item-"),
+		list:     gamelist.New("Official Games", listItems, zoneManager, "games-item-"),
 		carousel: c,
 		styles:   defaultDetailsStyles(),
 	}

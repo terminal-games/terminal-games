@@ -14,6 +14,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	zone "github.com/lrstanley/bubblezone"
+	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 )
 
 const (
@@ -46,12 +47,12 @@ type Styles struct {
 
 func DefaultStyles() Styles {
 	return Styles{
-		DotActive:   lipgloss.NewStyle().Foreground(lipgloss.Color("#d766ff")),
-		DotInactive: lipgloss.NewStyle().Foreground(lipgloss.Color("#555555")),
-		Caption:     lipgloss.NewStyle().Foreground(lipgloss.Color("#999999")),
-		Button:      lipgloss.NewStyle().Foreground(lipgloss.Color("#d766ff")).Bold(true),
-		Title:       lipgloss.NewStyle().Foreground(lipgloss.Color("#ffffff")).Bold(true),
-		Hint:        lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")),
+		DotActive:   lipgloss.NewStyle().Foreground(theme.Primary),
+		DotInactive: lipgloss.NewStyle().Foreground(theme.TextSubtle),
+		Caption:     lipgloss.NewStyle().Foreground(theme.TextMuted),
+		Button:      lipgloss.NewStyle().Foreground(theme.Primary).Bold(true),
+		Title:       lipgloss.NewStyle().Bold(true),
+		Hint:        lipgloss.NewStyle().Foreground(theme.TextMuted),
 	}
 }
 

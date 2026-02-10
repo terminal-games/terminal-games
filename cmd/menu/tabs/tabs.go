@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
+	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 )
 
 const (
@@ -35,20 +36,19 @@ type Styles struct {
 func DefaultStyles() Styles {
 	return Styles{
 		ActiveTab: lipgloss.NewStyle().
-			Background(lipgloss.Color("#9966ff")).
-			Foreground(lipgloss.Color("#ffffff")).
+			Background(theme.Primary).
+			Foreground(theme.OnPrimary).
 			Padding(0, 1),
 		InactiveTab: lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#888888")).
+			Foreground(theme.TextMuted).
 			Padding(0, 1),
 		HoverTab: lipgloss.NewStyle().
-			Background(lipgloss.Color("#3a3a3a")).
-			Foreground(lipgloss.Color("#ffffff")).
+			Background(theme.Surface).
 			Padding(0, 1),
 		ActiveBar: lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#9966ff")),
+			Foreground(theme.Primary),
 		InactiveBar: lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#888888")),
+			Foreground(theme.Line),
 	}
 }
 

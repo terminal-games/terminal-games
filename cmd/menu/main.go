@@ -19,6 +19,7 @@ import (
 
 	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
 	"github.com/terminal-games/terminal-games/cmd/menu/tabs"
+	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 	"github.com/terminal-games/terminal-games/pkg/bubblewrap"
 	_ "github.com/terminal-games/terminal-games/pkg/net/http"
 )
@@ -37,6 +38,7 @@ type model struct {
 	tabs        tabs.Model
 	contentArea lipgloss.Style
 	barStyle    lipgloss.Style
+	titleStyle  lipgloss.Style
 	keys        keyMap
 	help        help.Model
 	games       gamesModel
@@ -113,6 +115,8 @@ func (m model) activeKeyMap() helpKeyMap {
 }
 
 func main() {
+	lipgloss.SetDefaultRenderer(bubblewrap.MakeRenderer())
+
 	zoneManager := zone.New()
 
 	db, err := sql.Open("libsql", os.Getenv("TURSO_URL"))
@@ -130,7 +134,8 @@ func main() {
 		zone:        zoneManager,
 		tabs:        tabs.New(menuTabs, zoneManager, "menu-tab-"),
 		contentArea: lipgloss.NewStyle().Padding(1, 2),
-		barStyle:    lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")),
+		barStyle:    lipgloss.NewStyle().Foreground(theme.Line),
+		titleStyle:  lipgloss.NewStyle().Foreground(theme.Primary).Bold(true),
 		keys:        newKeyMap(),
 		help:        help.New(),
 		games:       newGamesModel(zoneManager),
@@ -226,7 +231,7 @@ func (m *model) View() string {
 
 	tabsView := m.tabs.View()
 	tabsWidth := m.tabs.TotalWidth()
-	title := " Terminal Games"
+	title := m.titleStyle.Render(" Terminal Games")
 	titleWidth := lipgloss.Width(title)
 
 	viewportWidth := maxWidth
