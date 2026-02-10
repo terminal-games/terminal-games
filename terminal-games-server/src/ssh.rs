@@ -101,8 +101,7 @@ impl SshServer {
     ) -> SshSession {
         tracing::info!(addr=?addr, "new_client");
 
-        let (auth_sender, auth_receiver) =
-            tokio::sync::oneshot::channel::<(String, Option<u64>)>();
+        let (auth_sender, auth_receiver) = tokio::sync::oneshot::channel::<(String, Option<u64>)>();
         let (term_sender, term_receiver) = tokio::sync::oneshot::channel::<String>();
         let (args_sender, args_receiver) = tokio::sync::oneshot::channel::<Vec<u8>>();
         let (ssh_session_sender, ssh_session_receiver) =
@@ -117,6 +116,24 @@ impl SshServer {
         tokio::task::spawn(async move {
             let (session_handle, channel_id, remote_sshid) = ssh_session_receiver.await.unwrap();
             let (username, user_id) = auth_receiver.await.unwrap();
+            let locale = if let Some(uid) = user_id {
+                match app_server
+                    .db
+                    .query(
+                        "SELECT locale FROM users WHERE id = ?1 LIMIT 1",
+                        libsql::params!(uid),
+                    )
+                    .await
+                {
+                    Ok(mut rows) => match rows.next().await {
+                        Ok(Some(row)) => row.get::<String>(0).unwrap_or_else(|_| "en".to_string()),
+                        _ => "en".to_string(),
+                    },
+                    Err(_) => "en".to_string(),
+                }
+            } else {
+                "en".to_string()
+            };
 
             // enter the alternate screen so that we aren't moving the cursor
             // around and overwriting the original terminal
@@ -162,7 +179,11 @@ impl SshServer {
                         ("menu".into(), None, has_audio)
                     } else if let Some(pos) = args.iter().position(|&b| b.is_ascii_whitespace()) {
                         let shortname = String::from_utf8_lossy(&args[..pos]).into();
-                        let rest: Vec<u8> = args[pos..].iter().copied().skip_while(|b| b.is_ascii_whitespace()).collect();
+                        let rest: Vec<u8> = args[pos..]
+                            .iter()
+                            .copied()
+                            .skip_while(|b| b.is_ascii_whitespace())
+                            .collect();
                         (shortname, (!rest.is_empty()).then_some(rest), has_audio)
                     } else {
                         (String::from_utf8_lossy(&args).into(), None, has_audio)
@@ -186,6 +207,7 @@ impl SshServer {
                 graceful_shutdown_token: token,
                 network_info,
                 user_id,
+                locale,
             });
             loop {
                 tokio::select! {
@@ -323,9 +345,7 @@ impl Handler for SshSession {
         _: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let _ = self
-            .resize_tx
-            .send((col_width as u16, row_height as u16));
+        let _ = self.resize_tx.send((col_width as u16, row_height as u16));
         session.channel_success(channel)?;
         Ok(())
     }
@@ -354,9 +374,7 @@ impl Handler for SshSession {
         _: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let _ = self
-            .resize_tx
-            .send((col_width as u16, row_height as u16));
+        let _ = self.resize_tx.send((col_width as u16, row_height as u16));
         if let Some(term_sender) = self.term.take() {
             let _ = term_sender.send(term.to_string());
         }

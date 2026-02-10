@@ -36,6 +36,7 @@ type model struct {
 	h           int
 	zone        *zone.Manager
 	tabs        tabs.Model
+	localizer   localizer
 	contentArea lipgloss.Style
 	barStyle    lipgloss.Style
 	titleStyle  lipgloss.Style
@@ -68,19 +69,19 @@ type keyMap struct {
 	PrevTab key.Binding
 }
 
-func newKeyMap() keyMap {
+func newKeyMap(localizer localizer) keyMap {
 	return keyMap{
 		Quit: key.NewBinding(
 			key.WithKeys("q", "ctrl+c"),
-			key.WithHelp("q", "quit"),
+			key.WithHelp("q", localizer.Text(textHelpQuit)),
 		),
 		NextTab: key.NewBinding(
 			key.WithKeys("tab"),
-			key.WithHelp("tab", "next tab"),
+			key.WithHelp("tab", localizer.Text(textHelpNextTab)),
 		),
 		PrevTab: key.NewBinding(
 			key.WithKeys("shift+tab"),
-			key.WithHelp("shift+tab", "prev tab"),
+			key.WithHelp("shift+tab", localizer.Text(textHelpPrevTab)),
 		),
 	}
 }
@@ -133,23 +134,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	menuTabs := []tabs.Tab{
-		{ID: "games", Title: "Games"},
-		{ID: "profile", Title: "Profile"},
-		{ID: "about", Title: "About"},
-	}
-
-	p := bubblewrap.NewProgram(&model{
+	menuModel := &model{
 		zone:        zoneManager,
-		tabs:        tabs.New(menuTabs, zoneManager, "menu-tab-"),
+		localizer:   newLocalizer(),
 		contentArea: lipgloss.NewStyle().Padding(1, 2),
 		barStyle:    lipgloss.NewStyle().Foreground(theme.Line),
 		titleStyle:  lipgloss.NewStyle().Bold(true),
-		keys:        newKeyMap(),
+		keys:        newKeyMap(newLocalizer()),
 		help:        help.New(),
-		games:       newGamesModel(zoneManager),
+		games:       newGamesModel(zoneManager, db),
 		profile:     newProfileModel(zoneManager, db),
-	}, tea.WithAltScreen(), tea.WithMouseAllMotion())
+	}
+	menuModel.applyLocalization()
+
+	p := bubblewrap.NewProgram(menuModel, tea.WithAltScreen(), tea.WithMouseAllMotion())
 
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
@@ -177,6 +175,9 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			next := (m.tabs.Active + 1) % len(m.tabs.Tabs)
 			cmd := m.tabs.SetActive(next)
+			if m.tabs.ActiveTab().ID == "games" {
+				cmd = tea.Batch(cmd, m.games.onActivated())
+			}
 			return m, cmd
 		case key.Matches(msg, m.keys.PrevTab):
 			if m.games.carousel.Modal || m.inputCaptured() {
@@ -187,6 +188,9 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				prev = len(m.tabs.Tabs) - 1
 			}
 			cmd := m.tabs.SetActive(prev)
+			if m.tabs.ActiveTab().ID == "games" {
+				cmd = tea.Batch(cmd, m.games.onActivated())
+			}
 			return m, cmd
 		}
 
@@ -201,14 +205,27 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tabs.TabChangedMsg:
+		if msg.Tab.ID == "games" {
+			return m, m.games.onActivated()
+		}
 		return m, nil
 
-	case profileDataMsg, profileSavedMsg, replayDeletedMsg:
+	case profileDataMsg:
 		var cmd tea.Cmd
 		m.profile, cmd = m.profile.Update(message)
 		if cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+		m.syncLocalizationFromProfile()
+		return m, tea.Batch(cmds...)
+
+	case profileSavedMsg, replayDeletedMsg:
+		var cmd tea.Cmd
+		m.profile, cmd = m.profile.Update(message)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		m.syncLocalizationFromProfile()
 		return m, tea.Batch(cmds...)
 	}
 
@@ -223,6 +240,7 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+		m.syncLocalizationFromProfile()
 	}
 	m.tabs, cmd = m.tabs.Update(message)
 	if cmd != nil {
@@ -240,7 +258,7 @@ func (m *model) View() string {
 
 	tabsView := m.tabs.View()
 	tabsWidth := m.tabs.TotalWidth()
-	title := m.titleStyle.Render(" Terminal Games")
+	title := m.titleStyle.Render(" " + m.localizer.Text(textHeaderTitle))
 	titleWidth := lipgloss.Width(title)
 
 	viewportWidth := maxWidth
@@ -252,7 +270,7 @@ func (m *model) View() string {
 		requiredWidth = titleWidth + tabsWidth + 1
 	}
 	if viewportWidth < requiredWidth || m.h < minViewportHeight {
-		return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Center, "Window must be larger")
+		return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Center, m.localizer.Text(textWindowTooSmall))
 	}
 
 	paddingTotal := viewportWidth - tabsWidth
@@ -328,7 +346,7 @@ func (m *model) View() string {
 	case "about":
 		content = m.renderAboutTab(contentWidth, contentHeightInner)
 	default:
-		content = "Unknown tab"
+		content = m.localizer.Text(textUnknownTab)
 	}
 
 	styledContent := m.contentArea.
@@ -339,4 +357,25 @@ func (m *model) View() string {
 
 	fullView := lipgloss.JoinVertical(lipgloss.Left, centeredTabsView, styledContent, helpView)
 	return m.zone.Scan(lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Top, fullView))
+}
+
+func (m *model) syncLocalizationFromProfile() {
+	if m.localizer.SetPreferred(m.profile.languages) {
+		m.applyLocalization()
+	}
+}
+
+func (m *model) applyLocalization() {
+	activeID := m.tabs.ActiveTab().ID
+	m.keys = newKeyMap(m.localizer)
+	m.tabs = tabs.New([]tabs.Tab{
+		{ID: "games", Title: m.localizer.Text(textTabGames)},
+		{ID: "profile", Title: m.localizer.Text(textTabProfile)},
+		{ID: "about", Title: m.localizer.Text(textTabAbout)},
+	}, m.zone, "menu-tab-")
+	m.games.applyLocalization(m.localizer, m.profile.languages)
+	m.profile.applyLocalization(m.localizer)
+	if activeID != "" {
+		m.tabs.SetActiveByID(activeID)
+	}
 }

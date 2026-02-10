@@ -36,6 +36,11 @@ type Screenshot struct {
 	Caption string
 }
 
+type Labels struct {
+	Screenshots string
+	EscToClose  string
+}
+
 type Styles struct {
 	DotActive   lipgloss.Style
 	DotInactive lipgloss.Style
@@ -60,6 +65,7 @@ type Model struct {
 	Screenshots []Screenshot
 	Modal       bool
 	Styles      Styles
+	Labels      Labels
 	zone        *zone.Manager
 
 	scrollX     float64
@@ -80,7 +86,11 @@ type Model struct {
 func New(zoneManager *zone.Manager) Model {
 	return Model{
 		Styles: DefaultStyles(),
-		zone:   zoneManager,
+		Labels: Labels{
+			Screenshots: "Screenshots",
+			EscToClose:  "ESC to close",
+		},
+		zone: zoneManager,
 	}
 }
 
@@ -234,6 +244,14 @@ func (m *Model) Reset() tea.Cmd {
 	return nil
 }
 
+func (m *Model) RestartAuto() tea.Cmd {
+	m.autoGen++
+	if len(m.Screenshots) > 1 {
+		return autoAdvanceCmd(m.autoGen)
+	}
+	return nil
+}
+
 func (m Model) GoToPage(page int) (Model, tea.Cmd) {
 	n := len(m.Screenshots)
 	if n <= 1 {
@@ -316,7 +334,7 @@ func (m Model) View(viewWidth int) string {
 
 // ViewButton renders the clickable button shown when the carousel can't fit inline.
 func (m Model) ViewButton() string {
-	btn := m.Styles.Button.Render(fmt.Sprintf("▶ Screenshots (%d)", len(m.Screenshots)))
+	btn := m.Styles.Button.Render(fmt.Sprintf("▶ %s (%d)", m.Labels.Screenshots, len(m.Screenshots)))
 	if m.zone != nil {
 		btn = m.zone.Mark(btnZoneID, btn)
 	}
@@ -335,7 +353,7 @@ func (m Model) ViewModal(title string, width, height int) string {
 	}
 
 	titleStr := m.Styles.Title.Render(title)
-	hintStr := m.Styles.Hint.Render("ESC to close")
+	hintStr := m.Styles.Hint.Render(m.Labels.EscToClose)
 	gap := cw - lipgloss.Width(titleStr) - lipgloss.Width(hintStr)
 	if gap < 1 {
 		gap = 1
@@ -344,6 +362,10 @@ func (m Model) ViewModal(title string, width, height int) string {
 
 	content := header + "\n" + m.View(cw)
 	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, content)
+}
+
+func (m *Model) SetLabels(labels Labels) {
+	m.Labels = labels
 }
 
 func CanFitInline(width, height int) bool {

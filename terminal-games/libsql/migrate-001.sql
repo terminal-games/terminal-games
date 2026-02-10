@@ -9,8 +9,27 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS games (
     id INTEGER PRIMARY KEY,
     shortname TEXT NOT NULL UNIQUE,
-    title TEXT NOT NULL,
     path TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS game_localizations (
+    game_id INTEGER NOT NULL,
+    locale TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT(''),
+    details TEXT NOT NULL DEFAULT(''),
+    PRIMARY KEY(game_id, locale),
+    FOREIGN KEY(game_id) REFERENCES games(id)
+);
+
+CREATE TABLE IF NOT EXISTS game_screenshot_localizations (
+    game_id INTEGER NOT NULL,
+    locale TEXT NOT NULL,
+    sort_order INTEGER NOT NULL,
+    image TEXT NOT NULL,
+    caption TEXT NOT NULL DEFAULT(''),
+    PRIMARY KEY(game_id, locale, sort_order),
+    FOREIGN KEY(game_id) REFERENCES games(id)
 );
 
 CREATE TABLE IF NOT EXISTS envs (

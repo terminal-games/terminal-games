@@ -141,10 +141,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let db_path = data_dir.join("terminal-games.db");
 
-    let db = libsql::Builder::new_local(&db_path)
-        .build()
-        .await
-        .unwrap();
+    let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
 
     let conn = db.connect().unwrap();
 
@@ -162,8 +159,8 @@ async fn main() -> Result<()> {
 
     let _ = conn
         .execute(
-            "INSERT INTO games (shortname, title, path) VALUES (?1, ?2, ?3)",
-            libsql::params!(first_app_shortname.as_str(), first_app_shortname.as_str(), args.wasm_file.as_str()),
+            "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
+            libsql::params!(first_app_shortname.as_str(), args.wasm_file.as_str()),
         )
         .await;
 
@@ -171,8 +168,8 @@ async fn main() -> Result<()> {
         if let Some((shortname, path)) = game.split_once('=') {
             let _ = conn
                 .execute(
-                    "INSERT INTO games (shortname, title, path) VALUES (?1, ?2, ?3)",
-                    libsql::params!(shortname, shortname, path),
+                    "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
+                    libsql::params!(shortname, path),
                 )
                 .await;
         }
@@ -211,6 +208,23 @@ async fn main() -> Result<()> {
         }
     } else {
         user_id
+    };
+    let locale = if let Some(uid) = user_id {
+        match conn
+            .query(
+                "SELECT locale FROM users WHERE id = ?1 LIMIT 1",
+                libsql::params!(uid),
+            )
+            .await
+        {
+            Ok(mut rows) => match rows.next().await {
+                Ok(Some(row)) => row.get::<String>(0).unwrap_or_else(|_| "en".to_string()),
+                _ => "en".to_string(),
+            },
+            Err(_) => "en".to_string(),
+        }
+    } else {
+        "en".to_string()
     };
 
     let local_discovery = Arc::new(LocalDiscovery::new());
@@ -281,6 +295,7 @@ async fn main() -> Result<()> {
         network_info: network_info.clone(),
         first_app_shortname,
         user_id,
+        locale,
     });
 
     thread::spawn(move || {
@@ -309,7 +324,12 @@ async fn main() -> Result<()> {
     let (delayed_tx, mut delayed_rx) = tokio::sync::mpsc::channel(100);
 
     tokio::spawn(async move {
-        let mut rate_limited = RateLimitedStream::with_rate(NullSink, network_info.clone(), bandwidth, bandwidth_capacity);
+        let mut rate_limited = RateLimitedStream::with_rate(
+            NullSink,
+            network_info.clone(),
+            bandwidth,
+            bandwidth_capacity,
+        );
         let mut stdout = std::io::stdout();
 
         while let Some((data, deliver_at, delay_ms)) = delayed_rx.recv().await {

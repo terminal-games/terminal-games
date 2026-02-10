@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use wasmtime_wasi::I32Exit;
 
 use crate::{
-    audio::{AudioBuffer, CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
+    audio::{AudioBuffer, Mixer, CHANNELS, FRAME_SIZE, SAMPLE_RATE},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
     replay::ReplayBuffer,
@@ -83,6 +83,7 @@ pub struct AppInstantiationParams {
     pub network_info: Arc<dyn NetworkInfo>,
     pub first_app_shortname: String,
     pub user_id: Option<u64>,
+    pub locale: String,
 }
 
 impl AppServer {
@@ -153,13 +154,15 @@ impl AppServer {
         let db = self.db.clone();
         let engine = self.engine.clone();
         let linker = self.linker.clone();
-        
+
         tokio::task::spawn(async move {
             let engine = engine;
-            
+
             let mut window_size_receiver = params.window_size_receiver;
             let (first_cols, first_rows) = *window_size_receiver.borrow();
-            let mut terminal = Arc::new(Mutex::new(headless_terminal::Parser::new(first_rows, first_cols, 0)));
+            let mut terminal = Arc::new(Mutex::new(headless_terminal::Parser::new(
+                first_rows, first_cols, 0,
+            )));
 
             let (app_output_sender, mut app_output_receiver) =
                 tokio::sync::mpsc::channel::<Vec<u8>>(1);
@@ -201,6 +204,7 @@ impl AppServer {
                 username: params.username.clone(),
                 audio_enabled,
                 user_id: params.user_id,
+                locale: params.locale.clone(),
             });
             let (mut app, mut instance_pre) = Self::prepare_instantiate(&ctx, first_app_shortname)
                 .await
@@ -208,7 +212,13 @@ impl AppServer {
             let first_app_shortname = app.shortname.clone();
             let first_app_id = app.app_id;
 
-            let replay_buffer = Arc::new(Mutex::new(ReplayBuffer::new(first_cols, first_rows, first_app_shortname.clone(), first_app_id, params.term.clone())));
+            let replay_buffer = Arc::new(Mutex::new(ReplayBuffer::new(
+                first_cols,
+                first_rows,
+                first_app_shortname.clone(),
+                first_app_id,
+                params.term.clone(),
+            )));
             let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(1);
 
             let (filtered_input_tx, filtered_input_rx) = tokio::sync::mpsc::channel(20);
@@ -227,19 +237,36 @@ impl AppServer {
                             graceful_shutdown_token.cancel();
                         }
                         if data.contains(&0x12) {
-                            let now = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-                            if now.saturating_sub(replay_last_at) < Duration::from_secs(REPLAY_RATE_LIMIT_SECS) {
-                                let _ = notification_tx.send(" Please wait 10 seconds between replays. ".to_string()).await;
+                            let now = std::time::SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap();
+                            if now.saturating_sub(replay_last_at)
+                                < Duration::from_secs(REPLAY_RATE_LIMIT_SECS)
+                            {
+                                let _ = notification_tx
+                                    .send(" Please wait 10 seconds between replays. ".to_string())
+                                    .await;
                             } else {
                                 replay_last_at = now;
-                                let _ = notification_tx.send(" \x1b[3mUploading replay... ".to_string()).await;
+                                let _ = notification_tx
+                                    .send(" \x1b[3mUploading replay... ".to_string())
+                                    .await;
                                 let db = db.clone();
                                 let username = username.clone();
                                 let notification_tx = notification_tx.clone();
                                 let replay_buffer = replay_buffer.clone();
                                 tokio::spawn(async move {
-                                    let (initial_app_id, asciicast) = replay_buffer.lock().await.serialize_asciicast();
-                                    let notification = match save_replay(&db, user_id, initial_app_id, &username, &asciicast).await {
+                                    let (initial_app_id, asciicast) =
+                                        replay_buffer.lock().await.serialize_asciicast();
+                                    let notification = match save_replay(
+                                        &db,
+                                        user_id,
+                                        initial_app_id,
+                                        &username,
+                                        &asciicast,
+                                    )
+                                    .await
+                                    {
                                         Ok(url) => {
                                             tracing::info!(%url, "Uploaded replay");
                                             format!(" \x1b[3mReplay saved: \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ", url, url)
@@ -274,8 +301,12 @@ impl AppServer {
                 async move {
                     let mut escape_buffer = EscapeSequenceBuffer::new();
                     let mut status_bar_interval = tokio::time::interval(Duration::from_secs(1));
-                    let mut status_bar =
-                        StatusBar::new(first_app_shortname, username.clone(), network_info, notification_rx);
+                    let mut status_bar = StatusBar::new(
+                        first_app_shortname,
+                        username.clone(),
+                        network_info,
+                        notification_rx,
+                    );
 
                     loop {
                         tokio::select! {
@@ -504,6 +535,22 @@ impl AppServer {
         if let Some(user_id) = ctx.user_id {
             envs.push(("USER_ID".to_string(), user_id.to_string()));
         }
+        let mut locale = ctx.locale.clone();
+        if let Some(user_id) = ctx.user_id {
+            if let Ok(mut rows) = ctx
+                .db
+                .query(
+                    "SELECT locale FROM users WHERE id = ?1 LIMIT 1",
+                    libsql::params!(user_id),
+                )
+                .await
+            {
+                if let Ok(Some(row)) = rows.next().await {
+                    locale = row.get::<String>(0).unwrap_or(locale);
+                }
+            }
+        }
+        envs.push(("LOCALE".to_string(), locale));
 
         let wasi_ctx = wasmtime_wasi::WasiCtx::builder()
             .stdout(MyStdoutStream {
@@ -618,11 +665,7 @@ impl AppServer {
         let remote_addr = tcp_stream.peer_addr().unwrap_or(addrs[0]);
 
         let stream = if mode == 1 {
-            let hostname: String = address
-                .split(':')
-                .next()
-                .unwrap_or(&address)
-                .to_string();
+            let hostname: String = address.split(':').next().unwrap_or(&address).to_string();
 
             let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
             root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -705,13 +748,21 @@ impl AppServer {
                     anyhow::bail!("failed to find host memory");
                 };
 
-                mem.write(&mut caller, local_addr_ptr as usize, local_addr_str.as_bytes())?;
+                mem.write(
+                    &mut caller,
+                    local_addr_ptr as usize,
+                    local_addr_str.as_bytes(),
+                )?;
                 mem.write(
                     &mut caller,
                     local_addr_len_ptr as usize,
                     &(local_addr_str.len() as u32).to_le_bytes(),
                 )?;
-                mem.write(&mut caller, remote_addr_ptr as usize, remote_addr_str.as_bytes())?;
+                mem.write(
+                    &mut caller,
+                    remote_addr_ptr as usize,
+                    remote_addr_str.as_bytes(),
+                )?;
                 mem.write(
                     &mut caller,
                     remote_addr_len_ptr as usize,
@@ -726,9 +777,7 @@ impl AppServer {
                 caller.data_mut().conn_manager.pending_dials[dial_id_usize] = Some(pending);
                 Ok(POLL_DIAL_PENDING)
             }
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                Ok(POLL_DIAL_ERR_TASK_FAILED)
-            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Ok(POLL_DIAL_ERR_TASK_FAILED),
         }
     }
 
@@ -1250,6 +1299,7 @@ pub struct AppContext {
     linker: Arc<wasmtime::Linker<AppState>>,
     app_output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     user_id: Option<u64>,
+    locale: String,
 }
 
 pub struct AppState {
@@ -1418,7 +1468,11 @@ impl EscapeSequenceBuffer {
             }
             b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' | b'#' | b' ' => {
                 // 3-byte sequences
-                if seq.len() < 3 { seq.len() } else { 0 }
+                if seq.len() < 3 {
+                    seq.len()
+                } else {
+                    0
+                }
             }
             _ => 0, // 2-byte sequences are complete
         }
@@ -1680,29 +1734,28 @@ static IPV6_NON_GLOBAL: OnceLock<Vec<Ipv6Net>> = OnceLock::new();
 fn init_ipv4_non_global() -> Vec<Ipv4Net> {
     [
         // https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry.xhtml
-        "192.88.99.0/24", // Deprecated (6to4 Relay Anycast)
-        "0.0.0.0/8", // "This network"
-        "0.0.0.0/32", // "This host on this network"
-        "10.0.0.0/8", // Private-Use
-        "100.64.0.0/10", // Shared Address Space
-        "169.254.0.0/16", // Link Local
-        "172.16.0.0/12", // Private-Use
-        "192.0.0.0/24", // IETF Protocol Assignments
-        "192.0.0.0/29", // IPv4 Service Continuity Prefix
-        "192.0.0.8/32", // IPv4 dummy address
-        "192.0.0.170/32", // NAT64/DNS64 Discovery
-        "192.0.0.171/32", // NAT64/DNS64 Discovery
-        "192.0.2.0/24", // Documentation (TEST-NET-1)
-        "192.88.99.2/32", // 6a44-relay anycast address
-        "192.168.0.0/16", // Private-Use
-        "198.18.0.0/15", // Benchmarking
-        "198.51.100.0/24", // Documentation (TEST-NET-2)
-        "203.0.113.0/24", // Documentation (TEST-NET-3)
-        "240.0.0.0/4", // Reserved
+        "192.88.99.0/24",     // Deprecated (6to4 Relay Anycast)
+        "0.0.0.0/8",          // "This network"
+        "0.0.0.0/32",         // "This host on this network"
+        "10.0.0.0/8",         // Private-Use
+        "100.64.0.0/10",      // Shared Address Space
+        "169.254.0.0/16",     // Link Local
+        "172.16.0.0/12",      // Private-Use
+        "192.0.0.0/24",       // IETF Protocol Assignments
+        "192.0.0.0/29",       // IPv4 Service Continuity Prefix
+        "192.0.0.8/32",       // IPv4 dummy address
+        "192.0.0.170/32",     // NAT64/DNS64 Discovery
+        "192.0.0.171/32",     // NAT64/DNS64 Discovery
+        "192.0.2.0/24",       // Documentation (TEST-NET-1)
+        "192.88.99.2/32",     // 6a44-relay anycast address
+        "192.168.0.0/16",     // Private-Use
+        "198.18.0.0/15",      // Benchmarking
+        "198.51.100.0/24",    // Documentation (TEST-NET-2)
+        "203.0.113.0/24",     // Documentation (TEST-NET-3)
+        "240.0.0.0/4",        // Reserved
         "255.255.255.255/32", // Limited Broadcast
-        "127.0.0.0/8", // Loopback
-
-        "224.0.0.0/4", // Multicast
+        "127.0.0.0/8",        // Loopback
+        "224.0.0.0/4",        // Multicast
     ]
     .into_iter()
     .map(|s| s.parse().expect("valid IPv4 CIDR"))
@@ -1712,23 +1765,22 @@ fn init_ipv4_non_global() -> Vec<Ipv4Net> {
 fn init_ipv6_non_global() -> Vec<Ipv6Net> {
     [
         // https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry.xhtml
-        "::1/128", // Loopback Address
-        "::/128", // Unspecified Address
-        "::ffff:0:0/96", // IPv4-mapped Address
+        "::1/128",        // Loopback Address
+        "::/128",         // Unspecified Address
+        "::ffff:0:0/96",  // IPv4-mapped Address
         "64:ff9b:1::/48", // IPv4-IPv6 Translat.
-        "100::/64", // Discard-Only Address Block
+        "100::/64",       // Discard-Only Address Block
         "100:0:0:1::/64", // Dummy IPv6 Prefix
-        "2001:2::/48", // Benchmarking
-        "2001:db8::/32", // 2001:db8::/32
-        "3fff::/20", // Documentation
-        "5f00::/16", // Segment Routing (SRv6) SIDs
-        "fe80::/10", // Link-Local Unicast
-        "2001::/23", // IETF Protocol Assignments
-        "fc00::/7", // Unique-Local
-        "2001::/32", // TEREDO
-        "2002::/16", // 6to4
-
-        "ff00::/8", // Multicast
+        "2001:2::/48",    // Benchmarking
+        "2001:db8::/32",  // 2001:db8::/32
+        "3fff::/20",      // Documentation
+        "5f00::/16",      // Segment Routing (SRv6) SIDs
+        "fe80::/10",      // Link-Local Unicast
+        "2001::/23",      // IETF Protocol Assignments
+        "fc00::/7",       // Unique-Local
+        "2001::/32",      // TEREDO
+        "2002::/16",      // 6to4
+        "ff00::/8",       // Multicast
     ]
     .into_iter()
     .map(|s| s.parse().expect("valid IPv6 CIDR"))

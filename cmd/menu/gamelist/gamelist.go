@@ -30,6 +30,18 @@ type Item struct {
 	FilterExtra string
 }
 
+type Labels struct {
+	Up          string
+	Down        string
+	Filter      string
+	ClearFilter string
+	ApplyFilter string
+	Cancel      string
+	Games       string
+	Of          string
+	FilterValue string
+}
+
 type Styles struct {
 	Title        lipgloss.Style
 	Count        lipgloss.Style
@@ -70,22 +82,40 @@ type KeyMap struct {
 }
 
 func DefaultKeyMap() KeyMap {
+	return KeyMapWithLabels(DefaultLabels())
+}
+
+func DefaultLabels() Labels {
+	return Labels{
+		Up:          "up",
+		Down:        "down",
+		Filter:      "filter",
+		ClearFilter: "clear filter",
+		ApplyFilter: "apply filter",
+		Cancel:      "cancel",
+		Games:       "games",
+		Of:          "of",
+		FilterValue: "Filter",
+	}
+}
+
+func KeyMapWithLabels(labels Labels) KeyMap {
 	return KeyMap{
 		Up: key.NewBinding(
 			key.WithKeys("up", "k"),
-			key.WithHelp("↑/k", "up"),
+			key.WithHelp("↑/k", labels.Up),
 		),
 		Down: key.NewBinding(
 			key.WithKeys("down", "j"),
-			key.WithHelp("↓/j", "down"),
+			key.WithHelp("↓/j", labels.Down),
 		),
 		Filter: key.NewBinding(
 			key.WithKeys("/"),
-			key.WithHelp("/", "filter"),
+			key.WithHelp("/", labels.Filter),
 		),
 		Clear: key.NewBinding(
 			key.WithKeys("esc"),
-			key.WithHelp("esc", "clear filter"),
+			key.WithHelp("esc", labels.ClearFilter),
 		),
 	}
 }
@@ -116,6 +146,7 @@ type Model struct {
 	Styles   Styles
 	Keys     KeyMap
 	Duration time.Duration
+	Labels   Labels
 
 	zone         *zone.Manager
 	zonePrefix   string
@@ -144,6 +175,7 @@ func New(title string, items []Item, zoneManager *zone.Manager, zonePrefix strin
 		Hovered:    -1,
 		Filtered:   filtered,
 		Styles:     DefaultStyles(),
+		Labels:     DefaultLabels(),
 		Keys:       DefaultKeyMap(),
 		Duration:   120 * time.Millisecond,
 		zone:       zoneManager,
@@ -169,8 +201,8 @@ func (m Model) ShortHelp() []key.Binding {
 	if m.filtering {
 		bindings = append(
 			bindings,
-			key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "apply filter")),
-			key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "cancel")),
+			key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", m.Labels.ApplyFilter)),
+			key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", m.Labels.Cancel)),
 		)
 		return bindings
 	}
@@ -289,9 +321,9 @@ func (m *Model) View(width, height int) string {
 
 	count := len(m.Filtered)
 	total := len(m.Items)
-	countLabel := fmt.Sprintf("%d games", count)
+	countLabel := fmt.Sprintf("%d %s", count, m.Labels.Games)
 	if count != total {
-		countLabel = fmt.Sprintf("%d of %d games", count, total)
+		countLabel = fmt.Sprintf("%d %s %d %s", count, m.Labels.Of, total, m.Labels.Games)
 	}
 	headerLines = append(headerLines, m.Styles.Count.Render(countLabel))
 
@@ -303,7 +335,7 @@ func (m *Model) View(width, height int) string {
 		}
 		filterLine = m.Styles.FilterPrompt.Render("/ " + m.filterDraft + cursor)
 	} else if m.filterValue != "" {
-		filterLine = m.Styles.FilterText.Render("Filter: " + m.filterValue)
+		filterLine = m.Styles.FilterText.Render(m.Labels.FilterValue + ": " + m.filterValue)
 	}
 	if filterLine != "" {
 		headerLines = append(headerLines, filterLine)
@@ -320,6 +352,11 @@ func (m *Model) View(width, height int) string {
 	lines = append(lines, m.renderItems(width, listHeight)...)
 
 	return strings.Join(lines, "\n")
+}
+
+func (m *Model) SetLabels(labels Labels) {
+	m.Labels = labels
+	m.Keys = KeyMapWithLabels(labels)
 }
 
 func (m Model) moveSelection(delta int) (Model, tea.Cmd) {

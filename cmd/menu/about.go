@@ -5,5 +5,5 @@
 package main
 
 func (m *model) renderAboutTab(width, height int) string {
-	return "About"
+	return m.localizer.Text(textAboutBody)
 }
