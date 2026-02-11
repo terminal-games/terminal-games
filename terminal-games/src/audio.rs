@@ -78,8 +78,9 @@ impl AudioBuffer {
             .copy_from_slice(&samples[..first_chunk * CHANNELS]);
 
         if second_chunk > 0 {
-            inner.samples[..second_chunk * CHANNELS]
-                .copy_from_slice(&samples[first_chunk * CHANNELS..first_chunk * CHANNELS + second_chunk * CHANNELS]);
+            inner.samples[..second_chunk * CHANNELS].copy_from_slice(
+                &samples[first_chunk * CHANNELS..first_chunk * CHANNELS + second_chunk * CHANNELS],
+            );
         }
 
         inner.write_pos = (inner.write_pos + to_write) % self.capacity;
@@ -321,11 +322,7 @@ impl Mixer {
                 let frames_read = self.audio_buffer.read(&mut read_buffer, frame_size);
 
                 let data = (*self.frame).data[0] as *mut f32;
-                std::ptr::copy_nonoverlapping(
-                    read_buffer.as_ptr(),
-                    data,
-                    frame_size * CHANNELS,
-                );
+                std::ptr::copy_nonoverlapping(read_buffer.as_ptr(), data, frame_size * CHANNELS);
 
                 if frames_read > 0 && frames_read < frame_size {
                     tracing::trace!(frames_read, frame_size, "audio buffer underrun");

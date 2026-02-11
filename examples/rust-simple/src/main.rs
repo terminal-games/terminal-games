@@ -7,6 +7,9 @@ use terminal_games_sdk::{
     terminput,
 };
 
+#[used]
+static TERMINAL_GAMES_MANIFEST: &[u8] = include_bytes!("../terminal-games.json");
+
 fn main() -> std::io::Result<()> {
     let mut terminal = Terminal::new(TerminalGamesBackend::new(std::io::stdout()))?;
     terminal.clear()?;

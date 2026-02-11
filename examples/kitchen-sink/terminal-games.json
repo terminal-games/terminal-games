@@ -1,0 +1,30 @@
+{
+  "terminal_games_manifest_version": 1,
+  "shortname": "kitchen-sink",
+  "details": {
+    "name": {
+      "en": "Kitchen Sink",
+      "de": "Kuechenbecken"
+    },
+    "description": {
+      "en": "Terminal feature showcase.",
+      "de": "Terminal-Funktionen im Ueberblick."
+    },
+    "details": {
+      "en": "Explore forms, mouse interactions, viewport behavior, and text styling in one place.",
+      "de": "Formulare, Mausinteraktion, Viewports und Textstile in einer Demo."
+    },
+    "screenshots": {
+      "en": [
+        {
+          "content": "┌───────────────────────────────────────────────────────────────────────────────\n│\n│ Hi. Last char: . Size: 80x25 Mouse: 67 15 [hover me] \u001b]8;;https://example.com\u001b\\example\u001b]8;;\u001b\\ This program will\n│\n│ Peer ID: 6c6f63610000019c4bc29cadf7f34a7b\n│\n│ Audio: Playing | Volume: 80% | Position: 0s / 1m32s\n│   [Space]=Play/Pause  [+/-]=Volume  [M]=Mute\n│\n│ Network: ↑1 B/s ↓263 B/s RTT 3ms throttled: never\n│\n│ Peers (↑/↓ to select, Enter to send message):\n│ > 6c6f63610000019c4bc29cadf7f34a7b [loca] local (you)\n│\n│ Recent Messages:\n│ No messages yet\n│\n│\n│\n│ [REMOTE_SSHID=SSH-2.0-OpenSSH_10.2 USERNAME=mbund PEER_ID=6c6f63610000019c4bc2\n│ hasDarkBackground=true\n│\n└───────────────────────────────────────────────────────────────────────────────\n",
+          "caption": "Actual screenshot of kitchen sink example"
+        },
+        {
+          "content": "+------------------------------------------------------------------------------+\n| Kitchen Sink - Input Playground                                              |\n|                                                                              |\n| Try key bindings, filtering, and layout transitions.                         |\n| Designed to exercise common terminal app edge cases.                         |\n+------------------------------------------------------------------------------+",
+          "caption": "Input playground and layout transitions"
+        }
+      ]
+    }
+  }
+}

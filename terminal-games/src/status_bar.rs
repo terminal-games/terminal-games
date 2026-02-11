@@ -54,6 +54,10 @@ impl StatusBar {
         }
     }
 
+    pub fn set_username(&mut self, username: String) {
+        self.username = username;
+    }
+
     fn content(&self, width: u16) -> Vec<u8> {
         let active_tab = format!(" {} ", self.shortname)
             .bold()
@@ -131,7 +135,7 @@ impl StatusBar {
                     expires: Instant::now() + NOTIFICATION_DURATION,
                 });
             }
-            Err(_) => {},
+            Err(_) => {}
         }
 
         let content = self.content(width);

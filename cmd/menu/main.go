@@ -5,23 +5,26 @@
 package main
 
 import (
-	"database/sql"
+	_ "embed"
 	"log"
-	"os"
 	"strings"
+	"time"
+	_ "unsafe"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	zone "github.com/lrstanley/bubblezone"
-	_ "github.com/tursodatabase/libsql-client-go/libsql"
 
 	"github.com/terminal-games/terminal-games/cmd/menu/tabs"
 	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 	"github.com/terminal-games/terminal-games/pkg/bubblewrap"
 	_ "github.com/terminal-games/terminal-games/pkg/net/http"
 )
+
+//go:embed "terminal-games.json"
+var terminalGamesManifestJSON []byte
 
 const (
 	maxWidth          = 120
@@ -34,6 +37,9 @@ type model struct {
 	w           int
 	h           int
 	zone        *zone.Manager
+	started     bool
+	localeReady bool
+	showLoading bool
 	tabs        tabs.Model
 	localizer   localizer
 	contentArea lipgloss.Style
@@ -49,6 +55,8 @@ type helpKeyMap interface {
 	ShortHelp() []key.Binding
 	FullHelp() [][]key.Binding
 }
+
+type startupLoadingDelayElapsedMsg struct{}
 
 type helpBindings struct {
 	short []key.Binding
@@ -128,11 +136,6 @@ func main() {
 
 	zoneManager := zone.New()
 
-	db, err := sql.Open("libsql", os.Getenv("TURSO_URL"))
-	if err != nil {
-		os.Exit(1)
-	}
-
 	menuModel := &model{
 		zone:        zoneManager,
 		localizer:   newLocalizer(),
@@ -141,8 +144,8 @@ func main() {
 		titleStyle:  lipgloss.NewStyle().Bold(true),
 		keys:        newKeyMap(newLocalizer()),
 		help:        help.New(),
-		games:       newGamesModel(zoneManager, db),
-		profile:     newProfileModel(zoneManager, db),
+		games:       newGamesModel(zoneManager),
+		profile:     newProfileModel(zoneManager),
 	}
 	menuModel.applyMenuLocalization()
 
@@ -154,7 +157,12 @@ func main() {
 }
 
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(m.tabs.Init(), m.games.Init(), m.profile.Init())
+	return tea.Batch(
+		m.tabs.Init(),
+		m.games.Init(),
+		m.profile.Init(),
+		startupLoadingDelayCmd(),
+	)
 }
 
 func (m *model) setActiveTab(index int) tea.Cmd {
@@ -215,6 +223,9 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if m.localizer.SetPreferred(msg.preferred) {
 			m.applyMenuLocalization()
 		}
+		m.localeReady = true
+	case startupLoadingDelayElapsedMsg:
+		m.showLoading = true
 	}
 
 	var cmd tea.Cmd
@@ -228,10 +239,21 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	m.tabs, cmd = m.tabs.Update(message)
 	cmds = append(cmds, cmd)
 
+	if !m.started && m.startupReady() {
+		m.started = true
+	}
+
 	return m, tea.Batch(cmds...)
 }
 
 func (m *model) View() string {
+	if !m.started {
+		if !m.showLoading {
+			return ""
+		}
+		return m.renderLoadingView()
+	}
+
 	if m.games.carousel.Modal {
 		item := m.games.selectedItem()
 		return m.zone.Scan(m.games.carousel.ViewModal(item.Name, m.w, m.h))
@@ -337,6 +359,30 @@ func (m *model) View() string {
 
 	fullView := lipgloss.JoinVertical(lipgloss.Left, centeredTabsView, styledContent, helpView)
 	return m.zone.Scan(lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Top, fullView))
+}
+
+func (m model) startupReady() bool {
+	if !m.games.loaded || !m.profile.loaded {
+		return false
+	}
+	if m.profile.loadErr != nil {
+		return true
+	}
+	return m.localeReady
+}
+
+func (m model) renderLoadingView() string {
+	loading := m.localizer.Text(textProfileLoading)
+	if m.w <= 0 || m.h <= 0 {
+		return loading
+	}
+	return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Center, loading)
+}
+
+func startupLoadingDelayCmd() tea.Cmd {
+	return tea.Tick(200*time.Millisecond, func(time.Time) tea.Msg {
+		return startupLoadingDelayElapsedMsg{}
+	})
 }
 
 func (m *model) applyMenuLocalization() {

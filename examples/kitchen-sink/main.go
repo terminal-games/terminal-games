@@ -70,12 +70,18 @@ var isHoveringAudio = &atomic.Bool{}
 //go:embed "Mesmerizing Galaxy Loop.ogg"
 var songEmbed []byte
 
+//go:embed "terminal-games.json"
+var terminalGamesManifestJSON []byte
+
 var (
 	songResource audio.Resource
 	song         *audio.Instance
 )
 
 func init() {
+	if len(terminalGamesManifestJSON) == 0 {
+		panic("missing terminal-games.json")
+	}
 	var err error
 	songResource, err = audio.NewResourceFromOGGVorbis(songEmbed)
 	if err != nil {

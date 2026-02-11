@@ -2,7 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{io, net::SocketAddr, pin::Pin, task::Poll, time::{Duration, Instant}};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    task::Poll,
+    time::{Duration, Instant},
+};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -342,9 +348,7 @@ impl AsyncWrite for Conn {
                 let _ = self.sleep.as_mut().poll(cx);
                 Poll::Pending
             }
-            Ok(n) => {
-                Poll::Ready(Ok(n))
-            }
+            Ok(n) => Poll::Ready(Ok(n)),
             Err(e) => Poll::Ready(Err(e)),
         }
     }
@@ -365,7 +369,10 @@ impl AsyncRead for Conn {
     ) -> Poll<io::Result<()>> {
         if let Some(deadline) = self.read_deadline {
             if Instant::now() > deadline {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, "deadline exceeded")));
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "deadline exceeded",
+                )));
             }
         }
 
@@ -380,9 +387,16 @@ impl AsyncRead for Conn {
 
         if result < 0 {
             let err = match result {
-                CONN_ERR_INVALID_CONN_ID => io::Error::new(io::ErrorKind::InvalidInput, "invalid connection ID"),
-                CONN_ERR_CONNECTION_ERROR => io::Error::new(io::ErrorKind::ConnectionReset, "connection closed or error"),
-                _ => io::Error::new(io::ErrorKind::Other, format!("conn_read failed with error code: {}", result)),
+                CONN_ERR_INVALID_CONN_ID => {
+                    io::Error::new(io::ErrorKind::InvalidInput, "invalid connection ID")
+                }
+                CONN_ERR_CONNECTION_ERROR => {
+                    io::Error::new(io::ErrorKind::ConnectionReset, "connection closed or error")
+                }
+                _ => io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("conn_read failed with error code: {}", result),
+                ),
             };
             return Poll::Ready(Err(err));
         }

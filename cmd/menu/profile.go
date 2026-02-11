@@ -5,9 +5,7 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -247,11 +245,9 @@ type profileSavedMsg struct{ err error }
 type replayDeletedMsg struct{ err error }
 
 type profileModel struct {
-	db     *sql.DB
 	zone   *zone.Manager
 	keys   profileKeyMap
 	styles profileStyles
-	userID string
 	tr     localizer
 
 	loaded  bool
@@ -300,13 +296,11 @@ func newProfileKeyMapWithLocalizer(localizer localizer) profileKeyMap {
 	}
 }
 
-func newProfileModel(zoneManager *zone.Manager, db *sql.DB) profileModel {
+func newProfileModel(zoneManager *zone.Manager) profileModel {
 	return profileModel{
-		db:     db,
 		zone:   zoneManager,
 		keys:   newProfileKeyMapWithLocalizer(newLocalizer()),
 		styles: defaultProfileStyles(),
-		userID: os.Getenv("USER_ID"),
 		tr:     newLocalizer(),
 		editor: inlineEditor{placeholder: newLocalizer().Text(textProfileNameHint), maxLen: 32},
 	}
@@ -323,27 +317,15 @@ func (m profileModel) Init() tea.Cmd   { return m.fetchProfileData() }
 
 func (m profileModel) fetchProfileData() tea.Cmd {
 	return func() tea.Msg {
-		if m.userID == "" || m.db == nil {
-			return profileDataMsg{err: fmt.Errorf("not signed in")}
-		}
 		var d profileDataMsg
-		if err := m.db.QueryRow("SELECT username, locale FROM users WHERE id = ?", m.userID).Scan(&d.username, &d.locale); err != nil {
+		var err error
+		d.username, d.locale, err = menuFetchProfile()
+		if err != nil {
 			return profileDataMsg{err: err}
 		}
-		rows, err := m.db.Query(
-			"SELECT r.created_at, r.asciinema_url, COALESCE(gl.title, g.shortname) FROM replays r LEFT JOIN games g ON r.game_id = g.id LEFT JOIN game_localizations gl ON gl.game_id = g.id AND gl.locale = ? WHERE r.user_id = ? ORDER BY r.created_at DESC",
-			m.tr.tag.String(),
-			m.userID,
-		)
+		d.replays, err = menuFetchReplays(m.tr.tag.String())
 		if err != nil {
-			return d
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var r replay
-			if rows.Scan(&r.createdAt, &r.asciinemaURL, &r.gameTitle) == nil {
-				d.replays = append(d.replays, r)
-			}
+			return profileDataMsg{username: d.username, locale: d.locale, err: err}
 		}
 		return d
 	}
@@ -351,7 +333,8 @@ func (m profileModel) fetchProfileData() tea.Cmd {
 
 func (m profileModel) saveUsername(username string) tea.Cmd {
 	return func() tea.Msg {
-		_, err := m.db.Exec("UPDATE users SET username = ? WHERE id = ?", username, m.userID)
+		locale := buildAcceptLanguage(m.languages)
+		err := menuSaveProfile(username, locale)
 		return profileSavedMsg{err: err}
 	}
 }
@@ -359,14 +342,14 @@ func (m profileModel) saveUsername(username string) tea.Cmd {
 func (m profileModel) saveLanguages() tea.Cmd {
 	locale := buildAcceptLanguage(m.languages)
 	return func() tea.Msg {
-		_, err := m.db.Exec("UPDATE users SET locale = ? WHERE id = ?", locale, m.userID)
+		err := menuSaveProfile(m.username, locale)
 		return profileSavedMsg{err: err}
 	}
 }
 
 func (m profileModel) deleteReplay(createdAt int64) tea.Cmd {
 	return func() tea.Msg {
-		_, err := m.db.Exec("DELETE FROM replays WHERE user_id = ? AND created_at = ?", m.userID, createdAt)
+		err := menuDeleteReplay(createdAt)
 		return replayDeletedMsg{err: err}
 	}
 }
@@ -793,9 +776,6 @@ func cursor(selected bool) string {
 }
 
 func (m profileModel) renderProfileTab(width, height int) string {
-	if m.userID == "" {
-		return m.styles.Label.Render(m.tr.Text(textProfileNotSignedIn))
-	}
 	if !m.loaded {
 		return m.styles.Label.Render(m.tr.Text(textProfileLoading))
 	}

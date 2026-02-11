@@ -1,0 +1,15 @@
+{
+  "terminal_games_manifest_version": 1,
+  "shortname": "rust-kitchen-sink",
+  "details": {
+    "name": {
+      "en": "Rust Kitchen Sink"
+    },
+    "description": {
+      "en": "Advanced Rust feature suite."
+    },
+    "details": {
+      "en": "The kitchen sink example, but in Rust"
+    }
+  }
+}

@@ -102,8 +102,7 @@ impl Decoder for RawDecoder {
         let values_to_read = frames_to_read * CHANNELS;
         let src_offset = self.position * CHANNELS;
 
-        buffer[..values_to_read]
-            .copy_from_slice(&samples[src_offset..src_offset + values_to_read]);
+        buffer[..values_to_read].copy_from_slice(&samples[src_offset..src_offset + values_to_read]);
         self.position += frames_to_read;
 
         values_to_read

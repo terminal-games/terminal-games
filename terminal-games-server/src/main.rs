@@ -5,90 +5,153 @@
 mod ssh;
 mod web;
 
-use std::sync::Arc;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use wasmparser::{Parser, Payload};
 
 use terminal_games::{
     app::AppServer,
     mesh::{EnvDiscovery, Mesh},
 };
 
-async fn upsert_game(conn: &libsql::Connection, shortname: &str, path: &str) -> Result<u64> {
-    Ok(conn
-        .query(
-            "INSERT INTO games (shortname, path) VALUES (?1, ?2) ON CONFLICT(shortname) DO UPDATE SET path = excluded.path RETURNING id",
-            libsql::params!(shortname, path),
-        )
-        .await?
-        .next()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("failed to upsert game: {shortname}"))?
-        .get::<u64>(0)?)
-}
-
-async fn upsert_game_localization(
+async fn upsert_game(
     conn: &libsql::Connection,
-    game_id: u64,
-    locale: &str,
-    title: &str,
-    description: &str,
-    details: &str,
+    shortname: &str,
+    path: &str,
+    details_json: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO game_localizations (game_id, locale, title, description, details) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(game_id, locale) DO UPDATE SET title = excluded.title, description = excluded.description, details = excluded.details",
-        libsql::params!(game_id, locale, title, description, details),
+        "INSERT INTO games (shortname, path, details) VALUES (?1, ?2, json(?3)) ON CONFLICT(shortname) DO UPDATE SET path = excluded.path, details = excluded.details",
+        libsql::params!(shortname, path, details_json),
     )
     .await?;
     Ok(())
 }
 
-async fn upsert_game_screenshot(
-    conn: &libsql::Connection,
-    game_id: u64,
-    locale: &str,
-    sort_order: i64,
-    image: &str,
-    caption: &str,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO game_screenshot_localizations (game_id, locale, sort_order, image, caption) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(game_id, locale, sort_order) DO UPDATE SET image = excluded.image, caption = excluded.caption",
-        libsql::params!(game_id, locale, sort_order, image, caption),
-    )
-    .await?;
+#[derive(Deserialize)]
+struct TerminalGamesManifest {
+    terminal_games_manifest_version: u32,
+    shortname: String,
+    details: serde_json::Value,
+}
+
+const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_MARKER: &[u8] = br#""terminal_games_manifest_version""#;
+
+fn find_subslice(haystack: &[u8], needle: &[u8], start_at: usize) -> Option<usize> {
+    if needle.is_empty() || start_at >= haystack.len() {
+        return None;
+    }
+    haystack[start_at..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|idx| start_at + idx)
+}
+
+fn extract_manifest_from_blob(bytes: &[u8]) -> Option<TerminalGamesManifest> {
+    let mut marker_search_from = 0usize;
+    while let Some(marker_pos) = find_subslice(bytes, MANIFEST_MARKER, marker_search_from) {
+        marker_search_from = marker_pos + MANIFEST_MARKER.len();
+        let scan_start = marker_pos.saturating_sub(128 * 1024);
+        for start in (scan_start..=marker_pos).rev() {
+            if bytes[start] != b'{' {
+                continue;
+            }
+            let mut stream = serde_json::Deserializer::from_slice(&bytes[start..])
+                .into_iter::<TerminalGamesManifest>();
+            let Some(Ok(manifest)) = stream.next() else {
+                continue;
+            };
+            let consumed = stream.byte_offset();
+            if start + consumed <= marker_pos {
+                continue;
+            };
+            if manifest.terminal_games_manifest_version != MANIFEST_VERSION {
+                continue;
+            }
+            if manifest.shortname.trim().is_empty() {
+                continue;
+            }
+            return Some(manifest);
+        }
+    }
+    None
+}
+
+fn extract_manifest_from_wasm(bytes: &[u8]) -> Result<Option<TerminalGamesManifest>> {
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload? {
+            Payload::CustomSection(section) => {
+                if let Some(manifest) = extract_manifest_from_blob(section.data()) {
+                    return Ok(Some(manifest));
+                }
+            }
+            Payload::DataSection(reader) => {
+                for data in reader {
+                    let data = data?;
+                    if let Some(manifest) = extract_manifest_from_blob(data.data) {
+                        return Ok(Some(manifest));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn collect_wasm_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            collect_wasm_files(&path, out)?;
+            continue;
+        }
+        if file_type.is_file() && path.extension().is_some_and(|ext| ext == "wasm") {
+            out.push(path);
+        }
+    }
     Ok(())
 }
 
-fn pad_ascii_line(text: &str, width: usize) -> String {
-    let mut out = text.chars().take(width).collect::<String>();
-    let len = out.chars().count();
-    if len < width {
-        out.push_str(&" ".repeat(width - len));
-    }
-    out
-}
+async fn sync_games_from_embedded_manifests(conn: &libsql::Connection) -> Result<usize> {
+    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
+    let mut wasm_files = Vec::new();
+    collect_wasm_files(&cwd, &mut wasm_files)?;
+    wasm_files.sort();
 
-fn screenshot_card(title: &str, lines: &[&str]) -> String {
-    const INNER_WIDTH: usize = 78;
-    const INNER_HEIGHT: usize = 22;
-
-    let mut body = Vec::with_capacity(INNER_HEIGHT);
-    body.push(format!("  {}", title));
-    body.push(String::new());
-    for line in lines {
-        body.push(format!("  {}", line));
+    let mut upserted = 0usize;
+    for wasm_path in wasm_files {
+        let bytes = fs::read(&wasm_path)
+            .with_context(|| format!("failed to read {}", wasm_path.display()))?;
+        let Some(manifest) = extract_manifest_from_wasm(&bytes)
+            .with_context(|| format!("failed to parse wasm {}", wasm_path.display()))?
+        else {
+            continue;
+        };
+        let details_json = serde_json::to_string(&manifest.details)
+            .context("failed to serialize manifest details")?;
+        let db_path = wasm_path
+            .strip_prefix(&cwd)
+            .unwrap_or(&wasm_path)
+            .to_string_lossy()
+            .to_string();
+        upsert_game(conn, &manifest.shortname, &db_path, &details_json).await?;
+        upserted += 1;
+        tracing::info!(shortname = %manifest.shortname, path = %db_path, "Upserted game from wasm manifest");
     }
-    while body.len() < INNER_HEIGHT {
-        body.push(String::new());
-    }
-
-    let mut framed = Vec::with_capacity(INNER_HEIGHT + 2);
-    framed.push(format!("+{}+", "-".repeat(INNER_WIDTH)));
-    for line in body.into_iter().take(INNER_HEIGHT) {
-        framed.push(format!("|{}|", pad_ascii_line(&line, INNER_WIDTH)));
-    }
-    framed.push(format!("+{}+", "-".repeat(INNER_WIDTH)));
-    framed.join("\n")
+    Ok(upserted)
 }
 
 #[tokio::main]
@@ -106,6 +169,11 @@ async fn main() -> Result<()> {
         .await
         .unwrap();
 
+    // let db = libsql::Builder::new_local("./terminal-games.db")
+    //     .build()
+    //     .await
+    //     .unwrap();
+
     let conn = db.connect().unwrap();
 
     let tx = conn.transaction().await.unwrap();
@@ -114,222 +182,11 @@ async fn main() -> Result<()> {
         .unwrap();
     tx.commit().await.unwrap();
 
-    let kitchen_sink_game_id = upsert_game(
-        &conn,
-        "kitchen-sink",
-        "examples/kitchen-sink/kitchen-sink.wasm",
-    )
-    .await?;
-    upsert_game_localization(
-        &conn,
-        kitchen_sink_game_id,
-        "en",
-        "Kitchen Sink",
-        "Terminal feature showcase.",
-        "Explore forms, mouse interactions, viewport behavior, and text styling in one place.",
-    )
-    .await?;
-    upsert_game_localization(
-        &conn,
-        kitchen_sink_game_id,
-        "de",
-        "Kuechenbecken",
-        "Terminal-Funktionen im Ueberblick.",
-        "Formulare, Mausinteraktion, Viewports und Textstile in einer Demo.",
-    )
-    .await?;
-    upsert_game_screenshot(
-        &conn,
-        kitchen_sink_game_id,
-        "en",
-        0,
-        &screenshot_card(
-            "Kitchen Sink - Main View",
-            &[
-                "Discover interactive widgets and animated panes.",
-                "Use keyboard or mouse to inspect each component.",
-            ],
-        ),
-        "Main view with interactive component gallery",
-    )
-    .await?;
-    upsert_game_screenshot(
-        &conn,
-        kitchen_sink_game_id,
-        "en",
-        1,
-        &screenshot_card(
-            "Kitchen Sink - Input Playground",
-            &[
-                "Try key bindings, filtering, and layout transitions.",
-                "Designed to exercise common terminal app edge cases.",
-            ],
-        ),
-        "Input playground and layout transitions",
-    )
-    .await?;
-    upsert_game_screenshot(
-        &conn,
-        kitchen_sink_game_id,
-        "de",
-        1,
-        &screenshot_card(
-            "Kitchen Sink - Eingabe-Spielwiese",
-            &[
-                "Probiere Tastenkürzel, Filterung und Layout-Übergänge aus.",
-                "Entwickelt, um gängige Randfälle von Terminal-Apps zu testen.",
-            ],
-        ),
-        "Eingabe-Spielwiese und Layout-Übergänge",
-    )
-    .await?;
-
-    let menu_game_id = upsert_game(&conn, "menu", "cmd/menu/menu.wasm").await?;
-    upsert_game_localization(
-        &conn,
-        menu_game_id,
-        "en",
-        "Menu",
-        "Browse and launch games.",
-        "Includes localization-aware metadata, replay history, and profile preferences.",
-    )
-    .await?;
-    upsert_game_localization(
-        &conn,
-        menu_game_id,
-        "de",
-        "Menü",
-        "Spiele finden und starten.",
-        "Mit lokalisierter Anzeige, Replay-Verlauf und Profileinstellungen.",
-    )
-    .await?;
-    upsert_game_screenshot(
-        &conn,
-        menu_game_id,
-        "en",
-        0,
-        &screenshot_card(
-            "Terminal Games Menu",
-            &[
-                "Switch between games, profile, and about tabs.",
-                "Select a title and press Enter to play instantly.",
-            ],
-        ),
-        "Games tab with localized list and play action",
-    )
-    .await?;
-    upsert_game_screenshot(
-        &conn,
-        menu_game_id,
-        "de",
-        0,
-        &screenshot_card(
-            "Terminal Games Menü",
-            &[
-                "Zwischen Spiele-, Profil- und Info-Tab wechseln.",
-                "Titel wählen und mit Enter sofort starten.",
-            ],
-        ),
-        "Spiele-Tab mit lokalisierter Liste",
-    )
-    .await?;
-
-    let _ = conn
-        .query(
-            "INSERT INTO envs (game_id, name, value) VALUES (?1, ?2, ?3)",
-            libsql::params!(
-                menu_game_id,
-                "TURSO_URL",
-                format!("{}?authToken={}", libsql_url, libsql_auth_token)
-            ),
-        )
-        .await;
-
-    let rust_simple_game_id = upsert_game(
-        &conn,
-        "rust-simple",
-        "target/wasm32-wasip1/release/rust-simple.wasm",
-    )
-    .await?;
-    upsert_game_localization(
-        &conn,
-        rust_simple_game_id,
-        "en",
-        "Rust Simple",
-        "Fast Rust gameplay demo.",
-        "Good for smoke-testing runtime behavior and minimal input/output loops.",
-    )
-    .await?;
-    upsert_game_localization(
-        &conn,
-        rust_simple_game_id,
-        "de",
-        "Rust Einfach",
-        "Schnelle Rust-Spiel Demo.",
-        "Ideal fuer schnelle Laufzeittests mit wenig Komplexitaet.",
-    )
-    .await?;
-    upsert_game_screenshot(
-        &conn,
-        rust_simple_game_id,
-        "en",
-        0,
-        &screenshot_card(
-            "Rust Simple",
-            &[
-                "Fast launch path for quick verification runs.",
-                "Minimal UI designed for tight feedback loops.",
-            ],
-        ),
-        "Minimal Rust game experience",
-    )
-    .await?;
-
-    let rust_kitchen_sink_game_id = upsert_game(
-        &conn,
-        "rust-kitchen-sink",
-        "target/wasm32-wasip1/release/rust-kitchen-sink.wasm",
-    )
-    .await?;
-    upsert_game_localization(
-        &conn,
-        rust_kitchen_sink_game_id,
-        "en",
-        "Rust Kitchen Sink",
-        "Advanced Rust feature suite.",
-        "Use it to validate cross-platform behavior and advanced engine integrations.",
-    )
-    .await?;
-    upsert_game_screenshot(
-        &conn,
-        rust_kitchen_sink_game_id,
-        "en",
-        0,
-        &screenshot_card(
-            "Rust Kitchen Sink - Feature Matrix",
-            &[
-                "Rendering, input, and async behavior in one scenario.",
-                "A practical testbed for complex runtime interactions.",
-            ],
-        ),
-        "Feature matrix overview",
-    )
-    .await?;
-    upsert_game_screenshot(
-        &conn,
-        rust_kitchen_sink_game_id,
-        "en",
-        1,
-        &screenshot_card(
-            "Rust Kitchen Sink - Systems View",
-            &[
-                "Observe app lifecycle and runtime transitions.",
-                "Ideal for diagnosing integration-level regressions.",
-            ],
-        ),
-        "Systems-level runtime view",
-    )
-    .await?;
+    let upserted = sync_games_from_embedded_manifests(&conn).await?;
+    tracing::info!(
+        count = upserted,
+        "Synchronized games from embedded wasm manifests"
+    );
 
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
     mesh.start_discovery().await.unwrap();

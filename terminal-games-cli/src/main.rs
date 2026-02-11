@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::Result;
 use clap::Parser;
-use flate2::{write::DeflateEncoder, Compression};
+use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
 use smallvec::SmallVec;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
         .with_target("terminal_games", args.log_level)
         .with_target("terminal_games_cli", args.log_level)
         .with_default(tracing::Level::WARN);
-    use tracing_subscriber::{layer::SubscriberExt, Layer};
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
             .with_writer(move || LogBuffer(log_buffer_writer.clone()))
@@ -156,11 +156,20 @@ async fn main() -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("app")
         .to_string();
+    let default_details = |shortname: &str| {
+        format!(
+            r#"{{"name":{{"en":"{shortname}"}},"description":{{"en":""}},"details":{{"en":""}},"screenshots":{{}}}}"#
+        )
+    };
 
     let _ = conn
         .execute(
-            "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-            libsql::params!(first_app_shortname.as_str(), args.wasm_file.as_str()),
+            "INSERT INTO games (shortname, path, details) VALUES (?1, ?2, json(?3))",
+            libsql::params!(
+                first_app_shortname.as_str(),
+                args.wasm_file.as_str(),
+                default_details(first_app_shortname.as_str())
+            ),
         )
         .await;
 
@@ -168,8 +177,8 @@ async fn main() -> Result<()> {
         if let Some((shortname, path)) = game.split_once('=') {
             let _ = conn
                 .execute(
-                    "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-                    libsql::params!(shortname, path),
+                    "INSERT INTO games (shortname, path, details) VALUES (?1, ?2, json(?3))",
+                    libsql::params!(shortname, path, default_details(shortname)),
                 )
                 .await;
         }

@@ -53,7 +53,13 @@ struct AsciicastTerm<'a> {
 }
 
 impl ReplayBuffer {
-    pub fn new(cols: u16, rows: u16, shortname: String, app_id: AppId, term_type: Option<String>) -> Self {
+    pub fn new(
+        cols: u16,
+        rows: u16,
+        shortname: String,
+        app_id: AppId,
+        term_type: Option<String>,
+    ) -> Self {
         Self {
             events: VecDeque::with_capacity(1024),
             vt: avt::Vt::new((cols as usize).max(1), (rows as usize).max(1)),
@@ -104,7 +110,8 @@ impl ReplayBuffer {
                     self.vt.feed_str(&String::from_utf8_lossy(&data));
                 }
                 ReplayEvent::Resize { cols, rows } => {
-                    self.vt.resize((cols as usize).max(1), (rows as usize).max(1));
+                    self.vt
+                        .resize((cols as usize).max(1), (rows as usize).max(1));
                 }
                 ReplayEvent::AppSwitch { app_id, shortname } => {
                     self.initial_shortname = shortname;
@@ -141,7 +148,10 @@ impl ReplayBuffer {
             },
             timestamp,
             title: format!("Terminal Games | {}", self.initial_shortname),
-            command: format!("ssh -C terminal-games.fly.dev -t {}", self.initial_shortname),
+            command: format!(
+                "ssh -C terminal-games.fly.dev -t {}",
+                self.initial_shortname
+            ),
             tags: vec!["terminal-games", &self.initial_shortname],
         };
         serde_json::to_writer(&mut output, &header).unwrap();
@@ -169,10 +179,23 @@ impl ReplayBuffer {
                     write_event(&mut output, interval_secs, "o", &text);
                 }
                 ReplayEvent::Resize { cols, rows } => {
-                    write_event(&mut output, interval_secs, "r", &format!("{}x{}", cols, rows));
+                    write_event(
+                        &mut output,
+                        interval_secs,
+                        "r",
+                        &format!("{}x{}", cols, rows),
+                    );
                 }
-                ReplayEvent::AppSwitch { app_id: _, shortname } => {
-                    write_event(&mut output, interval_secs, "m", &format!("app:{}", shortname));
+                ReplayEvent::AppSwitch {
+                    app_id: _,
+                    shortname,
+                } => {
+                    write_event(
+                        &mut output,
+                        interval_secs,
+                        "m",
+                        &format!("app:{}", shortname),
+                    );
                 }
             }
         }

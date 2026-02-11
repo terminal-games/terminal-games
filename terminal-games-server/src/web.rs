@@ -9,19 +9,19 @@ use std::{convert::Infallible, io::Write};
 use axum::extract::connect_info::Connected;
 use axum::extract::{ConnectInfo, Request};
 use axum::{
+    Router,
     body::Body,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{Html, Response},
     routing::get,
-    Router,
 };
 use bytes::Bytes;
-use flate2::write::DeflateEncoder;
 use flate2::Compression;
+use flate2::write::DeflateEncoder;
 use futures::{SinkExt, StreamExt};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};

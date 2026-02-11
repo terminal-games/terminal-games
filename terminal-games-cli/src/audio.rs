@@ -6,7 +6,7 @@ use std::{
     collections::VecDeque,
     ffi::CString,
     ptr,
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
 };
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};

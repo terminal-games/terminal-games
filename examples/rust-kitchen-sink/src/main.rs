@@ -25,6 +25,9 @@ use terminal_games_sdk::{
     terminput,
 };
 
+#[used]
+static TERMINAL_GAMES_MANIFEST: &[u8] = include_bytes!("../terminal-games.json");
+
 const SONG_DATA: &[u8] = include_bytes!("../../kitchen-sink/Mesmerizing Galaxy Loop.ogg");
 
 fn format_time(time: SystemTime) -> String {
@@ -187,7 +190,9 @@ async fn main() -> std::io::Result<()> {
                                     let (mut sender, conn) =
                                         hyper::client::conn::http2::handshake(TokioExecutor, io)
                                             .await
-                                            .map_err(|e| format!("HTTP/2 handshake failed: {}", e))?;
+                                            .map_err(|e| {
+                                                format!("HTTP/2 handshake failed: {}", e)
+                                            })?;
 
                                     tokio::task::spawn(async move {
                                         if let Err(err) = conn.await {
@@ -341,7 +346,12 @@ async fn main() -> std::io::Result<()> {
                 match response.as_ref() {
                     None => "HTTP: Press 'r' to make request".to_string(),
                     Some(Ok((parts, body))) => {
-                        format!("HTTP: {} | Body: {} bytes\n{:#?}", parts.status, body.len(), parts)
+                        format!(
+                            "HTTP: {} | Body: {} bytes\n{:#?}",
+                            parts.status,
+                            body.len(),
+                            parts
+                        )
                     }
                     Some(Err(e)) => format!("HTTP Error: {}", e),
                 }

@@ -5,9 +5,6 @@
 package main
 
 import (
-	"database/sql"
-	"fmt"
-	"os"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -27,28 +24,32 @@ const (
 	playZoneID = "games-play"
 )
 
-type localizedString struct {
-	Default string
-	ByLang  map[string]string
+func resolveLocalized(preferred []language.Tag, localized map[string]string, fallback string) string {
+	if locale := negotiateLocale(preferred, localized); locale != "" {
+		if text, ok := localized[locale]; ok {
+			return text
+		}
+	}
+	if text, ok := localized["en"]; ok {
+		return text
+	}
+	for _, text := range localized {
+		return text
+	}
+	return fallback
 }
 
-func (s localizedString) Resolve(locale string) string {
-	if text, ok := s.ByLang[locale]; ok {
-		return text
-	}
-	if text, ok := s.ByLang["en"]; ok {
-		return text
-	}
-	return s.Default
+type gameDetails struct {
+	Name          map[string]string                `json:"name"`
+	Description   map[string]string                `json:"description"`
+	Details       map[string]string                `json:"details"`
+	ScreenshotsBy map[string][]carousel.Screenshot `json:"screenshots"`
 }
 
 type gameData struct {
-	ID            int64
-	Shortname     string
-	Name          localizedString
-	Description   localizedString
-	Details       localizedString
-	ScreenshotsBy map[string][]carousel.Screenshot
+	ID        int64       `json:"id"`
+	Shortname string      `json:"shortname"`
+	Details   gameDetails `json:"details"`
 }
 
 type gameItem struct {
@@ -67,7 +68,6 @@ type gamesDataMsg struct {
 
 type gamesModel struct {
 	zone      *zone.Manager
-	db        *sql.DB
 	rawGames  []gameData
 	items     []gameItem
 	list      gamelist.Model
@@ -106,10 +106,9 @@ func defaultDetailsStyles() gamesDetailsStyles {
 	}
 }
 
-func newGamesModel(zoneManager *zone.Manager, db *sql.DB) gamesModel {
+func newGamesModel(zoneManager *zone.Manager) gamesModel {
 	m := gamesModel{
 		zone:      zoneManager,
-		db:        db,
 		list:      gamelist.New("", nil, zoneManager, "games-item-"),
 		carousel:  carousel.New(zoneManager),
 		styles:    defaultDetailsStyles(),
@@ -138,70 +137,10 @@ func (m gamesModel) Init() tea.Cmd { return tea.Batch(m.carousel.Init(), m.fetch
 
 func (m gamesModel) fetchGamesData() tea.Cmd {
 	return func() tea.Msg {
-		if m.db == nil {
-			return gamesDataMsg{err: fmt.Errorf("database unavailable")}
-		}
-
-		current := os.Getenv("APP_SHORTNAME")
-		rows, err := m.db.Query("SELECT id, shortname FROM games WHERE (? = '' OR shortname != ?) ORDER BY id", current, current)
+		games, err := menuFetchGames()
 		if err != nil {
 			return gamesDataMsg{err: err}
 		}
-		defer rows.Close()
-
-		gamesByID := map[int64]*gameData{}
-		var games []gameData
-		for rows.Next() {
-			var id int64
-			var shortname string
-			if rows.Scan(&id, &shortname) != nil {
-				continue
-			}
-			game := gameData{
-				ID:            id,
-				Shortname:     shortname,
-				Name:          localizedString{Default: shortname, ByLang: map[string]string{}},
-				Description:   localizedString{ByLang: map[string]string{}},
-				Details:       localizedString{ByLang: map[string]string{}},
-				ScreenshotsBy: map[string][]carousel.Screenshot{},
-			}
-			games = append(games, game)
-			gamesByID[id] = &games[len(games)-1]
-		}
-
-		if locRows, err := m.db.Query("SELECT game_id, locale, title, description, details FROM game_localizations"); err == nil {
-			defer locRows.Close()
-			for locRows.Next() {
-				var gameID int64
-				var locale, title, desc, details string
-				if locRows.Scan(&gameID, &locale, &title, &desc, &details) != nil {
-					continue
-				}
-				if g := gamesByID[gameID]; g != nil {
-					g.Name.ByLang[locale] = title
-					g.Description.ByLang[locale] = desc
-					g.Details.ByLang[locale] = details
-				}
-			}
-		}
-
-		if shotRows, err := m.db.Query("SELECT game_id, locale, image, caption FROM game_screenshot_localizations ORDER BY game_id, locale, sort_order"); err == nil {
-			defer shotRows.Close()
-			for shotRows.Next() {
-				var gameID int64
-				var locale, image, caption string
-				if shotRows.Scan(&gameID, &locale, &image, &caption) != nil {
-					continue
-				}
-				if g := gamesByID[gameID]; g != nil {
-					g.ScreenshotsBy[locale] = append(g.ScreenshotsBy[locale], carousel.Screenshot{
-						Content: image,
-						Caption: caption,
-					})
-				}
-			}
-		}
-
 		return gamesDataMsg{games: games}
 	}
 }
@@ -214,13 +153,12 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		if msg.err == nil {
 			m.rawGames = msg.games
 		}
-		m.applyLocalization(m.localizer, m.preferred)
-		return m, m.carousel.RestartAuto()
+		return m, m.applyLocalization(m.localizer, m.preferred)
 	case localizationChangedMsg:
 		localizerChanged := m.localizer.SetPreferred(msg.preferred)
 		preferredChanged := !sameLanguageTags(m.preferred, msg.preferred)
 		if localizerChanged || preferredChanged {
-			m.applyLocalization(m.localizer, msg.preferred)
+			return m, m.applyLocalization(m.localizer, msg.preferred)
 		}
 		return m, nil
 	case spinner.TickMsg:
@@ -392,7 +330,7 @@ func resolveScreenshots(preferred []language.Tag, byLang map[string][]carousel.S
 	return nil
 }
 
-func (m *gamesModel) applyLocalization(localizer localizer, preferred []language.Tag) {
+func (m *gamesModel) applyLocalization(localizer localizer, preferred []language.Tag) tea.Cmd {
 	m.localizer = localizer
 	m.tag = localizer.tag
 	if len(preferred) == 0 {
@@ -411,14 +349,14 @@ func (m *gamesModel) applyLocalization(localizer localizer, preferred []language
 	m.items = make([]gameItem, len(m.rawGames))
 	listItems := make([]gamelist.Item, len(m.rawGames))
 	for i := range m.rawGames {
-		locale := negotiateLocale(m.preferred, m.rawGames[i].Name.ByLang)
+		d := m.rawGames[i].Details
 		item := gameItem{
 			ID:          m.rawGames[i].ID,
 			Shortname:   m.rawGames[i].Shortname,
-			Name:        m.rawGames[i].Name.Resolve(locale),
-			Description: m.rawGames[i].Description.Resolve(locale),
-			Details:     m.rawGames[i].Details.Resolve(locale),
-			Screenshots: resolveScreenshots(m.preferred, m.rawGames[i].ScreenshotsBy),
+			Name:        resolveLocalized(m.preferred, d.Name, m.rawGames[i].Shortname),
+			Description: resolveLocalized(m.preferred, d.Description, ""),
+			Details:     resolveLocalized(m.preferred, d.Details, ""),
+			Screenshots: resolveScreenshots(m.preferred, d.ScreenshotsBy),
 		}
 		m.items[i] = item
 		listItems[i] = gamelist.Item{Name: item.Name, Description: item.Description, FilterExtra: item.Details}
@@ -431,7 +369,7 @@ func (m *gamesModel) applyLocalization(localizer localizer, preferred []language
 			break
 		}
 	}
-	_ = m.syncCarouselToSelection()
+	return m.syncCarouselToSelection()
 }
 
 func (m *gamesModel) renderGamesTab(width, height int) string {

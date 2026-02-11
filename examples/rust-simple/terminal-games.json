@@ -1,0 +1,26 @@
+{
+  "terminal_games_manifest_version": 1,
+  "shortname": "rust-simple",
+  "details": {
+    "name": {
+      "en": "Rust Simple",
+      "de": "Rust Einfach"
+    },
+    "description": {
+      "en": "Fast Rust gameplay demo.",
+      "de": "Schnelle Rust-Spiel Demo."
+    },
+    "details": {
+      "en": "Good for smoke-testing runtime behavior and minimal input/output loops.",
+      "de": "Ideal fuer schnelle Laufzeittests mit wenig Komplexitaet."
+    },
+    "screenshots": {
+      "en": [
+        {
+          "content": "+------------------------------------------------------------------------------+\n| Rust Simple                                                                  |\n|                                                                              |\n| Fast launch path for quick verification runs.                               |\n| Minimal UI designed for tight feedback loops.                               |\n+------------------------------------------------------------------------------+",
+          "caption": "Minimal Rust game experience"
+        }
+      ]
+    }
+  }
+}
