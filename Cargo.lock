@@ -5371,6 +5371,7 @@ dependencies = [
  "rand_core 0.6.4",
  "russh",
  "serde",
+ "serde_json",
  "smallvec",
  "terminal-games",
  "tokio",
@@ -5378,6 +5379,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "wasmparser 0.243.0",
 ]
 
 [[package]]

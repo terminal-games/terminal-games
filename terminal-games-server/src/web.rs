@@ -173,12 +173,21 @@ async fn websocket_handler(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown")
         .to_string();
+    let locale = headers
+        .get("accept-language")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "en".to_string());
 
     let (first_app_shortname, args) = match query.args.map(|s| s.into_bytes()) {
         Some(args) if !args.is_empty() => {
             if let Some(pos) = args.iter().position(|&b| b.is_ascii_whitespace()) {
                 let shortname = String::from_utf8_lossy(&args[..pos]).into();
-                let rest: Vec<u8> = args[pos..].iter().copied().skip_while(|b| b.is_ascii_whitespace()).collect();
+                let rest: Vec<u8> = args[pos..]
+                    .iter()
+                    .copied()
+                    .skip_while(|b| b.is_ascii_whitespace())
+                    .collect();
                 (shortname, (!rest.is_empty()).then_some(rest))
             } else {
                 (String::from_utf8_lossy(&args).into(), None)
@@ -187,7 +196,17 @@ async fn websocket_handler(
         _ => ("menu".into(), None),
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, server, user_agent, first_app_shortname, args, connect_info))
+    ws.on_upgrade(move |socket| {
+        handle_socket(
+            socket,
+            server,
+            user_agent,
+            first_app_shortname,
+            args,
+            connect_info,
+            locale,
+        )
+    })
 }
 
 async fn handle_socket(
@@ -197,6 +216,7 @@ async fn handle_socket(
     first_app_shortname: String,
     args: Option<Vec<u8>>,
     connect_info: MyConnectInfo,
+    locale: String,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -226,6 +246,8 @@ async fn handle_socket(
         window_size_receiver: resize_rx,
         graceful_shutdown_token: token,
         network_info: connect_info.network_info,
+        user_id: None,
+        locale,
     });
 
     let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel(1);
@@ -304,7 +326,9 @@ async fn recv_initial_resize(
     receiver: &mut futures::stream::SplitStream<WebSocket>,
 ) -> Option<(u16, u16)> {
     let msg = receiver.next().await?.ok()?;
-    let Message::Text(text) = msg else { return None };
+    let Message::Text(text) = msg else {
+        return None;
+    };
     parse_resize(text.strip_prefix("resize:")?)
 }
 

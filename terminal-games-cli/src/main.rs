@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::Result;
 use clap::Parser;
-use flate2::{write::DeflateEncoder, Compression};
+use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
 use smallvec::SmallVec;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -65,6 +65,10 @@ struct Args {
     /// Log verbosity level (off, error, warn, info, debug, trace)
     #[arg(long, default_value = "debug")]
     log_level: tracing::Level,
+
+    /// Username for CLI auth (default: $USER)
+    #[arg(long)]
+    username: Option<String>,
 }
 
 struct LogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -123,7 +127,7 @@ async fn main() -> Result<()> {
         .with_target("terminal_games", args.log_level)
         .with_target("terminal_games_cli", args.log_level)
         .with_default(tracing::Level::WARN);
-    use tracing_subscriber::{layer::SubscriberExt, Layer};
+    use tracing_subscriber::{Layer, layer::SubscriberExt};
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
             .with_writer(move || LogBuffer(log_buffer_writer.clone()))
@@ -137,10 +141,7 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let db_path = data_dir.join("terminal-games.db");
 
-    let db = libsql::Builder::new_local(&db_path)
-        .build()
-        .await
-        .unwrap();
+    let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
 
     let conn = db.connect().unwrap();
 
@@ -155,11 +156,20 @@ async fn main() -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("app")
         .to_string();
+    let default_details = |shortname: &str| {
+        format!(
+            r#"{{"name":{{"en":"{shortname}"}},"description":{{"en":""}},"details":{{"en":""}},"screenshots":{{}}}}"#
+        )
+    };
 
     let _ = conn
         .execute(
-            "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-            libsql::params!(first_app_shortname.as_str(), args.wasm_file.as_str()),
+            "INSERT INTO games (shortname, path, details) VALUES (?1, ?2, json(?3))",
+            libsql::params!(
+                first_app_shortname.as_str(),
+                args.wasm_file.as_str(),
+                default_details(first_app_shortname.as_str())
+            ),
         )
         .await;
 
@@ -167,12 +177,64 @@ async fn main() -> Result<()> {
         if let Some((shortname, path)) = game.split_once('=') {
             let _ = conn
                 .execute(
-                    "INSERT INTO games (shortname, path) VALUES (?1, ?2)",
-                    libsql::params!(shortname, path),
+                    "INSERT INTO games (shortname, path, details) VALUES (?1, ?2, json(?3))",
+                    libsql::params!(shortname, path, default_details(shortname)),
                 )
                 .await;
         }
     }
+
+    let username = args
+        .username
+        .clone()
+        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "cli".to_string()));
+    let user_id = match conn
+        .query(
+            "SELECT id FROM users WHERE username = ?1 AND pubkey_fingerprint IS NULL LIMIT 1",
+            libsql::params!(username.as_str()),
+        )
+        .await
+    {
+        Ok(mut rows) => match rows.next().await {
+            Ok(Some(row)) => row.get::<u64>(0).ok(),
+            _ => None,
+        },
+        Err(_) => None,
+    };
+    let user_id = if user_id.is_none() {
+        match conn
+            .query(
+                "INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (NULL, ?1, 'en') RETURNING id",
+                libsql::params!(username.as_str()),
+            )
+            .await
+        {
+            Ok(mut rows) => match rows.next().await {
+                Ok(Some(row)) => row.get::<u64>(0).ok(),
+                _ => None,
+            },
+            Err(_) => None,
+        }
+    } else {
+        user_id
+    };
+    let locale = if let Some(uid) = user_id {
+        match conn
+            .query(
+                "SELECT locale FROM users WHERE id = ?1 LIMIT 1",
+                libsql::params!(uid),
+            )
+            .await
+        {
+            Ok(mut rows) => match rows.next().await {
+                Ok(Some(row)) => row.get::<String>(0).unwrap_or_else(|_| "en".to_string()),
+                _ => "en".to_string(),
+            },
+            Err(_) => "en".to_string(),
+        }
+    } else {
+        "en".to_string()
+    };
 
     let local_discovery = Arc::new(LocalDiscovery::new());
     let region = local_discovery
@@ -236,11 +298,13 @@ async fn main() -> Result<()> {
         audio_sender: audio_player.as_ref().map(|_| audio_tx),
         remote_sshid: "cli".to_string(),
         term: Some(std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string())),
-        username: std::env::var("USER").unwrap_or_else(|_| "cli".to_string()),
+        username: username.clone(),
         window_size_receiver: resize_rx,
         graceful_shutdown_token: graceful_shutdown_token.clone(),
         network_info: network_info.clone(),
         first_app_shortname,
+        user_id,
+        locale,
     });
 
     thread::spawn(move || {
@@ -266,10 +330,15 @@ async fn main() -> Result<()> {
         Audio(Vec<u8>),
     }
 
-    let (delayed_tx, mut delayed_rx) = tokio::sync::mpsc::channel(1);
+    let (delayed_tx, mut delayed_rx) = tokio::sync::mpsc::channel(100);
 
     tokio::spawn(async move {
-        let mut rate_limited = RateLimitedStream::with_rate(NullSink, network_info.clone(), bandwidth, bandwidth_capacity);
+        let mut rate_limited = RateLimitedStream::with_rate(
+            NullSink,
+            network_info.clone(),
+            bandwidth,
+            bandwidth_capacity,
+        );
         let mut stdout = std::io::stdout();
 
         while let Some((data, deliver_at, delay_ms)) = delayed_rx.recv().await {

@@ -238,7 +238,9 @@ impl LocalDiscovery {
                 return Ok(region);
             }
         }
-        Err(anyhow::anyhow!("No available region slots (loc0-loc9 all in use)"))
+        Err(anyhow::anyhow!(
+            "No available region slots (loc0-loc9 all in use)"
+        ))
     }
 
     pub async fn register(&self, region: RegionId, port: u16) -> anyhow::Result<()> {

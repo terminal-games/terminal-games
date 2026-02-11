@@ -6,7 +6,7 @@ use std::{
     collections::VecDeque,
     ffi::CString,
     ptr,
-    sync::{mpsc, Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
 };
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -99,7 +99,10 @@ fn decode_ogg_opus(
     samples: Arc<Mutex<VecDeque<f32>>>,
     stream: cpal::Stream,
 ) -> anyhow::Result<()> {
-    let reader = Box::new(OggReader { receiver, buffer: Vec::new() });
+    let reader = Box::new(OggReader {
+        receiver,
+        buffer: Vec::new(),
+    });
     let reader_ptr = Box::into_raw(reader);
 
     let buffer_size = 4096;
@@ -125,11 +128,15 @@ fn decode_ogg_opus(
 
     let ogg = CString::new("ogg")?;
     let input_fmt = unsafe { ffmpeg::ffi::av_find_input_format(ogg.as_ptr()) };
-    if unsafe { ffmpeg::ffi::avformat_open_input(&mut fmt_ctx, ptr::null(), input_fmt, ptr::null_mut()) } < 0 {
+    if unsafe {
+        ffmpeg::ffi::avformat_open_input(&mut fmt_ctx, ptr::null(), input_fmt, ptr::null_mut())
+    } < 0
+    {
         anyhow::bail!("Failed to open OGG input");
     }
 
-    let decoder = unsafe { ffmpeg::ffi::avcodec_find_decoder(ffmpeg::ffi::AVCodecID::AV_CODEC_ID_OPUS) };
+    let decoder =
+        unsafe { ffmpeg::ffi::avcodec_find_decoder(ffmpeg::ffi::AVCodecID::AV_CODEC_ID_OPUS) };
     if decoder.is_null() {
         anyhow::bail!("Opus decoder not found");
     }

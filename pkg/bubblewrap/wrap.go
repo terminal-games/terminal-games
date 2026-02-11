@@ -70,7 +70,9 @@ func init() {
 				fromHost.Write(buffer[:n])
 			}
 
-			time.Sleep(1 * time.Millisecond)
+			if n == 0 {
+				time.Sleep(1 * time.Millisecond)
+			}
 		}
 	}()
 }

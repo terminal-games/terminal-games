@@ -93,7 +93,9 @@ impl SimulatedLatencyProvider {
 
 impl LatencyProvider for SimulatedLatencyProvider {
     fn latency(&self) -> std::io::Result<Duration> {
-        Ok(Duration::from_millis(self.latency_ms.load(Ordering::Relaxed)))
+        Ok(Duration::from_millis(
+            self.latency_ms.load(Ordering::Relaxed),
+        ))
     }
 }
 
@@ -155,14 +157,13 @@ impl<L: LatencyProvider> NetworkInformation<L> {
     }
 
     pub fn record_throttled(&self) {
-        self.last_throttled
-            .store(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
-                Ordering::Release,
-            );
+        self.last_throttled.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            Ordering::Release,
+        );
     }
 
     fn send(&self, bytes: usize) {
