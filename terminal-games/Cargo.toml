@@ -8,13 +8,15 @@ anyhow = "1"
 avt = "0.17"
 async-trait = "0.1"
 bytes = "1"
-ffmpeg-next = { version = "8", default-features = false, features = ["codec", "device"] }
 futures = "0.3"
 headless-terminal = { path = "../headless-terminal" }
 hex = "0.4"
 ipnet = "2"
 libc = "0.2"
 libsql = "0.9"
+ogg = "0.9"
+opus = "0.3"
+audiopus_sys = { version = "0.2", features = ["static"] }
 postcard = { version = "1", default-features = false }
 rand_core = "0.6"
 reqwest = { version = "0.13", features = ["multipart", "json"] }

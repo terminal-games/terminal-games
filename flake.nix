@@ -20,6 +20,9 @@
           inherit system;
           overlays = [(import rust-overlay)];
         };
+        muslCc = pkgs.pkgsStatic.stdenv.cc;
+        muslBin = "${muslCc}/bin";
+        muslPrefix = muslCc.targetPrefix;
 
         rust-toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
       in rec {
@@ -34,16 +37,22 @@
             wasm-tools
             go-task
             flyctl
+            muslCc
           ];
           nativeBuildInputs = with pkgs; [
+            cmake
             pkg-config
           ];
           buildInputs = with pkgs; [
-            ffmpeg
             clang
-            alsa-lib
           ];
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+          CMAKE_POLICY_VERSION_MINIMUM = "3.5";
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${muslBin}/${muslPrefix}cc";
+          CC_x86_64_unknown_linux_musl = "${muslBin}/${muslPrefix}cc";
+          CXX_x86_64_unknown_linux_musl = "${muslBin}/${muslPrefix}c++";
+          AR_x86_64_unknown_linux_musl = "${muslBin}/${muslPrefix}ar";
+          PKG_CONFIG_ALLOW_CROSS = "1";
           GOOS = "wasip1";
           GOARCH = "wasm";
         };

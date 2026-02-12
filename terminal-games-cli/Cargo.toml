@@ -11,13 +11,14 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 cpal = "0.17"
 crossterm = { version = "0.29", features = ["event-stream"] }
-ffmpeg-next = { version = "8", default-features = false, features = ["codec", "format"] }
 flate2 = "1"
-libc = "0.2"
 futures = "0.3"
 hyper = "1"
 hyper-util = "0.1"
 libsql = "0.9"
+ogg = "0.9"
+opus = "0.3"
+audiopus_sys = { version = "0.2", features = ["static"] }
 rand = "0.9"
 rand_core = "0.6"
 russh = "0.57"
