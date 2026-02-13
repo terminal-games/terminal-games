@@ -20,12 +20,6 @@
           "content": "+------------------------------------------------------------------------------+\n| Terminal Games Menu                                                         |\n|                                                                              |\n| Switch between games, profile, and about tabs.                              |\n| Select a title and press Enter to play instantly.                           |\n+------------------------------------------------------------------------------+",
           "caption": "Games tab with localized list and play action"
         }
-      ],
-      "de": [
-        {
-          "content": "+------------------------------------------------------------------------------+\n| Terminal Games Menue                                                        |\n|                                                                              |\n| Zwischen Spiele-, Profil- und Info-Tab wechseln.                            |\n| Titel waehlen und mit Enter sofort starten.                                 |\n+------------------------------------------------------------------------------+",
-          "caption": "Spiele-Tab mit lokalisierter Liste"
-        }
       ]
     }
   }

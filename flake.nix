@@ -25,7 +25,55 @@
         muslPrefix = muslCc.targetPrefix;
 
         rust-toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rust-toolchain;
+          rustc = rust-toolchain;
+        };
       in rec {
+        packages.terminal-games-server = pkgs.rustPlatform.buildRustPackage {
+          pname = "terminal-games-server";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
+          nativeBuildInputs = with pkgs; [
+            cmake
+            pkg-config
+          ];
+          buildInputs = with pkgs; [
+            libopus
+          ];
+          buildAndTestSubdir = "terminal-games-server";
+        };
+
+        apps.terminal-games-server = {
+          type = "app";
+          program = "${packages.terminal-games-server}/bin/terminal-games-server";
+        };
+
+        packages.terminal-games-cli = pkgs.rustPlatform.buildRustPackage {
+          pname = "terminal-games-cli";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
+          nativeBuildInputs = with pkgs; [
+            cmake
+            pkg-config
+          ];
+          buildInputs = with pkgs; [
+            libopus
+          ];
+          buildAndTestSubdir = "terminal-games-cli";
+        };
+
+        apps.terminal-games-cli = {
+          type = "app";
+          program = "${packages.terminal-games-cli}/bin/terminal-games-cli";
+        };
+
         devShells.default = pkgs.mkShell {
           name = "terminal-games";
           packages = with pkgs; [

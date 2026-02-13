@@ -16,6 +16,7 @@ use std::{
 
 use hex::ToHex;
 use ipnet::{Ipv4Net, Ipv6Net};
+use rustls_platform_verifier::BuilderVerifierExt;
 use smallvec::SmallVec;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -742,15 +743,19 @@ impl AppServer {
         let stream = if mode == 1 {
             let hostname: String = address.split(':').next().unwrap_or(&address).to_string();
 
-            let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
-            root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            let mut config = tokio_rustls::rustls::ClientConfig::builder()
-                .with_root_certificates(root_cert_store)
-                .with_no_client_auth();
+            let mut config = match tokio_rustls::rustls::ClientConfig::builder()
+                .with_platform_verifier()
+            {
+                Ok(builder) => builder.with_no_client_auth(),
+                Err(e) => {
+                    tracing::error!("do_connect: failed to initialize TLS verifier: {:?}", e);
+                    return Err(POLL_DIAL_ERR_TLS_HANDSHAKE);
+                }
+            };
             config.alpn_protocols.push(b"h2".to_vec());
             let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
 
-            let dnsname = match rustls_pki_types::ServerName::try_from(hostname) {
+            let dnsname = match tokio_rustls::rustls::pki_types::ServerName::try_from(hostname) {
                 Ok(name) => name,
                 Err(_) => {
                     tracing::error!("do_connect: invalid DNS name");

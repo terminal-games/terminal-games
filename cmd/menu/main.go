@@ -26,6 +26,12 @@ import (
 //go:embed "terminal-games.json"
 var terminalGamesManifestJSON []byte
 
+func init() {
+	if len(terminalGamesManifestJSON) == 0 {
+		panic("missing terminal-games.json")
+	}
+}
+
 const (
 	maxWidth          = 120
 	minContentHeight  = 5
