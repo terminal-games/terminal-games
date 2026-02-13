@@ -45,6 +45,7 @@
           ];
           buildInputs = with pkgs; [
             clang
+            pkgsStatic.libopus
           ];
           LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
           CMAKE_POLICY_VERSION_MINIMUM = "3.5";
