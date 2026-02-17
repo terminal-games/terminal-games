@@ -39,7 +39,10 @@ pub fn spawn_audio_player() -> anyhow::Result<AudioPlayerHandle> {
 fn run_audio_player(receiver: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
     use std::{ffi::CString, io::BufReader, os::unix::net::UnixStream};
 
-    use pulseaudio::protocol::{self, stream::{BufferAttr, StreamFlags}};
+    use pulseaudio::protocol::{
+        self,
+        stream::{BufferAttr, StreamFlags},
+    };
 
     const BYTES_PER_MS: u32 = SAMPLE_RATE * CHANNELS as u32 * 4 / 1000;
 
@@ -109,9 +112,8 @@ fn run_audio_player(receiver: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
         proto_ver,
     )?;
 
-    let (_, stream_info) = protocol::read_reply_message::<protocol::CreatePlaybackStreamReply>(
-        &mut sock, proto_ver,
-    )?;
+    let (_, stream_info) =
+        protocol::read_reply_message::<protocol::CreatePlaybackStreamReply>(&mut sock, proto_ver)?;
     let channel = stream_info.channel;
     tracing::debug!(channel, "PulseAudio playback stream created");
 
@@ -161,7 +163,10 @@ fn run_audio_player(receiver: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn run_audio_player(receiver: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
-    use std::{collections::VecDeque, sync::{Arc, Mutex}};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -267,7 +272,10 @@ impl Seek for OggReader {
         let target = target as usize;
         self.fill_until(target);
         if target > self.buffer.len() {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "seek past end"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "seek past end",
+            ));
         }
 
         self.position = target;
@@ -338,8 +346,7 @@ impl OggOpusDecoder {
                 if packet.data[9] != CHANNELS as u8 {
                     anyhow::bail!("unsupported channel count: {}", packet.data[9]);
                 }
-                self.pre_skip =
-                    u16::from_le_bytes([packet.data[10], packet.data[11]]) as usize;
+                self.pre_skip = u16::from_le_bytes([packet.data[10], packet.data[11]]) as usize;
                 self.decoder = Some(Decoder::new(SAMPLE_RATE, Channels::Stereo)?);
                 continue;
             }

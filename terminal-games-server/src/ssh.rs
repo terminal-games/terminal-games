@@ -11,7 +11,7 @@ use russh::server::*;
 use russh::{Channel, ChannelId, Pty};
 use tokio_util::sync::CancellationToken;
 
-use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::app::{AppCapacityError, AppInstantiationParams, AppServer};
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 
 pub struct SshSession {
@@ -31,6 +31,8 @@ pub(crate) struct SshServer {
 }
 
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
+const OVERLOAD_MESSAGE: &str =
+    "Server is temporarily overloaded. Please try again in a moment.\r\n";
 
 impl SshServer {
     pub async fn new(app_server: Arc<AppServer>) -> anyhow::Result<Self> {
@@ -112,10 +114,10 @@ impl SshServer {
         let cancellation_token = CancellationToken::new();
         let token = cancellation_token.clone();
         let app_server = self.app_server.clone();
-
         tokio::task::spawn(async move {
             let (session_handle, channel_id, remote_sshid) = ssh_session_receiver.await.unwrap();
             let (username, user_id) = auth_receiver.await.unwrap();
+
             let locale = if let Some(uid) = user_id {
                 match app_server
                     .db
@@ -194,7 +196,7 @@ impl SshServer {
 
             let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
             let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
-            let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
+            let mut exit_rx = match app_server.instantiate_app(AppInstantiationParams {
                 first_app_shortname,
                 args,
                 input_receiver: input_rx,
@@ -208,7 +210,27 @@ impl SshServer {
                 network_info,
                 user_id,
                 locale,
-            });
+            }) {
+                Ok(exit_rx) => exit_rx,
+                Err(AppCapacityError { active, max }) => {
+                    tracing::warn!(
+                        active,
+                        max,
+                        "Rejecting new SSH session due to max active app limit"
+                    );
+                    let _ = session_handle
+                        .data(channel_id, OVERLOAD_MESSAGE.as_bytes().to_vec().into())
+                        .await;
+                    let _ = session_handle
+                        .disconnect(
+                            russh::Disconnect::ByApplication,
+                            "Server overloaded".to_string(),
+                            "en-US".to_string(),
+                        )
+                        .await;
+                    return;
+                }
+            };
             loop {
                 tokio::select! {
                     biased;

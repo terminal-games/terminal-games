@@ -29,8 +29,10 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
-use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::app::{AppCapacityError, AppInstantiationParams, AppServer};
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
+
+const OVERLOAD_MESSAGE: &str = "Server is temporarily overloaded. Please try again in a moment.";
 
 #[derive(Clone)]
 struct MyConnectInfo {
@@ -234,7 +236,7 @@ async fn handle_socket(
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(20);
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
-    let exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
+    let exit_rx = match server.app_server.instantiate_app(AppInstantiationParams {
         first_app_shortname,
         args,
         input_receiver: input_rx,
@@ -248,7 +250,19 @@ async fn handle_socket(
         network_info: connect_info.network_info,
         user_id: None,
         locale,
-    });
+    }) {
+        Ok(exit_rx) => exit_rx,
+        Err(AppCapacityError { active, max }) => {
+            tracing::warn!(
+                active,
+                max,
+                "Rejecting new web session due to max active app limit"
+            );
+            let _ = sender.send(Message::Text(OVERLOAD_MESSAGE.into())).await;
+            let _ = sender.send(Message::Close(None)).await;
+            return;
+        }
+    };
 
     let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel(1);
 

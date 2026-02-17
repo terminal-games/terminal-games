@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use unicode_width::UnicodeWidthStr;
 use yansi::Paint;
 
@@ -24,7 +24,7 @@ struct Notification {
 
 pub struct StatusBar {
     pub shortname: String,
-    username: String,
+    username_rx: watch::Receiver<String>,
     tickers: Vec<String>,
     session_start_time: std::time::Instant,
     prev_size: (u16, u16),
@@ -37,13 +37,13 @@ pub struct StatusBar {
 impl StatusBar {
     pub fn new(
         shortname: String,
-        username: String,
+        username_rx: watch::Receiver<String>,
         network_info: Arc<dyn NetworkInfo>,
         notification_rx: mpsc::Receiver<String>,
     ) -> Self {
         Self {
             shortname,
-            username,
+            username_rx,
             tickers: vec!["A".to_string(), "B".to_string(), "C".to_string()],
             session_start_time: std::time::Instant::now(),
             prev_size: (0, 0),
@@ -54,17 +54,13 @@ impl StatusBar {
         }
     }
 
-    pub fn set_username(&mut self, username: String) {
-        self.username = username;
-    }
-
     fn content(&self, width: u16) -> Vec<u8> {
         let active_tab = format!(" {} ", self.shortname)
             .bold()
             .black()
             .on_green()
             .to_string();
-        let username = format!(" {} ", self.username)
+        let username = format!(" {} ", self.username_rx.borrow().as_str())
             .white()
             .on_fixed(237)
             .to_string();

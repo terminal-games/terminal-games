@@ -3,11 +3,11 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
+    io::{self, Write},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    io::{self, Write},
     time::{Duration, Instant},
 };
 

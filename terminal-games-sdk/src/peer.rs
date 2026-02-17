@@ -269,11 +269,17 @@ pub fn send(data: &[u8], peer_ids: &[PeerId]) -> Result<(), PeerError> {
 
 /// A synchronous iterator over peer messages. The caller is responsible for
 /// managing polling frequency (e.g., with sleep)
-pub struct MessageReader;
+pub struct MessageReader {
+    from_peer_buf: [u8; 16],
+    data_buf: Vec<u8>,
+}
 
 impl MessageReader {
     pub fn new() -> Self {
-        MessageReader
+        MessageReader {
+            from_peer_buf: [0u8; 16],
+            data_buf: vec![0u8; 64 * 1024],
+        }
     }
 }
 
@@ -287,23 +293,20 @@ impl Iterator for MessageReader {
     type Item = Message;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut from_peer_buf = [0u8; 16];
-        let mut data_buf = vec![0u8; 64 * 1024];
-
         let ret = unsafe {
             crate::internal::peer_recv(
-                from_peer_buf.as_mut_ptr(),
-                data_buf.as_mut_ptr(),
-                data_buf.len() as u32,
+                self.from_peer_buf.as_mut_ptr(),
+                self.data_buf.as_mut_ptr(),
+                self.data_buf.len() as u32,
             )
         };
 
         if ret > 0 {
-            let from_peer = PeerId(from_peer_buf);
-            data_buf.truncate(ret as usize);
+            let from_peer = PeerId(self.from_peer_buf);
+            let data = self.data_buf[..ret as usize].to_vec();
             Some(Message {
                 from: from_peer,
-                data: data_buf,
+                data,
             })
         } else {
             // ret == 0: no data available immediately

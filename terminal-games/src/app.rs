@@ -3,12 +3,12 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
@@ -18,7 +18,7 @@ use hex::ToHex;
 use ipnet::{Ipv4Net, Ipv6Net};
 use rustls_platform_verifier::BuilderVerifierExt;
 use smallvec::SmallVec;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 use wasmtime_wasi::I32Exit;
 
@@ -70,7 +70,7 @@ const MENU_REQ_ERR_NOT_MENU_APP: i32 = -1;
 const MENU_REQ_ERR_INVALID_INPUT: i32 = -2;
 const MENU_REQ_ERR_TOO_MANY_REQUESTS: i32 = -3;
 
-const MAX_MENU_REQUESTS: usize = 128;
+const MAX_MENU_REQUESTS: usize = 4;
 
 const MENU_POLL_PENDING: i32 = -1;
 const MENU_POLL_ERR_INVALID_REQUEST_ID: i32 = -2;
@@ -83,6 +83,8 @@ pub struct AppServer {
     engine: wasmtime::Engine,
     pub db: libsql::Connection,
     mesh: Mesh,
+    active_apps: Arc<AtomicUsize>,
+    module_cache: Arc<tokio::sync::RwLock<HashMap<u64, Arc<wasmtime::Module>>>>,
 }
 
 pub struct AppInstantiationParams {
@@ -101,86 +103,87 @@ pub struct AppInstantiationParams {
     pub locale: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AppCapacityError {
+    pub active: usize,
+    pub max: usize,
+}
+
+impl std::fmt::Display for AppCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "too many active apps ({} >= {})", self.active, self.max)
+    }
+}
+
+impl std::error::Error for AppCapacityError {}
+
 impl AppServer {
     pub fn new(mesh: Mesh, db: libsql::Connection) -> anyhow::Result<Self> {
         let mut config = wasmtime::Config::new();
-        config.async_support(true);
-        config.epoch_interruption(true);
         let cache_config = wasmtime::CacheConfig::new();
         config.cache(Some(wasmtime::Cache::new(cache_config).unwrap()));
+        let active_apps = Arc::new(AtomicUsize::new(0));
         let engine = wasmtime::Engine::new(&config)?;
-        tokio::task::spawn({
-            let engine = engine.clone();
-            let mut epoch_interval = tokio::time::interval(Duration::from_millis(20));
-
-            async move {
-                loop {
-                    tokio::select! {
-                        _ = epoch_interval.tick() => {
-                           engine.increment_epoch();
-                        }
-                    }
-                }
-            }
-        });
 
         let mut linker = wasmtime::Linker::<AppState>::new(&engine);
         wasmtime_wasi::p1::add_to_linker_async(&mut linker, |t| &mut t.app.wasi_ctx)?;
 
-        linker.func_wrap("terminal_games", "dial", Self::host_dial)?;
-        linker.func_wrap("terminal_games", "poll_dial", Self::poll_dial)?;
-        linker.func_wrap("terminal_games", "conn_close", Self::conn_close)?;
-        linker.func_wrap("terminal_games", "conn_write", Self::conn_write)?;
-        linker.func_wrap("terminal_games", "conn_read", Self::conn_read)?;
-        linker.func_wrap("terminal_games", "terminal_read", Self::terminal_read)?;
+        linker.func_wrap_async("terminal_games", "dial", Self::host_dial)?;
+        linker.func_wrap_async("terminal_games", "poll_dial", Self::poll_dial)?;
+        linker.func_wrap_async("terminal_games", "conn_close", Self::conn_close)?;
+        linker.func_wrap_async("terminal_games", "conn_write", Self::conn_write)?;
+        linker.func_wrap_async("terminal_games", "conn_read", Self::conn_read)?;
+        linker.func_wrap_async("terminal_games", "terminal_read", Self::terminal_read)?;
         linker.func_wrap_async("terminal_games", "terminal_size", Self::terminal_size)?;
         linker.func_wrap_async("terminal_games", "terminal_cursor", Self::terminal_cursor)?;
         linker.func_wrap_async("terminal_games", "change_app", Self::change_app)?;
         linker.func_wrap_async("terminal_games", "next_app_ready", Self::next_app_ready)?;
-        linker.func_wrap("terminal_games", "peer_send", Self::peer_send)?;
-        linker.func_wrap("terminal_games", "peer_recv", Self::peer_recv)?;
+        linker.func_wrap_async("terminal_games", "peer_send", Self::peer_send)?;
+        linker.func_wrap_async("terminal_games", "peer_recv", Self::peer_recv)?;
         linker.func_wrap_async("terminal_games", "region_latency", Self::region_latency)?;
         linker.func_wrap_async("terminal_games", "peer_list", Self::peer_list)?;
-        linker.func_wrap(
+        linker.func_wrap_async(
             "terminal_games",
             "graceful_shutdown_poll",
             Self::graceful_shutdown_poll,
         )?;
-        linker.func_wrap("terminal_games", "network_info", Self::host_network_info)?;
-        linker.func_wrap("terminal_games", "audio_write", Self::audio_write)?;
-        linker.func_wrap("terminal_games", "audio_info", Self::audio_info)?;
-        linker.func_wrap(
+        linker.func_wrap_async("terminal_games", "network_info", Self::host_network_info)?;
+        linker.func_wrap_async("terminal_games", "audio_write", Self::audio_write)?;
+        linker.func_wrap_async("terminal_games", "audio_info", Self::audio_info)?;
+        linker.func_wrap_async(
             "terminal_games",
             "menu_games_list_start",
             Self::menu_games_list_start,
         )?;
-        linker.func_wrap(
+        linker.func_wrap_async(
             "terminal_games",
             "menu_profile_get_start",
             Self::menu_profile_get_start,
         )?;
-        linker.func_wrap(
+        linker.func_wrap_async(
             "terminal_games",
             "menu_profile_set_start",
             Self::menu_profile_set_start,
         )?;
-        linker.func_wrap(
+        linker.func_wrap_async(
             "terminal_games",
             "menu_replays_list_start",
             Self::menu_replays_list_start,
         )?;
-        linker.func_wrap(
+        linker.func_wrap_async(
             "terminal_games",
             "menu_replay_delete_start",
             Self::menu_replay_delete_start,
         )?;
-        linker.func_wrap("terminal_games", "menu_poll", Self::menu_poll)?;
+        linker.func_wrap_async("terminal_games", "menu_poll", Self::menu_poll)?;
 
         Ok(Self {
             linker: Arc::new(linker),
             mesh,
             db,
             engine,
+            active_apps,
+            module_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         })
     }
 
@@ -188,15 +191,55 @@ impl AppServer {
     pub fn instantiate_app(
         &self,
         params: AppInstantiationParams,
-    ) -> tokio::sync::oneshot::Receiver<I32Exit> {
+    ) -> Result<tokio::sync::oneshot::Receiver<I32Exit>, AppCapacityError> {
+        struct RunningAppGuard(Arc<AtomicUsize>);
+        impl Drop for RunningAppGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
+        let active_apps = self.active_apps.clone();
+        let running_app_guard = if let Ok(limit) = std::env::var("MAX_ACTIVE_APPS") {
+            if let Ok(max_active_apps) = limit.parse::<usize>() {
+                let mut active = active_apps.load(Ordering::Acquire);
+                loop {
+                    if active >= max_active_apps {
+                        return Err(AppCapacityError {
+                            active,
+                            max: max_active_apps,
+                        });
+                    }
+                    match active_apps.compare_exchange_weak(
+                        active,
+                        active + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break RunningAppGuard(active_apps.clone()),
+                        Err(now_active) => active = now_active,
+                    }
+                }
+            } else {
+                active_apps.fetch_add(1, Ordering::AcqRel);
+                RunningAppGuard(active_apps.clone())
+            }
+        } else {
+            active_apps.fetch_add(1, Ordering::AcqRel);
+            RunningAppGuard(active_apps.clone())
+        };
+
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
 
         let mesh = self.mesh.clone();
         let db = self.db.clone();
         let engine = self.engine.clone();
         let linker = self.linker.clone();
+        let module_cache = self.module_cache.clone();
 
         tokio::task::spawn(async move {
+            let _running_app_guard = running_app_guard;
+
             let engine = engine;
 
             let mut window_size_receiver = params.window_size_receiver;
@@ -204,9 +247,11 @@ impl AppServer {
             let mut terminal = Arc::new(Mutex::new(headless_terminal::Parser::new(
                 first_rows, first_cols, 0,
             )));
+            let mut terminal_snapshot =
+                Arc::new(TerminalSnapshot::new(first_cols, first_rows, 0, 0));
 
             let (app_output_sender, mut app_output_receiver) =
-                tokio::sync::mpsc::channel::<Vec<u8>>(1);
+                tokio::sync::mpsc::channel::<Vec<u8>>(64);
             let has_next_app_shortname = Arc::new(AtomicBool::new(false));
             let (shortname_sender, mut shortname_receiver) =
                 tokio::sync::mpsc::channel::<(AppId, String)>(1);
@@ -235,8 +280,8 @@ impl AppServer {
             }
 
             let mut exit_code = I32Exit(0);
+            let (menu_username_tx, menu_username_rx) = watch::channel(params.username.clone());
             let menu_session = Arc::new(Mutex::new(MenuSessionState {
-                username: params.username.clone(),
                 locale: params.locale.clone(),
                 replays: Vec::new(),
             }));
@@ -244,6 +289,7 @@ impl AppServer {
                 db: db.clone(),
                 linker,
                 mesh,
+                module_cache,
                 app_output_sender,
                 remote_sshid: params.remote_sshid,
                 term: params.term.clone(),
@@ -251,6 +297,7 @@ impl AppServer {
                 user_id: params.user_id,
                 locale: params.locale.clone(),
                 menu_session: menu_session.clone(),
+                menu_username_tx: menu_username_tx.clone(),
             });
             let (mut app, mut instance_pre) = Self::prepare_instantiate(&ctx, first_app_shortname)
                 .await
@@ -276,6 +323,7 @@ impl AppServer {
                 let db = db.clone();
                 let user_id = params.user_id;
                 let menu_session = menu_session.clone();
+                let menu_username_rx = menu_username_rx.clone();
                 async move {
                     let mut replay_last_at = Duration::ZERO;
                     while let Some(data) = input_receiver.recv().await {
@@ -301,11 +349,9 @@ impl AppServer {
                                 let menu_session = menu_session.clone();
                                 let notification_tx = notification_tx.clone();
                                 let replay_buffer = replay_buffer.clone();
+                                let menu_username_rx = menu_username_rx.clone();
                                 tokio::spawn(async move {
-                                    let username = {
-                                        let session = menu_session.lock().await;
-                                        session.username.clone()
-                                    };
+                                    let username = menu_username_rx.borrow().clone();
                                     let (initial_app_id, asciicast) =
                                         replay_buffer.lock().await.serialize_asciicast();
                                     let notification = match save_replay(
@@ -351,14 +397,14 @@ impl AppServer {
                 let terminal = terminal.clone();
                 let network_info = network_info.clone();
                 let replay_buffer = replay_buffer.clone();
-                let menu_session = menu_session.clone();
+                let mut menu_username_rx = menu_username_rx.clone();
+                let terminal_snapshot = terminal_snapshot.clone();
                 async move {
                     let mut escape_buffer = EscapeSequenceBuffer::new();
                     let mut status_bar_interval = tokio::time::interval(Duration::from_secs(1));
-                    let username = { menu_session.lock().await.username.clone() };
                     let mut status_bar = StatusBar::new(
                         first_app_shortname,
-                        username,
+                        menu_username_rx.clone(),
                         network_info,
                         notification_rx,
                     );
@@ -384,7 +430,6 @@ impl AppServer {
 
                             data = app_output_receiver.recv() => {
                                 let Some(mut data) = data else { continue };
-
                                 if has_next_app_shortname.load(Ordering::Acquire) {
                                     // strip exiting the alternate screen buffer to make
                                     // sure transitions between apps are smooth
@@ -411,21 +456,23 @@ impl AppServer {
                                     continue;
                                 }
 
-                                let username = { menu_session.lock().await.username.clone() };
                                 {
                                     let mut terminal = terminal.lock().await;
                                     terminal.process(&output);
                                     let screen = terminal.screen_mut();
-                                    let (height, _width) = screen.size();
+                                    let (height, width) = screen.size();
                                     let dirty = screen.take_damaged_rows();
                                     if dirty.contains(&(height - 1)) {
-                                        status_bar.set_username(username);
                                         status_bar.maybe_render_into(screen, &mut output, true);
                                     }
+                                    let (cursor_y, cursor_x) = screen.cursor_position();
+                                    terminal_snapshot.set(width, height, cursor_x, cursor_y);
                                 }
 
-                                replay_buffer.lock().await.push_output(output.clone());
-                                let _ = output_sender.send(output).await;
+                                if !output.is_empty() {
+                                    replay_buffer.lock().await.push_output(output.clone());
+                                    let _ = output_sender.send(output).await;
+                                }
                             }
 
                             result = window_size_receiver.changed() => {
@@ -435,13 +482,13 @@ impl AppServer {
                                 replay_buffer.lock().await.push_resize(width, height);
 
                                 let mut output = Vec::new();
-                                let username = { menu_session.lock().await.username.clone() };
                                 {
                                     let mut terminal = terminal.lock().await;
                                     let screen = terminal.screen_mut();
                                     screen.set_size(height, width);
-                                    status_bar.set_username(username);
                                     status_bar.maybe_render_into(screen, &mut output, true);
+                                    let (cursor_y, cursor_x) = screen.cursor_position();
+                                    terminal_snapshot.set(width, height, cursor_x, cursor_y);
                                 }
                                 if !output.is_empty() {
                                     replay_buffer.lock().await.push_output(output.clone());
@@ -451,9 +498,17 @@ impl AppServer {
 
                             _ = status_bar_interval.tick() => {
                                 let mut output = Vec::new();
-                                let username = { menu_session.lock().await.username.clone() };
-                                status_bar.set_username(username);
                                 status_bar.maybe_render_into(terminal.lock().await.screen(), &mut output, false);
+                                if !output.is_empty() {
+                                    replay_buffer.lock().await.push_output(output.clone());
+                                    let _ = output_sender.send(output).await;
+                                }
+                            }
+
+                            result = menu_username_rx.changed() => {
+                                if result.is_err() { break };
+                                let mut output = Vec::new();
+                                status_bar.maybe_render_into(terminal.lock().await.screen(), &mut output, true);
                                 if !output.is_empty() {
                                     replay_buffer.lock().await.push_output(output.clone());
                                     let _ = output_sender.send(output).await;
@@ -477,7 +532,7 @@ impl AppServer {
                     app,
                     ctx,
                     conn_manager: ConnectionManager::default(),
-                    menu_requests: Vec::with_capacity(MAX_MENU_REQUESTS.min(16)),
+                    menu_requests: Vec::with_capacity(MAX_MENU_REQUESTS),
                     limits: AppLimiter::default(),
                     terminal: terminal,
                     next_app: None,
@@ -486,11 +541,11 @@ impl AppServer {
                     graceful_shutdown_token,
                     network_info: network_info.clone(),
                     audio_buffer: audio_buffer.clone(),
+                    terminal_snapshot,
                 };
 
                 let mut store = wasmtime::Store::new(&engine, state);
                 store.limiter(|state| &mut state.limits);
-                store.epoch_deadline_callback(|_| Ok(wasmtime::UpdateDeadline::Yield(1)));
 
                 let call_result = {
                     let func = {
@@ -529,6 +584,7 @@ impl AppServer {
                 input_receiver = state.input_receiver;
                 terminal = state.terminal;
                 ctx = state.ctx;
+                terminal_snapshot = state.terminal_snapshot;
 
                 if let Some(next_app) = state.next_app.take() {
                     let (next_app, next_instance_pre) = next_app.await.unwrap();
@@ -548,7 +604,11 @@ impl AppServer {
             let _ = exit_tx.send(exit_code);
         });
 
-        return exit_rx;
+        Ok(exit_rx)
+    }
+
+    pub fn active_app_count(&self) -> usize {
+        self.active_apps.load(Ordering::Acquire)
     }
 
     async fn prepare_instantiate(
@@ -584,13 +644,10 @@ impl AppServer {
             envs.push((name, value));
         }
         envs.push(("REMOTE_SSHID".to_string(), ctx.remote_sshid.clone()));
-        let mut username = String::new();
+        let username = ctx.menu_username_tx.borrow().clone();
         let mut locale = ctx.locale.clone();
         {
             let session = ctx.menu_session.lock().await;
-            if !session.username.is_empty() {
-                username = session.username.clone();
-            }
             if !session.locale.is_empty() {
                 locale = session.locale.clone();
             }
@@ -633,6 +690,7 @@ impl AppServer {
                 sender: ctx.app_output_sender.clone(),
             })
             .envs(&envs)
+            // .allow_blocking_current_thread(true)
             .build_p1();
 
         let mut rows = ctx
@@ -646,7 +704,7 @@ impl AppServer {
 
         let row = rows.next().await.unwrap().unwrap();
         let wasm_path: String = row.get(0).unwrap();
-        let module = wasmtime::Module::from_file(ctx.linker.engine(), wasm_path).unwrap();
+        let module = Self::load_or_compile_module(ctx, app_id, &wasm_path).await?;
         let instance_pre = ctx.linker.instantiate_pre(&module).unwrap();
 
         Ok((
@@ -661,50 +719,70 @@ impl AppServer {
         ))
     }
 
-    fn host_dial(
-        mut caller: wasmtime::Caller<'_, AppState>,
-        address_ptr: i32,
-        address_len: u32,
-        mode: u32,
-    ) -> anyhow::Result<i32> {
-        let mut buf = [0u8; 256];
-        if address_len as usize >= buf.len() {
-            return Ok(DIAL_ERR_ADDRESS_TOO_LONG);
-        }
-        let len = address_len as usize;
-        let offset = address_ptr as usize;
-
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            anyhow::bail!("dial: failed to find host memory");
-        };
-
-        mem.read(&caller, offset, &mut buf[..len])?;
-
-        if caller.data().conn_manager.active_connection_count() >= MAX_CONNECTIONS {
-            return Ok(DIAL_ERR_TOO_MANY_CONNECTIONS);
-        }
-
-        let address = String::from_utf8_lossy(&buf[..len]).to_string();
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        tokio::spawn(async move {
-            let result = Self::do_connect(address, mode).await;
-            let _ = tx.send(result);
-        });
-
-        let pending = PendingDial { receiver: rx };
-        let pending_dials = &mut caller.data_mut().conn_manager.pending_dials;
-
-        for (i, slot) in pending_dials.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(pending);
-                return Ok(i as i32);
+    async fn load_or_compile_module(
+        ctx: &AppContext,
+        app_id: u64,
+        wasm_path: &str,
+    ) -> anyhow::Result<Arc<wasmtime::Module>> {
+        {
+            let cache = ctx.module_cache.read().await;
+            if let Some(module) = cache.get(&app_id) {
+                return Ok(module.clone());
             }
         }
-        let slot_id = pending_dials.len() as i32;
-        pending_dials.push(Some(pending));
-        Ok(slot_id)
+
+        let module = Arc::new(wasmtime::Module::from_file(ctx.linker.engine(), wasm_path)?);
+        let mut cache = ctx.module_cache.write().await;
+        let entry = cache.entry(app_id).or_insert_with(|| module.clone());
+        Ok(entry.clone())
+    }
+
+    fn host_dial(
+        mut caller: wasmtime::Caller<'_, AppState>,
+        (address_ptr, address_len, mode): (i32, u32, u32),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
+
+            let mut buf = [0u8; 256];
+            if address_len as usize >= buf.len() {
+                return Ok(DIAL_ERR_ADDRESS_TOO_LONG);
+            }
+            let len = address_len as usize;
+            let offset = address_ptr as usize;
+
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("dial: failed to find host memory");
+            };
+
+            mem.read(&caller, offset, &mut buf[..len])?;
+
+            if caller.data().conn_manager.active_connection_count() >= MAX_CONNECTIONS {
+                return Ok(DIAL_ERR_TOO_MANY_CONNECTIONS);
+            }
+
+            let address = String::from_utf8_lossy(&buf[..len]).to_string();
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+
+            tokio::spawn(async move {
+                let result = Self::do_connect(address, mode).await;
+                let _ = tx.send(result);
+            });
+
+            let pending = PendingDial { receiver: rx };
+            let pending_dials = &mut caller.data_mut().conn_manager.pending_dials;
+
+            for (i, slot) in pending_dials.iter_mut().enumerate() {
+                if slot.is_none() {
+                    *slot = Some(pending);
+                    return Ok(i as i32);
+                }
+            }
+            let slot_id = pending_dials.len() as i32;
+            pending_dials.push(Some(pending));
+            Ok(slot_id)
+        })
     }
 
     async fn do_connect(
@@ -743,15 +821,14 @@ impl AppServer {
         let stream = if mode == 1 {
             let hostname: String = address.split(':').next().unwrap_or(&address).to_string();
 
-            let mut config = match tokio_rustls::rustls::ClientConfig::builder()
-                .with_platform_verifier()
-            {
-                Ok(builder) => builder.with_no_client_auth(),
-                Err(e) => {
-                    tracing::error!("do_connect: failed to initialize TLS verifier: {:?}", e);
-                    return Err(POLL_DIAL_ERR_TLS_HANDSHAKE);
-                }
-            };
+            let mut config =
+                match tokio_rustls::rustls::ClientConfig::builder().with_platform_verifier() {
+                    Ok(builder) => builder.with_no_client_auth(),
+                    Err(e) => {
+                        tracing::error!("do_connect: failed to initialize TLS verifier: {:?}", e);
+                        return Err(POLL_DIAL_ERR_TLS_HANDSHAKE);
+                    }
+                };
             config.alpn_protocols.push(b"h2".to_vec());
             let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
 
@@ -781,222 +858,237 @@ impl AppServer {
 
     fn poll_dial(
         mut caller: wasmtime::Caller<'_, AppState>,
-        dial_id: i32,
-        local_addr_ptr: i32,
-        local_addr_len_ptr: i32,
-        remote_addr_ptr: i32,
-        remote_addr_len_ptr: i32,
-    ) -> anyhow::Result<i32> {
-        let dial_id_usize = dial_id as usize;
+        (dial_id, local_addr_ptr, local_addr_len_ptr, remote_addr_ptr, remote_addr_len_ptr): (
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+        ),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
 
-        {
-            let conn_manager = &caller.data().conn_manager;
-            if dial_id_usize >= conn_manager.pending_dials.len() {
-                return Ok(POLL_DIAL_ERR_INVALID_DIAL_ID);
-            }
-            if conn_manager.pending_dials[dial_id_usize].is_none() {
-                return Ok(POLL_DIAL_ERR_INVALID_DIAL_ID);
-            }
-        }
+            let dial_id_usize = dial_id as usize;
 
-        let mut pending = caller.data_mut().conn_manager.pending_dials[dial_id_usize]
-            .take()
-            .unwrap();
-
-        match pending.receiver.try_recv() {
-            Ok(Ok((stream, local_addr, remote_addr))) => {
-                let conn_manager = &mut caller.data_mut().conn_manager;
-                let slot = conn_manager.find_free_conn_slot();
-
-                if slot.is_none() {
-                    return Ok(POLL_DIAL_ERR_TOO_MANY_CONNECTIONS);
+            {
+                let conn_manager = &caller.data().conn_manager;
+                if dial_id_usize >= conn_manager.pending_dials.len() {
+                    return Ok(POLL_DIAL_ERR_INVALID_DIAL_ID);
                 }
-
-                let slot_id = slot.unwrap();
-                let conn = Connection { stream };
-
-                if slot_id < conn_manager.connections.len() {
-                    conn_manager.connections[slot_id] = Some(conn);
-                } else {
-                    conn_manager.connections.push(Some(conn));
+                if conn_manager.pending_dials[dial_id_usize].is_none() {
+                    return Ok(POLL_DIAL_ERR_INVALID_DIAL_ID);
                 }
-
-                let local_addr_str = local_addr.to_string();
-                let remote_addr_str = remote_addr.to_string();
-
-                let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                    anyhow::bail!("failed to find host memory");
-                };
-
-                mem.write(
-                    &mut caller,
-                    local_addr_ptr as usize,
-                    local_addr_str.as_bytes(),
-                )?;
-                mem.write(
-                    &mut caller,
-                    local_addr_len_ptr as usize,
-                    &(local_addr_str.len() as u32).to_le_bytes(),
-                )?;
-                mem.write(
-                    &mut caller,
-                    remote_addr_ptr as usize,
-                    remote_addr_str.as_bytes(),
-                )?;
-                mem.write(
-                    &mut caller,
-                    remote_addr_len_ptr as usize,
-                    &(remote_addr_str.len() as u32).to_le_bytes(),
-                )?;
-
-                tracing::info!(conn_id = slot_id, %local_addr, %remote_addr, "dial completed");
-                Ok(slot_id as i32)
             }
-            Ok(Err(error_code)) => Ok(error_code),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                caller.data_mut().conn_manager.pending_dials[dial_id_usize] = Some(pending);
-                Ok(POLL_DIAL_PENDING)
+
+            let mut pending = caller.data_mut().conn_manager.pending_dials[dial_id_usize]
+                .take()
+                .unwrap();
+
+            match pending.receiver.try_recv() {
+                Ok(Ok((stream, local_addr, remote_addr))) => {
+                    let conn_manager = &mut caller.data_mut().conn_manager;
+                    let slot = conn_manager.find_free_conn_slot();
+
+                    if slot.is_none() {
+                        return Ok(POLL_DIAL_ERR_TOO_MANY_CONNECTIONS);
+                    }
+
+                    let slot_id = slot.unwrap();
+                    let conn = Connection { stream };
+
+                    if slot_id < conn_manager.connections.len() {
+                        conn_manager.connections[slot_id] = Some(conn);
+                    } else {
+                        conn_manager.connections.push(Some(conn));
+                    }
+
+                    let local_addr_str = local_addr.to_string();
+                    let remote_addr_str = remote_addr.to_string();
+
+                    let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                        wasmtime::bail!("failed to find host memory");
+                    };
+
+                    mem.write(
+                        &mut caller,
+                        local_addr_ptr as usize,
+                        local_addr_str.as_bytes(),
+                    )?;
+                    mem.write(
+                        &mut caller,
+                        local_addr_len_ptr as usize,
+                        &(local_addr_str.len() as u32).to_le_bytes(),
+                    )?;
+                    mem.write(
+                        &mut caller,
+                        remote_addr_ptr as usize,
+                        remote_addr_str.as_bytes(),
+                    )?;
+                    mem.write(
+                        &mut caller,
+                        remote_addr_len_ptr as usize,
+                        &(remote_addr_str.len() as u32).to_le_bytes(),
+                    )?;
+
+                    tracing::info!(conn_id = slot_id, %local_addr, %remote_addr, "dial completed");
+                    Ok(slot_id as i32)
+                }
+                Ok(Err(error_code)) => Ok(error_code),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    caller.data_mut().conn_manager.pending_dials[dial_id_usize] = Some(pending);
+                    Ok(POLL_DIAL_PENDING)
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    Ok(POLL_DIAL_ERR_TASK_FAILED)
+                }
             }
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Ok(POLL_DIAL_ERR_TASK_FAILED),
-        }
+        })
     }
 
-    fn conn_close(mut caller: wasmtime::Caller<'_, AppState>, conn_id: i32) -> anyhow::Result<i32> {
-        let conn_id_usize = conn_id as usize;
-        let connections = &mut caller.data_mut().conn_manager.connections;
+    fn conn_close(
+        mut caller: wasmtime::Caller<'_, AppState>,
+        (conn_id,): (i32,),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
 
-        if conn_id_usize >= connections.len() || connections[conn_id_usize].is_none() {
-            return Ok(CONN_ERR_INVALID_CONN_ID);
-        }
+            let conn_id_usize = conn_id as usize;
+            let connections = &mut caller.data_mut().conn_manager.connections;
 
-        connections[conn_id_usize] = None;
-        tracing::info!(conn_id, "connection closed");
-        Ok(0)
+            if conn_id_usize >= connections.len() || connections[conn_id_usize].is_none() {
+                return Ok(CONN_ERR_INVALID_CONN_ID);
+            }
+
+            connections[conn_id_usize] = None;
+            tracing::info!(conn_id, "connection closed");
+            Ok(0)
+        })
     }
 
     fn conn_write(
         mut caller: wasmtime::Caller<'_, AppState>,
-        conn_id: i32,
-        data_ptr: i32,
-        data_len: u32,
-    ) -> anyhow::Result<i32> {
-        let mut buf = [0u8; 4 * 1024];
-        let len = (data_len as usize).min(buf.len());
-        let offset = data_ptr as usize;
+        (conn_id, data_ptr, data_len): (i32, i32, u32),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
 
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            anyhow::bail!("failed to find host memory");
-        };
+            let mut buf = [0u8; 4 * 1024];
+            let len = (data_len as usize).min(buf.len());
+            let offset = data_ptr as usize;
 
-        mem.read(&caller, offset, &mut buf[..len])?;
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("failed to find host memory");
+            };
 
-        let conn_manager = &mut caller.data_mut().conn_manager;
+            mem.read(&caller, offset, &mut buf[..len])?;
 
-        let conn_id_usize = conn_id as usize;
-        if conn_id_usize >= conn_manager.connections.len() {
-            return Ok(CONN_ERR_INVALID_CONN_ID);
-        }
+            let conn_manager = &mut caller.data_mut().conn_manager;
 
-        let Some(conn) = conn_manager.connections[conn_id_usize].as_mut() else {
-            return Ok(CONN_ERR_INVALID_CONN_ID);
-        };
+            let conn_id_usize = conn_id as usize;
+            if conn_id_usize >= conn_manager.connections.len() {
+                return Ok(CONN_ERR_INVALID_CONN_ID);
+            }
 
-        if conn_manager.bandwidth.tokens() < len {
-            return Ok(0);
-        }
-        conn_manager.bandwidth.consume(len);
+            let Some(conn) = conn_manager.connections[conn_id_usize].as_mut() else {
+                return Ok(CONN_ERR_INVALID_CONN_ID);
+            };
 
-        match conn.stream.try_write(&buf[..len]) {
-            Ok(n) => {
-                if n > 0 {
-                    tracing::debug!(n, "conn_write");
+            if conn_manager.bandwidth.tokens() < len {
+                return Ok(0);
+            }
+            conn_manager.bandwidth.consume(len);
+
+            match conn.stream.try_write(&buf[..len]) {
+                Ok(n) => Ok(n as i32),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+                Err(e) => {
+                    tracing::error!("conn_write: stream write failed: {:?}", e);
+                    Ok(CONN_ERR_CONNECTION_ERROR)
                 }
-                Ok(n as i32)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
-            Err(e) => {
-                tracing::error!("conn_write: stream write failed: {:?}", e);
-                Ok(CONN_ERR_CONNECTION_ERROR)
-            }
-        }
+        })
     }
 
     fn conn_read(
         mut caller: wasmtime::Caller<'_, AppState>,
-        conn_id: i32,
-        ptr: i32,
-        len: u32,
-    ) -> anyhow::Result<i32> {
-        let conn_id_usize = conn_id as usize;
+        (conn_id, ptr, len): (i32, i32, u32),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
 
-        {
-            let connections = &caller.data().conn_manager.connections;
-            if conn_id_usize >= connections.len() {
-                return Ok(CONN_ERR_INVALID_CONN_ID);
-            }
-            if connections[conn_id_usize].is_none() {
-                return Ok(CONN_ERR_INVALID_CONN_ID);
-            };
-        }
+            let conn_id_usize = conn_id as usize;
 
-        let mut buf = [0u8; 4 * 1024];
-        let read_len = (len as usize).min(buf.len());
-
-        let n = {
-            let connections = &mut caller.data_mut().conn_manager.connections;
-            let conn = connections[conn_id_usize].as_mut().unwrap();
-
-            match conn.stream.try_read(&mut buf[..read_len]) {
-                Ok(0) => return Ok(CONN_ERR_CONNECTION_ERROR),
-                Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
-                Err(e) => {
-                    tracing::error!("conn_read: stream read error: {:?}", e);
-                    return Ok(CONN_ERR_CONNECTION_ERROR);
+            {
+                let connections = &caller.data().conn_manager.connections;
+                if conn_id_usize >= connections.len() {
+                    return Ok(CONN_ERR_INVALID_CONN_ID);
                 }
+                if connections[conn_id_usize].is_none() {
+                    return Ok(CONN_ERR_INVALID_CONN_ID);
+                };
             }
-        };
 
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            anyhow::bail!("failed to find host memory");
-        };
+            let mut buf = [0u8; 4 * 1024];
+            let read_len = (len as usize).min(buf.len());
 
-        mem.write(&mut caller, ptr as usize, &buf[..n])?;
+            let n = {
+                let connections = &mut caller.data_mut().conn_manager.connections;
+                let conn = connections[conn_id_usize].as_mut().unwrap();
 
-        if n > 0 {
-            tracing::debug!(n, "conn_read");
-        }
+                match conn.stream.try_read(&mut buf[..read_len]) {
+                    Ok(0) => return Ok(CONN_ERR_CONNECTION_ERROR),
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
+                    Err(e) => {
+                        tracing::error!("conn_read: stream read error: {:?}", e);
+                        return Ok(CONN_ERR_CONNECTION_ERROR);
+                    }
+                }
+            };
 
-        Ok(n as i32)
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("failed to find host memory");
+            };
+
+            mem.write(&mut caller, ptr as usize, &buf[..n])?;
+
+            Ok(n as i32)
+        })
     }
 
     fn terminal_read(
         mut caller: wasmtime::Caller<'_, AppState>,
-        ptr: i32,
-        _len: u32,
-    ) -> anyhow::Result<i32> {
-        match caller.data_mut().input_receiver.try_recv() {
-            Ok(buf) => {
-                let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                    anyhow::bail!("terminal_read: failed to find host memory");
-                };
-                let offset = ptr as u32 as usize;
-                mem.write(&mut caller, offset, buf.as_ref())?;
-                Ok(buf.len() as i32)
+        (ptr, _len): (i32, u32),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
+
+            match caller.data_mut().input_receiver.try_recv() {
+                Ok(buf) => {
+                    let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                        wasmtime::bail!("terminal_read: failed to find host memory");
+                    };
+                    let offset = ptr as u32 as usize;
+                    mem.write(&mut caller, offset, buf.as_ref())?;
+                    Ok(buf.len() as i32)
+                }
+                Err(_) => Ok(0),
             }
-            Err(_) => Ok(0),
-        }
+        })
     }
 
     fn terminal_size(
         mut caller: wasmtime::Caller<'_, AppState>,
         (width_ptr, height_ptr): (i32, i32),
-    ) -> Box<dyn Future<Output = anyhow::Result<()>> + Send + '_> {
+    ) -> Box<dyn Future<Output = wasmtime::Result<()>> + Send + '_> {
         Box::new(async move {
+            tokio::task::yield_now().await;
+
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                anyhow::bail!("terminal_size: failed to find host memory");
+                wasmtime::bail!("terminal_size: failed to find host memory");
             };
-            let (height, width) = caller.data().terminal.lock().await.screen().size();
+            let (width, height) = caller.data().terminal_snapshot.size();
             let effective_height = if height > 0 { height - 1 } else { 0 };
 
             let width_offset = width_ptr as u32 as usize;
@@ -1012,18 +1104,14 @@ impl AppServer {
     fn terminal_cursor(
         mut caller: wasmtime::Caller<'_, AppState>,
         (x_ptr, y_ptr): (i32, i32),
-    ) -> Box<dyn Future<Output = anyhow::Result<()>> + Send + '_> {
+    ) -> Box<dyn Future<Output = wasmtime::Result<()>> + Send + '_> {
         Box::new(async move {
+            tokio::task::yield_now().await;
+
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                anyhow::bail!("terminal_cursor: failed to find host memory");
+                wasmtime::bail!("terminal_cursor: failed to find host memory");
             };
-            let (y, x) = caller
-                .data()
-                .terminal
-                .lock()
-                .await
-                .screen()
-                .cursor_position();
+            let (x, y) = caller.data().terminal_snapshot.cursor_position();
 
             let x_offset = x_ptr as u32 as usize;
             mem.write(&mut caller, x_offset, &x.to_le_bytes())?;
@@ -1038,15 +1126,17 @@ impl AppServer {
     fn change_app(
         mut caller: wasmtime::Caller<'_, AppState>,
         (ptr, len): (i32, u32),
-    ) -> Box<dyn Future<Output = anyhow::Result<i32>> + Send + '_> {
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
         Box::new(async move {
+            tokio::task::yield_now().await;
+
             let len = len as usize;
             if len == 0 || len > 128 {
                 return Ok(-1);
             }
 
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                anyhow::bail!("change_app: failed to find host memory");
+                wasmtime::bail!("change_app: failed to find host memory");
             };
 
             let mut buf = vec![0u8; len];
@@ -1078,8 +1168,10 @@ impl AppServer {
     fn next_app_ready(
         caller: wasmtime::Caller<'_, AppState>,
         (): (),
-    ) -> Box<dyn Future<Output = anyhow::Result<i32>> + Send + '_> {
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
         Box::new(async move {
+            tokio::task::yield_now().await;
+
             let ready = caller.data().has_next_app.load(Ordering::Acquire);
             Ok(if ready { 1 } else { 0 })
         })
@@ -1087,107 +1179,102 @@ impl AppServer {
 
     fn peer_send(
         mut caller: wasmtime::Caller<'_, AppState>,
-        peer_ids_ptr: i32,
-        peer_ids_count: u32,
-        data_ptr: i32,
-        data_len: u32,
-    ) -> anyhow::Result<i32> {
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            anyhow::bail!("peer_send: failed to find host memory");
-        };
+        (peer_ids_ptr, peer_ids_count, data_ptr, data_len): (i32, u32, i32, u32),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
 
-        if peer_ids_count == 0 || peer_ids_count > 1024 {
-            return Ok(PEER_SEND_ERR_INVALID_PEER_COUNT);
-        }
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("peer_send: failed to find host memory");
+            };
 
-        if data_len == 0 {
-            // not sure why someone would do this but it's pretty easy to send no data
-            return Ok(0);
-        }
-
-        if data_len > 64 * 1024 {
-            return Ok(PEER_SEND_ERR_DATA_TOO_LARGE);
-        }
-        const PEER_ID_SIZE: usize = std::mem::size_of::<PeerId>();
-        let peer_ids_offset = peer_ids_ptr as usize;
-        let peer_ids_count = peer_ids_count as usize;
-        let total_peer_ids_size = peer_ids_count * std::mem::size_of::<PeerId>();
-
-        let mut peer_ids_buf = vec![0u8; total_peer_ids_size];
-        mem.read(&caller, peer_ids_offset, &mut peer_ids_buf)?;
-
-        let mut peer_ids = Vec::with_capacity(peer_ids_count);
-        for i in 0..peer_ids_count {
-            let offset = i * PEER_ID_SIZE;
-            let mut peer_id_bytes = [0u8; PEER_ID_SIZE];
-            peer_id_bytes.copy_from_slice(&peer_ids_buf[offset..offset + PEER_ID_SIZE]);
-            peer_ids.push(crate::mesh::PeerId::from_bytes(peer_id_bytes));
-        }
-
-        let data_offset = data_ptr as usize;
-        let data_len = data_len as usize;
-        let mut data_buf = vec![0u8; data_len];
-        mem.read(&caller, data_offset, &mut data_buf)?;
-
-        match caller.data_mut().app.peer_tx.try_send((peer_ids, data_buf)) {
-            Ok(_) => {
-                tracing::debug!("peer_send: sent message to {} peers", peer_ids_count);
-                Ok(0)
+            if peer_ids_count == 0 || peer_ids_count > 1024 {
+                return Ok(PEER_SEND_ERR_INVALID_PEER_COUNT);
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!("peer_send: channel full, message dropped");
-                Ok(PEER_SEND_ERR_CHANNEL_FULL)
+
+            if data_len == 0 {
+                return Ok(0);
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                tracing::error!("peer_send: channel closed");
-                Ok(PEER_SEND_ERR_CHANNEL_CLOSED)
+
+            if data_len > 64 * 1024 {
+                return Ok(PEER_SEND_ERR_DATA_TOO_LARGE);
             }
-        }
+            const PEER_ID_SIZE: usize = std::mem::size_of::<PeerId>();
+            let peer_ids_offset = peer_ids_ptr as usize;
+            let peer_ids_count = peer_ids_count as usize;
+            let mut peer_ids = Vec::with_capacity(peer_ids_count);
+            for i in 0..peer_ids_count {
+                let offset = i * PEER_ID_SIZE;
+                let mut peer_id_bytes = [0u8; PEER_ID_SIZE];
+                mem.read(&caller, peer_ids_offset + offset, &mut peer_id_bytes)?;
+                peer_ids.push(crate::mesh::PeerId::from_bytes(peer_id_bytes));
+            }
+
+            let data_offset = data_ptr as usize;
+            let data_len = data_len as usize;
+            let mut data_buf = vec![0u8; data_len];
+            mem.read(&caller, data_offset, &mut data_buf)?;
+
+            match caller.data_mut().app.peer_tx.try_send((peer_ids, data_buf)) {
+                Ok(_) => Ok(0),
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!("peer_send: channel full, message dropped");
+                    Ok(PEER_SEND_ERR_CHANNEL_FULL)
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::error!("peer_send: channel closed");
+                    Ok(PEER_SEND_ERR_CHANNEL_CLOSED)
+                }
+            }
+        })
     }
 
     fn peer_recv(
         mut caller: wasmtime::Caller<'_, AppState>,
-        from_peer_ptr: i32,
-        data_ptr: i32,
-        data_max_len: u32,
-    ) -> anyhow::Result<i32> {
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            anyhow::bail!("peer_recv: failed to find host memory");
-        };
+        (from_peer_ptr, data_ptr, data_max_len): (i32, i32, u32),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
 
-        let msg = match caller.data_mut().app.peer_rx.try_recv() {
-            Ok(msg) => msg,
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                return Ok(0);
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                return Ok(PEER_RECV_ERR_CHANNEL_DISCONNECTED);
-            }
-        };
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("peer_recv: failed to find host memory");
+            };
 
-        let from_peer_offset = from_peer_ptr as usize;
-        let peer_id_buf = msg.from_peer().to_bytes();
+            let msg = match caller.data_mut().app.peer_rx.try_recv() {
+                Ok(msg) => msg,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    return Ok(0);
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Ok(PEER_RECV_ERR_CHANNEL_DISCONNECTED);
+                }
+            };
 
-        mem.write(&mut caller, from_peer_offset, &peer_id_buf)?;
+            let from_peer_offset = from_peer_ptr as usize;
+            let peer_id_buf = msg.from_peer().to_bytes();
 
-        let data_offset = data_ptr as usize;
-        let data_max_len = data_max_len as usize;
-        let data = msg.data();
-        let data_to_write = std::cmp::min(data.len(), data_max_len);
+            mem.write(&mut caller, from_peer_offset, &peer_id_buf)?;
 
-        mem.write(&mut caller, data_offset, &data[..data_to_write])?;
+            let data_offset = data_ptr as usize;
+            let data_max_len = data_max_len as usize;
+            let data = msg.data();
+            let data_to_write = std::cmp::min(data.len(), data_max_len);
 
-        tracing::debug!("peer_recv: received message of {} bytes", data_to_write);
-        Ok(data_to_write as i32)
+            mem.write(&mut caller, data_offset, &data[..data_to_write])?;
+
+            Ok(data_to_write as i32)
+        })
     }
 
     fn region_latency(
         mut caller: wasmtime::Caller<'_, AppState>,
         (region_ptr,): (i32,),
-    ) -> Box<dyn Future<Output = anyhow::Result<i32>> + Send + '_> {
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
         Box::new(async move {
+            tokio::task::yield_now().await;
+
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                anyhow::bail!("region_latency: failed to find host memory");
+                wasmtime::bail!("region_latency: failed to find host memory");
             };
 
             let region_offset = region_ptr as usize;
@@ -1207,10 +1294,12 @@ impl AppServer {
     fn peer_list(
         mut caller: wasmtime::Caller<'_, AppState>,
         (peer_ids_ptr, length, total_count_ptr): (i32, u32, i32),
-    ) -> Box<dyn Future<Output = anyhow::Result<i32>> + Send + '_> {
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
         Box::new(async move {
+            tokio::task::yield_now().await;
+
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                anyhow::bail!("peer_list: failed to find host memory");
+                wasmtime::bail!("peer_list: failed to find host memory");
             };
 
             let app_id = caller.data().app.app_id;
@@ -1240,184 +1329,214 @@ impl AppServer {
         })
     }
 
-    fn menu_games_list_start(mut caller: wasmtime::Caller<'_, AppState>) -> anyhow::Result<i32> {
-        if caller.data().app.shortname != "menu" {
-            return Ok(MENU_REQ_ERR_NOT_MENU_APP);
-        }
-        let db = caller.data().ctx.db.clone();
-        let current_shortname = caller.data().app.shortname.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let _ = tx.send(Self::load_menu_games(db, current_shortname).await);
-        });
-        Ok(Self::insert_menu_request(caller.data_mut(), rx))
+    fn menu_games_list_start(
+        mut caller: wasmtime::Caller<'_, AppState>,
+        (): (),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
+
+            if caller.data().app.shortname != "menu" {
+                return Ok(MENU_REQ_ERR_NOT_MENU_APP);
+            }
+            let db = caller.data().ctx.db.clone();
+            let current_shortname = caller.data().app.shortname.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = tx.send(Self::load_menu_games(db, current_shortname).await);
+            });
+            Ok(Self::insert_menu_request(caller.data_mut(), rx))
+        })
     }
 
-    fn menu_profile_get_start(mut caller: wasmtime::Caller<'_, AppState>) -> anyhow::Result<i32> {
-        if caller.data().app.shortname != "menu" {
-            return Ok(MENU_REQ_ERR_NOT_MENU_APP);
-        }
-        let db = caller.data().ctx.db.clone();
-        let user_id = caller.data().ctx.user_id;
-        let menu_session = caller.data().ctx.menu_session.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let _ = tx.send(Self::load_menu_profile(db, user_id, menu_session).await);
-        });
-        Ok(Self::insert_menu_request(caller.data_mut(), rx))
+    fn menu_profile_get_start(
+        mut caller: wasmtime::Caller<'_, AppState>,
+        (): (),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
+
+            if caller.data().app.shortname != "menu" {
+                return Ok(MENU_REQ_ERR_NOT_MENU_APP);
+            }
+            let db = caller.data().ctx.db.clone();
+            let user_id = caller.data().ctx.user_id;
+            let menu_session = caller.data().ctx.menu_session.clone();
+            let menu_username_tx = caller.data().ctx.menu_username_tx.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = tx.send(
+                    Self::load_menu_profile(db, user_id, menu_session, menu_username_tx).await,
+                );
+            });
+            Ok(Self::insert_menu_request(caller.data_mut(), rx))
+        })
     }
 
     fn menu_profile_set_start(
         mut caller: wasmtime::Caller<'_, AppState>,
-        username_ptr: i32,
-        username_len: u32,
-        locale_ptr: i32,
-        locale_len: u32,
-    ) -> anyhow::Result<i32> {
-        if caller.data().app.shortname != "menu" {
-            return Ok(MENU_REQ_ERR_NOT_MENU_APP);
-        }
-        if username_len > 1024 || locale_len > 1024 {
-            return Ok(MENU_REQ_ERR_INVALID_INPUT);
-        }
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            anyhow::bail!("menu_profile_set_start: failed to find host memory");
-        };
-        let mut username_bytes = vec![0u8; username_len as usize];
-        let mut locale_bytes = vec![0u8; locale_len as usize];
-        mem.read(&caller, username_ptr as usize, &mut username_bytes)?;
-        mem.read(&caller, locale_ptr as usize, &mut locale_bytes)?;
-        let Ok(username) = String::from_utf8(username_bytes) else {
-            return Ok(MENU_REQ_ERR_INVALID_INPUT);
-        };
-        let Ok(locale) = String::from_utf8(locale_bytes) else {
-            return Ok(MENU_REQ_ERR_INVALID_INPUT);
-        };
+        (username_ptr, username_len, locale_ptr, locale_len): (i32, u32, i32, u32),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
 
-        let db = caller.data().ctx.db.clone();
-        let user_id = caller.data().ctx.user_id;
-        let menu_session = caller.data().ctx.menu_session.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let _ =
-                tx.send(Self::save_menu_profile(db, user_id, menu_session, username, locale).await);
-        });
-        Ok(Self::insert_menu_request(caller.data_mut(), rx))
+            if caller.data().app.shortname != "menu" {
+                return Ok(MENU_REQ_ERR_NOT_MENU_APP);
+            }
+            if username_len > 1024 || locale_len > 1024 {
+                return Ok(MENU_REQ_ERR_INVALID_INPUT);
+            }
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("menu_profile_set_start: failed to find host memory");
+            };
+            let mut username_bytes = vec![0u8; username_len as usize];
+            let mut locale_bytes = vec![0u8; locale_len as usize];
+            mem.read(&caller, username_ptr as usize, &mut username_bytes)?;
+            mem.read(&caller, locale_ptr as usize, &mut locale_bytes)?;
+            let Ok(username) = String::from_utf8(username_bytes) else {
+                return Ok(MENU_REQ_ERR_INVALID_INPUT);
+            };
+            let Ok(locale) = String::from_utf8(locale_bytes) else {
+                return Ok(MENU_REQ_ERR_INVALID_INPUT);
+            };
+
+            let db = caller.data().ctx.db.clone();
+            let user_id = caller.data().ctx.user_id;
+            let menu_session = caller.data().ctx.menu_session.clone();
+            let menu_username_tx = caller.data().ctx.menu_username_tx.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = tx.send(
+                    Self::save_menu_profile(
+                        db,
+                        user_id,
+                        menu_session,
+                        menu_username_tx,
+                        username,
+                        locale,
+                    )
+                    .await,
+                );
+            });
+            Ok(Self::insert_menu_request(caller.data_mut(), rx))
+        })
     }
 
     fn menu_replays_list_start(
         mut caller: wasmtime::Caller<'_, AppState>,
-        locale_ptr: i32,
-        locale_len: u32,
-    ) -> anyhow::Result<i32> {
-        if caller.data().app.shortname != "menu" {
-            return Ok(MENU_REQ_ERR_NOT_MENU_APP);
-        }
-        if locale_len > 64 {
-            return Ok(MENU_REQ_ERR_INVALID_INPUT);
-        }
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            anyhow::bail!("menu_replays_list_start: failed to find host memory");
-        };
-        let mut locale_bytes = vec![0u8; locale_len as usize];
-        mem.read(&caller, locale_ptr as usize, &mut locale_bytes)?;
-        let Ok(locale) = String::from_utf8(locale_bytes) else {
-            return Ok(MENU_REQ_ERR_INVALID_INPUT);
-        };
+        (locale_ptr, locale_len): (i32, u32),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
 
-        let db = caller.data().ctx.db.clone();
-        let user_id = caller.data().ctx.user_id;
-        let menu_session = caller.data().ctx.menu_session.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let _ = tx.send(Self::load_menu_replays(db, user_id, menu_session, locale).await);
-        });
-        Ok(Self::insert_menu_request(caller.data_mut(), rx))
+            if caller.data().app.shortname != "menu" {
+                return Ok(MENU_REQ_ERR_NOT_MENU_APP);
+            }
+            if locale_len > 64 {
+                return Ok(MENU_REQ_ERR_INVALID_INPUT);
+            }
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("menu_replays_list_start: failed to find host memory");
+            };
+            let mut locale_bytes = vec![0u8; locale_len as usize];
+            mem.read(&caller, locale_ptr as usize, &mut locale_bytes)?;
+            let Ok(locale) = String::from_utf8(locale_bytes) else {
+                return Ok(MENU_REQ_ERR_INVALID_INPUT);
+            };
+
+            let db = caller.data().ctx.db.clone();
+            let user_id = caller.data().ctx.user_id;
+            let menu_session = caller.data().ctx.menu_session.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = tx.send(Self::load_menu_replays(db, user_id, menu_session, locale).await);
+            });
+            Ok(Self::insert_menu_request(caller.data_mut(), rx))
+        })
     }
 
     fn menu_replay_delete_start(
         mut caller: wasmtime::Caller<'_, AppState>,
-        created_at: i64,
-    ) -> anyhow::Result<i32> {
-        if caller.data().app.shortname != "menu" {
-            return Ok(MENU_REQ_ERR_NOT_MENU_APP);
-        }
-        let db = caller.data().ctx.db.clone();
-        let user_id = caller.data().ctx.user_id;
-        let menu_session = caller.data().ctx.menu_session.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let _ = tx.send(Self::delete_menu_replay(db, user_id, menu_session, created_at).await);
-        });
-        Ok(Self::insert_menu_request(caller.data_mut(), rx))
+        (created_at,): (i64,),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
+
+            if caller.data().app.shortname != "menu" {
+                return Ok(MENU_REQ_ERR_NOT_MENU_APP);
+            }
+            let db = caller.data().ctx.db.clone();
+            let user_id = caller.data().ctx.user_id;
+            let menu_session = caller.data().ctx.menu_session.clone();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ =
+                    tx.send(Self::delete_menu_replay(db, user_id, menu_session, created_at).await);
+            });
+            Ok(Self::insert_menu_request(caller.data_mut(), rx))
+        })
     }
 
     fn menu_poll(
         mut caller: wasmtime::Caller<'_, AppState>,
-        request_id: i32,
-        data_ptr: i32,
-        data_max_len: u32,
-        data_len_ptr: i32,
-    ) -> anyhow::Result<i32> {
-        let request_id = request_id as usize;
-        {
-            let state = caller.data();
-            if request_id >= state.menu_requests.len() || state.menu_requests[request_id].is_none()
+        (request_id, data_ptr, data_max_len, data_len_ptr): (i32, i32, u32, i32),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
+
+            let request_id = request_id as usize;
             {
-                return Ok(MENU_POLL_ERR_INVALID_REQUEST_ID);
+                let state = caller.data();
+                if request_id >= state.menu_requests.len()
+                    || state.menu_requests[request_id].is_none()
+                {
+                    return Ok(MENU_POLL_ERR_INVALID_REQUEST_ID);
+                }
             }
-        }
 
-        let request = caller.data_mut().menu_requests[request_id]
-            .as_mut()
-            .unwrap();
-        if let MenuRequestState::Pending(receiver) = &mut request.state {
-            match receiver.try_recv() {
-                Ok(result) => {
-                    request.state = MenuRequestState::Complete(result);
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                    return Ok(MENU_POLL_PENDING);
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    caller.data_mut().menu_requests[request_id] = None;
-                    return Ok(MENU_POLL_ERR_TASK_FAILED);
+            let mut request = caller.data_mut().menu_requests[request_id].take().unwrap();
+            if let MenuRequestState::Pending(receiver) = &mut request.state {
+                match receiver.try_recv() {
+                    Ok(result) => {
+                        request.state =
+                            MenuRequestState::Complete(result.map(Vec::into_boxed_slice));
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                        caller.data_mut().menu_requests[request_id] = Some(request);
+                        return Ok(MENU_POLL_PENDING);
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        return Ok(MENU_POLL_ERR_TASK_FAILED);
+                    }
                 }
             }
-        }
 
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            anyhow::bail!("menu_poll: failed to find host memory");
-        };
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("menu_poll: failed to find host memory");
+            };
 
-        let completed = {
-            let request = caller.data_mut().menu_requests[request_id]
-                .as_ref()
-                .unwrap();
-            match &request.state {
-                MenuRequestState::Complete(result) => Some(result.clone()),
-                MenuRequestState::Pending(_) => None,
-            }
-        };
-        match completed {
-            Some(Ok(data)) => {
-                let needed = data.len() as u32;
-                mem.write(&mut caller, data_len_ptr as usize, &needed.to_le_bytes())?;
-                if needed > data_max_len {
-                    return Ok(MENU_POLL_ERR_BUFFER_TOO_SMALL);
+            match request.state {
+                MenuRequestState::Complete(Ok(data)) => {
+                    let needed = data.len() as u32;
+                    mem.write(&mut caller, data_len_ptr as usize, &needed.to_le_bytes())?;
+                    if needed > data_max_len {
+                        request.state = MenuRequestState::Complete(Ok(data));
+                        caller.data_mut().menu_requests[request_id] = Some(request);
+                        return Ok(MENU_POLL_ERR_BUFFER_TOO_SMALL);
+                    }
+                    if needed > 0 {
+                        mem.write(&mut caller, data_ptr as usize, &data)?;
+                    }
+                    Ok(1)
                 }
-                if needed > 0 {
-                    mem.write(&mut caller, data_ptr as usize, &data)?;
+                MenuRequestState::Complete(Err(_)) => Ok(MENU_POLL_ERR_REQUEST_FAILED),
+                MenuRequestState::Pending(receiver) => {
+                    request.state = MenuRequestState::Pending(receiver);
+                    caller.data_mut().menu_requests[request_id] = Some(request);
+                    Ok(MENU_POLL_PENDING)
                 }
-                caller.data_mut().menu_requests[request_id] = None;
-                Ok(1)
             }
-            Some(Err(_)) => {
-                caller.data_mut().menu_requests[request_id] = None;
-                Ok(MENU_POLL_ERR_REQUEST_FAILED)
-            }
-            None => Ok(MENU_POLL_PENDING),
-        }
+        })
     }
 
     fn insert_menu_request(
@@ -1487,6 +1606,7 @@ impl AppServer {
         db: libsql::Connection,
         user_id: Option<u64>,
         menu_session: Arc<Mutex<MenuSessionState>>,
+        menu_username_tx: watch::Sender<String>,
     ) -> Result<Vec<u8>, String> {
         #[derive(serde::Serialize)]
         struct ProfileOut {
@@ -1497,7 +1617,7 @@ impl AppServer {
         let mut profile = {
             let session = menu_session.lock().await;
             ProfileOut {
-                username: session.username.clone(),
+                username: menu_username_tx.borrow().clone(),
                 locale: session.locale.clone(),
             }
         };
@@ -1518,8 +1638,8 @@ impl AppServer {
                     .get::<String>(1)
                     .unwrap_or_else(|_| profile.locale.clone());
                 let mut session = menu_session.lock().await;
-                session.username = profile.username.clone();
                 session.locale = profile.locale.clone();
+                let _ = menu_username_tx.send(profile.username.clone());
             }
         }
 
@@ -1530,6 +1650,7 @@ impl AppServer {
         db: libsql::Connection,
         user_id: Option<u64>,
         menu_session: Arc<Mutex<MenuSessionState>>,
+        menu_username_tx: watch::Sender<String>,
         username: String,
         locale: String,
     ) -> Result<Vec<u8>, String> {
@@ -1543,9 +1664,9 @@ impl AppServer {
         }
         {
             let mut session = menu_session.lock().await;
-            session.username = username;
             session.locale = locale;
         }
+        let _ = menu_username_tx.send(username);
         Ok(Vec::new())
     }
 
@@ -1645,124 +1766,141 @@ impl AppServer {
         Ok(Vec::new())
     }
 
-    fn graceful_shutdown_poll(caller: wasmtime::Caller<'_, AppState>) -> anyhow::Result<i32> {
-        let is_cancelled = caller.data().graceful_shutdown_token.is_cancelled();
-        Ok(if is_cancelled { 1 } else { 0 })
+    fn graceful_shutdown_poll(
+        caller: wasmtime::Caller<'_, AppState>,
+        (): (),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
+
+            let is_cancelled = caller.data().graceful_shutdown_token.is_cancelled();
+            Ok(if is_cancelled { 1 } else { 0 })
+        })
     }
 
     fn host_network_info(
         mut caller: wasmtime::Caller<'_, AppState>,
-        bytes_per_sec_in_ptr: i32,
-        bytes_per_sec_out_ptr: i32,
-        last_throttled_ms_ptr: i32,
-        latency_ms_ptr: i32,
-    ) -> anyhow::Result<i32> {
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            anyhow::bail!("network_info: failed to find host memory");
-        };
+        (bytes_per_sec_in_ptr, bytes_per_sec_out_ptr, last_throttled_ms_ptr, latency_ms_ptr): (
+            i32,
+            i32,
+            i32,
+            i32,
+        ),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
 
-        let info = &caller.data().network_info;
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("network_info: failed to find host memory");
+            };
 
-        let bytes_per_sec_in = info.bytes_per_sec_in();
-        let bytes_per_sec_out = info.bytes_per_sec_out();
-        let last_throttled_ms = info
-            .last_throttled()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let latency_ms = info.latency().map(|d| d.as_millis() as i32).unwrap_or(-1);
+            let info = &caller.data().network_info;
 
-        mem.write(
-            &mut caller,
-            bytes_per_sec_in_ptr as usize,
-            &bytes_per_sec_in.to_le_bytes(),
-        )?;
-        mem.write(
-            &mut caller,
-            bytes_per_sec_out_ptr as usize,
-            &bytes_per_sec_out.to_le_bytes(),
-        )?;
-        mem.write(
-            &mut caller,
-            last_throttled_ms_ptr as usize,
-            &last_throttled_ms.to_le_bytes(),
-        )?;
-        mem.write(
-            &mut caller,
-            latency_ms_ptr as usize,
-            &latency_ms.to_le_bytes(),
-        )?;
+            let bytes_per_sec_in = info.bytes_per_sec_in();
+            let bytes_per_sec_out = info.bytes_per_sec_out();
+            let last_throttled_ms = info
+                .last_throttled()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let latency_ms = info.latency().map(|d| d.as_millis() as i32).unwrap_or(-1);
 
-        Ok(0)
+            mem.write(
+                &mut caller,
+                bytes_per_sec_in_ptr as usize,
+                &bytes_per_sec_in.to_le_bytes(),
+            )?;
+            mem.write(
+                &mut caller,
+                bytes_per_sec_out_ptr as usize,
+                &bytes_per_sec_out.to_le_bytes(),
+            )?;
+            mem.write(
+                &mut caller,
+                last_throttled_ms_ptr as usize,
+                &last_throttled_ms.to_le_bytes(),
+            )?;
+            mem.write(
+                &mut caller,
+                latency_ms_ptr as usize,
+                &latency_ms.to_le_bytes(),
+            )?;
+
+            Ok(0)
+        })
     }
 
     fn audio_write(
         mut caller: wasmtime::Caller<'_, AppState>,
-        ptr: i32,
-        sample_count: u32,
-    ) -> anyhow::Result<i32> {
-        if sample_count == 0 {
-            return Ok(0);
-        }
+        (ptr, sample_count): (i32, u32),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
 
-        let sample_count = sample_count.min(SAMPLE_RATE) as usize;
-        let float_count = sample_count * CHANNELS;
-        let byte_count = float_count * std::mem::size_of::<f32>();
+            if sample_count == 0 {
+                return Ok(0);
+            }
 
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            anyhow::bail!("audio_write: failed to find host memory");
-        };
+            let sample_count = sample_count.min(SAMPLE_RATE) as usize;
+            let float_count = sample_count * CHANNELS;
+            let byte_count = float_count * std::mem::size_of::<f32>();
 
-        let mut buf = vec![0u8; byte_count];
-        let offset = ptr as usize;
-        mem.read(&caller, offset, &mut buf)?;
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("audio_write: failed to find host memory");
+            };
 
-        let samples: Vec<f32> = buf
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
+            let mut buf = vec![0u8; byte_count];
+            let offset = ptr as usize;
+            mem.read(&caller, offset, &mut buf)?;
 
-        let written = caller.data().audio_buffer.write(&samples);
+            let samples: Vec<f32> = buf
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
 
-        Ok(written as i32)
+            let written = caller.data().audio_buffer.write(&samples);
+
+            Ok(written as i32)
+        })
     }
 
     fn audio_info(
         mut caller: wasmtime::Caller<'_, AppState>,
-        frame_size_ptr: i32,
-        sample_rate_ptr: i32,
-        pts_ptr: i32,
-        buffer_available_ptr: i32,
-    ) -> anyhow::Result<i32> {
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            anyhow::bail!("audio_info: failed to find host memory");
-        };
+        (frame_size_ptr, sample_rate_ptr, pts_ptr, buffer_available_ptr): (i32, i32, i32, i32),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
 
-        let data = caller.data();
-        let pts = data.audio_buffer.pts.load(Ordering::Acquire);
-        let buffer_available = data.audio_buffer.available();
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("audio_info: failed to find host memory");
+            };
 
-        mem.write(
-            &mut caller,
-            frame_size_ptr as usize,
-            &(FRAME_SIZE as u32).to_le_bytes(),
-        )?;
+            let data = caller.data();
+            let pts = data.audio_buffer.pts.load(Ordering::Acquire);
+            let buffer_available = data.audio_buffer.available();
 
-        mem.write(
-            &mut caller,
-            sample_rate_ptr as usize,
-            &(SAMPLE_RATE).to_le_bytes(),
-        )?;
+            mem.write(
+                &mut caller,
+                frame_size_ptr as usize,
+                &(FRAME_SIZE as u32).to_le_bytes(),
+            )?;
 
-        mem.write(&mut caller, pts_ptr as usize, &(pts as u64).to_le_bytes())?;
+            mem.write(
+                &mut caller,
+                sample_rate_ptr as usize,
+                &(SAMPLE_RATE).to_le_bytes(),
+            )?;
 
-        mem.write(
-            &mut caller,
-            buffer_available_ptr as usize,
-            &(buffer_available as u32).to_le_bytes(),
-        )?;
+            mem.write(&mut caller, pts_ptr as usize, &(pts as u64).to_le_bytes())?;
 
-        Ok(0)
+            mem.write(
+                &mut caller,
+                buffer_available_ptr as usize,
+                &(buffer_available as u32).to_le_bytes(),
+            )?;
+
+            Ok(0)
+        })
     }
 }
 
@@ -1781,10 +1919,12 @@ pub struct AppContext {
     audio_enabled: bool,
     term: Option<String>,
     linker: Arc<wasmtime::Linker<AppState>>,
+    module_cache: Arc<tokio::sync::RwLock<HashMap<u64, Arc<wasmtime::Module>>>>,
     app_output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     user_id: Option<u64>,
     locale: String,
     menu_session: Arc<Mutex<MenuSessionState>>,
+    menu_username_tx: watch::Sender<String>,
 }
 
 pub struct AppState {
@@ -1802,6 +1942,52 @@ pub struct AppState {
     graceful_shutdown_token: CancellationToken,
     network_info: Arc<dyn NetworkInfo>,
     audio_buffer: Arc<AudioBuffer>,
+    terminal_snapshot: Arc<TerminalSnapshot>,
+}
+
+pub struct TerminalSnapshot {
+    packed: AtomicU64,
+}
+
+impl TerminalSnapshot {
+    fn new(width: u16, height: u16, cursor_x: u16, cursor_y: u16) -> Self {
+        Self {
+            packed: AtomicU64::new(Self::pack(width, height, cursor_x, cursor_y)),
+        }
+    }
+
+    fn size(&self) -> (u16, u16) {
+        let (width, height, _, _) = Self::unpack(self.packed.load(Ordering::Acquire));
+        (width, height)
+    }
+
+    fn set(&self, width: u16, height: u16, x: u16, y: u16) {
+        self.packed
+            .store(Self::pack(width, height, x, y), Ordering::Release);
+    }
+
+    fn cursor_position(&self) -> (u16, u16) {
+        let (_, _, x, y) = Self::unpack(self.packed.load(Ordering::Acquire));
+        (x, y)
+    }
+
+    #[inline]
+    fn pack(width: u16, height: u16, cursor_x: u16, cursor_y: u16) -> u64 {
+        (width as u64)
+            | ((height as u64) << 16)
+            | ((cursor_x as u64) << 32)
+            | ((cursor_y as u64) << 48)
+    }
+
+    #[inline]
+    fn unpack(packed: u64) -> (u16, u16, u16, u16) {
+        (
+            packed as u16,
+            (packed >> 16) as u16,
+            (packed >> 32) as u16,
+            (packed >> 48) as u16,
+        )
+    }
 }
 
 pub struct ConnectionManager {
@@ -1848,7 +2034,7 @@ pub struct PendingMenuRequest {
 
 pub enum MenuRequestState {
     Pending(tokio::sync::oneshot::Receiver<Result<Vec<u8>, String>>),
-    Complete(Result<Vec<u8>, String>),
+    Complete(Result<Box<[u8]>, String>),
 }
 
 #[derive(Clone)]
@@ -1909,7 +2095,6 @@ struct GameDetailsOut {
 }
 
 pub struct MenuSessionState {
-    username: String,
     locale: String,
     replays: Vec<SessionReplay>,
 }
@@ -1919,12 +2104,16 @@ pub struct Connection {
 }
 
 struct AppLimiter {
-    total: usize,
+    memory_total: usize,
+    table_total: usize,
 }
 
 impl Default for AppLimiter {
     fn default() -> Self {
-        AppLimiter { total: 0 }
+        AppLimiter {
+            memory_total: 0,
+            table_total: 0,
+        }
     }
 }
 
@@ -1934,12 +2123,14 @@ impl wasmtime::ResourceLimiter for AppLimiter {
         current: usize,
         desired: usize,
         maximum: Option<usize>,
-    ) -> anyhow::Result<bool> {
+    ) -> wasmtime::Result<bool> {
         tracing::trace!(current, desired, maximum, "memory growing");
-        self.total -= current;
-        self.total += desired;
-        if self.total >= 32 * 1024 * 1024 {
-            tracing::trace!(total = self.total, "rejected memory grow");
+        self.memory_total = self
+            .memory_total
+            .saturating_sub(current)
+            .saturating_add(desired);
+        if self.memory_total >= 24 * 1024 * 1024 {
+            tracing::error!(total = self.memory_total, "rejected memory grow");
             return Ok(false);
         }
 
@@ -1951,8 +2142,17 @@ impl wasmtime::ResourceLimiter for AppLimiter {
         current: usize,
         desired: usize,
         maximum: Option<usize>,
-    ) -> anyhow::Result<bool> {
+    ) -> wasmtime::Result<bool> {
         tracing::trace!(current, desired, maximum, "table growing");
+        self.table_total = self
+            .table_total
+            .saturating_sub(current)
+            .saturating_add(desired);
+        if self.table_total >= 20_000 {
+            tracing::error!(total = self.table_total, "rejected table grow");
+            return Ok(false);
+        }
+
         return Ok(true);
     }
 }

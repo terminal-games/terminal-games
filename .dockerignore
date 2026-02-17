@@ -1,3 +1,7 @@
-target/
+target
+.git
+.gitignore
+Dockerfile
+.dockerignore
 *.wasm
 *.db
