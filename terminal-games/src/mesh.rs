@@ -13,16 +13,19 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf, BufMut, BytesMut};
-use futures::{SinkExt, StreamExt};
+use base64::Engine as _;
+use futures::StreamExt;
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
+use tarpc::{client, context, server};
+use tarpc::server::Channel;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
+use tokio_rustls::{TlsAcceptor, TlsConnector, rustls};
 use tokio_util::{
-    codec::{Decoder, Encoder, Framed},
+    codec::{Framed, LengthDelimitedCodec},
     sync::CancellationToken,
     task::TaskTracker,
 };
@@ -31,16 +34,18 @@ use crate::rate_limiting::get_tcp_rtt_from_fd;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Message {
-    Handshake(HandshakeMessage),
     PeerMessage(PeerMessage),
     PeerListSync(PeerListSyncMessage),
     PeerAdded(PeerChangeMessage),
     PeerRemoved(PeerChangeMessage),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct HandshakeMessage {
-    region: RegionId,
+#[tarpc::service]
+trait MeshRpc {
+    async fn peer_message(msg: PeerMessage);
+    async fn peer_list_sync(msg: PeerListSyncMessage);
+    async fn peer_added(msg: PeerChangeMessage);
+    async fn peer_removed(msg: PeerChangeMessage);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -679,7 +684,7 @@ impl MeshInner {
 
         let stream = match TcpStream::connect(addr).await {
             Ok(stream) => {
-                tracing::info!(%region, peer = %addr, "Connected to mesh node");
+                tracing::info!(%region, peer = %addr, "Connected TCP to mesh node");
                 stream
             }
             Err(e) => {
@@ -740,8 +745,16 @@ impl MeshInner {
             .handle_connection_inner(stream, addr, expected_region)
             .await;
 
-        if let Some(region) = result.as_ref().ok().copied().or(expected_region) {
-            self.regions.lock().await.remove(&region);
+        if let Err(error) = &result {
+            tracing::warn!(%addr, ?expected_region, ?error, "Mesh connection failed");
+        }
+
+        if expected_region.is_some() {
+            if let Some(region) = result.as_ref().ok().copied().or(expected_region) {
+                self.regions.lock().await.remove(&region);
+                tracing::info!(region=%region, %addr, "Disconnected");
+            }
+        } else if let Ok(region) = result {
             tracing::info!(region=%region, %addr, "Disconnected");
         }
     }
@@ -749,108 +762,133 @@ impl MeshInner {
     async fn handle_connection_inner(
         self: &Arc<Self>,
         stream: TcpStream,
-        addr: SocketAddr,
+        _addr: SocketAddr,
         expected_region: Option<RegionId>,
     ) -> anyhow::Result<RegionId> {
-        let fd = stream.as_raw_fd();
-        let (mut sink, mut stream) = Framed::new(stream, MessageCodec).split();
-
-        sink.send(Message::Handshake(HandshakeMessage {
-            region: self.region,
-        }))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to send handshake: {}", e))?;
-
-        let their_region = match stream.next().await {
-            Some(Ok(Message::Handshake(h))) => h.region,
-            _ => return Err(anyhow::anyhow!("Bad handshake")),
+        let role = if expected_region.is_some() {
+            ConnectionRole::Outgoing
+        } else {
+            ConnectionRole::Incoming
         };
 
-        if let Some(expected) = expected_region {
-            if their_region != expected {
-                tracing::warn!(%expected, actual=%their_region, %addr, "Region mismatch");
-                return Err(anyhow::anyhow!(
-                    "Region mismatch: expected {}, got {}",
-                    expected,
-                    their_region
-                ));
-            }
-        }
+        let fd = stream.as_raw_fd();
+        let stream = self.tls_wrap_stream(stream, role).await?;
 
-        let local_peers_by_app = self
-            .peers
-            .lock()
-            .await
-            .iter()
-            .map(|(app_id, peer_map)| (*app_id, peer_map.keys().copied().collect()))
-            .collect();
-        sink.send(Message::PeerListSync(PeerListSyncMessage {
-            region: self.region,
-            peers_by_app: local_peers_by_app,
-        }))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to send peer list sync: {}", e))?;
+        if matches!(role, ConnectionRole::Outgoing) {
+            let mut codec = LengthDelimitedCodec::new();
+            codec.set_max_frame_length(MESH_MAX_FRAME_LEN);
+            let framed = Framed::new(stream, codec);
+            let transport = tarpc::serde_transport::new::<
+                _,
+                tarpc::Response<MeshRpcResponse>,
+                tarpc::ClientMessage<MeshRpcRequest>,
+                _,
+            >(
+                framed,
+                tarpc::tokio_serde::formats::Bincode::default(),
+            );
+            let rpc_client = MeshRpcClient::new(client::Config::default(), transport).spawn();
+            let their_region = expected_region.expect("outgoing must have expected_region");
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
-        let cancel = self.cancel.clone();
-        self.tasks.spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    msg = rx.recv() => {
-                        match msg {
-                            Some(msg) => {
-                                if sink.send(msg).await.is_err() {
-                                    break;
-                                }
+            let local_peers_by_app = self
+                .peers
+                .lock()
+                .await
+                .iter()
+                .map(|(app_id, peer_map)| (*app_id, peer_map.keys().copied().collect()))
+                .collect();
+            rpc_client
+                .peer_list_sync(
+                    context::current(),
+                    PeerListSyncMessage {
+                        region: self.region,
+                        peers_by_app: local_peers_by_app,
+                    },
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to send initial peer list sync: {}", e))?;
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
+            let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+            let cancel = self.cancel.clone();
+            self.tasks.spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        msg = rx.recv() => {
+                            let Some(msg) = msg else { break };
+                            let send_result = match msg {
+                                Message::PeerMessage(msg) => rpc_client.peer_message(context::current(), msg).await,
+                                Message::PeerListSync(msg) => rpc_client.peer_list_sync(context::current(), msg).await,
+                                Message::PeerAdded(msg) => rpc_client.peer_added(context::current(), msg).await,
+                                Message::PeerRemoved(msg) => rpc_client.peer_removed(context::current(), msg).await,
+                            };
+                            if let Err(error) = send_result {
+                                tracing::warn!(region=%their_region, ?error, "RPC send failed");
+                                break;
                             }
-                            None => break,
                         }
                     }
                 }
-            }
-        });
+                let _ = done_tx.send(());
+            });
 
-        self.regions.lock().await.insert(
-            their_region,
-            RegionState::Active(ActiveConnection { tx, conn_fd: fd }),
-        );
+            self.regions.lock().await.insert(
+                their_region,
+                RegionState::Active(ActiveConnection { tx, conn_fd: fd }),
+            );
 
-        tracing::info!(region=%their_region, %addr, "Connected");
-
-        loop {
             tokio::select! {
-                _ = self.cancel.cancelled() => break,
-                result = stream.next() => {
-                    match result {
-                        Some(Ok(message)) => {
-                            match message {
-                                Message::PeerMessage(msg) => {
-                                    self.handle_peer_message(msg).await;
-                                }
-                                Message::PeerListSync(msg) => {
-                                    self.handle_peer_list_sync(msg).await;
-                                }
-                                Message::PeerAdded(msg) => {
-                                    self.handle_peer_added(msg).await;
-                                }
-                                Message::PeerRemoved(msg) => {
-                                    self.handle_peer_removed(msg).await;
-                                }
-                                Message::Handshake(_) => {
-                                    tracing::warn!(%their_region, "Unexpected handshake after connection established");
-                                }
-                            }
-                        }
-                        _ => break,
-                    }
-                }
+                _ = self.cancel.cancelled() => {}
+                _ = &mut done_rx => {}
             }
+
+            self.handle_region_disconnect(their_region).await;
+            return Ok(their_region);
         }
 
-        self.handle_region_disconnect(their_region).await;
+        let remote_region = Arc::new(Mutex::new(None));
+        let remote_region_for_server = remote_region.clone();
+        let inner = self.clone();
+        let mut codec = LengthDelimitedCodec::new();
+        codec.set_max_frame_length(MESH_MAX_FRAME_LEN);
+        let framed = Framed::new(stream, codec);
+        let transport = tarpc::serde_transport::new::<
+            _,
+            tarpc::ClientMessage<MeshRpcRequest>,
+            tarpc::Response<MeshRpcResponse>,
+            _,
+        >(
+            framed,
+            tarpc::tokio_serde::formats::Bincode::default(),
+        );
+        let channel = server::BaseChannel::with_defaults(transport);
+        let serve_fut = async move {
+            channel
+                .execute(
+                    MeshRpcServer {
+                        inner,
+                        remote_region: remote_region_for_server,
+                    }
+                    .serve(),
+                )
+                .for_each(|response| async move {
+                    let _ = response.await;
+                })
+                .await;
+        };
+        tokio::select! {
+            _ = self.cancel.cancelled() => {}
+            _ = serve_fut => {}
+        }
 
-        Ok(their_region)
+        let maybe_region = *remote_region.lock().await;
+        if let Some(region) = maybe_region {
+            self.handle_region_disconnect(region).await;
+            Ok(region)
+        } else {
+            Err(anyhow::anyhow!("connection closed before authentication"))
+        }
     }
 
     async fn handle_peer_list_sync(&self, msg: PeerListSyncMessage) {
@@ -959,57 +997,248 @@ impl MeshInner {
     }
 }
 
-struct MessageCodec;
+const MESH_MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
+const MESH_TLS_SERVER_NAME: &str = "mesh.internal";
+const MESH_PINNED_PEM_ENV: &str = "MESH_PINNED_PEM";
 
-impl Decoder for MessageCodec {
-    type Item = Message;
-    type Error = std::io::Error;
+#[derive(Clone, Copy)]
+enum ConnectionRole {
+    Outgoing,
+    Incoming,
+}
 
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < 4 {
-            return Ok(None);
+impl MeshInner {
+    fn mtls_pem_value() -> anyhow::Result<Vec<u8>> {
+        let value = std::env::var(MESH_PINNED_PEM_ENV)
+            .map_err(|_| anyhow::anyhow!("{MESH_PINNED_PEM_ENV} must be set"))?;
+        if value.is_empty() {
+            return Err(anyhow::anyhow!("{MESH_PINNED_PEM_ENV} must not be empty"));
+        }
+        let pem_data = base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .map_err(|e| anyhow::anyhow!("Failed to decode base64 from {}: {}", MESH_PINNED_PEM_ENV, e))?;
+        if pem_data.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{} decoded to empty PEM data",
+                MESH_PINNED_PEM_ENV
+            ));
+        }
+        Ok(pem_data)
+    }
+
+    fn load_tls_materials(
+    ) -> anyhow::Result<(
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+        rustls::pki_types::CertificateDer<'static>,
+    )> {
+        let pem_data = Self::mtls_pem_value()?;
+        let mut cert_reader = std::io::BufReader::new(pem_data.as_slice());
+        let certs = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("Failed to parse certificates from {}: {}", MESH_PINNED_PEM_ENV, e))?;
+        if certs.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{} did not contain certificates",
+                MESH_PINNED_PEM_ENV
+            ));
         }
 
-        let mut length_bytes = [0u8; 4];
-        length_bytes.copy_from_slice(&src[..4]);
-        let length = u32::from_be_bytes(length_bytes) as usize;
+        let mut key_reader = std::io::BufReader::new(pem_data.as_slice());
+        let key = rustls_pemfile::private_key(&mut key_reader)
+            .map_err(|e| anyhow::anyhow!("Failed to parse private key from {}: {}", MESH_PINNED_PEM_ENV, e))?
+            .ok_or_else(|| anyhow::anyhow!("{} did not contain a private key", MESH_PINNED_PEM_ENV))?;
+        let pinned_cert = certs[0].clone();
+        Ok((certs, key, pinned_cert))
+    }
 
-        if src.len() < 4 + length {
-            src.reserve(4 + length - src.len());
-            return Ok(None);
-        }
+    fn tls_server_config() -> anyhow::Result<Arc<rustls::ServerConfig>> {
+        let (certs, key, pinned_cert) = Self::load_tls_materials()?;
+        let client_verifier = Arc::new(PinnedClientCertVerifier::new(pinned_cert));
+        let mut config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(certs, key)
+            .map_err(|e| anyhow::anyhow!("Failed to build TLS server config: {}", e))?;
+        config.alpn_protocols.push(b"terminal-games-mesh-v1".to_vec());
+        Ok(Arc::new(config))
+    }
 
-        src.advance(4);
+    fn tls_client_config() -> anyhow::Result<Arc<rustls::ClientConfig>> {
+        let (certs, key, pinned_cert) = Self::load_tls_materials()?;
+        let mut config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier::new(pinned_cert)))
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| anyhow::anyhow!("Failed to build TLS client config: {}", e))?;
+        config.alpn_protocols.push(b"terminal-games-mesh-v1".to_vec());
+        Ok(Arc::new(config))
+    }
 
-        let message_bytes = src.split_to(length);
-
-        match postcard::from_bytes::<Message>(&message_bytes) {
-            Ok(message) => Ok(Some(message)),
-            Err(e) => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to deserialize message: {}", e),
-            )),
+    async fn tls_wrap_stream(
+        &self,
+        stream: TcpStream,
+        role: ConnectionRole,
+    ) -> anyhow::Result<tokio_rustls::TlsStream<TcpStream>> {
+        match role {
+            ConnectionRole::Outgoing => {
+                let connector = TlsConnector::from(Self::tls_client_config()?);
+                let dnsname = rustls::pki_types::ServerName::try_from(MESH_TLS_SERVER_NAME)
+                    .map_err(|_| anyhow::anyhow!("Invalid TLS server name '{}'", MESH_TLS_SERVER_NAME))?;
+                let tls_stream = connector
+                    .connect(dnsname, stream)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("TLS client handshake failed: {}", e))?;
+                Ok(tokio_rustls::TlsStream::Client(tls_stream))
+            }
+            ConnectionRole::Incoming => {
+                let acceptor = TlsAcceptor::from(Self::tls_server_config()?);
+                let tls_stream = acceptor
+                    .accept(stream)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("TLS server handshake failed: {}", e))?;
+                Ok(tokio_rustls::TlsStream::Server(tls_stream))
+            }
         }
     }
 }
 
-impl Encoder<Message> for MessageCodec {
-    type Error = std::io::Error;
+#[derive(Debug)]
+struct PinnedServerCertVerifier {
+    pinned_cert: Vec<u8>,
+}
 
-    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        let data = postcard::to_allocvec(&item).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to serialize message: {}", e),
-            )
-        })?;
+impl PinnedServerCertVerifier {
+    fn new(pinned_cert: rustls::pki_types::CertificateDer<'static>) -> Self {
+        Self {
+            pinned_cert: pinned_cert.as_ref().to_vec(),
+        }
+    }
 
-        let length = data.len() as u32;
-        dst.reserve(4 + data.len());
-        dst.put_u32(length);
+    fn supported_algs() -> rustls::crypto::WebPkiSupportedAlgorithms {
+        rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms
+    }
+}
 
-        dst.extend_from_slice(&data);
+impl rustls::client::danger::ServerCertVerifier for PinnedServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() != self.pinned_cert.as_slice() {
+            return Err(rustls::Error::General(
+                "peer certificate does not match pinned mesh certificate".to_string(),
+            ));
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
 
-        Ok(())
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &Self::supported_algs())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &Self::supported_algs())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        Self::supported_algs().supported_schemes()
+    }
+}
+
+#[derive(Debug)]
+struct PinnedClientCertVerifier {
+    pinned_cert: Vec<u8>,
+}
+
+impl PinnedClientCertVerifier {
+    fn new(pinned_cert: rustls::pki_types::CertificateDer<'static>) -> Self {
+        Self {
+            pinned_cert: pinned_cert.as_ref().to_vec(),
+        }
+    }
+
+    fn supported_algs() -> rustls::crypto::WebPkiSupportedAlgorithms {
+        rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for PinnedClientCertVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        if end_entity.as_ref() != self.pinned_cert.as_slice() {
+            return Err(rustls::Error::General(
+                "peer certificate does not match pinned mesh certificate".to_string(),
+            ));
+        }
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &Self::supported_algs())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &Self::supported_algs())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        Self::supported_algs().supported_schemes()
+    }
+}
+
+#[derive(Clone)]
+struct MeshRpcServer {
+    inner: Arc<MeshInner>,
+    remote_region: Arc<Mutex<Option<RegionId>>>,
+}
+
+impl MeshRpc for MeshRpcServer {
+    async fn peer_message(self, _: context::Context, msg: PeerMessage) {
+        self.inner.handle_peer_message(msg).await;
+    }
+
+    async fn peer_list_sync(self, _: context::Context, msg: PeerListSyncMessage) {
+        *self.remote_region.lock().await = Some(msg.region);
+        self.inner.handle_peer_list_sync(msg).await;
+    }
+
+    async fn peer_added(self, _: context::Context, msg: PeerChangeMessage) {
+        self.inner.handle_peer_added(msg).await;
+    }
+
+    async fn peer_removed(self, _: context::Context, msg: PeerChangeMessage) {
+        self.inner.handle_peer_removed(msg).await;
     }
 }

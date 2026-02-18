@@ -86,6 +86,7 @@
             go-task
             flyctl
             muslCc
+            openssl
           ];
           nativeBuildInputs = with pkgs; [
             cmake
