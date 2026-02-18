@@ -149,7 +149,7 @@ impl ReplayBuffer {
             timestamp,
             title: format!("Terminal Games | {}", self.initial_shortname),
             command: format!(
-                "ssh -C terminal-games.fly.dev -t {}",
+                "ssh -C terminalgames.net -t {}",
                 self.initial_shortname
             ),
             tags: vec!["terminal-games", &self.initial_shortname],

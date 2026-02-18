@@ -89,7 +89,7 @@ impl StatusBar {
 
         let left = active_tab + &username + &net + &latency + &notification;
 
-        let ssh_callout = " ssh -C terminal-games.fly.dev ".bold().black().on_green();
+        let ssh_callout = " ssh -C terminalgames.net ".bold().black().on_green();
         let ticker_index = ((std::time::Instant::now() - self.session_start_time).as_secs() / 10)
             as usize
             % self.tickers.len();
