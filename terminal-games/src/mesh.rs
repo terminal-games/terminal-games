@@ -17,8 +17,8 @@ use base64::Engine as _;
 use futures::StreamExt;
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
-use tarpc::{client, context, server};
 use tarpc::server::Channel;
+use tarpc::{client, context, server};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
@@ -783,10 +783,7 @@ impl MeshInner {
                 tarpc::Response<MeshRpcResponse>,
                 tarpc::ClientMessage<MeshRpcRequest>,
                 _,
-            >(
-                framed,
-                tarpc::tokio_serde::formats::Bincode::default(),
-            );
+            >(framed, tarpc::tokio_serde::formats::Bincode::default());
             let rpc_client = MeshRpcClient::new(client::Config::default(), transport).spawn();
             let their_region = expected_region.expect("outgoing must have expected_region");
 
@@ -858,10 +855,7 @@ impl MeshInner {
             tarpc::ClientMessage<MeshRpcRequest>,
             tarpc::Response<MeshRpcResponse>,
             _,
-        >(
-            framed,
-            tarpc::tokio_serde::formats::Bincode::default(),
-        );
+        >(framed, tarpc::tokio_serde::formats::Bincode::default());
         let channel = server::BaseChannel::with_defaults(transport);
         let serve_fut = async move {
             channel
@@ -1016,7 +1010,13 @@ impl MeshInner {
         }
         let pem_data = base64::engine::general_purpose::STANDARD
             .decode(value)
-            .map_err(|e| anyhow::anyhow!("Failed to decode base64 from {}: {}", MESH_PINNED_PEM_ENV, e))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to decode base64 from {}: {}",
+                    MESH_PINNED_PEM_ENV,
+                    e
+                )
+            })?;
         if pem_data.is_empty() {
             return Err(anyhow::anyhow!(
                 "{} decoded to empty PEM data",
@@ -1026,8 +1026,7 @@ impl MeshInner {
         Ok(pem_data)
     }
 
-    fn load_tls_materials(
-    ) -> anyhow::Result<(
+    fn load_tls_materials() -> anyhow::Result<(
         Vec<rustls::pki_types::CertificateDer<'static>>,
         rustls::pki_types::PrivateKeyDer<'static>,
         rustls::pki_types::CertificateDer<'static>,
@@ -1036,7 +1035,13 @@ impl MeshInner {
         let mut cert_reader = std::io::BufReader::new(pem_data.as_slice());
         let certs = rustls_pemfile::certs(&mut cert_reader)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| anyhow::anyhow!("Failed to parse certificates from {}: {}", MESH_PINNED_PEM_ENV, e))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to parse certificates from {}: {}",
+                    MESH_PINNED_PEM_ENV,
+                    e
+                )
+            })?;
         if certs.is_empty() {
             return Err(anyhow::anyhow!(
                 "{} did not contain certificates",
@@ -1046,8 +1051,16 @@ impl MeshInner {
 
         let mut key_reader = std::io::BufReader::new(pem_data.as_slice());
         let key = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|e| anyhow::anyhow!("Failed to parse private key from {}: {}", MESH_PINNED_PEM_ENV, e))?
-            .ok_or_else(|| anyhow::anyhow!("{} did not contain a private key", MESH_PINNED_PEM_ENV))?;
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to parse private key from {}: {}",
+                    MESH_PINNED_PEM_ENV,
+                    e
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!("{} did not contain a private key", MESH_PINNED_PEM_ENV)
+            })?;
         let pinned_cert = certs[0].clone();
         Ok((certs, key, pinned_cert))
     }
@@ -1059,7 +1072,9 @@ impl MeshInner {
             .with_client_cert_verifier(client_verifier)
             .with_single_cert(certs, key)
             .map_err(|e| anyhow::anyhow!("Failed to build TLS server config: {}", e))?;
-        config.alpn_protocols.push(b"terminal-games-mesh-v1".to_vec());
+        config
+            .alpn_protocols
+            .push(b"terminal-games-mesh-v1".to_vec());
         Ok(Arc::new(config))
     }
 
@@ -1070,7 +1085,9 @@ impl MeshInner {
             .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier::new(pinned_cert)))
             .with_client_auth_cert(certs, key)
             .map_err(|e| anyhow::anyhow!("Failed to build TLS client config: {}", e))?;
-        config.alpn_protocols.push(b"terminal-games-mesh-v1".to_vec());
+        config
+            .alpn_protocols
+            .push(b"terminal-games-mesh-v1".to_vec());
         Ok(Arc::new(config))
     }
 
@@ -1083,7 +1100,9 @@ impl MeshInner {
             ConnectionRole::Outgoing => {
                 let connector = TlsConnector::from(Self::tls_client_config()?);
                 let dnsname = rustls::pki_types::ServerName::try_from(MESH_TLS_SERVER_NAME)
-                    .map_err(|_| anyhow::anyhow!("Invalid TLS server name '{}'", MESH_TLS_SERVER_NAME))?;
+                    .map_err(|_| {
+                        anyhow::anyhow!("Invalid TLS server name '{}'", MESH_TLS_SERVER_NAME)
+                    })?;
                 let tls_stream = connector
                     .connect(dnsname, stream)
                     .await

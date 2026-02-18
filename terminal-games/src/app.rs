@@ -122,8 +122,18 @@ impl AppServer {
         let mut config = wasmtime::Config::new();
         let cache_config = wasmtime::CacheConfig::new();
         config.cache(Some(wasmtime::Cache::new(cache_config).unwrap()));
+        config.epoch_interruption(true);
         let active_apps = Arc::new(AtomicUsize::new(0));
         let engine = wasmtime::Engine::new(&config)?;
+        std::thread::spawn({
+            let engine = engine.weak();
+            move || {
+                while let Some(engine) = engine.upgrade() {
+                    engine.increment_epoch();
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        });
 
         let mut linker = wasmtime::Linker::<AppState>::new(&engine);
         wasmtime_wasi::p1::add_to_linker_async(&mut linker, |t| &mut t.app.wasi_ctx)?;
@@ -546,6 +556,7 @@ impl AppServer {
 
                 let mut store = wasmtime::Store::new(&engine, state);
                 store.limiter(|state| &mut state.limits);
+                store.epoch_deadline_async_yield_and_update(1);
 
                 let call_result = {
                     let func = {
