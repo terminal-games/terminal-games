@@ -277,7 +277,7 @@ impl AppServer {
             if let Some(audio_tx) = audio_tx {
                 let audio_buffer = audio_buffer.clone();
                 let hard_shutdown_token = hard_shutdown_token.clone();
-                std::thread::spawn(move || {
+                tokio::task::spawn(async move {
                     let mut mixer = match Mixer::new(audio_tx, audio_buffer) {
                         Ok(mixer) => mixer,
                         Err(error) => {
@@ -285,7 +285,7 @@ impl AppServer {
                             return;
                         }
                     };
-                    _ = mixer.run(hard_shutdown_token);
+                    _ = mixer.run(hard_shutdown_token).await;
                 });
             }
 
@@ -701,7 +701,6 @@ impl AppServer {
                 sender: ctx.app_output_sender.clone(),
             })
             .envs(&envs)
-            // .allow_blocking_current_thread(true)
             .build_p1();
 
         let mut rows = ctx

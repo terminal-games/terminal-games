@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 pub const SAMPLE_RATE: u32 = 48000;
 pub const FRAME_SIZE: usize = 480;
 pub const CHANNELS: usize = 2;
+const OUTPUT_BUFFER_CAPACITY: usize = 16 * 1024;
 
 struct AudioBufferInner {
     samples: Vec<f32>,
@@ -140,6 +141,7 @@ impl AudioBuffer {
 pub struct Mixer {
     encoder: Encoder,
     packet_writer: PacketWriter<'static, ChannelWriter>,
+    audio_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     serial: u32,
     granule_pos: u64,
     pts: usize,
@@ -156,16 +158,16 @@ impl Mixer {
         encoder.set_vbr(false)?;
         let pre_skip = encoder.get_lookahead()? as u16;
 
-        let writer = ChannelWriter { audio_tx };
-        let mut packet_writer = PacketWriter::new(writer);
+        let writer = ChannelWriter {
+            output_buffer: Vec::with_capacity(OUTPUT_BUFFER_CAPACITY),
+        };
+        let packet_writer = PacketWriter::new(writer);
         let serial = 0x5447_4F50;
-
-        packet_writer.write_packet(opus_head(pre_skip), serial, PacketWriteEndInfo::EndPage, 0)?;
-        packet_writer.write_packet(opus_tags(), serial, PacketWriteEndInfo::EndPage, 0)?;
 
         Ok(Self {
             encoder,
             packet_writer,
+            audio_tx,
             serial,
             granule_pos: pre_skip as u64,
             pts: 0,
@@ -173,15 +175,46 @@ impl Mixer {
         })
     }
 
-    pub fn run(&mut self, cancellation_token: CancellationToken) -> anyhow::Result<()> {
+    async fn flush_output(
+        &mut self,
+        cancellation_token: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        let output_buffer = &mut self.packet_writer.inner_mut().output_buffer;
+        if output_buffer.is_empty() {
+            return Ok(());
+        }
+
+        let chunk = std::mem::replace(output_buffer, Vec::with_capacity(OUTPUT_BUFFER_CAPACITY));
+
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        tokio::select! {
+            _ = cancellation_token.cancelled() => return Ok(()),
+            send_result = self.audio_tx.send(chunk) => {
+                send_result.map_err(|_| anyhow::anyhow!("audio receiver dropped"))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn run(&mut self, cancellation_token: CancellationToken) -> anyhow::Result<()> {
         let frame_size = FRAME_SIZE;
         let sample_rate = SAMPLE_RATE;
         let start_time = Instant::now();
+        let pre_skip = self.granule_pos;
 
         let mut read_buffer = vec![0.0f32; frame_size * CHANNELS];
         let mut packet_buffer = vec![0u8; 1500];
 
         // tracing::info!(frame_size, sample_rate, channels = CHANNELS, "mixer started");
+        self.packet_writer
+            .write_packet(opus_head(pre_skip as u16), self.serial, PacketWriteEndInfo::EndPage, 0)?;
+        self.flush_output(&cancellation_token).await?;
+        self.packet_writer
+            .write_packet(opus_tags(), self.serial, PacketWriteEndInfo::EndPage, 0)?;
+        self.flush_output(&cancellation_token).await?;
 
         loop {
             if cancellation_token.is_cancelled() {
@@ -200,7 +233,10 @@ impl Mixer {
                 start_time + Duration::from_secs_f64(self.pts as f64 / sample_rate as f64);
             let sleep_duration = expected_time.saturating_duration_since(Instant::now());
             if sleep_duration > Duration::ZERO {
-                std::thread::sleep(sleep_duration);
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(sleep_duration) => {}
+                }
             }
 
             self.pts += frame_size;
@@ -215,19 +251,18 @@ impl Mixer {
                 PacketWriteEndInfo::EndPage,
                 self.granule_pos,
             )?;
+            self.flush_output(&cancellation_token).await?;
         }
     }
 }
 
 struct ChannelWriter {
-    audio_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    output_buffer: Vec<u8>,
 }
 
 impl Write for ChannelWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.audio_tx
-            .blocking_send(buf.to_vec())
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "audio receiver dropped"))?;
+        self.output_buffer.extend_from_slice(buf);
         Ok(buf.len())
     }
 
