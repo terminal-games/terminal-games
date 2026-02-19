@@ -107,11 +107,9 @@ impl SshServer {
 
     fn new_client(
         &self,
-        addr: std::net::SocketAddr,
+        _addr: std::net::SocketAddr,
         network_info: Arc<NetworkInformation<TcpLatencyProvider>>,
     ) -> SshSession {
-        tracing::info!(addr=?addr, "new_client");
-
         let (auth_sender, auth_receiver) = tokio::sync::oneshot::channel::<(String, Option<u64>)>();
         let (term_sender, term_receiver) = tokio::sync::oneshot::channel::<String>();
         let (args_sender, args_receiver) = tokio::sync::oneshot::channel::<Vec<u8>>();
@@ -571,7 +569,6 @@ impl Handler for SshSession {
         user: &str,
         pubkey: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        tracing::info!(user, "auth_publickey");
         let user_id = if let Ok(mut rows) = self
             .server
             .app_server
@@ -594,6 +591,13 @@ impl Handler for SshSession {
         };
         if let Some(auth_sender) = self.auth.take() {
             let _ = auth_sender.send((user.to_string(), user_id));
+        }
+        Ok(Auth::Accept)
+    }
+
+    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+        if let Some(auth_sender) = self.auth.take() {
+            let _ = auth_sender.send((user.to_string(), None));
         }
         Ok(Auth::Accept)
     }
