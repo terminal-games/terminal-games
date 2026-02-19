@@ -78,6 +78,11 @@ const MENU_POLL_ERR_TASK_FAILED: i32 = -3;
 const MENU_POLL_ERR_BUFFER_TOO_SMALL: i32 = -4;
 const MENU_POLL_ERR_REQUEST_FAILED: i32 = -5;
 
+const NEXT_APP_READY_READY: i32 = 1;
+const NEXT_APP_READY_NOT_READY: i32 = 0;
+const NEXT_APP_READY_ERR_UNKNOWN_SHORTNAME: i32 = -1;
+const NEXT_APP_READY_ERR_PREPARE_FAILED_OTHER: i32 = -2;
+
 pub struct AppServer {
     linker: Arc<wasmtime::Linker<AppState>>,
     engine: wasmtime::Engine,
@@ -566,7 +571,14 @@ impl AppServer {
                 terminal_snapshot = state.terminal_snapshot;
 
                 if let Some(next_app) = state.next_app.take() {
-                    let Ok((next_app, next_instance_pre)) = next_app.await else {
+                    let next_app = match next_app {
+                        NextAppState::Pending(next_app) => next_app
+                            .await
+                            .unwrap_or(Err(NextAppPrepareErrorCode::Other)),
+                        NextAppState::Ready(next_app) => Ok(next_app),
+                        NextAppState::Failed(_) => break,
+                    };
+                    let Ok((next_app, next_instance_pre)) = next_app else {
                         break;
                     };
                     if shortname_sender
@@ -605,7 +617,7 @@ impl AppServer {
         let app_id_row = app_id_rows
             .next()
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Unknown game shortname: {shortname}"))?;
+            .ok_or_else(|| UnknownGameShortnameError(shortname.clone()))?;
         let app_id = app_id_row.get::<u64>(0)?;
 
         let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(AppId(app_id)).await;
@@ -1131,16 +1143,32 @@ impl AppServer {
             };
 
             let has_next_app = caller.data().has_next_app.clone();
-            if caller.data().next_app.is_none() || has_next_app.load(Ordering::Acquire) {
+            let should_prepare = !matches!(
+                caller.data().next_app.as_ref(),
+                Some(NextAppState::Pending(_))
+            );
+            if should_prepare {
                 has_next_app.store(false, Ordering::Release);
                 let ctx = caller.data().ctx.clone();
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                caller.data_mut().next_app = Some(rx);
+                caller.data_mut().next_app = Some(NextAppState::Pending(rx));
                 tokio::task::spawn(async move {
-                    if let Ok(next_app) = Self::prepare_instantiate(&ctx, shortname).await {
-                        let _ = tx.send(next_app);
-                        has_next_app.store(true, Ordering::Release);
-                    }
+                    let result = match Self::prepare_instantiate(&ctx, shortname).await {
+                        Ok(next_app) => {
+                            has_next_app.store(true, Ordering::Release);
+                            Ok(next_app)
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "change_app preload failed");
+                            has_next_app.store(false, Ordering::Release);
+                            if err.downcast_ref::<UnknownGameShortnameError>().is_some() {
+                                Err(NextAppPrepareErrorCode::UnknownShortname)
+                            } else {
+                                Err(NextAppPrepareErrorCode::Other)
+                            }
+                        }
+                    };
+                    let _ = tx.send(result);
                 });
             }
 
@@ -1149,14 +1177,47 @@ impl AppServer {
     }
 
     fn next_app_ready(
-        caller: wasmtime::Caller<'_, AppState>,
+        mut caller: wasmtime::Caller<'_, AppState>,
         (): (),
     ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
         Box::new(async move {
             tokio::task::yield_now().await;
 
             let ready = caller.data().has_next_app.load(Ordering::Acquire);
-            Ok(if ready { 1 } else { 0 })
+            if ready {
+                return Ok(NEXT_APP_READY_READY);
+            }
+
+            let Some(next_app_state) = caller.data_mut().next_app.take() else {
+                return Ok(NEXT_APP_READY_NOT_READY);
+            };
+            match next_app_state {
+                NextAppState::Pending(mut next_app_rx) => match next_app_rx.try_recv() {
+                    Ok(Ok(next_app)) => {
+                        caller.data_mut().next_app = Some(NextAppState::Ready(next_app));
+                        Ok(NEXT_APP_READY_READY)
+                    }
+                    Ok(Err(error_code)) => {
+                        caller.data_mut().next_app = Some(NextAppState::Failed(error_code));
+                        Ok(error_code.to_i32())
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                        caller.data_mut().next_app = Some(NextAppState::Pending(next_app_rx));
+                        Ok(NEXT_APP_READY_NOT_READY)
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        Ok(NEXT_APP_READY_ERR_PREPARE_FAILED_OTHER)
+                    }
+                },
+                NextAppState::Ready(next_app) => {
+                    caller.data_mut().next_app = Some(NextAppState::Ready(next_app));
+                    Ok(NEXT_APP_READY_READY)
+                }
+                NextAppState::Failed(error_code) => {
+                    caller.data_mut().next_app = Some(NextAppState::Failed(error_code));
+                    Ok(error_code.to_i32())
+                }
+            }
         })
     }
 
@@ -1919,9 +1980,7 @@ pub struct AppState {
     menu_requests: Vec<Option<PendingMenuRequest>>,
     limits: AppLimiter,
     terminal: Arc<Mutex<Terminal>>,
-    next_app: Option<
-        tokio::sync::oneshot::Receiver<(PreloadedAppState, wasmtime::InstancePre<AppState>)>,
-    >,
+    next_app: Option<NextAppState>,
     has_next_app: Arc<AtomicBool>,
     input_receiver: tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
     graceful_shutdown_token: CancellationToken,
@@ -1929,6 +1988,41 @@ pub struct AppState {
     audio_buffer: Arc<AudioBuffer>,
     terminal_snapshot: Arc<TerminalSnapshot>,
 }
+
+enum NextAppState {
+    Pending(tokio::sync::oneshot::Receiver<NextAppPrepareResult>),
+    Ready((PreloadedAppState, wasmtime::InstancePre<AppState>)),
+    Failed(NextAppPrepareErrorCode),
+}
+
+type NextAppPrepareResult =
+    Result<(PreloadedAppState, wasmtime::InstancePre<AppState>), NextAppPrepareErrorCode>;
+
+#[derive(Clone, Copy)]
+enum NextAppPrepareErrorCode {
+    UnknownShortname,
+    Other,
+}
+
+impl NextAppPrepareErrorCode {
+    fn to_i32(self) -> i32 {
+        match self {
+            Self::UnknownShortname => NEXT_APP_READY_ERR_UNKNOWN_SHORTNAME,
+            Self::Other => NEXT_APP_READY_ERR_PREPARE_FAILED_OTHER,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UnknownGameShortnameError(String);
+
+impl std::fmt::Display for UnknownGameShortnameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Unknown game shortname: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownGameShortnameError {}
 
 pub struct TerminalSnapshot {
     packed: AtomicU64,

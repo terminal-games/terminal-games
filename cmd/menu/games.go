@@ -165,7 +165,13 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		if !m.playBusy {
 			return m, nil
 		}
-		if app.Ready() {
+		ready, err := app.Ready()
+		if err != nil {
+			m.playBusy = false
+			m.playError = err.Error()
+			return m, nil
+		}
+		if ready {
 			return m, tea.Quit
 		}
 		var cmd tea.Cmd

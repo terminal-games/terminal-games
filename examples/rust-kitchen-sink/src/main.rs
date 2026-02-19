@@ -234,8 +234,10 @@ async fn main() -> std::io::Result<()> {
             last_event = Some(event);
         }
 
-        if app::next_app_ready() {
-            break;
+        match app::next_app_ready() {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(_) => break,
         }
 
         if app::graceful_shutdown_poll() {

@@ -11,6 +11,16 @@ import (
 	"unsafe"
 )
 
+const (
+	nextAppReadyErrUnknownShortname = -1
+	nextAppReadyErrOther            = -2
+)
+
+var (
+	ErrNextAppUnknownShortname = errors.New("unknown app shortname")
+	ErrNextAppPrepareFailed    = errors.New("failed to prepare app switch")
+)
+
 //go:wasmimport terminal_games change_app
 //go:noescape
 func change_app(address_ptr unsafe.Pointer, addressLen uint32) int32
@@ -34,7 +44,7 @@ func Change(shortname string) error {
 	b := []byte(shortname)
 	ret := change_app(unsafe.Pointer(&b[0]), uint32(len(b)))
 	if ret < 0 {
-		return fmt.Errorf("change_app failed")
+		return fmt.Errorf("change_app failed with code %d", ret)
 	}
 
 	return nil
@@ -46,8 +56,19 @@ func Change(shortname string) error {
 // This can be called in a loop by the current guest before exiting to ensure
 // the next app will start quickly once the host performs the switch. This is
 // useful for building a loading UI
-func Ready() bool {
-	return next_app_ready() > 0
+func Ready() (bool, error) {
+	ret := next_app_ready()
+	switch ret {
+	case nextAppReadyErrUnknownShortname:
+		return false, ErrNextAppUnknownShortname
+	case nextAppReadyErrOther:
+		return false, ErrNextAppPrepareFailed
+	default:
+		if ret < 0 {
+			return false, fmt.Errorf("next_app_ready failed with code %d", ret)
+		}
+	}
+	return ret > 0, nil
 }
 
 // GracefulShutdownPoll polls whether a graceful shutdown has been triggered by the host.

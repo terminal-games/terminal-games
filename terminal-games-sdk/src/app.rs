@@ -18,14 +18,40 @@ pub fn change_app(shortname: impl AsRef<str>) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+const NEXT_APP_READY_ERR_UNKNOWN_SHORTNAME: i32 = -1;
+const NEXT_APP_READY_ERR_OTHER: i32 = -2;
+
+#[derive(Debug)]
+pub enum NextAppReadyError {
+    UnknownShortname,
+    Other(i32),
+}
+
+impl std::fmt::Display for NextAppReadyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownShortname => write!(f, "unknown app shortname"),
+            Self::Other(code) => write!(f, "next_app_ready failed with code {}", code),
+        }
+    }
+}
+
+impl std::error::Error for NextAppReadyError {}
+
 /// Reports whether the next app requested via [`change_app`] is fully warmed in
 /// the host's module cache and ready to switch to.
 ///
 /// This can be called in a loop by the current guest before exiting to ensure
 /// the next app will start quickly once the host performs the switch. This is
 /// useful for building a loading UI
-pub fn next_app_ready() -> bool {
-    return unsafe { crate::internal::next_app_ready() } > 0;
+pub fn next_app_ready() -> Result<bool, NextAppReadyError> {
+    let result = unsafe { crate::internal::next_app_ready() };
+    match result {
+        NEXT_APP_READY_ERR_UNKNOWN_SHORTNAME => Err(NextAppReadyError::UnknownShortname),
+        NEXT_APP_READY_ERR_OTHER => Err(NextAppReadyError::Other(result)),
+        r if r < 0 => Err(NextAppReadyError::Other(r)),
+        r => Ok(r > 0),
+    }
 }
 
 /// Polls whether a graceful shutdown has been triggered by the host.
