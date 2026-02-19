@@ -37,6 +37,7 @@ const (
 	minContentHeight  = 5
 	minViewportWidth  = 40
 	minViewportHeight = 11
+	helpPaddingX      = 2
 )
 
 type model struct {
@@ -80,6 +81,14 @@ type keyMap struct {
 	Quit    key.Binding
 	NextTab key.Binding
 	PrevTab key.Binding
+}
+
+type contentLayout struct {
+	height      int
+	paddingY    int
+	paddingX    int
+	innerWidth  int
+	innerHeight int
 }
 
 func newKeyMap(localizer localizer) keyMap {
@@ -270,101 +279,100 @@ func (m *model) View() string {
 	title := m.titleStyle.Render(" " + m.localizer.Text(textHeaderTitle))
 	titleWidth := lipgloss.Width(title)
 
-	viewportWidth := maxWidth
-	if m.w < viewportWidth {
-		viewportWidth = m.w
-	}
-	requiredWidth := minViewportWidth
-	if titleWidth+tabsWidth+1 > requiredWidth {
-		requiredWidth = titleWidth + tabsWidth + 1
-	}
-	if viewportWidth < requiredWidth || m.h < minViewportHeight {
+	viewportWidth := min(m.w, maxWidth)
+	if !m.canRenderViewport(viewportWidth, titleWidth, tabsWidth) {
 		return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Center, m.localizer.Text(textWindowTooSmall))
 	}
 
-	paddingTotal := viewportWidth - tabsWidth
-	if paddingTotal < 0 {
-		paddingTotal = 0
-	}
-	leftPad := paddingTotal / 2
-	minLeftPad := titleWidth + 1
-	if leftPad < minLeftPad {
-		leftPad = minLeftPad
-	}
-	rightPad := viewportWidth - leftPad - tabsWidth
-	if rightPad < 0 {
-		rightPad = 0
+	centeredTabsView := m.renderCenteredTabsView(viewportWidth, tabsView, tabsWidth, title, titleWidth)
+	helpView := m.renderHelpView(viewportWidth)
+	layout := m.computeContentLayout(viewportWidth, lipgloss.Height(centeredTabsView), lipgloss.Height(helpView))
+	if m.tabs.ActiveTab().ID == "games" && m.games.gameDetailsNeedsMoreHeight(layout.innerWidth, layout.innerHeight) {
+		helpView = ""
+		layout = m.computeContentLayout(viewportWidth, lipgloss.Height(centeredTabsView), 0)
 	}
 
-	tabLines := strings.Split(tabsView, "\n")
-	var centeredTabs strings.Builder
-	centeredTabs.WriteString(strings.Repeat(" ", viewportWidth))
-	centeredTabs.WriteString("\n")
-	if len(tabLines) > 0 {
-		line := title + strings.Repeat(" ", leftPad-titleWidth) + tabLines[0] + strings.Repeat(" ", rightPad)
-		centeredTabs.WriteString(lipgloss.NewStyle().Width(viewportWidth).Render(line))
-	}
-	if len(tabLines) > 1 {
-		centeredTabs.WriteString("\n")
-		barLine := m.barStyle.Render(strings.Repeat(tabs.HeavyHorizontal, leftPad)) + tabLines[1] +
-			m.barStyle.Render(strings.Repeat(tabs.HeavyHorizontal, rightPad))
-		centeredTabs.WriteString(lipgloss.NewStyle().Width(viewportWidth).Render(barLine))
-	}
-
-	centeredTabsView := lipgloss.NewStyle().Width(viewportWidth).Render(centeredTabs.String())
-
-	m.help.Width = viewportWidth
-	var helpLines []string
-	if keyMap := m.contextualKeyMap(); keyMap != nil {
-		helpLines = append(helpLines, lipgloss.NewStyle().Width(viewportWidth).Render(m.help.View(keyMap)))
-	}
-	if keyMap := m.globalHelpKeyMap(); keyMap != nil {
-		helpLines = append(helpLines, lipgloss.NewStyle().Width(viewportWidth).Render(m.help.View(keyMap)))
-	}
-	helpView := lipgloss.NewStyle().Padding(1, 2).Render(strings.Join(helpLines, "\n"))
-	helpHeight := lipgloss.Height(helpView)
-
-	contentHeight := m.h - lipgloss.Height(centeredTabsView) - helpHeight
-	if contentHeight < 0 {
-		contentHeight = 0
-	}
-
-	contentPaddingY := 1
-	contentPaddingX := 2
-	if contentHeight <= minContentHeight+2 {
-		contentPaddingY = 0
-		contentPaddingX = 1
-	}
-
-	contentWidth := viewportWidth - 2*contentPaddingX
-	contentHeightInner := contentHeight - 2*contentPaddingY
-	if contentWidth < 0 {
-		contentWidth = 0
-	}
-	if contentHeightInner < 0 {
-		contentHeightInner = 0
-	}
-
-	var content string
-	switch m.tabs.ActiveTab().ID {
-	case "games":
-		content = m.renderGamesTab(contentWidth, contentHeightInner)
-	case "profile":
-		content = m.renderProfileTab(contentWidth, contentHeightInner)
-	case "about":
-		content = m.renderAboutTab(contentWidth, contentHeightInner)
-	default:
-		content = m.localizer.Text(textUnknownTab)
-	}
+	content := m.renderActiveTab(layout.innerWidth, layout.innerHeight)
 
 	styledContent := m.contentArea.
-		Padding(contentPaddingY, contentPaddingX).
+		Padding(layout.paddingY, layout.paddingX).
 		Width(viewportWidth).
-		Height(contentHeight).
+		Height(layout.height).
 		Render(content)
 
 	fullView := lipgloss.JoinVertical(lipgloss.Left, centeredTabsView, styledContent, helpView)
 	return m.zone.Scan(lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Top, fullView))
+}
+
+func (m *model) canRenderViewport(viewportWidth, titleWidth, tabsWidth int) bool {
+	requiredWidth := max(minViewportWidth, titleWidth+tabsWidth+1)
+	return viewportWidth >= requiredWidth && m.h >= minViewportHeight
+}
+
+func (m *model) renderCenteredTabsView(viewportWidth int, tabsView string, tabsWidth int, title string, titleWidth int) string {
+	paddingTotal := max(0, viewportWidth-tabsWidth)
+	leftPad := max(paddingTotal/2, titleWidth+1)
+	rightPad := max(0, viewportWidth-leftPad-tabsWidth)
+
+	tabLines := strings.Split(tabsView, "\n")
+	lines := []string{strings.Repeat(" ", viewportWidth)}
+	if len(tabLines) > 0 {
+		line := title + strings.Repeat(" ", leftPad-titleWidth) + tabLines[0] + strings.Repeat(" ", rightPad)
+		lines = append(lines, lipgloss.NewStyle().Width(viewportWidth).Render(line))
+	}
+	if len(tabLines) > 1 {
+		barLine := m.barStyle.Render(strings.Repeat(tabs.HeavyHorizontal, leftPad)) + tabLines[1] +
+			m.barStyle.Render(strings.Repeat(tabs.HeavyHorizontal, rightPad))
+		lines = append(lines, lipgloss.NewStyle().Width(viewportWidth).Render(barLine))
+	}
+	return lipgloss.NewStyle().Width(viewportWidth).Render(strings.Join(lines, "\n"))
+}
+
+func (m *model) renderHelpView(viewportWidth int) string {
+	innerWidth := max(0, viewportWidth-2*helpPaddingX)
+	m.help.Width = innerWidth
+
+	helpLines := make([]string, 0, 2)
+	if keyMap := m.contextualKeyMap(); keyMap != nil {
+		helpLines = append(helpLines, lipgloss.NewStyle().Width(innerWidth).Render(m.help.View(keyMap)))
+	}
+	if keyMap := m.globalHelpKeyMap(); keyMap != nil {
+		helpLines = append(helpLines, lipgloss.NewStyle().Width(innerWidth).Render(m.help.View(keyMap)))
+	}
+	return lipgloss.NewStyle().Padding(1, helpPaddingX).Render(strings.Join(helpLines, "\n"))
+}
+
+func (m *model) computeContentLayout(viewportWidth, headerHeight, helpHeight int) contentLayout {
+	height := max(0, m.h-headerHeight-helpHeight)
+	paddingY := 1
+	paddingX := 2
+	if height <= minContentHeight+2 {
+		paddingY = 0
+		paddingX = 1
+	}
+
+	innerWidth := max(0, viewportWidth-2*paddingX)
+	innerHeight := max(0, height-2*paddingY)
+	return contentLayout{
+		height:      height,
+		paddingY:    paddingY,
+		paddingX:    paddingX,
+		innerWidth:  innerWidth,
+		innerHeight: innerHeight,
+	}
+}
+
+func (m *model) renderActiveTab(width, height int) string {
+	switch m.tabs.ActiveTab().ID {
+	case "games":
+		return m.renderGamesTab(width, height)
+	case "profile":
+		return m.renderProfileTab(width, height)
+	case "about":
+		return m.renderAboutTab(width, height)
+	default:
+		return m.localizer.Text(textUnknownTab)
+	}
 }
 
 func (m model) startupReady() bool {
