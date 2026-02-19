@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
@@ -83,7 +83,6 @@ pub struct AppServer {
     engine: wasmtime::Engine,
     pub db: libsql::Connection,
     mesh: Mesh,
-    active_apps: Arc<AtomicUsize>,
     module_cache: Arc<tokio::sync::RwLock<HashMap<u64, Arc<wasmtime::Module>>>>,
 }
 
@@ -103,27 +102,12 @@ pub struct AppInstantiationParams {
     pub locale: String,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct AppCapacityError {
-    pub active: usize,
-    pub max: usize,
-}
-
-impl std::fmt::Display for AppCapacityError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "too many active apps ({} >= {})", self.active, self.max)
-    }
-}
-
-impl std::error::Error for AppCapacityError {}
-
 impl AppServer {
     pub fn new(mesh: Mesh, db: libsql::Connection) -> anyhow::Result<Self> {
         let mut config = wasmtime::Config::new();
         let cache_config = wasmtime::CacheConfig::new();
         config.cache(Some(wasmtime::Cache::new(cache_config).unwrap()));
         config.epoch_interruption(true);
-        let active_apps = Arc::new(AtomicUsize::new(0));
         let engine = wasmtime::Engine::new(&config)?;
         std::thread::spawn({
             let engine = engine.weak();
@@ -192,53 +176,12 @@ impl AppServer {
             mesh,
             db,
             engine,
-            active_apps,
             module_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         })
     }
 
     /// Run an app with IO defined in [`params`] in the background
-    pub fn instantiate_app(
-        &self,
-        params: AppInstantiationParams,
-    ) -> Result<tokio::sync::oneshot::Receiver<I32Exit>, AppCapacityError> {
-        struct RunningAppGuard(Arc<AtomicUsize>);
-        impl Drop for RunningAppGuard {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-
-        let active_apps = self.active_apps.clone();
-        let running_app_guard = if let Ok(limit) = std::env::var("MAX_ACTIVE_APPS") {
-            if let Ok(max_active_apps) = limit.parse::<usize>() {
-                let mut active = active_apps.load(Ordering::Acquire);
-                loop {
-                    if active >= max_active_apps {
-                        return Err(AppCapacityError {
-                            active,
-                            max: max_active_apps,
-                        });
-                    }
-                    match active_apps.compare_exchange_weak(
-                        active,
-                        active + 1,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => break RunningAppGuard(active_apps.clone()),
-                        Err(now_active) => active = now_active,
-                    }
-                }
-            } else {
-                active_apps.fetch_add(1, Ordering::AcqRel);
-                RunningAppGuard(active_apps.clone())
-            }
-        } else {
-            active_apps.fetch_add(1, Ordering::AcqRel);
-            RunningAppGuard(active_apps.clone())
-        };
-
+    pub fn instantiate_app(&self, params: AppInstantiationParams) -> tokio::sync::oneshot::Receiver<I32Exit> {
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
 
         let mesh = self.mesh.clone();
@@ -248,8 +191,6 @@ impl AppServer {
         let module_cache = self.module_cache.clone();
 
         tokio::task::spawn(async move {
-            let _running_app_guard = running_app_guard;
-
             let engine = engine;
 
             let mut window_size_receiver = params.window_size_receiver;
@@ -615,11 +556,7 @@ impl AppServer {
             let _ = exit_tx.send(exit_code);
         });
 
-        Ok(exit_rx)
-    }
-
-    pub fn active_app_count(&self) -> usize {
-        self.active_apps.load(Ordering::Acquire)
+        exit_rx
     }
 
     async fn prepare_instantiate(

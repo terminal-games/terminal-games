@@ -22,7 +22,7 @@ use smallvec::SmallVec;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use terminal_games::{
-    app::{AppCapacityError, AppInstantiationParams, AppServer},
+    app::{AppInstantiationParams, AppServer},
     mesh::{LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
 };
@@ -291,7 +291,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut exit_rx = match app_server.instantiate_app(AppInstantiationParams {
+    let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
         args: None,
         input_receiver: input_rx,
         output_sender: output_tx,
@@ -305,12 +305,7 @@ async fn main() -> Result<()> {
         first_app_shortname,
         user_id,
         locale,
-    }) {
-        Ok(exit_rx) => exit_rx,
-        Err(AppCapacityError { active, max }) => {
-            anyhow::bail!("Too many active apps ({} >= {})", active, max);
-        }
-    };
+    });
 
     thread::spawn(move || {
         let stdin = std::io::stdin();

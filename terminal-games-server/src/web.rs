@@ -5,6 +5,11 @@
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::{convert::Infallible, io::Write};
+use std::{
+    collections::HashMap,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use axum::extract::connect_info::Connected;
 use axum::extract::{ConnectInfo, Request};
@@ -16,7 +21,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
-    response::{Html, Response},
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use bytes::Bytes;
@@ -25,14 +30,16 @@ use flate2::write::DeflateEncoder;
 use futures::{SinkExt, StreamExt};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use serde::Deserialize;
+use rand_core::{OsRng, RngCore};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
-use terminal_games::app::{AppCapacityError, AppInstantiationParams, AppServer};
+use terminal_games::app::{AppInstantiationParams, AppServer};
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 
-const OVERLOAD_MESSAGE: &str = "Server is temporarily overloaded. Please try again in a moment.";
+use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
 
 #[derive(Clone)]
 struct MyConnectInfo {
@@ -48,11 +55,17 @@ impl Connected<MyConnectInfo> for MyConnectInfo {
 #[derive(Clone)]
 pub struct WebServer {
     app_server: Arc<AppServer>,
+    admission_controller: Arc<AdmissionController>,
+    pow: Arc<PowGate>,
 }
 
 impl WebServer {
-    pub fn new(app_server: Arc<AppServer>) -> Self {
-        Self { app_server }
+    pub fn new(app_server: Arc<AppServer>, admission_controller: Arc<AdmissionController>) -> Self {
+        Self {
+            app_server,
+            admission_controller,
+            pow: Arc::new(PowGate::new(18, Duration::from_secs(90))),
+        }
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -72,6 +85,7 @@ impl WebServer {
                 "/jitter-buffer-processor.js",
                 get(serve_jitter_buffer_processor_js),
             )
+            .route("/pow/challenge", get(pow_challenge_handler))
             .route("/ws", get(websocket_handler))
             .with_state(self.clone());
 
@@ -161,6 +175,8 @@ async fn serve_jitter_buffer_processor_js() -> Response {
 #[derive(Deserialize)]
 struct WebSocketQuery {
     args: Option<String>,
+    pow_id: Option<String>,
+    pow_counter: Option<u64>,
 }
 
 async fn websocket_handler(
@@ -197,6 +213,14 @@ async fn websocket_handler(
         }
         _ => ("menu".into(), None),
     };
+
+    let verified = match (query.pow_id.as_deref(), query.pow_counter) {
+        (Some(pow_id), Some(counter)) => server.pow.verify(pow_id, counter),
+        _ => false,
+    };
+    if !verified {
+        return (StatusCode::FORBIDDEN, "invalid proof of work").into_response();
+    }
 
     ws.on_upgrade(move |socket| {
         handle_socket(
@@ -236,7 +260,12 @@ async fn handle_socket(
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(20);
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
-    let exit_rx = match server.app_server.instantiate_app(AppInstantiationParams {
+    let admission_ticket = server.admission_controller.issue_ticket();
+    if !wait_for_admission(&mut sender, &mut receiver, &resize_tx, &admission_ticket).await {
+        return;
+    }
+
+    let exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
         first_app_shortname,
         args,
         input_receiver: input_rx,
@@ -250,19 +279,7 @@ async fn handle_socket(
         network_info: connect_info.network_info,
         user_id: None,
         locale,
-    }) {
-        Ok(exit_rx) => exit_rx,
-        Err(AppCapacityError { active, max }) => {
-            tracing::warn!(
-                active,
-                max,
-                "Rejecting new web session due to max active app limit"
-            );
-            let _ = sender.send(Message::Text(OVERLOAD_MESSAGE.into())).await;
-            let _ = sender.send(Message::Close(None)).await;
-            return;
-        }
-    };
+    });
 
     let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel(1);
 
@@ -334,6 +351,7 @@ async fn handle_socket(
     }
 
     cancellation_token.cancel();
+    drop(admission_ticket);
 }
 
 async fn recv_initial_resize(
@@ -353,4 +371,165 @@ fn parse_resize(text: &str) -> Option<(u16, u16)> {
 
 fn sanitize_user_agent(ua: &str) -> String {
     ua.chars().take(256).collect()
+}
+
+#[derive(Serialize)]
+struct PowChallengeResponse {
+    id: String,
+    nonce: String,
+    difficulty: u8,
+}
+
+async fn pow_challenge_handler(State(server): State<WebServer>) -> axum::Json<PowChallengeResponse> {
+    let challenge = server.pow.issue();
+    axum::Json(challenge)
+}
+
+struct PowGate {
+    difficulty: u8,
+    ttl: Duration,
+    challenges: Mutex<HashMap<String, PowChallenge>>,
+}
+
+struct PowChallenge {
+    nonce: String,
+    expires_at: Instant,
+}
+
+impl PowGate {
+    fn new(difficulty: u8, ttl: Duration) -> Self {
+        Self {
+            difficulty,
+            ttl,
+            challenges: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn issue(&self) -> PowChallengeResponse {
+        let mut guard = self.challenges.lock().unwrap();
+        let now = Instant::now();
+        guard.retain(|_, challenge| challenge.expires_at > now);
+        let id = random_token(16);
+        let nonce = random_token(16);
+        guard.insert(
+            id.clone(),
+            PowChallenge {
+                nonce: nonce.clone(),
+                expires_at: now + self.ttl,
+            },
+        );
+        PowChallengeResponse {
+            id,
+            nonce,
+            difficulty: self.difficulty,
+        }
+    }
+
+    fn verify(&self, id: &str, counter: u64) -> bool {
+        let challenge = {
+            let mut guard = self.challenges.lock().unwrap();
+            guard.remove(id)
+        };
+        let Some(challenge) = challenge else {
+            return false;
+        };
+        if challenge.expires_at <= Instant::now() {
+            return false;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(challenge.nonce.as_bytes());
+        hasher.update(b":");
+        hasher.update(counter.to_string().as_bytes());
+        let digest = hasher.finalize();
+        leading_zero_bits(&digest) >= self.difficulty as u32
+    }
+}
+
+fn random_token(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    let mut rng = OsRng;
+    rng.fill_bytes(&mut buf);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes * 2);
+    for b in buf {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn leading_zero_bits(bytes: &[u8]) -> u32 {
+    let mut bits = 0u32;
+    for byte in bytes {
+        if *byte == 0 {
+            bits += 8;
+            continue;
+        }
+        bits += byte.leading_zeros();
+        return bits;
+    }
+    bits
+}
+
+async fn wait_for_admission(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    receiver: &mut futures::stream::SplitStream<WebSocket>,
+    resize_tx: &tokio::sync::watch::Sender<(u16, u16)>,
+    ticket: &AdmissionTicket,
+) -> bool {
+    let mut updates = ticket.subscribe().await;
+    loop {
+        let status = *updates.borrow();
+        match status {
+            AdmissionState::Allowed => {
+                return sender
+                    .send(Message::Text("queue:allowed".into()))
+                    .await
+                    .is_ok();
+            }
+            AdmissionState::Queued(position) => {
+                if sender
+                    .send(Message::Text(format!("queue:queued:{position}").into()))
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+        }
+
+        tokio::select! {
+            changed = updates.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+            msg = receiver.next() => {
+                match msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        if data.contains(&0x03) || data.contains(&b'q') {
+                            let _ = sender.send(Message::Close(None)).await;
+                            return false;
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        let text_str = text.to_string();
+                        if let Some(rest) = text_str.strip_prefix("resize:") {
+                            if let Some((w, h)) = parse_resize(rest) {
+                                let _ = resize_tx.send((w, h));
+                            }
+                        } else if let Some(ts) = text_str.strip_prefix("ping:") {
+                            if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
+                                return false;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                        return false;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }

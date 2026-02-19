@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+mod admission;
 mod ssh;
 mod web;
 
@@ -193,19 +194,22 @@ async fn main() -> Result<()> {
     mesh.serve().await.unwrap();
 
     let app_server = Arc::new(AppServer::new(mesh.clone(), conn).unwrap());
-
-    let ssh_app_server = app_server.clone();
-    let web_app_server = app_server.clone();
+    let max_active_apps = std::env::var("MAX_ACTIVE_APPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(usize::MAX);
+    let admission_controller = Arc::new(admission::AdmissionController::new(max_active_apps));
 
     tokio::select! {
         result = async {
-            let mut server = ssh::SshServer::new(ssh_app_server).await?;
+            let mut server = ssh::SshServer::new(app_server.clone(), admission_controller.clone()).await?;
             server.run().await
         } => {
             result.expect("Failed running SSH server");
         }
         result = async {
-            let server = web::WebServer::new(web_app_server);
+            let server = web::WebServer::new(app_server.clone(), admission_controller.clone());
             server.run().await
         } => {
             result.expect("Failed running web server");
