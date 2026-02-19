@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
 bytes = "1"
 flate2 = "1"
 futures = "0.3"

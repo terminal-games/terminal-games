@@ -999,7 +999,7 @@ impl MeshInner {
 
 const MESH_MAX_FRAME_LEN: usize = 8 * 1024 * 1024;
 const MESH_TLS_SERVER_NAME: &str = "mesh.internal";
-const MESH_PINNED_PEM_ENV: &str = "MESH_PINNED_PEM";
+const MESH_PINNED_PEM_ENV: &str = "MESH_PINNED_PEM_BASE64";
 
 #[derive(Clone, Copy)]
 enum ConnectionRole {

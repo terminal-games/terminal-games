@@ -5,6 +5,7 @@
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use rand_core::{OsRng, RngCore};
 use russh::keys::ssh_key::{self, PublicKey};
 use russh::server::*;
@@ -51,14 +52,38 @@ impl SshServer {
     }
 
     pub async fn run(&mut self) -> Result<(), anyhow::Error> {
+        let host_key = match std::env::var("SSH_HOST_KEY_BASE64") {
+            Ok(encoded) => {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(encoded.trim())
+                    .map_err(|e| {
+                        anyhow::anyhow!("Invalid SSH_HOST_KEY_BASE64 (base64 decode failed): {e}")
+                    })?;
+                russh::keys::PrivateKey::from_openssh(&decoded).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Invalid SSH_HOST_KEY_BASE64 (OpenSSH private key parse failed): {e}"
+                    )
+                })?
+            }
+            Err(std::env::VarError::NotPresent) => {
+                tracing::warn!(
+                    "SSH_HOST_KEY_BASE64 not set; generating ephemeral SSH host key for this run"
+                );
+                russh::keys::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519)
+                    .map_err(|e| anyhow::anyhow!("Failed to generate SSH host key: {e}"))?
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(anyhow::anyhow!(
+                    "Invalid SSH_HOST_KEY_BASE64 (environment variable is not valid Unicode)"
+                ));
+            }
+        };
+
         let config = Config {
             inactivity_timeout: Some(std::time::Duration::from_secs(3600)),
             auth_rejection_time: std::time::Duration::from_secs(3),
             auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
-            keys: vec![
-                russh::keys::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519)
-                    .map_err(|e| anyhow::anyhow!("Failed to generate SSH host key: {e}"))?,
-            ],
+            keys: vec![host_key],
             nodelay: true,
             ..Default::default()
         };
