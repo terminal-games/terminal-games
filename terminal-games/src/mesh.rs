@@ -106,9 +106,15 @@ impl PeerId {
     }
 
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        let region = RegionId::from_bytes(bytes[0..4].try_into().unwrap());
-        let timestamp = u64::from_be_bytes(bytes[4..12].try_into().unwrap());
-        let randomness = u32::from_be_bytes(bytes[12..16].try_into().unwrap());
+        let mut region_bytes = [0u8; 4];
+        region_bytes.copy_from_slice(&bytes[0..4]);
+        let mut timestamp_bytes = [0u8; 8];
+        timestamp_bytes.copy_from_slice(&bytes[4..12]);
+        let mut randomness_bytes = [0u8; 4];
+        randomness_bytes.copy_from_slice(&bytes[12..16]);
+        let region = RegionId::from_bytes(region_bytes);
+        let timestamp = u64::from_be_bytes(timestamp_bytes);
+        let randomness = u32::from_be_bytes(randomness_bytes);
         Self {
             timestamp,
             randomness,
@@ -430,8 +436,8 @@ impl Mesh {
         let peer_id = PeerId {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default(),
             randomness: rand_core::OsRng.next_u32(),
             region: self.inner.region,
         };

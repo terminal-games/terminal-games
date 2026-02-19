@@ -58,7 +58,10 @@ impl AdmissionController {
         let (tx, rx) = watch::channel(AdmissionState::Queued(1));
 
         {
-            let mut state = self.inner.state.lock().unwrap();
+            let mut state = match self.inner.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             if state.running < self.inner.max_running {
                 state.running += 1;
                 let _ = tx.send(AdmissionState::Allowed);
@@ -77,7 +80,10 @@ impl AdmissionController {
     }
 
     pub fn should_require_captcha(&self) -> bool {
-        let state = self.inner.state.lock().unwrap();
+        let state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         state.running.saturating_mul(2) >= self.inner.max_running
     }
 }
@@ -90,7 +96,10 @@ impl AdmissionTicket {
 
 impl Drop for AdmissionTicket {
     fn drop(&mut self) {
-        let mut state = self.controller.state.lock().unwrap();
+        let mut state = match self.controller.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         match *self.rx.borrow() {
             AdmissionState::Allowed => {
                 if state.running > 0 {

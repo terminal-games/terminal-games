@@ -106,7 +106,7 @@ impl AppServer {
     pub fn new(mesh: Mesh, db: libsql::Connection) -> anyhow::Result<Self> {
         let mut config = wasmtime::Config::new();
         let cache_config = wasmtime::CacheConfig::new();
-        config.cache(Some(wasmtime::Cache::new(cache_config).unwrap()));
+        config.cache(Some(wasmtime::Cache::new(cache_config)?));
         config.epoch_interruption(true);
         let engine = wasmtime::Engine::new(&config)?;
         std::thread::spawn({
@@ -181,7 +181,10 @@ impl AppServer {
     }
 
     /// Run an app with IO defined in [`params`] in the background
-    pub fn instantiate_app(&self, params: AppInstantiationParams) -> tokio::sync::oneshot::Receiver<I32Exit> {
+    pub fn instantiate_app(
+        &self,
+        params: AppInstantiationParams,
+    ) -> tokio::sync::oneshot::Receiver<I32Exit> {
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
 
         let mesh = self.mesh.clone();
@@ -250,9 +253,14 @@ impl AppServer {
                 menu_session: menu_session.clone(),
                 menu_username_tx: menu_username_tx.clone(),
             });
-            let (mut app, mut instance_pre) = Self::prepare_instantiate(&ctx, first_app_shortname)
-                .await
-                .unwrap();
+            let (mut app, mut instance_pre) =
+                match Self::prepare_instantiate(&ctx, first_app_shortname).await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let _ = exit_tx.send(I32Exit(1));
+                        return;
+                    }
+                };
             let first_app_shortname = app.shortname.clone();
             let first_app_id = app.app_id;
 
@@ -284,7 +292,7 @@ impl AppServer {
                         if data.contains(&0x12) {
                             let now = std::time::SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
-                                .unwrap();
+                                .unwrap_or(Duration::ZERO);
                             if now.saturating_sub(replay_last_at)
                                 < Duration::from_secs(REPLAY_RATE_LIMIT_SECS)
                             {
@@ -303,8 +311,20 @@ impl AppServer {
                                 let menu_username_rx = menu_username_rx.clone();
                                 tokio::spawn(async move {
                                     let username = menu_username_rx.borrow().clone();
-                                    let (initial_app_id, asciicast) =
-                                        replay_buffer.lock().await.serialize_asciicast();
+                                    let (initial_app_id, asciicast) = match replay_buffer
+                                        .lock()
+                                        .await
+                                        .serialize_asciicast()
+                                    {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "Failed to serialize replay");
+                                            let _ = notification_tx
+                                                .send(" Failed to serialize replay. ".to_string())
+                                                .await;
+                                            return;
+                                        }
+                                    };
                                     let notification = match save_replay(
                                         &db,
                                         menu_session,
@@ -500,12 +520,19 @@ impl AppServer {
                 store.epoch_deadline_async_yield_and_update(1);
 
                 let call_result = {
-                    let func = {
-                        let instance = instance_pre.instantiate_async(&mut store).await.unwrap();
-                        let func = instance
-                            .get_typed_func::<(), ()>(&mut store, "_start")
-                            .unwrap();
-                        func
+                    let instance = match instance_pre.instantiate_async(&mut store).await {
+                        Ok(instance) => instance,
+                        Err(err) => {
+                            tracing::error!(error = %err, "Failed to instantiate module");
+                            break;
+                        }
+                    };
+                    let func = match instance.get_typed_func::<(), ()>(&mut store, "_start") {
+                        Ok(func) => func,
+                        Err(err) => {
+                            tracing::error!(error = %err, "Failed to locate _start");
+                            break;
+                        }
                     };
 
                     has_next_app_shortname.store(false, Ordering::Release);
@@ -539,11 +566,16 @@ impl AppServer {
                 terminal_snapshot = state.terminal_snapshot;
 
                 if let Some(next_app) = state.next_app.take() {
-                    let (next_app, next_instance_pre) = next_app.await.unwrap();
-                    shortname_sender
+                    let Ok((next_app, next_instance_pre)) = next_app.await else {
+                        break;
+                    };
+                    if shortname_sender
                         .send((next_app.app_id, next_app.shortname.clone()))
                         .await
-                        .unwrap();
+                        .is_err()
+                    {
+                        break;
+                    }
                     app = next_app;
                     instance_pre = next_instance_pre;
                     continue;
@@ -563,20 +595,18 @@ impl AppServer {
         ctx: &AppContext,
         shortname: String,
     ) -> anyhow::Result<(PreloadedAppState, wasmtime::InstancePre<AppState>)> {
-        let app_id = ctx
+        let mut app_id_rows = ctx
             .db
             .query(
                 "SELECT id FROM games WHERE shortname = ?1",
                 [shortname.as_str()],
             )
-            .await
-            .unwrap()
+            .await?;
+        let app_id_row = app_id_rows
             .next()
-            .await
-            .unwrap()
-            .unwrap()
-            .get::<u64>(0)
-            .unwrap();
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Unknown game shortname: {shortname}"))?;
+        let app_id = app_id_row.get::<u64>(0)?;
 
         let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(AppId(app_id)).await;
 
@@ -584,11 +614,10 @@ impl AppServer {
         let mut rows = ctx
             .db
             .query("SELECT name, value FROM envs WHERE game_id = ?1", [app_id])
-            .await
-            .unwrap();
-        while let Some(row) = rows.next().await.unwrap() {
-            let name = row.get(0).unwrap();
-            let value = row.get(1).unwrap();
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let name = row.get(0)?;
+            let value = row.get(1)?;
             envs.push((name, value));
         }
         envs.push(("REMOTE_SSHID".to_string(), ctx.remote_sshid.clone()));
@@ -646,13 +675,15 @@ impl AppServer {
                 "SELECT path FROM games WHERE id = ?1",
                 libsql::params![app_id],
             )
-            .await
-            .unwrap();
+            .await?;
 
-        let row = rows.next().await.unwrap().unwrap();
-        let wasm_path: String = row.get(0).unwrap();
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Missing wasm path for game id {app_id}"))?;
+        let wasm_path: String = row.get(0)?;
         let module = Self::load_or_compile_module(ctx, app_id, &wasm_path).await?;
-        let instance_pre = ctx.linker.instantiate_pre(&module).unwrap();
+        let instance_pre = ctx.linker.instantiate_pre(&module)?;
 
         Ok((
             PreloadedAppState {
@@ -830,7 +861,7 @@ impl AppServer {
 
             let mut pending = caller.data_mut().conn_manager.pending_dials[dial_id_usize]
                 .take()
-                .unwrap();
+                .ok_or_else(|| wasmtime::Error::msg("pending dial unexpectedly missing"))?;
 
             match pending.receiver.try_recv() {
                 Ok(Ok((stream, local_addr, remote_addr))) => {
@@ -841,7 +872,9 @@ impl AppServer {
                         return Ok(POLL_DIAL_ERR_TOO_MANY_CONNECTIONS);
                     }
 
-                    let slot_id = slot.unwrap();
+                    let Some(slot_id) = slot else {
+                        return Ok(POLL_DIAL_ERR_TOO_MANY_CONNECTIONS);
+                    };
                     let conn = Connection { stream };
 
                     if slot_id < conn_manager.connections.len() {
@@ -981,7 +1014,9 @@ impl AppServer {
 
             let n = {
                 let connections = &mut caller.data_mut().conn_manager.connections;
-                let conn = connections[conn_id_usize].as_mut().unwrap();
+                let Some(conn) = connections[conn_id_usize].as_mut() else {
+                    return Ok(CONN_ERR_INVALID_CONN_ID);
+                };
 
                 match conn.stream.try_read(&mut buf[..read_len]) {
                     Ok(0) => return Ok(CONN_ERR_CONNECTION_ERROR),
@@ -1102,9 +1137,10 @@ impl AppServer {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 caller.data_mut().next_app = Some(rx);
                 tokio::task::spawn(async move {
-                    let next_app = Self::prepare_instantiate(&ctx, shortname).await.unwrap();
-                    let _ = tx.send(next_app);
-                    has_next_app.store(true, Ordering::Release);
+                    if let Ok(next_app) = Self::prepare_instantiate(&ctx, shortname).await {
+                        let _ = tx.send(next_app);
+                        has_next_app.store(true, Ordering::Release);
+                    }
                 });
             }
 
@@ -1441,7 +1477,9 @@ impl AppServer {
                 }
             }
 
-            let mut request = caller.data_mut().menu_requests[request_id].take().unwrap();
+            let Some(mut request) = caller.data_mut().menu_requests[request_id].take() else {
+                return Ok(MENU_POLL_ERR_INVALID_REQUEST_ID);
+            };
             if let MenuRequestState::Pending(receiver) = &mut request.state {
                 match receiver.try_recv() {
                     Ok(result) => {
@@ -2371,7 +2409,7 @@ async fn save_replay(
     if let Some(uid) = user_id {
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(Duration::ZERO)
             .as_secs() as i64;
         let _ = db
             .execute(
@@ -2382,7 +2420,7 @@ async fn save_replay(
     } else {
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(Duration::ZERO)
             .as_secs() as i64;
         let mut session = menu_session.lock().await;
         session.replays.push(SessionReplay {

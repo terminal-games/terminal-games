@@ -104,7 +104,9 @@ impl ReplayBuffer {
             if front.timestamp >= cutoff {
                 break;
             }
-            let event = self.events.pop_front().unwrap();
+            let Some(event) = self.events.pop_front() else {
+                break;
+            };
             match event.event {
                 ReplayEvent::Output(data) => {
                     self.vt.feed_str(&String::from_utf8_lossy(&data));
@@ -122,7 +124,7 @@ impl ReplayBuffer {
         }
     }
 
-    pub fn serialize_asciicast(&self) -> (AppId, Vec<u8>) {
+    pub fn serialize_asciicast(&self) -> Result<(AppId, Vec<u8>), serde_json::Error> {
         let mut output = Vec::with_capacity(16 * 1024);
         let now = Instant::now();
 
@@ -148,19 +150,16 @@ impl ReplayBuffer {
             },
             timestamp,
             title: format!("Terminal Games | {}", self.initial_shortname),
-            command: format!(
-                "ssh -C terminalgames.net -t {}",
-                self.initial_shortname
-            ),
+            command: format!("ssh -C terminalgames.net -t {}", self.initial_shortname),
             tags: vec!["terminal-games", &self.initial_shortname],
         };
-        serde_json::to_writer(&mut output, &header).unwrap();
+        serde_json::to_writer(&mut output, &header)?;
         output.push(b'\n');
 
         let mut prev_timestamp = self.vt_timestamp;
         let vt_output = self.vt.dump();
         if !vt_output.is_empty() {
-            write_event(&mut output, 0.0, "o", &vt_output);
+            write_event(&mut output, 0.0, "o", &vt_output)?;
             if prev_timestamp.is_none() {
                 prev_timestamp = self.events.front().map(|e| e.timestamp);
             }
@@ -176,7 +175,7 @@ impl ReplayBuffer {
             match &event.event {
                 ReplayEvent::Output(data) => {
                     let text = String::from_utf8_lossy(data);
-                    write_event(&mut output, interval_secs, "o", &text);
+                    write_event(&mut output, interval_secs, "o", &text)?;
                 }
                 ReplayEvent::Resize { cols, rows } => {
                     write_event(
@@ -184,7 +183,7 @@ impl ReplayBuffer {
                         interval_secs,
                         "r",
                         &format!("{}x{}", cols, rows),
-                    );
+                    )?;
                 }
                 ReplayEvent::AppSwitch {
                     app_id: _,
@@ -195,18 +194,24 @@ impl ReplayBuffer {
                         interval_secs,
                         "m",
                         &format!("app:{}", shortname),
-                    );
+                    )?;
                 }
             }
         }
 
-        (self.initial_app_id, output)
+        Ok((self.initial_app_id, output))
     }
 }
 
-fn write_event(output: &mut Vec<u8>, interval_secs: f64, code: &str, data: &str) {
+fn write_event(
+    output: &mut Vec<u8>,
+    interval_secs: f64,
+    code: &str,
+    data: &str,
+) -> Result<(), serde_json::Error> {
     let interval_secs = (interval_secs * 1000.0).round() / 1000.0;
     let event: (f64, &str, &str) = (interval_secs, code, data);
-    serde_json::to_writer(&mut *output, &event).unwrap();
+    serde_json::to_writer(&mut *output, &event)?;
     output.push(b'\n');
+    Ok(())
 }

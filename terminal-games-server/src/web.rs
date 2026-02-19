@@ -4,12 +4,12 @@
 
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::{convert::Infallible, io::Write};
 use std::{
     collections::HashMap,
     sync::Mutex,
     time::{Duration, Instant},
 };
+use std::{convert::Infallible, io::Write};
 
 use axum::extract::connect_info::Connected;
 use axum::extract::{ConnectInfo, Request};
@@ -92,7 +92,13 @@ impl WebServer {
         let mut make_service = app.into_make_service_with_connect_info::<MyConnectInfo>();
         let listener = tokio::net::TcpListener::bind(listen_addr).await?;
         loop {
-            let (stream, _remote_addr) = listener.accept().await.unwrap();
+            let (stream, _remote_addr) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("failed to accept web connection: {e}");
+                    continue;
+                }
+            };
             if let Err(e) = stream.set_nodelay(true) {
                 tracing::warn!("set_nodelay() failed: {e:?}");
             }
@@ -139,37 +145,36 @@ async fn serve_index() -> Html<&'static str> {
 }
 
 async fn serve_styles() -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "text/css")
-        .body(Body::from(include_str!("../web/styles.css")))
-        .unwrap()
+    static_response("text/css", include_str!("../web/styles.css"))
 }
 
 async fn serve_main_js() -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/javascript")
-        .body(Body::from(include_str!("../web/main.js")))
-        .unwrap()
+    static_response("application/javascript", include_str!("../web/main.js"))
 }
 
 async fn serve_opus_audio_player_js() -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/javascript")
-        .body(Body::from(include_str!("../web/opus-audio-player.js")))
-        .unwrap()
+    static_response(
+        "application/javascript",
+        include_str!("../web/opus-audio-player.js"),
+    )
 }
 
 async fn serve_jitter_buffer_processor_js() -> Response {
-    Response::builder()
+    static_response(
+        "application/javascript",
+        include_str!("../web/jitter-buffer-processor.js"),
+    )
+}
+
+fn static_response(content_type: &'static str, body: &'static str) -> Response {
+    match Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/javascript")
-        .body(Body::from(include_str!(
-            "../web/jitter-buffer-processor.js"
-        )))
-        .unwrap()
+        .header(CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+    {
+        Ok(response) => response,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -380,7 +385,9 @@ struct PowChallengeResponse {
     difficulty: u8,
 }
 
-async fn pow_challenge_handler(State(server): State<WebServer>) -> axum::Json<PowChallengeResponse> {
+async fn pow_challenge_handler(
+    State(server): State<WebServer>,
+) -> axum::Json<PowChallengeResponse> {
     let challenge = server.pow.issue();
     axum::Json(challenge)
 }
@@ -406,7 +413,10 @@ impl PowGate {
     }
 
     fn issue(&self) -> PowChallengeResponse {
-        let mut guard = self.challenges.lock().unwrap();
+        let mut guard = match self.challenges.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let now = Instant::now();
         guard.retain(|_, challenge| challenge.expires_at > now);
         let id = random_token(16);
@@ -427,7 +437,10 @@ impl PowGate {
 
     fn verify(&self, id: &str, counter: u64) -> bool {
         let challenge = {
-            let mut guard = self.challenges.lock().unwrap();
+            let mut guard = match self.challenges.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             guard.remove(id)
         };
         let Some(challenge) = challenge else {

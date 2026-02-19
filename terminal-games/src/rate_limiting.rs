@@ -26,7 +26,7 @@ impl EwmaRate {
     fn now_ns() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(Duration::ZERO)
             .as_nanos() as u64
     }
 
@@ -166,7 +166,7 @@ impl<L: LatencyProvider> NetworkInformation<L> {
         self.last_throttled.store(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or(Duration::ZERO)
                 .as_millis() as u64,
             Ordering::Release,
         );
@@ -182,7 +182,9 @@ impl<L: LatencyProvider> NetworkInformation<L> {
 
     fn set_last_throttled(&self, time: SystemTime) {
         self.last_throttled.store(
-            time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            time.duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_millis() as u64,
             Ordering::Release,
         );
     }
@@ -206,7 +208,7 @@ impl<L: LatencyProvider> NetworkInfo for NetworkInformation<L> {
         const LATENCY_REFRESH_MS: u64 = 250;
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(Duration::ZERO)
             .as_millis() as u64;
         let last_ms = self.last_latency_update_ms.load(Ordering::Relaxed);
         let cached_ms = self.cached_latency_ms.load(Ordering::Relaxed);

@@ -73,7 +73,8 @@ fn run_audio_player(receiver: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
     let mut props = protocol::Props::new();
     props.set(
         protocol::Prop::ApplicationName,
-        CString::new("terminal-games").unwrap(),
+        CString::new("terminal-games")
+            .map_err(|e| anyhow::anyhow!("invalid PulseAudio client name: {e}"))?,
     );
     protocol::write_command_message(
         sock.get_mut(),
@@ -186,7 +187,10 @@ fn run_audio_player(receiver: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
     let stream = device.build_output_stream(
         &config,
         move |output: &mut [f32], _| {
-            let mut buf = samples_cb.lock().unwrap();
+            let mut buf = match samples_cb.lock() {
+                Ok(buf) => buf,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             for sample in output.iter_mut() {
                 *sample = buf.pop_front().unwrap_or(0.0);
             }
@@ -200,7 +204,10 @@ fn run_audio_player(receiver: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
     let samples_ref = samples.clone();
 
     decode_ogg_opus(receiver, |new_samples| {
-        let mut buf = samples_ref.lock().unwrap();
+        let mut buf = match samples_ref.lock() {
+            Ok(buf) => buf,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         buf.extend(new_samples.iter().copied());
 
         const MAX_BUFFER_MS: usize = 40;

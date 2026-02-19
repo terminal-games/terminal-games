@@ -56,7 +56,8 @@ impl SshServer {
             auth_rejection_time: std::time::Duration::from_secs(3),
             auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
             keys: vec![
-                russh::keys::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap(),
+                russh::keys::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519)
+                    .map_err(|e| anyhow::anyhow!("Failed to generate SSH host key: {e}"))?,
             ],
             nodelay: true,
             ..Default::default()
@@ -90,15 +91,15 @@ impl SshServer {
                         match russh::server::run_stream(config, wrapped_stream, handler).await {
                             Ok(s) => s,
                             Err(e) => {
-                                tracing::info!("Connection setup failed: {:?}", e);
+                                tracing::debug!("Connection setup failed: {:?}", e);
                                 return;
                             }
                         };
 
                     if let Err(e) = session.await {
-                        tracing::info!("Connection closed with error: {:?}", e);
+                        tracing::debug!("Connection closed with error: {:?}", e);
                     } else {
-                        tracing::info!("Connection closed");
+                        tracing::debug!("Connection closed");
                     }
                 }
             });
@@ -123,8 +124,27 @@ impl SshServer {
         let app_server = self.app_server.clone();
         let admission_controller = self.admission_controller.clone();
         tokio::task::spawn(async move {
-            let (session_handle, channel_id, remote_sshid) = ssh_session_receiver.await.unwrap();
-            let (username, user_id) = auth_receiver.await.unwrap();
+            let (session_handle, channel_id, remote_sshid) = match ssh_session_receiver.await {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::trace!(error = ?err, "client disconnected before ssh session init");
+                    return;
+                }
+            };
+            let (username, user_id) = match auth_receiver.await {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::trace!(error = ?err, "missing auth context from client");
+                    let _ = session_handle
+                        .disconnect(
+                            russh::Disconnect::ByApplication,
+                            "Authentication failed".to_string(),
+                            "en-US".to_string(),
+                        )
+                        .await;
+                    return;
+                }
+            };
 
             let locale = if let Some(uid) = user_id {
                 match app_server
@@ -147,10 +167,20 @@ impl SshServer {
 
             // enter the alternate screen so that we aren't moving the cursor
             // around and overwriting the original terminal
-            session_handle
+            if let Err(err) = session_handle
                 .data(channel_id, b"\x1b[?1049h".to_vec().into())
                 .await
-                .unwrap();
+            {
+                tracing::trace!(error = ?err, "failed to enter alternate screen");
+                let _ = session_handle
+                    .disconnect(
+                        russh::Disconnect::ByApplication,
+                        "Connection setup failed".to_string(),
+                        "en-US".to_string(),
+                    )
+                    .await;
+                return;
+            }
 
             let term =
                 match tokio::time::timeout(std::time::Duration::from_millis(500), term_receiver)
@@ -159,7 +189,7 @@ impl SshServer {
                     Ok(Ok(term)) => Some(term),
                     Ok(Err(_)) => None,
                     Err(_) => {
-                        tracing::info!("No pty_request received within 500ms, cleaning up");
+                        tracing::trace!("no pty_request received within 500ms");
                         let _ = session_handle
                             .disconnect(
                                 russh::Disconnect::ByApplication,
@@ -520,7 +550,9 @@ async fn render_loading_screen(
     let mut out = Vec::new();
     out.extend_from_slice(b"\x1b[?25l\x1b[2J");
     out.extend_from_slice(format!("\x1b[{};{}H{}", title_row, title_col, title).as_bytes());
-    out.extend_from_slice(format!("\x1b[{};{}H{}", center_row, spinner_col, spinner_line).as_bytes());
+    out.extend_from_slice(
+        format!("\x1b[{};{}H{}", center_row, spinner_col, spinner_line).as_bytes(),
+    );
     out.extend_from_slice(format!("\x1b[{};{}H{}", queue_row, queue_col, queue_line).as_bytes());
     out.extend_from_slice(b"\x1b[H");
     session_handle

@@ -54,7 +54,10 @@ impl AudioBuffer {
             return 0;
         }
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
 
         let used = if inner.write_pos >= inner.read_pos {
             inner.write_pos - inner.read_pos
@@ -90,7 +93,10 @@ impl AudioBuffer {
     /// Read interleaved stereo samples from the buffer into the destination.
     /// Returns number of frames read. Missing frames are filled with silence.
     fn read(&self, dest: &mut [f32], frame_count: usize) -> usize {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
 
         let available = if inner.write_pos >= inner.read_pos {
             inner.write_pos - inner.read_pos
@@ -128,7 +134,10 @@ impl AudioBuffer {
     }
 
     pub fn available(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
 
         if inner.write_pos >= inner.read_pos {
             inner.write_pos - inner.read_pos
@@ -175,10 +184,7 @@ impl Mixer {
         })
     }
 
-    async fn flush_output(
-        &mut self,
-        cancellation_token: &CancellationToken,
-    ) -> anyhow::Result<()> {
+    async fn flush_output(&mut self, cancellation_token: &CancellationToken) -> anyhow::Result<()> {
         let output_buffer = &mut self.packet_writer.inner_mut().output_buffer;
         if output_buffer.is_empty() {
             return Ok(());
@@ -209,11 +215,19 @@ impl Mixer {
         let mut packet_buffer = vec![0u8; 1500];
 
         // tracing::info!(frame_size, sample_rate, channels = CHANNELS, "mixer started");
-        self.packet_writer
-            .write_packet(opus_head(pre_skip as u16), self.serial, PacketWriteEndInfo::EndPage, 0)?;
+        self.packet_writer.write_packet(
+            opus_head(pre_skip as u16),
+            self.serial,
+            PacketWriteEndInfo::EndPage,
+            0,
+        )?;
         self.flush_output(&cancellation_token).await?;
-        self.packet_writer
-            .write_packet(opus_tags(), self.serial, PacketWriteEndInfo::EndPage, 0)?;
+        self.packet_writer.write_packet(
+            opus_tags(),
+            self.serial,
+            PacketWriteEndInfo::EndPage,
+            0,
+        )?;
         self.flush_output(&cancellation_token).await?;
 
         loop {
