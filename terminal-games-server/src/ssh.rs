@@ -165,6 +165,63 @@ impl SshServer {
                 "en".to_string()
             };
 
+            let (first_app_shortname, args, has_audio): (String, Option<Vec<u8>>, bool) =
+                match tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                args_receiver,
+            )
+            .await
+            {
+                Ok(Ok(mut args)) => {
+                    let has_audio = args.starts_with(b"audio");
+                    if has_audio {
+                        args.drain(..5);
+                        while !args.is_empty() && args[0].is_ascii_whitespace() {
+                            args.remove(0);
+                        }
+                    }
+                    if args.is_empty() {
+                        ("menu".into(), None, has_audio)
+                    } else if let Some(pos) = args.iter().position(|&b| b.is_ascii_whitespace()) {
+                        let shortname = String::from_utf8_lossy(&args[..pos]).into();
+                        let rest: Vec<u8> = args[pos..]
+                            .iter()
+                            .copied()
+                            .skip_while(|b| b.is_ascii_whitespace())
+                            .collect();
+                        (shortname, (!rest.is_empty()).then_some(rest), has_audio)
+                    } else {
+                        (String::from_utf8_lossy(&args).into(), None, has_audio)
+                    }
+                }
+                _ => ("menu".into(), None, false),
+            };
+
+            let app_exists = match app_server
+                .db
+                .query(
+                    "SELECT 1 FROM games WHERE shortname = ?1 LIMIT 1",
+                    libsql::params!(first_app_shortname.as_str()),
+                )
+                .await
+            {
+                Ok(mut rows) => matches!(rows.next().await, Ok(Some(_))),
+                Err(err) => {
+                    tracing::warn!(error = ?err, "failed to validate requested app");
+                    false
+                }
+            };
+            if !app_exists {
+                let _ = session_handle
+                    .disconnect(
+                        russh::Disconnect::ByApplication,
+                        format!("Unknown game shortname: {}", first_app_shortname),
+                        "en-US".to_string(),
+                    )
+                    .await;
+                return;
+            }
+
             // enter the alternate screen so that we aren't moving the cursor
             // around and overwriting the original terminal
             if let Err(err) = session_handle
@@ -200,37 +257,6 @@ impl SshServer {
                         return;
                     }
                 };
-
-            let (first_app_shortname, args, has_audio) = match tokio::time::timeout(
-                std::time::Duration::from_millis(1),
-                args_receiver,
-            )
-            .await
-            {
-                Ok(Ok(mut args)) => {
-                    let has_audio = args.starts_with(b"audio");
-                    if has_audio {
-                        args.drain(..5);
-                        while !args.is_empty() && args[0].is_ascii_whitespace() {
-                            args.remove(0);
-                        }
-                    }
-                    if args.is_empty() {
-                        ("menu".into(), None, has_audio)
-                    } else if let Some(pos) = args.iter().position(|&b| b.is_ascii_whitespace()) {
-                        let shortname = String::from_utf8_lossy(&args[..pos]).into();
-                        let rest: Vec<u8> = args[pos..]
-                            .iter()
-                            .copied()
-                            .skip_while(|b| b.is_ascii_whitespace())
-                            .collect();
-                        (shortname, (!rest.is_empty()).then_some(rest), has_audio)
-                    } else {
-                        (String::from_utf8_lossy(&args).into(), None, has_audio)
-                    }
-                }
-                _ => ("menu".into(), None, false),
-            };
 
             let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
             let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
