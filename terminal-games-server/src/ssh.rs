@@ -892,14 +892,12 @@ impl Handler for SshSession {
         Ok(Auth::Accept)
     }
 
-    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
-        if let Some(auth_sender) = self.auth.take() {
-            let _ = auth_sender.send((user.to_string(), None));
-        }
-        Ok(Auth::Accept)
-    }
-
-    async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> {
+    async fn auth_keyboard_interactive<'a>(
+        &'a mut self,
+        user: &str,
+        _submethods: &str,
+        _response: Option<Response<'a>>,
+    ) -> Result<Auth, Self::Error> {
         if let Some(auth_sender) = self.auth.take() {
             let _ = auth_sender.send((user.to_string(), None));
         }
