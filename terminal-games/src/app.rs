@@ -28,6 +28,7 @@ use crate::{
     rate_limiting::{NetworkInfo, TokenBucket},
     replay::ReplayBuffer,
     status_bar::StatusBar,
+    terminal_profile::TerminalProfile,
 };
 
 /// Maximum number of concurrent connections per app instance
@@ -102,6 +103,7 @@ pub struct AppInstantiationParams {
     pub term: Option<String>,
     pub args: Option<Vec<u8>>,
     pub network_info: Arc<dyn NetworkInfo>,
+    pub terminal_profile: TerminalProfile,
     pub first_app_shortname: String,
     pub user_id: Option<u64>,
     pub locale: String,
@@ -147,6 +149,7 @@ impl AppServer {
             Self::graceful_shutdown_poll,
         )?;
         linker.func_wrap_async("terminal_games", "network_info", Self::host_network_info)?;
+        linker.func_wrap_async("terminal_games", "terminal_info", Self::host_terminal_info)?;
         linker.func_wrap_async("terminal_games", "audio_write", Self::audio_write)?;
         linker.func_wrap_async("terminal_games", "audio_info", Self::audio_info)?;
         linker.func_wrap_async(
@@ -216,6 +219,7 @@ impl AppServer {
                 tokio::sync::mpsc::channel::<(AppId, String)>(1);
 
             let network_info = params.network_info.clone();
+            let terminal_profile = params.terminal_profile;
             let hard_shutdown_token = CancellationToken::new();
             let audio_tx = params.audio_sender;
             let first_app_shortname = params.first_app_shortname;
@@ -382,6 +386,7 @@ impl AppServer {
                         first_app_shortname,
                         menu_username_rx.clone(),
                         network_info,
+                        terminal_profile,
                         notification_rx,
                     );
 
@@ -516,6 +521,7 @@ impl AppServer {
                     has_next_app: has_next_app_shortname.clone(),
                     graceful_shutdown_token,
                     network_info: network_info.clone(),
+                    terminal_profile,
                     audio_buffer: audio_buffer.clone(),
                     terminal_snapshot,
                 };
@@ -1876,6 +1882,48 @@ impl AppServer {
         })
     }
 
+    fn host_terminal_info(
+        mut caller: wasmtime::Caller<'_, AppState>,
+        (color_mode_ptr, has_bg_ptr, bg_r_ptr, bg_g_ptr, bg_b_ptr, has_dark_ptr, dark_ptr): (
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+        ),
+    ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
+        Box::new(async move {
+            tokio::task::yield_now().await;
+
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("terminal_info: failed to find host memory");
+            };
+
+            let profile = caller.data().terminal_profile;
+            let mode = profile.color_mode as u8;
+            let (has_bg, bg_r, bg_g, bg_b) = match profile.background_rgb {
+                Some((r, g, b)) => (1i32, r, g, b),
+                None => (0i32, 0u8, 0u8, 0u8),
+            };
+            let (has_dark, dark) = match profile.dark_background {
+                Some(is_dark) => (1i32, if is_dark { 1i32 } else { 0i32 }),
+                None => (0i32, 0i32),
+            };
+
+            mem.write(&mut caller, color_mode_ptr as usize, &[mode])?;
+            mem.write(&mut caller, has_bg_ptr as usize, &has_bg.to_le_bytes())?;
+            mem.write(&mut caller, bg_r_ptr as usize, &[bg_r])?;
+            mem.write(&mut caller, bg_g_ptr as usize, &[bg_g])?;
+            mem.write(&mut caller, bg_b_ptr as usize, &[bg_b])?;
+            mem.write(&mut caller, has_dark_ptr as usize, &has_dark.to_le_bytes())?;
+            mem.write(&mut caller, dark_ptr as usize, &dark.to_le_bytes())?;
+
+            Ok(0)
+        })
+    }
+
     fn audio_write(
         mut caller: wasmtime::Caller<'_, AppState>,
         (ptr, sample_count): (i32, u32),
@@ -1985,6 +2033,7 @@ pub struct AppState {
     input_receiver: tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
     graceful_shutdown_token: CancellationToken,
     network_info: Arc<dyn NetworkInfo>,
+    terminal_profile: TerminalProfile,
     audio_buffer: Arc<AudioBuffer>,
     terminal_snapshot: Arc<TerminalSnapshot>,
 }

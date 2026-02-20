@@ -38,6 +38,7 @@ use tower::{Service, ServiceExt};
 
 use terminal_games::app::{AppInstantiationParams, AppServer};
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
+use terminal_games::terminal_profile::TerminalProfile;
 
 use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
 
@@ -282,6 +283,7 @@ async fn handle_socket(
         window_size_receiver: resize_rx,
         graceful_shutdown_token: token,
         network_info: connect_info.network_info,
+        terminal_profile: TerminalProfile::web_default(),
         user_id: None,
         locale,
     });
@@ -352,7 +354,7 @@ async fn handle_socket(
     });
 
     if let Ok(exit_code) = exit_rx.await {
-        tracing::info!(?exit_code, "App exited");
+        tracing::trace!(?exit_code, "App exited");
     }
 
     cancellation_token.cancel();

@@ -10,6 +10,7 @@ use ratatui::{
 };
 
 use crate::ansi_backend::{AnsiBackend, EmulatorBackend};
+pub use crate::app::{TerminalColorMode, TerminalInfo};
 
 pub struct TerminalReader {}
 
@@ -73,4 +74,8 @@ impl TerminalGamesBackend {
     {
         AnsiBackend::new(writer, TerminalGamesTerminalEmulator {})
     }
+}
+
+pub fn info() -> io::Result<TerminalInfo> {
+    crate::app::terminal_info()
 }

@@ -726,19 +726,17 @@ type profileStyles struct {
 }
 
 func defaultProfileStyles() profileStyles {
-	profileStrong := lipgloss.AdaptiveColor{Light: "235", Dark: "255"}
-	profileMuted := lipgloss.AdaptiveColor{Light: "240", Dark: "250"}
 	return profileStyles{
-		ActiveLabel: lipgloss.NewStyle().Foreground(profileStrong).Bold(true),
-		Label:       lipgloss.NewStyle().Foreground(profileMuted),
-		Value:       lipgloss.NewStyle().Foreground(profileStrong),
-		Hint:        lipgloss.NewStyle().Foreground(profileMuted).Italic(true),
-		SelectedRow: lipgloss.NewStyle().Foreground(profileStrong).Bold(true),
-		HoverRow:    lipgloss.NewStyle().Foreground(profileStrong),
-		Row:         lipgloss.NewStyle().Foreground(profileStrong),
+		ActiveLabel: lipgloss.NewStyle().Foreground(theme.Text).Bold(true),
+		Label:       lipgloss.NewStyle().Foreground(theme.TextMuted),
+		Value:       lipgloss.NewStyle().Foreground(theme.Text),
+		Hint:        lipgloss.NewStyle().Foreground(theme.TextMuted).Italic(true),
+		SelectedRow: lipgloss.NewStyle().Foreground(theme.Text).Bold(true),
+		HoverRow:    lipgloss.NewStyle().Foreground(theme.Text),
+		Row:         lipgloss.NewStyle().Foreground(theme.Text),
 		Danger:      lipgloss.NewStyle().Foreground(theme.Danger).Bold(true),
-		Divider:     lipgloss.NewStyle().Foreground(profileMuted),
-		LangNum:     lipgloss.NewStyle().Foreground(profileMuted),
+		Divider:     lipgloss.NewStyle().Foreground(theme.TextMuted),
+		LangNum:     lipgloss.NewStyle().Foreground(theme.TextMuted),
 		URL:         lipgloss.NewStyle().Foreground(theme.Accent),
 	}
 }

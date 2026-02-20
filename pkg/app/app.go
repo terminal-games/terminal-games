@@ -90,6 +90,18 @@ func network_info(
 	latencyMsPtr unsafe.Pointer,
 ) int32
 
+//go:wasmimport terminal_games terminal_info
+//go:noescape
+func terminal_info(
+	colorModePtr unsafe.Pointer,
+	hasBgPtr unsafe.Pointer,
+	bgRPtr unsafe.Pointer,
+	bgGPtr unsafe.Pointer,
+	bgBPtr unsafe.Pointer,
+	hasDarkPtr unsafe.Pointer,
+	darkPtr unsafe.Pointer,
+) int32
+
 // NetworkInfo holds network information from the host.
 type NetworkInfo struct {
 	// BytesPerSecIn is the receive rate in bytes per second.
@@ -129,4 +141,56 @@ func GetNetworkInfo() (NetworkInfo, error) {
 		LastThrottled:  lastThrottled,
 		LatencyMs:      latencyMs,
 	}, nil
+}
+
+type TerminalColorMode uint8
+
+const (
+	TerminalColor16 TerminalColorMode = iota
+	TerminalColor256
+	TerminalColorTrueColor
+)
+
+type TerminalInfo struct {
+	ColorMode         TerminalColorMode
+	HasBackgroundRGB  bool
+	BackgroundRGB     [3]uint8
+	HasDarkBackground bool
+	DarkBackground    bool
+}
+
+func GetTerminalInfo() (TerminalInfo, error) {
+	var colorMode uint8
+	var hasBg int32
+	var bgR uint8
+	var bgG uint8
+	var bgB uint8
+	var hasDark int32
+	var dark int32
+
+	ret := terminal_info(
+		unsafe.Pointer(&colorMode),
+		unsafe.Pointer(&hasBg),
+		unsafe.Pointer(&bgR),
+		unsafe.Pointer(&bgG),
+		unsafe.Pointer(&bgB),
+		unsafe.Pointer(&hasDark),
+		unsafe.Pointer(&dark),
+	)
+	if ret < 0 {
+		return TerminalInfo{}, errors.New("terminal_info host call failed")
+	}
+
+	out := TerminalInfo{
+		ColorMode: TerminalColorMode(colorMode),
+	}
+	if hasBg > 0 {
+		out.HasBackgroundRGB = true
+		out.BackgroundRGB = [3]uint8{bgR, bgG, bgB}
+	}
+	if hasDark > 0 {
+		out.HasDarkBackground = true
+		out.DarkBackground = dark > 0
+	}
+	return out, nil
 }

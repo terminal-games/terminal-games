@@ -104,8 +104,25 @@ func NewProgram(model tea.Model, opts ...tea.ProgramOption) *tea.Program {
 }
 
 func MakeRenderer() *lipgloss.Renderer {
-	env := sshEnviron(os.Environ())
-	r := lipgloss.NewRenderer(os.Stdout, termenv.WithEnvironment(env), termenv.WithUnsafe(), termenv.WithColorCache(true))
+	r := lipgloss.NewRenderer(os.Stdout, termenv.WithProfile(termenv.TrueColor))
+
+	info, err := app.GetTerminalInfo()
+	if err == nil {
+		switch info.ColorMode {
+		case app.TerminalColorTrueColor:
+			r.SetColorProfile(termenv.TrueColor)
+		case app.TerminalColor256:
+			r.SetColorProfile(termenv.ANSI256)
+		case app.TerminalColor16:
+			r.SetColorProfile(termenv.ANSI)
+		}
+		if info.HasDarkBackground {
+			r.SetHasDarkBackground(info.DarkBackground)
+		}
+	} else {
+		r.SetColorProfile(termenv.TrueColor)
+	}
+
 	bg := querySessionBackgroundColor(fromHost, os.Stdout)
 	if bg != nil {
 		c, ok := colorful.MakeColor(bg)

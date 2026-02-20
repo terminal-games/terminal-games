@@ -110,3 +110,58 @@ pub fn network_info() -> std::io::Result<NetworkInfo> {
         latency_ms,
     })
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalColorMode {
+    Color16,
+    Color256,
+    TrueColor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalInfo {
+    pub color_mode: TerminalColorMode,
+    pub background_rgb: Option<(u8, u8, u8)>,
+    pub dark_background: Option<bool>,
+}
+
+pub fn terminal_info() -> std::io::Result<TerminalInfo> {
+    let mut color_mode = 0u8;
+    let mut has_bg = 0i32;
+    let mut bg_r = 0u8;
+    let mut bg_g = 0u8;
+    let mut bg_b = 0u8;
+    let mut has_dark = 0i32;
+    let mut dark = 0i32;
+    let result = unsafe {
+        crate::internal::terminal_info(
+            &mut color_mode,
+            &mut has_bg,
+            &mut bg_r,
+            &mut bg_g,
+            &mut bg_b,
+            &mut has_dark,
+            &mut dark,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "terminal_info host call failed",
+        ));
+    }
+
+    let color_mode = match color_mode {
+        2 => TerminalColorMode::TrueColor,
+        1 => TerminalColorMode::Color256,
+        _ => TerminalColorMode::Color16,
+    };
+    let background_rgb = (has_bg > 0).then_some((bg_r, bg_g, bg_b));
+    let dark_background = (has_dark > 0).then_some(dark > 0);
+
+    Ok(TerminalInfo {
+        color_mode,
+        background_rgb,
+        dark_background,
+    })
+}

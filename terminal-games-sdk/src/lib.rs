@@ -64,6 +64,15 @@ mod internal {
             last_throttled_ms_ptr: *mut i64,
             latency_ms_ptr: *mut i32,
         ) -> i32;
+        pub(crate) fn terminal_info(
+            color_mode_ptr: *mut u8,
+            has_bg_ptr: *mut i32,
+            bg_r_ptr: *mut u8,
+            bg_g_ptr: *mut u8,
+            bg_b_ptr: *mut u8,
+            has_dark_ptr: *mut i32,
+            dark_ptr: *mut i32,
+        ) -> i32;
 
         pub(crate) fn audio_write(ptr: *const f32, sample_count: u32) -> i32;
         pub(crate) fn audio_info(

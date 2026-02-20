@@ -25,6 +25,7 @@ use terminal_games::{
     app::{AppInstantiationParams, AppServer},
     mesh::{LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
+    terminal_profile::TerminalProfile,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -305,17 +306,20 @@ async fn main() -> Result<()> {
         None
     };
 
+    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+    let colorterm = std::env::var("COLORTERM").ok();
     let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
         args: None,
         input_receiver: input_rx,
         output_sender: output_tx,
         audio_sender: audio_player.as_ref().map(|_| audio_tx),
         remote_sshid: "cli".to_string(),
-        term: Some(std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string())),
+        term: Some(term.clone()),
         username: username.clone(),
         window_size_receiver: resize_rx,
         graceful_shutdown_token: graceful_shutdown_token.clone(),
         network_info: network_info.clone(),
+        terminal_profile: TerminalProfile::from_term(Some(&term), colorterm.as_deref()),
         first_app_shortname,
         user_id,
         locale,
@@ -386,7 +390,7 @@ async fn main() -> Result<()> {
 
             exit_code = &mut exit_rx => {
                 if let Ok(exit_code) = exit_code {
-                    tracing::info!(?exit_code, "App exited");
+                    tracing::trace!(?exit_code, "App exited");
                 }
                 break;
             }

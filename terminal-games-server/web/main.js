@@ -45,6 +45,8 @@ const POW_SPINNER_INTERVAL_MS = 120;
 let queuePosition = null;
 let spinnerInterval = null;
 let spinnerFrame = 0;
+const titleLabel = ' Terminal Games ';
+const styledTitle = '\x1b[38;2;23;23;23m\x1b[48;2;152;195;121m Terminal Games \x1b[0m';
 
 const measureLatency = () => {
     if (socket && socket.readyState === WebSocket.OPEN) {
@@ -121,12 +123,12 @@ const onSocketMessage = async (event) => {
 
 const onSocketError = (error) => {
     console.error('WebSocket error:', error);
-    term.write('\r\n\x1b[31mWebSocket connection error\x1b[0m\r\n');
+    term.write('\r\n\x1b[38;2;248;113;113mWebSocket connection error\x1b[0m\r\n');
 };
 
 const onSocketClose = () => {
     stopQueueSpinner();
-    term.write('\r\n\x1b[31mWebSocket connection closed\x1b[0m\r\n');
+    term.write('\r\n\x1b[38;2;248;113;113mWebSocket connection closed\x1b[0m\r\n');
     if (pingInterval) {
         clearInterval(pingInterval);
         pingInterval = null;
@@ -168,7 +170,6 @@ function renderQueueScreen() {
     if (queuePosition === null) {
         return;
     }
-    const title = 'Terminal Games';
     const spinnerLine = `${spinnerFrames[spinnerFrame]} Loading...`;
     const queueLine = `Position in queue: ${queuePosition}`;
     const centerRow = Math.max(1, Math.floor(term.rows / 2));
@@ -176,7 +177,7 @@ function renderQueueScreen() {
     const queueRow = Math.min(term.rows, centerRow + 1);
 
     term.write('\x1b[?25l\x1b[2J');
-    term.write(`\x1b[${titleRow};${centeredCol(title)}H${title}`);
+    term.write(`\x1b[${titleRow};${centeredCol(titleLabel)}H${styledTitle}`);
     term.write(`\x1b[${centerRow};${centeredCol(spinnerLine)}H${spinnerLine}`);
     term.write(`\x1b[${queueRow};${centeredCol(queueLine)}H${queueLine}`);
     term.write('\x1b[H');
@@ -393,7 +394,6 @@ function countLeadingZeroBits(bytes) {
 }
 
 function renderPowScreen(frame, attempts) {
-    const title = 'Terminal Games';
     const spinnerLine = `${spinnerFrames[frame]} Computing proof of work...`;
     const detailLine = `Hash attempts: ${attempts}`;
     const centerRow = Math.max(1, Math.floor(term.rows / 2));
@@ -401,7 +401,7 @@ function renderPowScreen(frame, attempts) {
     const detailRow = Math.min(term.rows, centerRow + 1);
 
     term.write('\x1b[?25l\x1b[2J');
-    term.write(`\x1b[${titleRow};${centeredCol(title)}H${title}`);
+    term.write(`\x1b[${titleRow};${centeredCol(titleLabel)}H${styledTitle}`);
     term.write(`\x1b[${centerRow};${centeredCol(spinnerLine)}H${spinnerLine}`);
     term.write(`\x1b[${detailRow};${centeredCol(detailLine)}H\x1b[2m${detailLine}\x1b[0m`);
     term.write('\x1b[H');
