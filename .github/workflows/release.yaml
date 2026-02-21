@@ -2,32 +2,48 @@ name: Build and Release
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   release-cli:
     runs-on: ubuntu-latest
     name: Release CLI
+    permissions: write-all
     steps:
       - uses: actions/checkout@v6
 
+      - name: Set up buildx (docker-container driver)
+        run: |
+          docker buildx create --name ci-builder --driver docker-container --use
+          docker buildx inspect --bootstrap
+
       - name: Docker Login
         run: |
-          docker login --username ${{ github.actor }} --password ${{ github.token }}
+          docker login --username ${{ github.actor }} --password ${{ github.token }} ghcr.io
 
       - name: Docker Build
         run: |
-          docker build -f Dockerfile.cli . -t ghcr.io/terminal-games/terminal-games-cli --cache-from type=registry,ref=ghcr.io/terminal-games/terminal-games-cli:buildcache --cache-to type=registry,ref=ghcr.io/terminal-games/terminal-games-cli:buildcache,mode=max
+          docker buildx build -f Dockerfile.cli . -t ghcr.io/terminal-games/terminal-games-cli:latest --load \
+            --cache-from type=registry,ref=ghcr.io/terminal-games/terminal-games-cli:buildcache \
+            --cache-to type=registry,ref=ghcr.io/terminal-games/terminal-games-cli:buildcache,mode=max
 
-      - name: Get tag name
-        id: tag-name
+      - name: Extract
         run: |
-          echo "tagname=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          CONTAINER_ID=$(docker create ghcr.io/terminal-games/terminal-games-cli:latest)
+          docker cp $CONTAINER_ID:/terminal-games-cli terminal-games-cli-x86_64-unknown-linux-musl
+          docker rm $CONTAINER_ID
 
-      - name: Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create ${{ steps.tag-name.outputs.tagname }} -t "terminal-games-cli" -n "Binary release (${{ steps.tag-name.outputs.tagname }})"
-          gh release upload ${{ steps.tag-name.outputs.tagname }} terminal-games-cli-x86_64-unknown-linux-musl
+      - uses: actions/upload-artifact@v6
+        with:
+          name: terminal-games-cli-x86_64-unknown-linux-musl
+          path: terminal-games-cli-x86_64-unknown-linux-musl
+
+      # - name: Get tag name
+      #   id: tag-name
+      #   run: |
+      #     echo "tagname=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      # - name: Release
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #   run: |
+      #     gh release create ${{ steps.tag-name.outputs.tagname }} -t "terminal-games-cli" -n "Binary release (${{ steps.tag-name.outputs.tagname }})"
+      #     gh release upload ${{ steps.tag-name.outputs.tagname }} terminal-games-cli-x86_64-unknown-linux-musl
