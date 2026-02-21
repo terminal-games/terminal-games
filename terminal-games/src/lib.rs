@@ -5,6 +5,8 @@
 pub mod app;
 mod audio;
 pub mod mesh;
+pub mod palette;
 pub mod rate_limiting;
 mod replay;
 mod status_bar;
+pub mod terminal_profile;

@@ -1,7 +1,7 @@
 use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -26,7 +26,7 @@ impl EwmaRate {
     fn now_ns() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(Duration::ZERO)
             .as_nanos() as u64
     }
 
@@ -105,6 +105,8 @@ pub struct NetworkInformation<L: LatencyProvider> {
     send_rate: EwmaRate,
     recv_rate: EwmaRate,
     last_throttled: AtomicU64,
+    cached_latency_ms: AtomicI32,
+    last_latency_update_ms: AtomicU64,
     latency_provider: L,
 }
 
@@ -116,6 +118,8 @@ impl NetworkInformation<TcpLatencyProvider> {
             send_rate: EwmaRate::new(1.0),
             recv_rate: EwmaRate::new(1.0),
             last_throttled: AtomicU64::new(0),
+            cached_latency_ms: AtomicI32::new(-1),
+            last_latency_update_ms: AtomicU64::new(0),
             latency_provider: TcpLatencyProvider::new(fd),
         }
     }
@@ -129,6 +133,8 @@ impl NetworkInformation<SimulatedLatencyProvider> {
             send_rate: EwmaRate::new(1.0),
             recv_rate: EwmaRate::new(1.0),
             last_throttled: AtomicU64::new(0),
+            cached_latency_ms: AtomicI32::new(-1),
+            last_latency_update_ms: AtomicU64::new(0),
             latency_provider: SimulatedLatencyProvider::new(latency_ms),
         }
     }
@@ -160,7 +166,7 @@ impl<L: LatencyProvider> NetworkInformation<L> {
         self.last_throttled.store(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or(Duration::ZERO)
                 .as_millis() as u64,
             Ordering::Release,
         );
@@ -176,7 +182,9 @@ impl<L: LatencyProvider> NetworkInformation<L> {
 
     fn set_last_throttled(&self, time: SystemTime) {
         self.last_throttled.store(
-            time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+            time.duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_millis() as u64,
             Ordering::Release,
         );
     }
@@ -197,7 +205,35 @@ impl<L: LatencyProvider> NetworkInfo for NetworkInformation<L> {
     }
 
     fn latency(&self) -> std::io::Result<Duration> {
-        self.latency_provider.latency()
+        const LATENCY_REFRESH_MS: u64 = 250;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis() as u64;
+        let last_ms = self.last_latency_update_ms.load(Ordering::Relaxed);
+        let cached_ms = self.cached_latency_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last_ms) < LATENCY_REFRESH_MS {
+            if cached_ms >= 0 {
+                return Ok(Duration::from_millis(cached_ms as u64));
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "latency unavailable",
+            ));
+        }
+
+        self.last_latency_update_ms.store(now_ms, Ordering::Relaxed);
+        match self.latency_provider.latency() {
+            Ok(latency) => {
+                let latency_ms = latency.as_millis().min(i32::MAX as u128) as i32;
+                self.cached_latency_ms.store(latency_ms, Ordering::Relaxed);
+                Ok(latency)
+            }
+            Err(err) => {
+                self.cached_latency_ms.store(-1, Ordering::Relaxed);
+                Err(err)
+            }
+        }
     }
 }
 

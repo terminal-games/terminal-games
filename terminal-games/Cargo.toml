@@ -7,23 +7,27 @@ edition = "2024"
 anyhow = "1"
 avt = "0.17"
 async-trait = "0.1"
+base64 = "0.22"
 bytes = "1"
-ffmpeg-next = { version = "8", default-features = false, features = ["codec", "device"] }
 futures = "0.3"
 headless-terminal = { path = "../headless-terminal" }
 hex = "0.4"
 ipnet = "2"
 libc = "0.2"
 libsql = "0.9"
-postcard = { version = "1", default-features = false }
+ogg = "0.9"
+opus = "0.3"
+audiopus_sys = { version = "0.2", features = ["static"] }
 rand_core = "0.6"
 reqwest = { version = "0.13", features = ["multipart", "json"] }
 rustls = "0.23"
-rustls-pki-types = "1"
+rustls-platform-verifier = "0.6"
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smallvec = "1"
 strip-ansi-escapes = "0.2"
+tarpc = { version = "0.37", features = ["serde", "serde-transport", "serde-transport-bincode", "tokio1"] }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = [
     "tls12",
@@ -34,7 +38,5 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
-wasmtime = "40"
-wasmtime-wasi = { version = "40", default-features = false, features = ["p1"] }
-webpki-roots = "1"
-yansi = { version = "1", features = ["hyperlink"] }
+wasmtime = { git = "https://github.com/mbund/wasmtime.git", branch = "wasip1-resource-table-memory-leak-fix" }
+wasmtime-wasi = { git = "https://github.com/mbund/wasmtime.git", branch = "wasip1-resource-table-memory-leak-fix", default-features = false, features = ["p1"] }

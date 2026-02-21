@@ -177,7 +177,7 @@ async fn main() -> std::io::Result<()> {
                             let conn_done_clone = conn_done.clone();
                             tokio::spawn(async move {
                                 let result = async {
-                                    let url = "https://example.com".parse::<hyper::Uri>().unwrap();
+                                    let url = "https://httpbin.org/get".parse::<hyper::Uri>().unwrap();
                                     let host = url.host().expect("uri has no host");
                                     let port = url.port_u16().unwrap_or(443);
                                     let address = format!("{}:{}", host, port);
@@ -234,8 +234,10 @@ async fn main() -> std::io::Result<()> {
             last_event = Some(event);
         }
 
-        if app::next_app_ready() {
-            break;
+        match app::next_app_ready() {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(_) => break,
         }
 
         if app::graceful_shutdown_poll() {

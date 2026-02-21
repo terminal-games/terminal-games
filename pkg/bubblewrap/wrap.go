@@ -56,7 +56,7 @@ type dimensions struct {
 var fromHost = &yieldingReadWriter{buf: bytes.NewBuffer(nil)}
 
 func init() {
-	debug.SetMemoryLimit(30 * 1024 * 1024)
+	debug.SetMemoryLimit(24 * 1024 * 1024)
 
 	go func() {
 		buffer := make([]byte, 512)
@@ -71,7 +71,7 @@ func init() {
 			}
 
 			if n == 0 {
-				time.Sleep(1 * time.Millisecond)
+				time.Sleep(10 * time.Millisecond)
 			}
 		}
 	}()
@@ -96,7 +96,7 @@ func NewProgram(model tea.Model, opts ...tea.ProgramOption) *tea.Program {
 				sentQuit = true
 			}
 
-			time.Sleep(1 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 
@@ -104,8 +104,25 @@ func NewProgram(model tea.Model, opts ...tea.ProgramOption) *tea.Program {
 }
 
 func MakeRenderer() *lipgloss.Renderer {
-	env := sshEnviron(os.Environ())
-	r := lipgloss.NewRenderer(os.Stdout, termenv.WithEnvironment(env), termenv.WithUnsafe(), termenv.WithColorCache(true))
+	r := lipgloss.NewRenderer(os.Stdout, termenv.WithProfile(termenv.TrueColor))
+
+	info, err := app.GetTerminalInfo()
+	if err == nil {
+		switch info.ColorMode {
+		case app.TerminalColorTrueColor:
+			r.SetColorProfile(termenv.TrueColor)
+		case app.TerminalColor256:
+			r.SetColorProfile(termenv.ANSI256)
+		case app.TerminalColor16:
+			r.SetColorProfile(termenv.ANSI)
+		}
+		if info.HasDarkBackground {
+			r.SetHasDarkBackground(info.DarkBackground)
+		}
+	} else {
+		r.SetColorProfile(termenv.TrueColor)
+	}
+
 	bg := querySessionBackgroundColor(fromHost, os.Stdout)
 	if bg != nil {
 		c, ok := colorful.MakeColor(bg)

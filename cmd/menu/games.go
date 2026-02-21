@@ -165,7 +165,13 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		if !m.playBusy {
 			return m, nil
 		}
-		if app.Ready() {
+		ready, err := app.Ready()
+		if err != nil {
+			m.playBusy = false
+			m.playError = err.Error()
+			return m, nil
+		}
+		if ready {
 			return m, tea.Quit
 		}
 		var cmd tea.Cmd
@@ -419,30 +425,71 @@ func (m *gamesModel) renderGameDetails(width, height int) string {
 	if item.Shortname == "" {
 		return lipgloss.NewStyle().Width(width).Height(height).Render(m.styles.Subtle.Render(m.localizer.Text(textGamesNoMatch)))
 	}
-	title := m.styles.Title.Render(item.Name)
-	desc := m.styles.Subtle.Render(item.Description)
-	body := m.styles.Body.Render(item.Details)
-	play := m.renderPlayButton(width, m.localizer.Text(textPlayButton))
-	if m.playBusy {
-		play = m.renderPlayButton(width, m.spin.View()+" "+m.localizer.Text(textPlayLoading))
+	content := m.renderGameDetailsContent(width, height, true)
+	return lipgloss.NewStyle().Width(width).MaxHeight(height).Render(content)
+}
+
+func (m *gamesModel) gameDetailsNeedsMoreHeight(width, height int) bool {
+	if width <= 0 || height <= 0 || !m.loaded || m.loadErr != nil {
+		return false
 	}
-	if m.zone != nil {
-		play = m.zone.Mark(playZoneID, play)
+	item := m.selectedItem()
+	if item.Shortname == "" {
+		return false
+	}
+	content := m.renderGameDetailsContent(width, height, false)
+	return lipgloss.Height(lipgloss.NewStyle().Width(width).Render(content)) > height
+}
+
+func (m *gamesModel) renderGameDetailsContent(width, height int, allowInlineScreenshots bool) string {
+	item := m.selectedItem()
+	showInlineScreenshots := allowInlineScreenshots && len(item.Screenshots) > 0 && carousel.CanFitInline(width, height)
+	parts := m.buildGameDetailsParts(item, width, showInlineScreenshots)
+	if showInlineScreenshots && m.detailsContentExceedsHeight(width, height, parts) {
+		parts = m.buildGameDetailsParts(item, width, false)
+	}
+	return strings.Join(parts, "\n")
+}
+
+func (m *gamesModel) buildGameDetailsParts(item gameItem, width int, inlineScreenshots bool) []string {
+	parts := []string{
+		m.styles.Title.Render(item.Name),
+		m.styles.Subtle.Render(item.Description),
+		"",
+		m.styles.Body.Render(item.Details),
 	}
 
-	parts := []string{title, desc, "", body}
 	if len(item.Screenshots) > 0 {
-		if carousel.CanFitInline(width, height) {
+		switch {
+		case inlineScreenshots:
 			parts = append(parts, "\n"+m.carousel.View(width))
-		} else if carousel.CanFitModal(m.termW, m.termH) {
+		case carousel.CanFitModal(m.termW, m.termH):
 			parts = append(parts, "", m.carousel.ViewButton())
 		}
 	}
-	parts = append(parts, "", play)
+
+	parts = append(parts, "", m.renderCurrentPlayButton(width))
 	if m.playError != "" {
 		parts = append(parts, m.styles.Error.Render(m.playError))
 	}
-	return lipgloss.NewStyle().Width(width).Height(height).Render(strings.Join(parts, "\n"))
+	return parts
+}
+
+func (m *gamesModel) renderCurrentPlayButton(width int) string {
+	label := m.localizer.Text(textPlayButton)
+	if m.playBusy {
+		label = m.spin.View() + " " + m.localizer.Text(textPlayLoading)
+	}
+	play := m.renderPlayButton(width, label)
+	if m.zone != nil {
+		return m.zone.Mark(playZoneID, play)
+	}
+	return play
+}
+
+func (m *gamesModel) detailsContentExceedsHeight(width, height int, parts []string) bool {
+	content := strings.Join(parts, "\n")
+	return lipgloss.Height(lipgloss.NewStyle().Width(width).Render(content)) > height
 }
 
 func (m *gamesModel) renderPlayButton(width int, label string) string {

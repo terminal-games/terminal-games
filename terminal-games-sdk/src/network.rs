@@ -160,8 +160,7 @@ impl PendingDial {
             match self.poll()? {
                 Some(result) => return Ok(result),
                 None => {
-                    // Yield to allow other tasks to run
-                    std::hint::spin_loop();
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             }
         }
@@ -175,7 +174,7 @@ impl PendingDial {
                 Some(result) => return Ok(result),
                 None => {
                     // Yield to tokio runtime to allow other tasks to run
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
         }

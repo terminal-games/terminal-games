@@ -11,6 +11,16 @@ import (
 	"unsafe"
 )
 
+const (
+	nextAppReadyErrUnknownShortname = -1
+	nextAppReadyErrOther            = -2
+)
+
+var (
+	ErrNextAppUnknownShortname = errors.New("unknown app shortname")
+	ErrNextAppPrepareFailed    = errors.New("failed to prepare app switch")
+)
+
 //go:wasmimport terminal_games change_app
 //go:noescape
 func change_app(address_ptr unsafe.Pointer, addressLen uint32) int32
@@ -34,7 +44,7 @@ func Change(shortname string) error {
 	b := []byte(shortname)
 	ret := change_app(unsafe.Pointer(&b[0]), uint32(len(b)))
 	if ret < 0 {
-		return fmt.Errorf("change_app failed")
+		return fmt.Errorf("change_app failed with code %d", ret)
 	}
 
 	return nil
@@ -46,8 +56,19 @@ func Change(shortname string) error {
 // This can be called in a loop by the current guest before exiting to ensure
 // the next app will start quickly once the host performs the switch. This is
 // useful for building a loading UI
-func Ready() bool {
-	return next_app_ready() > 0
+func Ready() (bool, error) {
+	ret := next_app_ready()
+	switch ret {
+	case nextAppReadyErrUnknownShortname:
+		return false, ErrNextAppUnknownShortname
+	case nextAppReadyErrOther:
+		return false, ErrNextAppPrepareFailed
+	default:
+		if ret < 0 {
+			return false, fmt.Errorf("next_app_ready failed with code %d", ret)
+		}
+	}
+	return ret > 0, nil
 }
 
 // GracefulShutdownPoll polls whether a graceful shutdown has been triggered by the host.
@@ -67,6 +88,18 @@ func network_info(
 	bytesPerSecOutPtr unsafe.Pointer,
 	lastThrottledMsPtr unsafe.Pointer,
 	latencyMsPtr unsafe.Pointer,
+) int32
+
+//go:wasmimport terminal_games terminal_info
+//go:noescape
+func terminal_info(
+	colorModePtr unsafe.Pointer,
+	hasBgPtr unsafe.Pointer,
+	bgRPtr unsafe.Pointer,
+	bgGPtr unsafe.Pointer,
+	bgBPtr unsafe.Pointer,
+	hasDarkPtr unsafe.Pointer,
+	darkPtr unsafe.Pointer,
 ) int32
 
 // NetworkInfo holds network information from the host.
@@ -108,4 +141,56 @@ func GetNetworkInfo() (NetworkInfo, error) {
 		LastThrottled:  lastThrottled,
 		LatencyMs:      latencyMs,
 	}, nil
+}
+
+type TerminalColorMode uint8
+
+const (
+	TerminalColor16 TerminalColorMode = iota
+	TerminalColor256
+	TerminalColorTrueColor
+)
+
+type TerminalInfo struct {
+	ColorMode         TerminalColorMode
+	HasBackgroundRGB  bool
+	BackgroundRGB     [3]uint8
+	HasDarkBackground bool
+	DarkBackground    bool
+}
+
+func GetTerminalInfo() (TerminalInfo, error) {
+	var colorMode uint8
+	var hasBg int32
+	var bgR uint8
+	var bgG uint8
+	var bgB uint8
+	var hasDark int32
+	var dark int32
+
+	ret := terminal_info(
+		unsafe.Pointer(&colorMode),
+		unsafe.Pointer(&hasBg),
+		unsafe.Pointer(&bgR),
+		unsafe.Pointer(&bgG),
+		unsafe.Pointer(&bgB),
+		unsafe.Pointer(&hasDark),
+		unsafe.Pointer(&dark),
+	)
+	if ret < 0 {
+		return TerminalInfo{}, errors.New("terminal_info host call failed")
+	}
+
+	out := TerminalInfo{
+		ColorMode: TerminalColorMode(colorMode),
+	}
+	if hasBg > 0 {
+		out.HasBackgroundRGB = true
+		out.BackgroundRGB = [3]uint8{bgR, bgG, bgB}
+	}
+	if hasDark > 0 {
+		out.HasDarkBackground = true
+		out.DarkBackground = dark > 0
+	}
+	return out, nil
 }

@@ -126,7 +126,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 
 		switch result {
 		case pollDialPending:
-			time.Sleep(1 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 			continue
 		default:
 			return nil, pollDialErrorFromCode(result)
@@ -199,7 +199,7 @@ func (c *WasmHostConn) Read(b []byte) (n int, err error) {
 			return int(readN), nil
 		}
 		if readN == 0 {
-			time.Sleep(1 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 		return 0, readErrorFromCode(readN)
@@ -243,7 +243,7 @@ func (c *WasmHostConn) Write(b []byte) (n int, err error) {
 		}
 
 		if written == 0 {
-			time.Sleep(1 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 

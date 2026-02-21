@@ -20,6 +20,9 @@ fn main() -> std::io::Result<()> {
     let start = Instant::now();
     let mut frame_counter = 1;
     let mut last_event = None;
+    let mut fps_window_start = Instant::now();
+    let mut fps_window_frames: u32 = 0;
+    let mut recent_fps = 0.0f64;
     'outer: loop {
         if app::graceful_shutdown_poll() {
             break;
@@ -37,21 +40,29 @@ fn main() -> std::io::Result<()> {
             last_event = Some(event);
         }
 
+        fps_window_frames += 1;
+        let fps_window_elapsed = fps_window_start.elapsed();
+        if fps_window_elapsed >= std::time::Duration::from_millis(250) {
+            recent_fps = fps_window_frames as f64 / fps_window_elapsed.as_secs_f64();
+            fps_window_frames = 0;
+            fps_window_start = Instant::now();
+        }
+
         terminal.draw(|frame| {
             let area = frame.area();
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Hello World!\ncounter={}\nlast_event={:#?}\nfps={}\nevent_counter={}\n",
+                    "Hello World!\ncounter={}\nlast_event={:#?}\nrecent_fps_250ms={:.1}\nevent_counter={}\nuptime_secs={:.2}\n",
                     frame_counter,
                     last_event,
-                    frame_counter as f64 / start.elapsed().as_secs_f64(),
+                    recent_fps,
                     event_counter,
+                    start.elapsed().as_secs_f64(),
                 )),
                 area,
             );
         })?;
         frame_counter += 1;
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     std::io::stdout().write(b"\x1b[?1003l")?;
     Ok(())

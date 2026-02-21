@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+mod admission;
 mod ssh;
 mod web;
 
@@ -161,26 +162,32 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let libsql_url = std::env::var("LIBSQL_URL").unwrap();
-    let libsql_auth_token = std::env::var("LIBSQL_AUTH_TOKEN").unwrap();
+    let libsql_url = std::env::var("LIBSQL_URL").context("LIBSQL_URL must be set")?;
+    let libsql_auth_token =
+        std::env::var("LIBSQL_AUTH_TOKEN").context("LIBSQL_AUTH_TOKEN must be set")?;
 
     let db = libsql::Builder::new_remote(libsql_url.clone(), libsql_auth_token.clone())
         .build()
         .await
-        .unwrap();
+        .context("Failed to initialize remote libsql client")?;
 
     // let db = libsql::Builder::new_local("./terminal-games.db")
     //     .build()
     //     .await
     //     .unwrap();
 
-    let conn = db.connect().unwrap();
+    let conn = db.connect().context("Failed to connect to libsql")?;
 
-    let tx = conn.transaction().await.unwrap();
+    let tx = conn
+        .transaction()
+        .await
+        .context("Failed to start migration transaction")?;
     tx.execute_batch(include_str!("../../terminal-games/libsql/migrate-001.sql"))
         .await
-        .unwrap();
-    tx.commit().await.unwrap();
+        .context("Failed to run migrations")?;
+    tx.commit()
+        .await
+        .context("Failed to commit migration transaction")?;
 
     let upserted = sync_games_from_embedded_manifests(&conn).await?;
     tracing::info!(
@@ -189,26 +196,29 @@ async fn main() -> Result<()> {
     );
 
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
-    mesh.start_discovery().await.unwrap();
-    mesh.serve().await.unwrap();
+    mesh.start_discovery().await?;
+    mesh.serve().await?;
 
-    let app_server = Arc::new(AppServer::new(mesh.clone(), conn).unwrap());
-
-    let ssh_app_server = app_server.clone();
-    let web_app_server = app_server.clone();
+    let app_server = Arc::new(AppServer::new(mesh.clone(), conn)?);
+    let max_active_apps = std::env::var("MAX_ACTIVE_APPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(usize::MAX);
+    let admission_controller = Arc::new(admission::AdmissionController::new(max_active_apps));
 
     tokio::select! {
         result = async {
-            let mut server = ssh::SshServer::new(ssh_app_server).await?;
+            let mut server = ssh::SshServer::new(app_server.clone(), admission_controller.clone()).await?;
             server.run().await
         } => {
-            result.expect("Failed running SSH server");
+            result?;
         }
         result = async {
-            let server = web::WebServer::new(web_app_server);
+            let server = web::WebServer::new(app_server.clone(), admission_controller.clone());
             server.run().await
         } => {
-            result.expect("Failed running web server");
+            result?;
         }
     }
 

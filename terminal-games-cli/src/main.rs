@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::Parser;
 use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
@@ -25,6 +25,7 @@ use terminal_games::{
     app::{AppInstantiationParams, AppServer},
     mesh::{LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
+    terminal_profile::TerminalProfile,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -75,7 +76,11 @@ struct LogBuffer(Arc<Mutex<Vec<u8>>>);
 
 impl Write for LogBuffer {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        let mut locked = match self.0.lock() {
+            Ok(locked) => locked,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        locked.extend_from_slice(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -141,15 +146,25 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let db_path = data_dir.join("terminal-games.db");
 
-    let db = libsql::Builder::new_local(&db_path).build().await.unwrap();
+    let db = libsql::Builder::new_local(&db_path)
+        .build()
+        .await
+        .context("Failed to initialize local libsql client")?;
 
-    let conn = db.connect().unwrap();
+    let conn = db
+        .connect()
+        .context("Failed to connect to local database")?;
 
-    let tx = conn.transaction().await.unwrap();
+    let tx = conn
+        .transaction()
+        .await
+        .context("Failed to start migration transaction")?;
     tx.execute_batch(include_str!("../../terminal-games/libsql/migrate-001.sql"))
         .await
-        .unwrap();
-    tx.commit().await.unwrap();
+        .context("Failed to run migrations")?;
+    tx.commit()
+        .await
+        .context("Failed to commit migration transaction")?;
 
     let first_app_shortname = Path::new(&args.wasm_file)
         .file_stem()
@@ -249,9 +264,9 @@ async fn main() -> Result<()> {
         .register(region, local_addr.port())
         .await
         .expect("Failed to register with local discovery");
-    mesh.start_discovery().await.unwrap();
+    mesh.start_discovery().await?;
 
-    let app_server = Arc::new(AppServer::new(mesh.clone(), conn).unwrap());
+    let app_server = Arc::new(AppServer::new(mesh.clone(), conn)?);
 
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
@@ -291,17 +306,20 @@ async fn main() -> Result<()> {
         None
     };
 
+    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+    let colorterm = std::env::var("COLORTERM").ok();
     let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
         args: None,
         input_receiver: input_rx,
         output_sender: output_tx,
         audio_sender: audio_player.as_ref().map(|_| audio_tx),
         remote_sshid: "cli".to_string(),
-        term: Some(std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string())),
+        term: Some(term.clone()),
         username: username.clone(),
         window_size_receiver: resize_rx,
         graceful_shutdown_token: graceful_shutdown_token.clone(),
         network_info: network_info.clone(),
+        terminal_profile: TerminalProfile::from_term(Some(&term), colorterm.as_deref()),
         first_app_shortname,
         user_id,
         locale,
@@ -372,7 +390,7 @@ async fn main() -> Result<()> {
 
             exit_code = &mut exit_rx => {
                 if let Ok(exit_code) = exit_code {
-                    tracing::info!(?exit_code, "App exited");
+                    tracing::trace!(?exit_code, "App exited");
                 }
                 break;
             }
@@ -423,7 +441,11 @@ async fn main() -> Result<()> {
     let _ = local_discovery.unregister().await;
     mesh.graceful_shutdown().await;
 
-    std::io::stderr().write_all(&log_buffer.lock().unwrap())?;
+    let logs = match log_buffer.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    std::io::stderr().write_all(&logs)?;
 
     Ok(())
 }
