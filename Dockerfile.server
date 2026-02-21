@@ -53,8 +53,5 @@ RUN cargo build --release -p terminal-games-server --target=x86_64-unknown-linux
 
 FROM scratch
 COPY --from=builder /etc/ssl/certs /etc/ssl/certs
-COPY --from=builder /etc/ssl/cert.pem /etc/ssl/cert.pem
-ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/terminal-games-server /terminal-games-server
-COPY ./cmd/menu/menu.wasm ./examples/kitchen-sink/kitchen-sink.wasm .
 ENTRYPOINT ["/terminal-games-server"]

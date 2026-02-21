@@ -1,0 +1,33 @@
+name: Build and Release
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-cli:
+    runs-on: ubuntu-latest
+    name: Release CLI
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Docker Login
+        run: |
+          docker login --username ${{ github.actor }} --password ${{ github.token }}
+
+      - name: Docker Build
+        run: |
+          docker build -f Dockerfile.cli . -t ghcr.io/terminal-games/terminal-games-cli --cache-from type=registry,ref=ghcr.io/terminal-games/terminal-games-cli:buildcache --cache-to type=registry,ref=ghcr.io/terminal-games/terminal-games-cli:buildcache,mode=max
+
+      - name: Get tag name
+        id: tag-name
+        run: |
+          echo "tagname=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ steps.tag-name.outputs.tagname }} -t "terminal-games-cli" -n "Binary release (${{ steps.tag-name.outputs.tagname }})"
+          gh release upload ${{ steps.tag-name.outputs.tagname }} terminal-games-cli-x86_64-unknown-linux-musl
