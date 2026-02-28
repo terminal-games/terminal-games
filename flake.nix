@@ -87,6 +87,10 @@
             flyctl
             muslCc
             openssl
+            opentofu
+            tofu-ls
+            ansible
+            lego
           ];
           nativeBuildInputs = with pkgs; [
             cmake

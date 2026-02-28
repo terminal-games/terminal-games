@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 use tarpc::server::Channel;
 use tarpc::{client, context, server};
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    sync::{Mutex, Notify},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector, rustls};
 use tokio_util::{
@@ -313,7 +314,7 @@ impl LocalDiscovery {
             Err(_) => return Vec::new(),
         };
 
-        contents
+        let entries: Vec<LocalRegistryEntry> = contents
             .lines()
             .filter_map(|line| {
                 let parts: Vec<&str> = line.splitn(3, ':').collect();
@@ -334,7 +335,29 @@ impl LocalDiscovery {
 
                 Some(LocalRegistryEntry { region, port, pid })
             })
-            .collect()
+            .collect();
+
+        let canonical = if entries.is_empty() {
+            String::new()
+        } else {
+            let lines: Vec<String> = entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{}:{}:{}",
+                        hex::encode(entry.region.as_bytes()),
+                        entry.port,
+                        entry.pid
+                    )
+                })
+                .collect();
+            lines.join("\n") + "\n"
+        };
+        if canonical != contents {
+            let _ = std::fs::write(&self.registry_path, canonical);
+        }
+
+        entries
     }
 }
 
@@ -366,10 +389,11 @@ impl Discovery for LocalDiscovery {
 struct ActiveConnection {
     tx: tokio::sync::mpsc::Sender<Message>,
     conn_fd: RawFd,
+    addr: SocketAddr,
 }
 
 enum RegionState {
-    Pending,
+    Pending(SocketAddr),
     Active(ActiveConnection),
 }
 
@@ -377,7 +401,7 @@ impl RegionState {
     fn as_active(&self) -> Option<&ActiveConnection> {
         match self {
             RegionState::Active(conn) => Some(conn),
-            RegionState::Pending => None,
+            RegionState::Pending(_) => None,
         }
     }
 }
@@ -390,6 +414,7 @@ struct MeshInner {
     discovery: Arc<dyn Discovery>,
     cancel: CancellationToken,
     tasks: TaskTracker,
+    heal_now: Notify,
 }
 
 #[derive(Clone)]
@@ -417,6 +442,7 @@ impl Mesh {
                 discovery,
                 cancel: CancellationToken::new(),
                 tasks: TaskTracker::new(),
+                heal_now: Notify::new(),
             }),
         }
     }
@@ -555,6 +581,11 @@ impl Mesh {
                             tracing::error!(?e, "Failed to connect to discovered peers");
                         }
                     }
+                    _ = inner.heal_now.notified() => {
+                        if let Err(e) = inner.heal_network().await {
+                            tracing::warn!(?e, "Failed immediate mesh heal");
+                        }
+                    }
                 }
             }
         });
@@ -679,13 +710,18 @@ impl MeshInner {
         addr: SocketAddr,
     ) -> anyhow::Result<()> {
         {
-            // Mark as pending before connecting to prevent heal_network
             let mut regions = self.regions.lock().await;
-            if regions.contains_key(&region) {
-                tracing::debug!(%region, "Already connected or connecting to region, skipping");
-                return Ok(());
+            if let Some(existing) = regions.get(&region) {
+                let existing_addr = match existing {
+                    RegionState::Pending(existing_addr) => *existing_addr,
+                    RegionState::Active(conn) => conn.addr,
+                };
+                if existing_addr == addr {
+                    tracing::debug!(%region, "Already connected or connecting to region, skipping");
+                    return Ok(());
+                }
             }
-            regions.insert(region, RegionState::Pending);
+            regions.insert(region, RegionState::Pending(addr));
         }
 
         let stream = match TcpStream::connect(addr).await {
@@ -694,7 +730,11 @@ impl MeshInner {
                 stream
             }
             Err(e) => {
-                self.regions.lock().await.remove(&region);
+                let mut regions = self.regions.lock().await;
+                if matches!(regions.get(&region), Some(RegionState::Pending(pending_addr)) if *pending_addr == addr)
+                {
+                    regions.remove(&region);
+                }
                 return Err(e.into());
             }
         };
@@ -709,14 +749,25 @@ impl MeshInner {
 
     async fn heal_network(self: &Arc<Self>) -> anyhow::Result<()> {
         let discovered = self.discovery.discover_peers().await?;
+        let discovered_by_region: HashMap<RegionId, SocketAddr> = discovered.into_iter().collect();
+        let current_regions: HashMap<RegionId, SocketAddr> = {
+            let regions = self.regions.lock().await;
+            regions
+                .iter()
+                .map(|(region, state)| {
+                    let addr = match state {
+                        RegionState::Pending(addr) => *addr,
+                        RegionState::Active(conn) => conn.addr,
+                    };
+                    (*region, addr)
+                })
+                .collect()
+        };
 
-        let current_regions: HashSet<RegionId> =
-            self.regions.lock().await.keys().copied().collect();
-
-        let targets: Vec<(RegionId, SocketAddr)> = discovered
+        let targets: Vec<(RegionId, SocketAddr)> = discovered_by_region
             .into_iter()
             .filter(|(region, _)| *region != self.region)
-            .filter(|(region, _)| !current_regions.contains(region))
+            .filter(|(region, addr)| current_regions.get(region) != Some(addr))
             .collect();
 
         if targets.is_empty() {
@@ -747,6 +798,7 @@ impl MeshInner {
         addr: SocketAddr,
         expected_region: Option<RegionId>,
     ) {
+        let fd = stream.as_raw_fd();
         let result = self
             .handle_connection_inner(stream, addr, expected_region)
             .await;
@@ -757,8 +809,23 @@ impl MeshInner {
 
         if expected_region.is_some() {
             if let Some(region) = result.as_ref().ok().copied().or(expected_region) {
-                self.regions.lock().await.remove(&region);
-                tracing::info!(region=%region, %addr, "Disconnected");
+                let removed = {
+                    let mut regions = self.regions.lock().await;
+                    match regions.get(&region) {
+                        Some(RegionState::Pending(pending_addr)) if *pending_addr == addr => {
+                            regions.remove(&region);
+                            true
+                        }
+                        Some(RegionState::Active(conn)) if conn.conn_fd == fd => {
+                            regions.remove(&region);
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if removed {
+                    tracing::info!(region=%region, %addr, "Disconnected");
+                }
             }
         } else if let Ok(region) = result {
             tracing::info!(region=%region, %addr, "Disconnected");
@@ -768,7 +835,7 @@ impl MeshInner {
     async fn handle_connection_inner(
         self: &Arc<Self>,
         stream: TcpStream,
-        _addr: SocketAddr,
+        addr: SocketAddr,
         expected_region: Option<RegionId>,
     ) -> anyhow::Result<RegionId> {
         let role = if expected_region.is_some() {
@@ -838,7 +905,11 @@ impl MeshInner {
 
             self.regions.lock().await.insert(
                 their_region,
-                RegionState::Active(ActiveConnection { tx, conn_fd: fd }),
+                RegionState::Active(ActiveConnection {
+                    tx,
+                    conn_fd: fd,
+                    addr,
+                }),
             );
 
             tokio::select! {
@@ -1007,6 +1078,9 @@ enum ConnectionRole {
     Incoming,
 }
 
+trait MeshIoStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T> MeshIoStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
 impl MeshInner {
     fn mtls_pem_value() -> anyhow::Result<Vec<u8>> {
         let value = std::env::var(MESH_PINNED_PEM_ENV)
@@ -1101,7 +1175,18 @@ impl MeshInner {
         &self,
         stream: TcpStream,
         role: ConnectionRole,
-    ) -> anyhow::Result<tokio_rustls::TlsStream<TcpStream>> {
+    ) -> anyhow::Result<Pin<Box<dyn MeshIoStream>>> {
+        if !matches!(
+            std::env::var(MESH_PINNED_PEM_ENV).as_deref(),
+            Ok(value) if !value.is_empty()
+        ) {
+            tracing::warn!(
+                "{MESH_PINNED_PEM_ENV} is not configured, using plain TCP for mesh connections"
+            );
+            let stream: Pin<Box<dyn MeshIoStream>> = Box::pin(stream);
+            return Ok(stream);
+        }
+
         match role {
             ConnectionRole::Outgoing => {
                 let connector = TlsConnector::from(Self::tls_client_config()?);
@@ -1113,7 +1198,8 @@ impl MeshInner {
                     .connect(dnsname, stream)
                     .await
                     .map_err(|e| anyhow::anyhow!("TLS client handshake failed: {}", e))?;
-                Ok(tokio_rustls::TlsStream::Client(tls_stream))
+                let stream: Pin<Box<dyn MeshIoStream>> = Box::pin(tls_stream);
+                Ok(stream)
             }
             ConnectionRole::Incoming => {
                 let acceptor = TlsAcceptor::from(Self::tls_server_config()?);
@@ -1121,7 +1207,8 @@ impl MeshInner {
                     .accept(stream)
                     .await
                     .map_err(|e| anyhow::anyhow!("TLS server handshake failed: {}", e))?;
-                Ok(tokio_rustls::TlsStream::Server(tls_stream))
+                let stream: Pin<Box<dyn MeshIoStream>> = Box::pin(tls_stream);
+                Ok(stream)
             }
         }
     }
@@ -1257,6 +1344,7 @@ impl MeshRpc for MeshRpcServer {
     async fn peer_list_sync(self, _: context::Context, msg: PeerListSyncMessage) {
         *self.remote_region.lock().await = Some(msg.region);
         self.inner.handle_peer_list_sync(msg).await;
+        self.inner.heal_now.notify_one();
     }
 
     async fn peer_added(self, _: context::Context, msg: PeerChangeMessage) {

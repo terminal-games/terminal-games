@@ -1,0 +1,21 @@
+{{ ansible_managed | comment }}
+
+[Unit]
+Description=Terminal Games Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/terminal-games/games
+EnvironmentFile=/etc/terminal-games/terminal-games-server.env
+ExecStart=/opt/terminal-games/bin/terminal-games-server
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=60
+StartLimitBurst=20
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

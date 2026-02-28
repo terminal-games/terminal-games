@@ -4,6 +4,7 @@
 
 use std::{
     collections::VecDeque,
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -15,7 +16,7 @@ const REPLAY_DURATION: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub enum ReplayEvent {
-    Output(Vec<u8>),
+    Output(Arc<Vec<u8>>),
     Resize { cols: u16, rows: u16 },
     AppSwitch { app_id: AppId, shortname: String },
 }
@@ -70,7 +71,7 @@ impl ReplayBuffer {
         }
     }
 
-    pub fn push_output(&mut self, data: Vec<u8>) {
+    pub fn push_output(&mut self, data: Arc<Vec<u8>>) {
         let now = Instant::now();
         self.prune(now);
         self.events.push_back(TimestampedEvent {

@@ -1,0 +1,115 @@
+- name: Deploy terminal-games-server
+  hosts: all
+  vars_files:
+    - "{{ playbook_dir }}/secrets.yml"
+  vars:
+    server_binary_local_path: "{{ playbook_dir }}/../target/x86_64-unknown-linux-musl/release/terminal-games-server"
+    server_binary_remote_path: /opt/terminal-games/bin/terminal-games-server
+    game_artifacts_local_dir: "{{ playbook_dir }}/apps"
+  tasks:
+    - name: Ensure required secret variables are provided
+      ansible.builtin.assert:
+        that:
+          - MESH_PINNED_PEM is defined
+          - MESH_PINNED_PEM | length > 0
+          - LIBSQL_AUTH_TOKEN is defined
+          - LIBSQL_AUTH_TOKEN | length > 0
+          - LIBSQL_URL is defined
+          - LIBSQL_URL | length > 0
+          - SSH_HOST_KEY_BASE64 is defined
+          - SSH_HOST_KEY_BASE64 | length > 0
+        fail_msg: "Set MESH_PINNED_PEM, LIBSQL_AUTH_TOKEN, LIBSQL_URL, and SSH_HOST_KEY_BASE64."
+      no_log: true
+
+    - name: Verify local server binary exists
+      ansible.builtin.stat:
+        path: "{{ server_binary_local_path }}"
+      register: server_binary_stat
+      delegate_to: localhost
+      become: false
+
+    - name: Fail when local server binary is missing
+      ansible.builtin.assert:
+        that:
+          - server_binary_stat.stat.exists
+          - server_binary_stat.stat.isreg
+        fail_msg: "Server binary missing at {{ server_binary_local_path }}. Build it first."
+
+    - name: Check if local game artifact directory exists
+      ansible.builtin.stat:
+        path: "{{ game_artifacts_local_dir }}"
+      register: game_artifacts_stat
+      delegate_to: localhost
+      become: false
+
+    - name: Ensure runtime directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - /opt/terminal-games/bin
+        - /opt/terminal-games/games
+        - /etc/terminal-games
+
+    - name: Deploy server binary
+      ansible.builtin.copy:
+        src: "{{ server_binary_local_path }}"
+        dest: "{{ server_binary_remote_path }}"
+        owner: root
+        group: root
+        mode: "0755"
+      notify: Restart terminal-games-server
+
+    - name: Sync game artifacts when available
+      ansible.builtin.copy:
+        src: "{{ game_artifacts_local_dir }}/"
+        dest: /opt/terminal-games/games/
+        owner: root
+        group: root
+        mode: "0644"
+      when: game_artifacts_stat.stat.isdir | default(false)
+
+    - name: Deploy server environment file
+      ansible.builtin.template:
+        src: terminal-games-server.env.j2
+        dest: /etc/terminal-games/terminal-games-server.env
+        owner: root
+        group: root
+        mode: "0600"
+      no_log: true
+      notify: Restart terminal-games-server
+
+    - name: Deploy systemd service
+      ansible.builtin.template:
+        src: terminal-games-server.service.j2
+        dest: /etc/systemd/system/terminal-games-server.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart terminal-games-server
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart terminal-games-server
+      ansible.builtin.systemd:
+        name: terminal-games-server
+        state: restarted
+
+- import_playbook: cert-sync-playbook.yaml
+
+- name: Ensure terminal-games-server is enabled and running
+  hosts: all
+  tasks:
+    - name: Enable and start terminal-games-server after cert sync
+      ansible.builtin.systemd:
+        name: terminal-games-server
+        enabled: true
+        state: started

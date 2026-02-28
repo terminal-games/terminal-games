@@ -21,4 +21,4 @@ primary_region = 'ord'
   min_machines_running = 0
 
 [[vm]]
-  size = 'shared-cpu-2x'
+  size = 'performance-1x'

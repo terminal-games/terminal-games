@@ -6,6 +6,8 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::{
     collections::HashMap,
+    fs::File,
+    io::BufReader,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -33,6 +35,10 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio_rustls::{
+    TlsAcceptor,
+    rustls::{ServerConfig, pki_types::PrivateKeyDer},
+};
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
@@ -70,12 +76,18 @@ impl WebServer {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
+        let tls_acceptor = load_tls_acceptor_from_env()?;
+        let default_web_listen_addr = if tls_acceptor.is_some() {
+            "0.0.0.0:443"
+        } else {
+            "0.0.0.0:8080"
+        };
         let listen_addr: std::net::SocketAddr = std::env::var("WEB_LISTEN_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
+            .unwrap_or_else(|_| default_web_listen_addr.to_string())
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid WEB_LISTEN_ADDR: {}", e))?;
 
-        tracing::info!(addr = %listen_addr, "Running web server");
+        tracing::info!(addr = %listen_addr, tls = tls_acceptor.is_some(), "Running web server");
 
         let app = Router::new()
             .route("/", get(serve_index))
@@ -114,24 +126,80 @@ impl WebServer {
                     .await,
             );
             let wrapped_stream = RateLimitedStream::new(stream, network_info);
+            let tls_acceptor = tls_acceptor.clone();
 
             tokio::spawn(async move {
-                let socket = TokioIo::new(wrapped_stream);
-
                 let hyper_service =
                     hyper::service::service_fn(move |request: Request<Incoming>| {
                         tower_service.clone().oneshot(request)
                     });
 
-                if let Err(err) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                    .serve_connection_with_upgrades(socket, hyper_service)
-                    .await
-                {
-                    eprintln!("failed to serve connection: {err:#}");
+                if let Some(tls_acceptor) = tls_acceptor {
+                    let tls_stream = match tls_acceptor.accept(wrapped_stream).await {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            tracing::warn!("TLS handshake failed: {err:#}");
+                            return;
+                        }
+                    };
+                    let socket = TokioIo::new(tls_stream);
+                    if let Err(err) =
+                        hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                            .serve_connection_with_upgrades(socket, hyper_service)
+                            .await
+                    {
+                        tracing::warn!("failed to serve TLS connection: {err:#}");
+                    }
+                } else {
+                    let socket = TokioIo::new(wrapped_stream);
+                    if let Err(err) =
+                        hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+                            .serve_connection_with_upgrades(socket, hyper_service)
+                            .await
+                    {
+                        tracing::warn!("failed to serve connection: {err:#}");
+                    }
                 }
             });
         }
     }
+}
+
+fn load_tls_acceptor_from_env() -> anyhow::Result<Option<TlsAcceptor>> {
+    let cert_path = std::env::var("WEB_TLS_CERT_PATH").ok();
+    let key_path = std::env::var("WEB_TLS_KEY_PATH").ok();
+    let (cert_path, key_path) = match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => (cert_path, key_path),
+        (None, None) => return Ok(None),
+        _ => anyhow::bail!("WEB_TLS_CERT_PATH and WEB_TLS_KEY_PATH must be set together"),
+    };
+
+    let mut cert_reader =
+        BufReader::new(File::open(&cert_path).map_err(|e| {
+            anyhow::anyhow!("Failed to open WEB_TLS_CERT_PATH {}: {}", cert_path, e)
+        })?);
+    let cert_chain = rustls_pemfile::certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, std::io::Error>>()
+        .map_err(|e| anyhow::anyhow!("Failed to parse certificate {}: {}", cert_path, e))?;
+    if cert_chain.is_empty() {
+        anyhow::bail!("No certificates found in WEB_TLS_CERT_PATH {}", cert_path);
+    }
+
+    let mut key_reader = BufReader::new(
+        File::open(&key_path)
+            .map_err(|e| anyhow::anyhow!("Failed to open WEB_TLS_KEY_PATH {}: {}", key_path, e))?,
+    );
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
+        .map_err(|e| anyhow::anyhow!("Failed to parse private key {}: {}", key_path, e))?
+        .ok_or_else(|| anyhow::anyhow!("No private key found in WEB_TLS_KEY_PATH {}", key_path))?;
+
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)
+        .map_err(|e| anyhow::anyhow!("Invalid TLS cert/key configuration: {}", e))?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    Ok(Some(TlsAcceptor::from(Arc::new(config))))
 }
 
 fn unwrap_infallible<T>(result: Result<T, Infallible>) -> T {
@@ -264,7 +332,7 @@ async fn handle_socket(
     let cancellation_token = CancellationToken::new();
     let token = cancellation_token.clone();
 
-    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(20);
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
     let admission_ticket = server.admission_controller.issue_ticket();
     if !wait_for_admission(&mut sender, &mut receiver, &resize_tx, &admission_ticket).await {

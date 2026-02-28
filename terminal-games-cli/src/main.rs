@@ -344,7 +344,10 @@ async fn main() -> Result<()> {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
 
     enum DelayedData {
-        Terminal { raw: Vec<u8>, metered: Vec<u8> },
+        Terminal {
+            raw: Arc<Vec<u8>>,
+            metered: Arc<Vec<u8>>,
+        },
         Audio(Vec<u8>),
     }
 
@@ -415,7 +418,7 @@ async fn main() -> Result<()> {
                 let metered_data = if compress {
                     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
                     encoder.write_all(&data).ok();
-                    encoder.finish().unwrap_or_default()
+                    Arc::new(encoder.finish().unwrap_or_default())
                 } else {
                     data.clone()
                 };

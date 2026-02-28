@@ -21,6 +21,12 @@ use terminal_games::{
     mesh::{EnvDiscovery, Mesh},
 };
 
+// Avoid musl's default allocator due to lackluster performance
+// https://nickb.dev/blog/default-musl-allocator-considered-harmful-to-performance
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 async fn upsert_game(
     conn: &libsql::Connection,
     shortname: &str,
@@ -162,19 +168,18 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let libsql_url = std::env::var("LIBSQL_URL").context("LIBSQL_URL must be set")?;
-    let libsql_auth_token =
-        std::env::var("LIBSQL_AUTH_TOKEN").context("LIBSQL_AUTH_TOKEN must be set")?;
-
-    let db = libsql::Builder::new_remote(libsql_url.clone(), libsql_auth_token.clone())
-        .build()
-        .await
-        .context("Failed to initialize remote libsql client")?;
-
-    // let db = libsql::Builder::new_local("./terminal-games.db")
-    //     .build()
-    //     .await
-    //     .unwrap();
+    let db = if let Ok(libsql_url) = std::env::var("LIBSQL_URL") {
+        let libsql_auth_token = std::env::var("LIBSQL_AUTH_TOKEN")
+            .context("LIBSQL_AUTH_TOKEN must be set if LIBSQL_URL is set")?;
+        libsql::Builder::new_remote(libsql_url.clone(), libsql_auth_token.clone())
+            .build()
+            .await
+            .context("Failed to initialize remote libsql client")?
+    } else {
+        libsql::Builder::new_local("./terminal-games.db")
+            .build()
+            .await?
+    };
 
     let conn = db.connect().context("Failed to connect to libsql")?;
 

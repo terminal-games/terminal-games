@@ -1,0 +1,129 @@
+- name: Issue wildcard certificate locally with DNS-01
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - "{{ playbook_dir }}/secrets.yml"
+  vars:
+    lego_state_dir: "{{ playbook_dir }}/.lego"
+    acme_email: admin@terminalgames.net
+    acme_domain: terminalgames.net
+    acme_wildcard_domain: "*.terminalgames.net"
+  tasks:
+    - name: Ensure Bunny API key is provided
+      ansible.builtin.assert:
+        that:
+          - BUNNYNET_API_KEY is defined
+          - BUNNYNET_API_KEY | length > 0
+        fail_msg: "Set BUNNYNET_API_KEY in secrets.yml."
+
+    - name: Ensure lego is installed on control host
+      ansible.builtin.command:
+        argv:
+          - lego
+          - --version
+      changed_when: false
+
+    - name: Ensure local lego state directory exists
+      ansible.builtin.file:
+        path: "{{ lego_state_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Check whether certificate already exists
+      ansible.builtin.stat:
+        path: "{{ lego_state_dir }}/certificates/{{ acme_domain }}.crt"
+      register: existing_cert
+
+    - name: Issue certificate with lego
+      ansible.builtin.command:
+        argv:
+          - lego
+          - --path
+          - "{{ lego_state_dir }}"
+          - --email
+          - "{{ acme_email }}"
+          - --accept-tos
+          - --dns
+          - bunny
+          - --domains
+          - "{{ acme_domain }}"
+          - --domains
+          - "{{ acme_wildcard_domain }}"
+          - run
+      environment:
+        BUNNY_API_KEY: "{{ BUNNYNET_API_KEY }}"
+      no_log: true
+      when: not existing_cert.stat.exists
+      register: lego_issue_result
+      changed_when: true
+
+    - name: Renew certificate with lego when already issued
+      ansible.builtin.command:
+        argv:
+          - lego
+          - --path
+          - "{{ lego_state_dir }}"
+          - --email
+          - "{{ acme_email }}"
+          - --accept-tos
+          - --dns
+          - bunny
+          - --domains
+          - "{{ acme_domain }}"
+          - --domains
+          - "{{ acme_wildcard_domain }}"
+          - renew
+          - --days
+          - "30"
+      environment:
+        BUNNY_API_KEY: "{{ BUNNYNET_API_KEY }}"
+      no_log: true
+      when: existing_cert.stat.exists
+      register: lego_renew_result
+      changed_when: "'No renewal' not in lego_renew_result.stdout"
+
+    - name: Read issued certificate chain
+      ansible.builtin.slurp:
+        path: "{{ lego_state_dir }}/certificates/{{ acme_domain }}.crt"
+      register: local_fullchain_pem
+
+    - name: Read issued private key
+      ansible.builtin.slurp:
+        path: "{{ lego_state_dir }}/certificates/{{ acme_domain }}.key"
+      register: local_privkey_pem
+
+- name: Sync issued certificate to servers
+  hosts: all
+  tasks:
+    - name: Ensure certificate directory exists
+      ansible.builtin.file:
+        path: /etc/terminal-games/certs
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy TLS certificate
+      ansible.builtin.copy:
+        content: "{{ hostvars['localhost'].local_fullchain_pem.content | b64decode }}"
+        dest: /etc/terminal-games/certs/terminalgames.net.crt
+        owner: root
+        group: root
+        mode: "0644"
+      register: cert_copy
+
+    - name: Deploy TLS private key
+      ansible.builtin.copy:
+        content: "{{ hostvars['localhost'].local_privkey_pem.content | b64decode }}"
+        dest: /etc/terminal-games/certs/terminalgames.net.key
+        owner: root
+        group: root
+        mode: "0600"
+      register: key_copy
+
+    - name: Restart terminal-games-server when certs changed
+      ansible.builtin.systemd:
+        name: terminal-games-server
+        state: restarted
+      when: cert_copy.changed or key_copy.changed

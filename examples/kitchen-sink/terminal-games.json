@@ -7,12 +7,12 @@
       "de": "Kuechenbecken"
     },
     "description": {
-      "en": "Terminal feature showcase.",
-      "de": "Terminal-Funktionen im Ueberblick."
+      "en": "Terminal Games API feature showcase.",
+      "de": "Terminal Games API im Überblick."
     },
     "details": {
-      "en": "Explore forms, mouse interactions, viewport behavior, and text styling in one place.",
-      "de": "Formulare, Mausinteraktion, Viewports und Textstile in einer Demo."
+      "en": "Terminal Games API feature showcase all in one place.\n\nLorem ipsum dolor sit amet, consectetur adipiscing elit. Morbi vulputate ligula ut tincidunt lobortis. Curabitur vel nulla at ipsum volutpat ultricies. Nam congue nisl tempus fermentum feugiat. Praesent et sodales lorem. Etiam imperdiet, eros et laoreet tincidunt, tellus ipsum luctus nibh, vitae dapibus eros erat sit amet ex. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Nunc eu ullamcorper odio, sed sagittis tortor. Proin faucibus neque turpis, nec posuere libero porttitor nec. Integer vitae pharetra mauris. Nullam rutrum quam nec risus finibus ultrices. Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Nulla maximus nisi id lorem porttitor, vel convallis diam cursus. Integer at dui lorem. Duis pulvinar et ligula id auctor.",
+      "de": "Hier finden Sie alle Funktionen der Terminal Games API im Überblick an einem Ort.\n\nLorem ipsum dolor sit amet, consectetur adipiscing elit. Praesent sit amet lectus sed lacus maximus congue. Morbi rhoncus lorem nec nisi hendrerit vulputate et vitae augue. Nulla facilisi. Ut vulputate nibh ac lacinia cursus. Donec sit amet fermentum lectus. Aenean quis dolor facilisis, ullamcorper nisl at, malesuada urna. Vivamus pellentesque faucibus justo, ut venenatis velit congue sodales. Cras sit amet accumsan nibh, ac lobortis ipsum. Sed vitae elit et erat condimentum consequat sed a lectus. Cras vitae orci sed quam fringilla pellentesque a sit amet lorem. Praesent quis vestibulum dolor."
     },
     "screenshots": {
       "en": [
@@ -21,8 +21,8 @@
           "caption": "Actual screenshot of kitchen sink example"
         },
         {
-          "content": "+------------------------------------------------------------------------------+\n| Kitchen Sink - Input Playground                                              |\n|                                                                              |\n| Try key bindings, filtering, and layout transitions.                         |\n| Designed to exercise common terminal app edge cases.                         |\n+------------------------------------------------------------------------------+",
-          "caption": "Input playground and layout transitions"
+          "content": "+------------------------------------------------------------------------------+\n| Kitchen Sink - Screenshot 2                                                  |\n|                                                                              |\n|                                                                              |\n+------------------------------------------------------------------------------+",
+          "caption": "Another screenshot"
         }
       ]
     }

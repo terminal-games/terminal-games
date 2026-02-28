@@ -1,0 +1,25 @@
+#cloud-config
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - unattended-upgrades
+  - htop
+
+write_files:
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      APT::Periodic::AutocleanInterval "7";
+
+  - path: /etc/ssh/sshd_config.d/99-custom.conf
+    content: |
+      Port 2222
+
+runcmd:
+  - ufw allow 2222/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw allow 3000/tcp

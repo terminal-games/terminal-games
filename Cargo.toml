@@ -9,3 +9,8 @@ members = [
     "terminal-games-server",
     "terminal-games",
 ]
+
+# [profile.release]
+# lto = true
+# codegen-units = 1
+# panic = "abort"

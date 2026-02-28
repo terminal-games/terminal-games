@@ -38,5 +38,5 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
-wasmtime = { git = "https://github.com/mbund/wasmtime.git", branch = "wasip1-resource-table-memory-leak-fix" }
-wasmtime-wasi = { git = "https://github.com/mbund/wasmtime.git", branch = "wasip1-resource-table-memory-leak-fix", default-features = false, features = ["p1"] }
+wasmtime = { version = "42", features = ["call-hook"] }
+wasmtime-wasi = { version = "42", default-features = false, features = ["p1"] }

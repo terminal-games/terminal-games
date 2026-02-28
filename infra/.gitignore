@@ -1,0 +1,6 @@
+inventory.ini
+.lego/
+secrets.yml
+terraform.tfvars
+*.auto.tfvars
+secrets.tfvars
