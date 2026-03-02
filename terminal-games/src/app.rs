@@ -1043,6 +1043,9 @@ impl AppServer {
     ) -> wasmtime::Result<i32> {
         match caller.data_mut().input_receiver.try_recv() {
             Ok(buf) => {
+                if buf.len() > 4096 {
+                    return Ok(0);
+                }
                 let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
                     wasmtime::bail!("terminal_read: failed to find host memory");
                 };
@@ -2161,7 +2164,7 @@ impl wasmtime::ResourceLimiter for AppLimiter {
             .memory_total
             .saturating_sub(current)
             .saturating_add(desired);
-        if self.memory_total >= 24 * 1024 * 1024 {
+        if self.memory_total >= 32 * 1024 * 1024 {
             tracing::error!(total = self.memory_total, "rejected memory grow");
             return Ok(false);
         }

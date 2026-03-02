@@ -56,10 +56,10 @@ type dimensions struct {
 var fromHost = &yieldingReadWriter{buf: bytes.NewBuffer(nil)}
 
 func init() {
-	debug.SetMemoryLimit(24 * 1024 * 1024)
+	debug.SetMemoryLimit(32 * 1024 * 1024)
 
 	go func() {
-		buffer := make([]byte, 512)
+		buffer := make([]byte, 4096)
 
 		for {
 			n := terminal_read(unsafe.Pointer(&buffer[0]), uint32(len(buffer)))
@@ -68,6 +68,7 @@ func init() {
 			}
 			if n > 0 {
 				fromHost.Write(buffer[:n])
+				runtime.Gosched()
 			}
 
 			if n == 0 {

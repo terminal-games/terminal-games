@@ -145,12 +145,13 @@ impl SshServer {
         let (ssh_session_sender, ssh_session_receiver) =
             tokio::sync::oneshot::channel::<(Handle, ChannelId, String)>();
 
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(20);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(10);
         let (resize_tx, mut resize_rx) = tokio::sync::watch::channel((0, 0));
         let cancellation_token = CancellationToken::new();
         let token = cancellation_token.clone();
         let app_server = self.app_server.clone();
         let admission_controller = self.admission_controller.clone();
+        let input_tx_clone = input_tx.clone();
         tokio::task::spawn(async move {
             let (session_handle, channel_id, remote_sshid) = match ssh_session_receiver.await {
                 Ok(v) => v,
@@ -194,7 +195,8 @@ impl SshServer {
             };
 
             let (first_app_shortname, args, has_audio): (String, Option<Vec<u8>>, bool) =
-                match tokio::time::timeout(std::time::Duration::from_millis(1), args_receiver).await
+                match tokio::time::timeout(std::time::Duration::from_millis(100), args_receiver)
+                    .await
                 {
                     Ok(Ok(mut args)) => {
                         let has_audio = args.starts_with(b"audio");
@@ -290,19 +292,11 @@ impl SshServer {
                 Duration::from_millis(500),
             )
             .await;
-            let (filtered_input_tx, mut filtered_input_rx) = tokio::sync::mpsc::channel(20);
             for data in buffered_input {
-                if filtered_input_tx.send(data).await.is_err() {
+                if input_tx_clone.send(data).await.is_err() {
                     return;
                 }
             }
-            tokio::task::spawn(async move {
-                while let Some(data) = input_rx.recv().await {
-                    if filtered_input_tx.send(data).await.is_err() {
-                        break;
-                    }
-                }
-            });
 
             let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
             let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
@@ -312,7 +306,7 @@ impl SshServer {
                     &session_handle,
                     channel_id,
                     &mut resize_rx,
-                    &mut filtered_input_rx,
+                    &mut input_rx,
                     &captcha,
                     terminal_profile,
                 )
@@ -336,7 +330,7 @@ impl SshServer {
                 &session_handle,
                 channel_id,
                 &mut resize_rx,
-                &mut filtered_input_rx,
+                &mut input_rx,
                 &admission_ticket,
                 terminal_profile,
             )
@@ -361,7 +355,7 @@ impl SshServer {
             let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
                 first_app_shortname,
                 args,
-                input_receiver: filtered_input_rx,
+                input_receiver: input_rx,
                 output_sender: output_tx,
                 audio_sender: has_audio.then_some(audio_tx),
                 remote_sshid,
@@ -910,12 +904,15 @@ impl Handler for SshSession {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        match self.input_sender.try_send(data.into()) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("input channel closed");
-            }
+        // match self.input_sender.try_send(data.into()) {
+        //     Ok(()) => {}
+        //     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+        //     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+        //         anyhow::bail!("input channel closed");
+        //     }
+        // }
+        if let Err(_) = self.input_sender.send(data.into()).await {
+            anyhow::bail!("input channel closed");
         }
 
         Ok(())
