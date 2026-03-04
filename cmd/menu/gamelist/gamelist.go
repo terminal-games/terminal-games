@@ -10,10 +10,10 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	zone "github.com/lrstanley/bubblezone"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	zone "github.com/lrstanley/bubblezone/v2"
 	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 )
 
@@ -132,8 +132,6 @@ type listLayout struct {
 	contentWidth int
 	itemStarts   []int
 	itemHeights  []int
-	nameLines    [][]string
-	descLines    [][]string
 	totalHeight  int
 }
 
@@ -159,8 +157,10 @@ type Model struct {
 	targetTop    float64
 	targetBottom float64
 	animStart    time.Time
-	animating    bool
-	initialized  bool
+	animating       bool
+	initialized     bool
+	lastLayoutWidth int
+	animGen         int
 }
 
 func New(title string, items []Item, zoneManager *zone.Manager, zonePrefix string) Model {
@@ -218,40 +218,42 @@ func (m Model) FullHelp() [][]key.Binding {
 	return [][]key.Binding{m.ShortHelp()}
 }
 
-type tickMsg time.Time
+type tickMsg struct{ gen int }
 
-func tickCmd() tea.Cmd {
-	return tea.Tick(16*time.Millisecond, func(t time.Time) tea.Msg {
-		return tickMsg(t)
+func tickCmd(gen int) tea.Cmd {
+	return tea.Tick(16*time.Millisecond, func(time.Time) tea.Msg {
+		return tickMsg{gen}
 	})
 }
 
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		if m.filtering {
-			switch msg.Type {
-			case tea.KeyEnter:
+			switch msg.String() {
+			case "enter":
 				m.filtering = false
 				m.filterValue = m.filterDraft
 				m.applyFilter()
 				return m, nil
-			case tea.KeyEsc:
+			case "esc":
 				m.filtering = false
 				m.filterDraft = m.filterValue
 				return m, nil
-			case tea.KeyBackspace, tea.KeyDelete:
+			case "backspace", "delete":
 				if len(m.filterDraft) > 0 {
 					m.filterDraft = m.filterDraft[:len(m.filterDraft)-1]
 				}
 				return m, nil
-			case tea.KeyRunes:
-				if len(msg.Runes) == 1 && unicode.IsPrint(msg.Runes[0]) && len(m.filterDraft) < 32 {
-					m.filterDraft += string(msg.Runes[0])
+			default:
+				if len(msg.Text) == 1 {
+					r := []rune(msg.Text)[0]
+					if unicode.IsPrint(r) && len(m.filterDraft) < 32 {
+						m.filterDraft += string(r)
+					}
 				}
 				return m, nil
 			}
-			return m, nil
 		}
 
 		switch {
@@ -273,13 +275,16 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		}
 
 	case tickMsg:
+		if msg.gen != m.animGen {
+			return m, nil
+		}
 		if m.animating {
 			if m.animProgress() >= 1.0 {
 				m.startTop = m.targetTop
 				m.startBottom = m.targetBottom
 				m.animating = false
 			} else {
-				return m, tickCmd()
+				return m, tickCmd(m.animGen)
 			}
 		}
 		return m, nil
@@ -289,18 +294,21 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 }
 
 func (m Model) HandleMouse(msg tea.MouseMsg) (Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.MouseWheelUp:
-		return m.moveSelection(-1)
-	case tea.MouseWheelDown:
-		return m.moveSelection(1)
+	switch event := msg.(type) {
+	case tea.MouseWheelMsg:
+		switch event.Button {
+		case tea.MouseWheelUp:
+			return m.moveSelection(-1)
+		case tea.MouseWheelDown:
+			return m.moveSelection(1)
+		}
 	}
 
-	switch msg.Action {
-	case tea.MouseActionMotion:
+	switch msg.(type) {
+	case tea.MouseMotionMsg:
 		m.Hovered = m.indexAtMouse(msg)
 		return m, nil
-	case tea.MouseActionRelease:
+	case tea.MouseReleaseMsg, tea.MouseClickMsg:
 		index := m.indexAtMouse(msg)
 		if index >= 0 && index < len(m.Filtered) && index != m.Selected {
 			m.Selected = index
@@ -439,7 +447,8 @@ func (m *Model) startAnim(index int) tea.Cmd {
 	m.animStart = time.Now()
 	m.animating = true
 	m.initialized = true
-	return tickCmd()
+	m.animGen++
+	return tickCmd(m.animGen)
 }
 
 func (m Model) itemBarEdges(index int) (float64, float64) {
@@ -486,7 +495,10 @@ func (m *Model) renderItems(width, height int) []string {
 		contentWidth = 0
 	}
 
-	m.layout = m.buildLayout(contentWidth)
+	if contentWidth != m.lastLayoutWidth || len(m.layout.itemStarts) != len(m.Filtered) {
+		m.layout = m.buildLayout(contentWidth)
+		m.lastLayoutWidth = contentWidth
+	}
 	totalHeight := m.layout.totalHeight
 	if !m.animating && m.Selected >= 0 {
 		m.syncBarToSelection()
@@ -512,15 +524,29 @@ func (m *Model) renderItems(width, height int) []string {
 
 	lines := make([]string, 0, height)
 	itemIndex := 0
+	var nameLines []string
+	var descLines []string
+	loadItemLines := func() {
+		if itemIndex < 0 || itemIndex >= len(m.Filtered) {
+			nameLines = nil
+			descLines = nil
+			return
+		}
+		idx := m.Filtered[itemIndex]
+		nameLines = wrapLines(m.Items[idx].Name, contentWidth)
+		descLines = wrapLines(m.Items[idx].Description, contentWidth)
+	}
 	itemEnd := 0
 	itemBlockEnd := 0
 	if len(m.layout.itemStarts) > 0 {
 		itemEnd = m.layout.itemStarts[0] + m.layout.itemHeights[0]
 		itemBlockEnd = itemEnd + defaultItemGap
+		loadItemLines()
 		for itemIndex < len(m.layout.itemStarts)-1 && offset >= itemBlockEnd {
 			itemIndex++
 			itemEnd = m.layout.itemStarts[itemIndex] + m.layout.itemHeights[itemIndex]
 			itemBlockEnd = itemEnd + defaultItemGap
+			loadItemLines()
 		}
 	}
 	for row := 0; row < height; row++ {
@@ -535,6 +561,7 @@ func (m *Model) renderItems(width, height int) []string {
 			itemIndex++
 			itemEnd = m.layout.itemStarts[itemIndex] + m.layout.itemHeights[itemIndex]
 			itemBlockEnd = itemEnd + defaultItemGap
+			loadItemLines()
 		}
 		lineInItem := lineIndex - m.layout.itemStarts[itemIndex]
 
@@ -553,8 +580,6 @@ func (m *Model) renderItems(width, height int) []string {
 
 		content := ""
 		if itemIndex >= 0 && itemIndex < len(m.Filtered) && lineInItem >= 0 && lineInItem < itemHeight {
-			nameLines := m.layout.nameLines[itemIndex]
-			descLines := m.layout.descLines[itemIndex]
 			if lineInItem < len(nameLines) {
 				content = nameLines[lineInItem]
 				switch {
@@ -599,18 +624,11 @@ func (m Model) buildLayout(contentWidth int) listLayout {
 		contentWidth: contentWidth,
 		itemStarts:   make([]int, count),
 		itemHeights:  make([]int, count),
-		nameLines:    make([][]string, count),
-		descLines:    make([][]string, count),
 	}
 
 	total := 0
 	for i, idx := range m.Filtered {
-		nameLines := wrapLines(m.Items[idx].Name, contentWidth)
-		descLines := wrapLines(m.Items[idx].Description, contentWidth)
-		layout.nameLines[i] = nameLines
-		layout.descLines[i] = descLines
-
-		height := len(nameLines) + len(descLines)
+		height := wrappedLineCount(m.Items[idx].Name, contentWidth) + wrappedLineCount(m.Items[idx].Description, contentWidth)
 		if height <= 0 {
 			height = 1
 		}
@@ -681,4 +699,24 @@ func wrapLines(text string, width int) []string {
 		return []string{""}
 	}
 	return lines
+}
+
+func wrappedLineCount(text string, width int) int {
+	if text == "" {
+		return 0
+	}
+	if width <= 0 {
+		return 1
+	}
+	segments := strings.Split(text, "\n")
+	total := 0
+	for _, segment := range segments {
+		w := lipgloss.Width(segment)
+		if w <= 0 {
+			total++
+			continue
+		}
+		total += (w-1)/width + 1
+	}
+	return total
 }

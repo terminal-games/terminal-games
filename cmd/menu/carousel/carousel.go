@@ -10,10 +10,10 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
-	zone "github.com/lrstanley/bubblezone"
+	zone "github.com/lrstanley/bubblezone/v2"
 	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 )
 
@@ -26,9 +26,8 @@ const (
 	autoInterval = 10 * time.Second
 	animDuration = 400 * time.Millisecond
 	snapDuration = 150 * time.Millisecond
-	dragElastic  = 0.3
-	frameZoneID  = "carousel-frame"
-	btnZoneID    = "carousel-btn"
+	frameZoneID = "carousel-frame"
+	btnZoneID   = "carousel-btn"
 )
 
 type Screenshot struct {
@@ -69,12 +68,6 @@ type Model struct {
 	zone        *zone.Manager
 
 	scrollX     float64
-	velocity    float64
-	dragging    bool
-	dragStartMX int
-	dragStartSX float64
-	lastMX      int
-	lastMT      time.Time
 	momentum    bool
 	animating   bool
 	animStartX  float64
@@ -94,11 +87,11 @@ func New(zoneManager *zone.Manager) Model {
 	}
 }
 
-type tickMsg time.Time
+type tickMsg struct{ gen int }
 
-func tickCmd() tea.Cmd {
-	return tea.Tick(16*time.Millisecond, func(t time.Time) tea.Msg {
-		return tickMsg(t)
+func tickCmd(gen int) tea.Cmd {
+	return tea.Tick(16*time.Millisecond, func(time.Time) tea.Msg {
+		return tickMsg{gen}
 	})
 }
 
@@ -120,6 +113,9 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tickMsg:
+		if msg.gen != m.autoGen {
+			return m, nil
+		}
 		if m.animating {
 			p := m.animProgress()
 			if p >= 1.0 {
@@ -132,7 +128,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			} else {
 				t := easeOutCubic(p)
 				m.scrollX = m.animStartX + (m.animTargetX-m.animStartX)*t
-				return m, tickCmd()
+				return m, tickCmd(m.autoGen)
 			}
 		}
 		return m, nil
@@ -141,7 +137,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		if msg.gen != m.autoGen {
 			return m, nil
 		}
-		if m.dragging || m.momentum {
+		if m.momentum {
 			return m, nil
 		}
 		n := len(m.Screenshots)
@@ -156,61 +152,21 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 }
 
 func (m *Model) HandleMouse(msg tea.MouseMsg) (Model, tea.Cmd, bool) {
-	switch msg.Action {
-	case tea.MouseActionPress:
-		if m.zone != nil && m.zone.Get(frameZoneID).InBounds(msg) {
-			m.dragging = true
-			m.dragStartMX = msg.X
-			m.dragStartSX = m.scrollX
-			m.lastMX = msg.X
-			m.lastMT = time.Now()
-			m.velocity = 0
-			m.momentum = false
-			m.animating = false
-			m.autoGen++
-			return *m, nil, true
-		}
-	case tea.MouseActionMotion:
-		if m.dragging {
-			n := len(m.Screenshots)
-			maxX := m.maxScrollX(n)
-			rawX := m.dragStartSX + float64(m.dragStartMX-msg.X)
-			m.scrollX = clampWithResistance(rawX, 0, maxX, dragElastic)
-			dt := time.Since(m.lastMT).Seconds()
-			if dt > 0 && dt < 0.1 {
-				instantV := float64(m.lastMX-msg.X) / dt
-				m.velocity = 0.6*m.velocity + 0.4*instantV
-			}
-			m.lastMX = msg.X
-			m.lastMT = time.Now()
-			return *m, nil, true
-		}
-	case tea.MouseActionRelease:
-		if m.dragging {
-			m.dragging = false
-			n := len(m.Screenshots)
-			if time.Since(m.lastMT) > 80*time.Millisecond {
-				m.velocity = 0
-			}
-			maxX := m.maxScrollX(n)
-			projected := math.Max(0, math.Min(m.scrollX+m.velocity*0.15, maxX))
-			targetPage := int(math.Round(projected / ScreenshotWidth))
-			if targetPage < 0 {
-				targetPage = 0
-			}
-			if targetPage >= n {
-				targetPage = n - 1
-			}
-			targetX := float64(targetPage * ScreenshotWidth)
-			m.animStartX = m.scrollX
-			m.animTargetX = targetX
-			m.animStart = time.Now()
-			m.animating = true
-			m.autoGen++
-			return *m, tickCmd(), true
-		}
+	switch msg := msg.(type) {
+	case tea.MouseReleaseMsg:
 		if m.zone != nil {
 			n := len(m.Screenshots)
+			fz := m.zone.Get(frameZoneID)
+			if n > 1 && fz.InBounds(msg) {
+				x, _ := fz.Pos(msg)
+				zoneWidth := fz.EndX - fz.StartX + 1
+				if x < zoneWidth/2 {
+					result, cmd := m.Prev()
+					return result, cmd, true
+				}
+				result, cmd := m.Next()
+				return result, cmd, true
+			}
 			cur := m.currentPage()
 			for i := range m.Screenshots {
 				if m.zone.Get(dotZoneID(i)).InBounds(msg) {
@@ -221,6 +177,13 @@ func (m *Model) HandleMouse(msg tea.MouseMsg) (Model, tea.Cmd, bool) {
 					return *m, nil, true
 				}
 			}
+			if fz.InBounds(msg) {
+				return *m, nil, true
+			}
+		}
+	case tea.MouseClickMsg:
+		if m.zone != nil && m.zone.Get(frameZoneID).InBounds(msg) {
+			return *m, nil, true
 		}
 	}
 	return *m, nil, false
@@ -230,10 +193,10 @@ func (m Model) BtnClicked(msg tea.MouseMsg) bool {
 	return m.zone != nil && m.zone.Get(btnZoneID).InBounds(msg)
 }
 
+func (m Model) IsDragging() bool { return false }
+
 func (m *Model) Reset() tea.Cmd {
 	m.scrollX = 0
-	m.velocity = 0
-	m.dragging = false
 	m.momentum = false
 	m.animating = false
 	m.Modal = false
@@ -257,14 +220,50 @@ func (m Model) GoToPage(page int) (Model, tea.Cmd) {
 	if n <= 1 {
 		return m, nil
 	}
+	if page < 0 {
+		page = 0
+	}
+	if page >= n {
+		page = n - 1
+	}
+	targetX := float64(page * ScreenshotWidth)
+	if m.animating && math.Abs(m.animTargetX-targetX) < 0.001 {
+		return m, nil
+	}
+	if math.Abs(m.scrollX-targetX) < 0.001 {
+		return m, nil
+	}
 	m.animStartX = m.scrollX
-	m.animTargetX = float64(page * ScreenshotWidth)
+	m.animTargetX = targetX
 	m.animStart = time.Now()
 	m.animating = true
 	m.momentum = false
-	m.dragging = false
 	m.autoGen++
-	return m, tea.Batch(tickCmd(), autoAdvanceCmd(m.autoGen))
+	return m, tea.Batch(tickCmd(m.autoGen), autoAdvanceCmd(m.autoGen))
+}
+
+func (m Model) Prev() (Model, tea.Cmd) {
+	n := len(m.Screenshots)
+	if n <= 1 {
+		return m, nil
+	}
+	cur := m.currentPage()
+	if cur == 0 {
+		return m.GoToPage(n - 1)
+	}
+	return m.GoToPage(cur - 1)
+}
+
+func (m Model) Next() (Model, tea.Cmd) {
+	n := len(m.Screenshots)
+	if n <= 1 {
+		return m, nil
+	}
+	cur := m.currentPage()
+	if cur == n-1 {
+		return m.GoToPage(0)
+	}
+	return m.GoToPage(cur + 1)
 }
 
 // View renders the carousel inline (screenshot + caption + dots).
@@ -301,11 +300,20 @@ func (m Model) View(viewWidth int) string {
 		fromLines := strings.Split(m.Screenshots[leftIdx].Content, "\n")
 		toLines := strings.Split(m.Screenshots[rightIdx].Content, "\n")
 		rows := make([]string, ScreenshotHeight)
+		fromVisible := ScreenshotWidth - intOff
+		if fromVisible > sw {
+			fromVisible = sw
+		}
+		toVisible := sw - fromVisible
 		for i := range rows {
 			from := padToScreenWidth(getLineOrEmpty(fromLines, i))
-			to := padToScreenWidth(getLineOrEmpty(toLines, i))
-			combined := from + "\x1b[0m" + to
-			rows[i] = ansi.Cut(combined, intOff, intOff+sw)
+			left := ansi.Cut(from, intOff, intOff+fromVisible)
+			if toVisible > 0 {
+				to := padToScreenWidth(getLineOrEmpty(toLines, i))
+				rows[i] = left + "\x1b[0m" + ansi.Truncate(to, toVisible, "")
+			} else {
+				rows[i] = left
+			}
 		}
 		frame = strings.Join(rows, "\n")
 	} else {
@@ -445,16 +453,6 @@ func easeOutCubic(t float64) float64 {
 	return 1 - (1-t)*(1-t)*(1-t)
 }
 
-func clampWithResistance(x, min, max, resistance float64) float64 {
-	if x < min {
-		return min + (x-min)*resistance
-	}
-	if x > max {
-		return max + (x-max)*resistance
-	}
-	return x
-}
-
 func getLineOrEmpty(lines []string, i int) string {
 	if i < len(lines) {
 		return lines[i]
@@ -469,6 +467,7 @@ func padToScreenWidth(line string) string {
 	}
 	return line + strings.Repeat(" ", ScreenshotWidth-w)
 }
+
 
 func PlaceholderScreenshot(title, fg, bg string) string {
 	titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(fg)).Background(lipgloss.Color(bg)).Bold(true)

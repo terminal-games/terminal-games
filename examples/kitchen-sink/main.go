@@ -16,9 +16,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	zone "github.com/lrstanley/bubblezone"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	zone "github.com/lrstanley/bubblezone/v2"
 
 	"github.com/terminal-games/terminal-games/pkg/app"
 	"github.com/terminal-games/terminal-games/pkg/audio"
@@ -90,8 +90,6 @@ func init() {
 }
 
 func main() {
-	r := bubblewrap.MakeRenderer()
-
 	var initialVolume float32 = 0.8
 	var audioPlaying bool = false
 	song = songResource.NewInstance()
@@ -102,18 +100,17 @@ func main() {
 
 	zone.NewGlobal()
 	p := bubblewrap.NewProgram(model{
-		timeLeft:          300,
-		mainStyle:         lipgloss.NewStyle().Padding(1).Border(lipgloss.NormalBorder()),
-		httpStyle:         lipgloss.NewStyle().Width(100),
-		hasDarkBackground: r.HasDarkBackground(),
-		peerID:            peer.CurrentID(),
-		peers:             []peer.ID{},
-		selectedPeerIdx:   0,
-		recentMessages:    make([]peerMessage, 0),
-		networkInfo:       app.NetworkInfo{},
-		audioPlaying:      audioPlaying,
-		audioVolume:       initialVolume,
-	}, tea.WithAltScreen(), tea.WithMouseAllMotion())
+		timeLeft:        300,
+		mainStyle:       lipgloss.NewStyle().Padding(1).Border(lipgloss.NormalBorder()),
+		httpStyle:       lipgloss.NewStyle().Width(100),
+		peerID:          peer.CurrentID(),
+		peers:           []peer.ID{},
+		selectedPeerIdx: 0,
+		recentMessages:  make([]peerMessage, 0),
+		networkInfo:     app.NetworkInfo{},
+		audioPlaying:    audioPlaying,
+		audioVolume:     initialVolume,
+	})
 
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
@@ -121,18 +118,25 @@ func main() {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(tick(), listenForPeerMessage(), refreshPeerList(), refreshNetworkInfo(m.networkInfo))
+	return tea.Batch(tea.RequestBackgroundColor, tick(), listenForPeerMessage(), refreshPeerList(), refreshNetworkInfo(m.networkInfo))
 }
 
 func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
+	case tea.BackgroundColorMsg:
+		m.hasDarkBackground = msg.IsDark()
+		return m, func() tea.Msg {
+			time.Sleep(2 * time.Second)
+			return tea.RequestBackgroundColor()
+		}
 	case tea.MouseMsg:
-		m.x = msg.X
-		m.y = msg.Y
+		mouse := msg.Mouse()
+		m.x = mouse.X
+		m.y = mouse.Y
 		m.isHoveringZone = zone.Get("myId").InBounds(msg)
 		isHoveringAudio.Store(m.isHoveringZone)
 		return m, nil
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		m.lastChar = msg.String()
 		switch msg.String() {
 		case "q", "esc", "ctrl+c":
@@ -175,7 +179,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "f":
 			fmt.Fprintf(os.Stdout, "\x1b[%d;%dH%c", m.h+2, 2, 'A')
 			return m, nil
-		case " ":
+		case "space":
 			if song != nil {
 				if m.audioPlaying {
 					song.Pause()
@@ -255,7 +259,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) View() string {
+func (m model) View() tea.View {
 	hoverString := "[hover me]"
 	if m.isHoveringZone {
 		hoverString = "[hello there]"
@@ -338,7 +342,12 @@ func (m model) View() string {
 		peerMessagesText,
 		m.httpStyle.Render(m.httpBody), os.Environ(), m.hasDarkBackground,
 	))
-	return zone.Scan(lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, content))
+	placed := zone.Scan(lipgloss.Place(m.w, m.h, lipgloss.Left, lipgloss.Top, content))
+	var v tea.View
+	v.SetContent(placed)
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeAllMotion
+	return v
 }
 
 func TerminalOSC8Link(link, text string) string {

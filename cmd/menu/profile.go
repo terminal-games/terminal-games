@@ -11,10 +11,10 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	zone "github.com/lrstanley/bubblezone"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	zone "github.com/lrstanley/bubblezone/v2"
 	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 	"golang.org/x/text/language"
 	"golang.org/x/text/language/display"
@@ -428,7 +428,7 @@ func (m profileModel) Update(msg tea.Msg) (profileModel, tea.Cmd) {
 		}
 		return m, nil
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch m.state {
 		case stateEditName:
 			return m.handleEditKey(msg)
@@ -448,7 +448,7 @@ func (m profileModel) Update(msg tea.Msg) (profileModel, tea.Cmd) {
 	return m, nil
 }
 
-func (m profileModel) handleEditKey(msg tea.KeyMsg) (profileModel, tea.Cmd) {
+func (m profileModel) handleEditKey(msg tea.KeyPressMsg) (profileModel, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.Save):
 		m.state = stateNormal
@@ -476,7 +476,7 @@ func (m profileModel) handleEditKey(msg tea.KeyMsg) (profileModel, tea.Cmd) {
 	return m, nil
 }
 
-func (m profileModel) handleLangsKey(msg tea.KeyMsg) (profileModel, tea.Cmd) {
+func (m profileModel) handleLangsKey(msg tea.KeyPressMsg) (profileModel, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.Done):
 		m.state = stateNormal
@@ -510,7 +510,7 @@ func (m profileModel) handleLangsKey(msg tea.KeyMsg) (profileModel, tea.Cmd) {
 	return m, nil
 }
 
-func (m profileModel) handleDropdownKey(msg tea.KeyMsg) (profileModel, tea.Cmd) {
+func (m profileModel) handleDropdownKey(msg tea.KeyPressMsg) (profileModel, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.Select):
 		if opt, ok := m.dropdown.Selected(); ok {
@@ -533,14 +533,17 @@ func (m profileModel) handleDropdownKey(msg tea.KeyMsg) (profileModel, tea.Cmd) 
 	case msg.String() == "backspace" || msg.String() == "delete":
 		m.dropdown.Backspace()
 	default:
-		if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && unicode.IsPrint(msg.Runes[0]) {
-			m.dropdown.TypeRune(msg.Runes[0])
+		if len(msg.Text) == 1 {
+			r := []rune(msg.Text)[0]
+			if unicode.IsPrint(r) {
+				m.dropdown.TypeRune(r)
+			}
 		}
 	}
 	return m, nil
 }
 
-func (m profileModel) handleDeleteConfirm(msg tea.KeyMsg) (profileModel, tea.Cmd) {
+func (m profileModel) handleDeleteConfirm(msg tea.KeyPressMsg) (profileModel, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.Confirm):
 		m.state = stateNormal
@@ -557,7 +560,7 @@ func (m profileModel) handleDeleteConfirm(msg tea.KeyMsg) (profileModel, tea.Cmd
 	return m, nil
 }
 
-func (m profileModel) handleKey(msg tea.KeyMsg) (profileModel, tea.Cmd) {
+func (m profileModel) handleKey(msg tea.KeyPressMsg) (profileModel, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.Down):
 		switch m.section {
@@ -602,28 +605,29 @@ func (m profileModel) handleMouse(msg tea.MouseMsg) (profileModel, tea.Cmd) {
 	if m.zone == nil {
 		return m, nil
 	}
-	switch msg.Type {
-	case tea.MouseWheelUp:
-		if m.state == stateLangDropdown {
-			m.dropdown.MoveUp()
-		} else if m.replayCursor > 0 {
-			m.section = sectionReplays
-			m.replayCursor--
+	switch event := msg.(type) {
+	case tea.MouseWheelMsg:
+		switch event.Button {
+		case tea.MouseWheelUp:
+			if m.state == stateLangDropdown {
+				m.dropdown.MoveUp()
+			} else if m.replayCursor > 0 {
+				m.section = sectionReplays
+				m.replayCursor--
+			}
+			return m, nil
+		case tea.MouseWheelDown:
+			if m.state == stateLangDropdown {
+				m.dropdown.MoveDown()
+			} else if m.replayCursor < len(m.replays)-1 {
+				m.section = sectionReplays
+				m.replayCursor++
+			}
+			return m, nil
 		}
-		return m, nil
-	case tea.MouseWheelDown:
-		if m.state == stateLangDropdown {
-			m.dropdown.MoveDown()
-		} else if m.replayCursor < len(m.replays)-1 {
-			m.section = sectionReplays
-			m.replayCursor++
-		}
-		return m, nil
-	}
-	switch msg.Action {
-	case tea.MouseActionMotion:
+	case tea.MouseMotionMsg:
 		m.hovered = m.zoneAt(msg)
-	case tea.MouseActionRelease:
+	case tea.MouseReleaseMsg, tea.MouseClickMsg:
 		return m.handleClick(m.zoneAt(msg))
 	}
 	return m, nil

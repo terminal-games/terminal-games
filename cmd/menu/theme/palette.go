@@ -4,17 +4,61 @@
 
 package theme
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"image/color"
+
+	"charm.land/lipgloss/v2"
+
+	"github.com/terminal-games/terminal-games/pkg/app"
+)
 
 var (
-	Primary   = lipgloss.AdaptiveColor{Light: "#98c379", Dark: "#98c379"}
-	Accent    = lipgloss.AdaptiveColor{Light: "#2563eb", Dark: "#60a5fa"}
-	Danger    = lipgloss.AdaptiveColor{Light: "#dc2626", Dark: "#f87171"}
-	OnPrimary = lipgloss.AdaptiveColor{Light: "#171717", Dark: "#171717"}
+	Primary   color.Color
+	Accent    color.Color
+	Danger    color.Color
+	OnPrimary color.Color
 
-	Text       = lipgloss.AdaptiveColor{Light: "#262626", Dark: "#f5f5f5"}
-	TextMuted  = lipgloss.AdaptiveColor{Light: "#525252", Dark: "#d4d4d4"}
-	TextSubtle = lipgloss.AdaptiveColor{Light: "#737373", Dark: "#a3a3a3"}
-	Surface    = lipgloss.AdaptiveColor{Light: "#e5e5e5", Dark: "#404040"}
-	Line       = lipgloss.AdaptiveColor{Light: "#d4d4d4", Dark: "#525252"}
+	Text       color.Color
+	TextMuted  color.Color
+	TextSubtle color.Color
+	Surface    color.Color
+	Line       color.Color
 )
+
+func init() {
+	SetHasDarkBackground(true)
+}
+
+func SetHasDarkBackground(isDark bool) {
+	Primary = lipgloss.Color("#98c379")
+	OnPrimary = lipgloss.Color("#171717")
+
+	if isDark {
+		Danger = lipgloss.Color("#f87171")
+		Accent = lipgloss.Color("#60a5fa")
+		Text = lipgloss.Color("#f5f5f5")
+		TextMuted = lipgloss.Color("#d4d4d4")
+		TextSubtle = lipgloss.Color("#a3a3a3")
+		Surface = lipgloss.Color("#404040")
+		Line = lipgloss.Color("#525252")
+		return
+	}
+
+	Danger = lipgloss.Color("#dc2626")
+	Accent = lipgloss.Color("#2563eb")
+	Text = lipgloss.Color("#262626")
+	TextMuted = lipgloss.Color("#525252")
+	TextSubtle = lipgloss.Color("#737373")
+	Surface = lipgloss.Color("#e5e5e5")
+	Line = lipgloss.Color("#d4d4d4")
+}
+
+func ConfigureFromTerminalInfo() {
+	isDark := true
+	info, err := app.GetTerminalInfo()
+	if err == nil && info.HasDarkBackground {
+		isDark = info.DarkBackground
+	}
+
+	SetHasDarkBackground(isDark)
+}

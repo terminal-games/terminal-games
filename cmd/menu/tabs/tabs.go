@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	zone "github.com/lrstanley/bubblezone"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	zone "github.com/lrstanley/bubblezone/v2"
 	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 )
 
@@ -69,6 +69,7 @@ type Model struct {
 	animStart    time.Time
 	animating    bool
 	initialized  bool
+	animGen      int
 }
 
 func New(tabs []Tab, zoneManager *zone.Manager, zonePrefix string) Model {
@@ -149,6 +150,7 @@ func (m *Model) startAnim(index int) {
 	m.targetLeft, m.targetRight = m.edgesFor(index)
 	m.animStart = time.Now()
 	m.animating = true
+	m.animGen++
 }
 
 func easeOutCubic(t float64) float64 {
@@ -178,7 +180,7 @@ func (m *Model) SetActive(index int) tea.Cmd {
 		m.Active = index
 		m.calculatePositions()
 		m.startAnim(index)
-		return tickCmd()
+		return tickCmd(m.animGen)
 	}
 	return nil
 }
@@ -199,11 +201,11 @@ func (m Model) ActiveTab() Tab {
 	return Tab{}
 }
 
-type TickMsg time.Time
+type TickMsg struct{ Gen int }
 
-func tickCmd() tea.Cmd {
-	return tea.Tick(16*time.Millisecond, func(t time.Time) tea.Msg {
-		return TickMsg(t)
+func tickCmd(gen int) tea.Cmd {
+	return tea.Tick(16*time.Millisecond, func(time.Time) tea.Msg {
+		return TickMsg{gen}
 	})
 }
 
@@ -219,7 +221,7 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.MouseMsg:
-		if msg.Action == tea.MouseActionMotion {
+		if _, ok := msg.(tea.MouseMotionMsg); ok {
 			m.Hovered = -1
 			for i, tab := range m.Tabs {
 				if m.zone.Get(m.zonePrefix + tab.ID).InBounds(msg) {
@@ -230,8 +232,10 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			return m, nil
 		}
 
-		if msg.Action != tea.MouseActionRelease {
-			return m, nil
+		if _, ok := msg.(tea.MouseReleaseMsg); !ok {
+			if _, ok := msg.(tea.MouseClickMsg); !ok {
+				return m, nil
+			}
 		}
 		for i, tab := range m.Tabs {
 			if m.zone.Get(m.zonePrefix + tab.ID).InBounds(msg) {
@@ -239,7 +243,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 					m.Active = i
 					m.calculatePositions()
 					m.startAnim(i)
-					return m, tea.Batch(tickCmd(), func() tea.Msg {
+					return m, tea.Batch(tickCmd(m.animGen), func() tea.Msg {
 						return TabChangedMsg{Index: i, Tab: tab}
 					})
 				}
@@ -248,6 +252,9 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 		}
 
 	case TickMsg:
+		if msg.Gen != m.animGen {
+			return m, nil
+		}
 		if !m.animating {
 			return m, nil
 		}
@@ -257,7 +264,7 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 			m.animating = false
 			return m, nil
 		}
-		return m, tickCmd()
+		return m, tickCmd(m.animGen)
 	}
 
 	return m, nil

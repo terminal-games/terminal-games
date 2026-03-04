@@ -145,7 +145,7 @@ impl SshServer {
         let (ssh_session_sender, ssh_session_receiver) =
             tokio::sync::oneshot::channel::<(Handle, ChannelId, String)>();
 
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(10);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(32);
         let (resize_tx, mut resize_rx) = tokio::sync::watch::channel((0, 0));
         let cancellation_token = CancellationToken::new();
         let token = cancellation_token.clone();
@@ -298,7 +298,7 @@ impl SshServer {
                 }
             }
 
-            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
+            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(8);
             let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
             if admission_controller.should_require_captcha() {
                 let captcha = generate_captcha(7);
@@ -904,15 +904,12 @@ impl Handler for SshSession {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // match self.input_sender.try_send(data.into()) {
-        //     Ok(()) => {}
-        //     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
-        //     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-        //         anyhow::bail!("input channel closed");
-        //     }
-        // }
-        if let Err(_) = self.input_sender.send(data.into()).await {
-            anyhow::bail!("input channel closed");
+        match self.input_sender.try_send(data.into()) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("input channel closed");
+            }
         }
 
         Ok(())

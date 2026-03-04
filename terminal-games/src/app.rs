@@ -74,6 +74,7 @@ const MENU_REQ_ERR_INVALID_INPUT: i32 = -2;
 const MENU_REQ_ERR_TOO_MANY_REQUESTS: i32 = -3;
 
 const MAX_MENU_REQUESTS: usize = 4;
+const WASM_MEMORY_LIMIT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
 const MENU_POLL_PENDING: i32 = -1;
 const MENU_POLL_ERR_INVALID_REQUEST_ID: i32 = -2;
@@ -276,7 +277,7 @@ impl AppServer {
             )));
             let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(1);
 
-            let (filtered_input_tx, filtered_input_rx) = tokio::sync::mpsc::channel(20);
+            let (filtered_input_tx, filtered_input_rx) = tokio::sync::mpsc::channel(10);
             tokio::task::spawn({
                 let mut input_receiver = params.input_receiver;
                 let graceful_shutdown_token = params.graceful_shutdown_token.clone();
@@ -300,13 +301,11 @@ impl AppServer {
                                 < Duration::from_secs(REPLAY_RATE_LIMIT_SECS)
                             {
                                 let _ = notification_tx
-                                    .send(" Please wait 10 seconds between replays. ".to_string())
-                                    .await;
+                                    .try_send(" Please wait 10 seconds between replays. ".to_string());
                             } else {
                                 replay_last_at = now;
                                 let _ = notification_tx
-                                    .send(" \x1b[3mUploading replay... ".to_string())
-                                    .await;
+                                    .try_send(" \x1b[3mUploading replay... ".to_string());
                                 let db = db.clone();
                                 let menu_session = menu_session.clone();
                                 let notification_tx = notification_tx.clone();
@@ -354,7 +353,7 @@ impl AppServer {
                         let filtered: SmallVec<[u8; 16]> =
                             data.into_iter().filter(|&b| b != 0x12).collect();
                         if !filtered.is_empty() {
-                            let _ = filtered_input_tx.send(filtered).await;
+                            let _ = filtered_input_tx.try_send(filtered);
                         }
                     }
                 }
@@ -2164,7 +2163,7 @@ impl wasmtime::ResourceLimiter for AppLimiter {
             .memory_total
             .saturating_sub(current)
             .saturating_add(desired);
-        if self.memory_total >= 32 * 1024 * 1024 {
+        if self.memory_total as u64 >= WASM_MEMORY_LIMIT_BYTES {
             tracing::error!(total = self.memory_total, "rejected memory grow");
             return Ok(false);
         }

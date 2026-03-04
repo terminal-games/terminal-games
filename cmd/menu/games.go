@@ -6,12 +6,13 @@ package main
 
 import (
 	"strings"
+	"unicode/utf8"
 
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	zone "github.com/lrstanley/bubblezone"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	zone "github.com/lrstanley/bubblezone/v2"
 	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
 	"github.com/terminal-games/terminal-games/cmd/menu/gamelist"
 	"github.com/terminal-games/terminal-games/cmd/menu/tabs"
@@ -21,7 +22,8 @@ import (
 )
 
 const (
-	playZoneID = "games-play"
+	playZoneID            = "games-play"
+	maxDetailsRenderBytes = 16 * 1024
 )
 
 func resolveLocalized(preferred []language.Tag, localized map[string]string, fallback string) string {
@@ -187,15 +189,29 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		m.termH = msg.Height
 		m.carousel.HandleWindowSize(msg.Width, msg.Height)
 		return m, nil
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		if m.playBusy {
 			return m, nil
 		}
 		if key.Matches(msg, m.playKey) && !m.list.Filtering() {
 			return m.startPlaySelected()
 		}
+		if msg.String() == "left" && !m.list.Filtering() {
+			var cmd tea.Cmd
+			m.carousel, cmd = m.carousel.Prev()
+			if cmd != nil {
+				return m, cmd
+			}
+		}
+		if msg.String() == "right" && !m.list.Filtering() {
+			var cmd tea.Cmd
+			m.carousel, cmd = m.carousel.Next()
+			if cmd != nil {
+				return m, cmd
+			}
+		}
 		if m.carousel.Modal {
-			if msg.Type == tea.KeyEsc {
+			if msg.String() == "esc" {
 				m.carousel.Modal = false
 			}
 			return m, nil
@@ -211,7 +227,10 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		if m.playBusy {
 			return m, nil
 		}
-		if msg.Action == tea.MouseActionRelease && m.zone != nil && m.zone.Get(playZoneID).InBounds(msg) {
+		_, isRelease := msg.(tea.MouseReleaseMsg)
+		_, isClick := msg.(tea.MouseClickMsg)
+		isSelectEvent := isRelease || isClick
+		if isSelectEvent && m.zone != nil && m.zone.Get(playZoneID).InBounds(msg) {
 			return m.startPlaySelected()
 		}
 		if m.carousel.Modal {
@@ -220,7 +239,7 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 			if handled {
 				return m, cmd
 			}
-			if msg.Action == tea.MouseActionRelease {
+			if isSelectEvent {
 				m.carousel.Modal = false
 			}
 			return m, nil
@@ -230,7 +249,7 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		if handled {
 			return m, cc
 		}
-		if msg.Action == tea.MouseActionRelease && m.carousel.BtnClicked(msg) {
+		if isSelectEvent && m.carousel.BtnClicked(msg) {
 			m.carousel.Modal = true
 			return m, nil
 		}
@@ -365,7 +384,7 @@ func (m *gamesModel) applyLocalization(localizer localizer, preferred []language
 			Screenshots: resolveScreenshots(m.preferred, d.ScreenshotsBy),
 		}
 		m.items[i] = item
-		listItems[i] = gamelist.Item{Name: item.Name, Description: item.Description, FilterExtra: item.Details}
+		listItems[i] = gamelist.Item{Name: item.Name, Description: item.Description}
 	}
 	m.list = gamelist.New(localizer.Text(textGamesListTitle), listItems, m.zone, "games-item-")
 	m.list.SetLabels(localizer.GameListLabels())
@@ -429,34 +448,20 @@ func (m *gamesModel) renderGameDetails(width, height int) string {
 	return lipgloss.NewStyle().Width(width).MaxHeight(height).Render(content)
 }
 
-func (m *gamesModel) gameDetailsNeedsMoreHeight(width, height int) bool {
-	if width <= 0 || height <= 0 || !m.loaded || m.loadErr != nil {
-		return false
-	}
-	item := m.selectedItem()
-	if item.Shortname == "" {
-		return false
-	}
-	content := m.renderGameDetailsContent(width, height, false)
-	return lipgloss.Height(lipgloss.NewStyle().Width(width).Render(content)) > height
-}
-
 func (m *gamesModel) renderGameDetailsContent(width, height int, allowInlineScreenshots bool) string {
 	item := m.selectedItem()
 	showInlineScreenshots := allowInlineScreenshots && len(item.Screenshots) > 0 && carousel.CanFitInline(width, height)
 	parts := m.buildGameDetailsParts(item, width, showInlineScreenshots)
-	if showInlineScreenshots && m.detailsContentExceedsHeight(width, height, parts) {
-		parts = m.buildGameDetailsParts(item, width, false)
-	}
 	return strings.Join(parts, "\n")
 }
 
 func (m *gamesModel) buildGameDetailsParts(item gameItem, width int, inlineScreenshots bool) []string {
+	details := clampUTF8Bytes(item.Details, maxDetailsRenderBytes)
 	parts := []string{
 		m.styles.Title.Render(item.Name),
 		m.styles.Subtle.Render(item.Description),
 		"",
-		m.styles.Body.Render(item.Details),
+		m.styles.Body.Render(details),
 	}
 
 	if len(item.Screenshots) > 0 {
@@ -487,14 +492,23 @@ func (m *gamesModel) renderCurrentPlayButton(width int) string {
 	return play
 }
 
-func (m *gamesModel) detailsContentExceedsHeight(width, height int, parts []string) bool {
-	content := strings.Join(parts, "\n")
-	return lipgloss.Height(lipgloss.NewStyle().Width(width).Render(content)) > height
-}
-
 func (m *gamesModel) renderPlayButton(width int, label string) string {
 	if width <= 0 {
 		return ""
 	}
 	return m.styles.PlayBtn.Render(lipgloss.Place(width, 3, lipgloss.Center, lipgloss.Center, label))
+}
+
+func clampUTF8Bytes(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
+		return s
+	}
+	i := limit
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	if i <= 0 {
+		return "..."
+	}
+	return s[:i] + "..."
 }

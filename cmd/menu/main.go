@@ -11,12 +11,14 @@ import (
 	"time"
 	_ "unsafe"
 
-	"github.com/charmbracelet/bubbles/help"
-	"github.com/charmbracelet/bubbles/key"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	zone "github.com/lrstanley/bubblezone"
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	zone "github.com/lrstanley/bubblezone/v2"
 
+	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
+	"github.com/terminal-games/terminal-games/cmd/menu/gamelist"
 	"github.com/terminal-games/terminal-games/cmd/menu/tabs"
 	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 	"github.com/terminal-games/terminal-games/pkg/bubblewrap"
@@ -56,6 +58,8 @@ type model struct {
 	help        help.Model
 	games       gamesModel
 	profile     profileModel
+	dirty       bool
+	viewCache   string
 }
 
 type helpKeyMap interface {
@@ -147,7 +151,7 @@ func (m model) globalHelpKeyMap() helpKeyMap {
 }
 
 func main() {
-	lipgloss.SetDefaultRenderer(bubblewrap.MakeRenderer())
+	theme.ConfigureFromTerminalInfo()
 
 	zoneManager := zone.New()
 
@@ -164,7 +168,7 @@ func main() {
 	}
 	menuModel.applyMenuLocalization()
 
-	p := bubblewrap.NewProgram(menuModel, tea.WithAltScreen(), tea.WithMouseAllMotion())
+	p := bubblewrap.NewProgram(menuModel)
 
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
@@ -192,76 +196,153 @@ func (m *model) setActiveTab(index int) tea.Cmd {
 }
 
 func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
-	var cmds []tea.Cmd
 	switch msg := message.(type) {
-	case tea.KeyMsg:
-		switch {
-		case key.Matches(msg, m.keys.Quit):
-			if msg.String() == "q" && m.inputCaptured() {
-				break
-			}
-			return m, tea.Quit
-		case key.Matches(msg, m.keys.NextTab):
-			if m.inputCaptured() {
-				return m, nil
-			}
-			next := (m.tabs.Active + 1) % len(m.tabs.Tabs)
-			return m, m.setActiveTab(next)
-		case key.Matches(msg, m.keys.PrevTab):
-			if m.inputCaptured() {
-				return m, nil
-			}
-			prev := m.tabs.Active - 1
-			if prev < 0 {
-				prev = len(m.tabs.Tabs) - 1
-			}
-			return m, m.setActiveTab(prev)
-		default:
-			var cmd tea.Cmd
-			if m.tabs.ActiveTab().ID == "games" {
-				m.games, cmd = m.games.Update(message)
-				if cmd != nil {
-					cmds = append(cmds, cmd)
-				}
-			} else if m.tabs.ActiveTab().ID == "profile" {
-				m.profile, cmd = m.profile.Update(message)
-				if cmd != nil {
-					cmds = append(cmds, cmd)
-				}
-			}
-			return m, cmd
-		}
+	case tea.KeyPressMsg:
+		return m.handleKey(msg)
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
 	case tea.WindowSizeMsg:
+		m.dirty = true
 		m.w = msg.Width
 		m.h = msg.Height
+		var cmd tea.Cmd
+		m.games, cmd = m.games.Update(message)
+		return m, cmd
+	case tea.BackgroundColorMsg:
+		m.dirty = true
+		theme.SetHasDarkBackground(msg.IsDark())
+		m.applyThemeStyles()
+		return m, nil
 	case localizationChangedMsg:
+		m.dirty = true
 		if m.localizer.SetPreferred(msg.preferred) {
 			m.applyMenuLocalization()
 		}
 		m.localeReady = true
+		var cmds []tea.Cmd
+		var cmd tea.Cmd
+		m.games, cmd = m.games.Update(message)
+		cmds = append(cmds, cmd)
+		m.profile, cmd = m.profile.Update(message)
+		cmds = append(cmds, cmd)
+		if !m.started && m.startupReady() {
+			m.started = true
+		}
+		return m, tea.Batch(cmds...)
 	case startupLoadingDelayElapsedMsg:
+		m.dirty = true
 		m.showLoading = true
+		return m, nil
+	default:
+		m.dirty = true
+		var cmds []tea.Cmd
+		var cmd tea.Cmd
+		m.games, cmd = m.games.Update(message)
+		cmds = append(cmds, cmd)
+		m.profile, cmd = m.profile.Update(message)
+		cmds = append(cmds, cmd)
+		m.tabs, cmd = m.tabs.Update(message)
+		cmds = append(cmds, cmd)
+		if !m.started && m.startupReady() {
+			m.started = true
+		}
+		return m, tea.Batch(cmds...)
 	}
+}
 
+func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	m.dirty = true
+	if key.Matches(msg, m.keys.Quit) {
+		if msg.String() != "q" || !m.inputCaptured() {
+			return m, tea.Quit
+		}
+	} else if key.Matches(msg, m.keys.NextTab) {
+		if m.inputCaptured() {
+			return m, nil
+		}
+		next := (m.tabs.Active + 1) % len(m.tabs.Tabs)
+		return m, m.setActiveTab(next)
+	} else if key.Matches(msg, m.keys.PrevTab) {
+		if m.inputCaptured() {
+			return m, nil
+		}
+		prev := m.tabs.Active - 1
+		if prev < 0 {
+			prev = len(m.tabs.Tabs) - 1
+		}
+		return m, m.setActiveTab(prev)
+	}
 	var cmd tea.Cmd
-
-	m.games, cmd = m.games.Update(message)
-	cmds = append(cmds, cmd)
-
-	m.profile, cmd = m.profile.Update(message)
-	cmds = append(cmds, cmd)
-
-	m.tabs, cmd = m.tabs.Update(message)
-	cmds = append(cmds, cmd)
-
-	if !m.started && m.startupReady() {
-		m.started = true
+	switch m.tabs.ActiveTab().ID {
+	case "games":
+		m.games, cmd = m.games.Update(msg)
+	case "profile":
+		m.profile, cmd = m.profile.Update(msg)
 	}
+	return m, cmd
+}
 
+func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if _, ok := msg.(tea.MouseMotionMsg); ok {
+		return m.handleMouseMotion(msg)
+	}
+	m.dirty = true
+	var cmds []tea.Cmd
+	var cmd tea.Cmd
+	m.tabs, cmd = m.tabs.Update(msg)
+	cmds = append(cmds, cmd)
+	switch m.tabs.ActiveTab().ID {
+	case "games":
+		m.games, cmd = m.games.Update(msg)
+		cmds = append(cmds, cmd)
+	case "profile":
+		m.profile, cmd = m.profile.Update(msg)
+		cmds = append(cmds, cmd)
+	}
 	return m, tea.Batch(cmds...)
 }
 
-func (m *model) View() string {
+func (m *model) handleMouseMotion(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	oldTabHover := m.tabs.Hovered
+	m.tabs, _ = m.tabs.Update(msg)
+
+	var cmd tea.Cmd
+	switch m.tabs.ActiveTab().ID {
+	case "games":
+		oldListHover := m.games.list.Hovered
+		wasDragging := m.games.carousel.IsDragging()
+		m.games, cmd = m.games.Update(msg)
+		if m.games.list.Hovered != oldListHover || m.games.carousel.IsDragging() || wasDragging {
+			m.dirty = true
+		}
+	case "profile":
+		oldHover := m.profile.hovered
+		m.profile, cmd = m.profile.Update(msg)
+		if m.profile.hovered != oldHover {
+			m.dirty = true
+		}
+	}
+	if m.tabs.Hovered != oldTabHover {
+		m.dirty = true
+	}
+	return m, cmd
+}
+
+func (m *model) View() tea.View {
+	var v tea.View
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeAllMotion
+	if !m.dirty && m.viewCache != "" {
+		v.SetContent(m.viewCache)
+		return v
+	}
+	m.dirty = false
+	m.viewCache = m.renderView()
+	v.SetContent(m.viewCache)
+	return v
+}
+
+func (m *model) renderView() string {
 	if !m.started {
 		if !m.showLoading {
 			return ""
@@ -287,10 +368,6 @@ func (m *model) View() string {
 	centeredTabsView := m.renderCenteredTabsView(viewportWidth, tabsView, tabsWidth, title, titleWidth)
 	helpView := m.renderHelpView(viewportWidth)
 	layout := m.computeContentLayout(viewportWidth, lipgloss.Height(centeredTabsView), lipgloss.Height(helpView))
-	if m.tabs.ActiveTab().ID == "games" && m.games.gameDetailsNeedsMoreHeight(layout.innerWidth, layout.innerHeight) {
-		helpView = ""
-		layout = m.computeContentLayout(viewportWidth, lipgloss.Height(centeredTabsView), 0)
-	}
 
 	content := m.renderActiveTab(layout.innerWidth, layout.innerHeight)
 
@@ -330,7 +407,7 @@ func (m *model) renderCenteredTabsView(viewportWidth int, tabsView string, tabsW
 
 func (m *model) renderHelpView(viewportWidth int) string {
 	innerWidth := max(0, viewportWidth-2*helpPaddingX)
-	m.help.Width = innerWidth
+	m.help.SetWidth(innerWidth)
 
 	helpLines := make([]string, 0, 2)
 	if keyMap := m.contextualKeyMap(); keyMap != nil {
@@ -407,4 +484,13 @@ func (m *model) applyMenuLocalization() {
 		{ID: "profile", Title: m.localizer.Text(textTabProfile)},
 		{ID: "about", Title: m.localizer.Text(textTabAbout)},
 	}, m.zone, "menu-tab-", activeID)
+}
+
+func (m *model) applyThemeStyles() {
+	m.barStyle = lipgloss.NewStyle().Foreground(theme.Line)
+	m.games.styles = defaultDetailsStyles()
+	m.games.list.Styles = gamelist.DefaultStyles()
+	m.games.carousel.Styles = carousel.DefaultStyles()
+	m.profile.styles = defaultProfileStyles()
+	m.applyMenuLocalization()
 }

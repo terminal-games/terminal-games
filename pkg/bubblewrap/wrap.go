@@ -6,21 +6,14 @@ package bubblewrap
 
 import (
 	"bytes"
-	"image/color"
-	"io"
 	"os"
 	"runtime"
 	"runtime/debug"
-	"strings"
 	"time"
 	"unsafe"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
-	"github.com/charmbracelet/x/input"
-	"github.com/lucasb-eyer/go-colorful"
-	"github.com/muesli/termenv"
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 
 	"github.com/terminal-games/terminal-games/pkg/app"
 )
@@ -56,7 +49,7 @@ type dimensions struct {
 var fromHost = &yieldingReadWriter{buf: bytes.NewBuffer(nil)}
 
 func init() {
-	debug.SetMemoryLimit(32 * 1024 * 1024)
+	debug.SetMemoryLimit(24 * 1024 * 1024)
 
 	go func() {
 		buffer := make([]byte, 4096)
@@ -79,9 +72,29 @@ func init() {
 }
 
 func NewProgram(model tea.Model, opts ...tea.ProgramOption) *tea.Program {
-	p := tea.NewProgram(model, append([]tea.ProgramOption{tea.WithInput(fromHost), tea.WithoutSignalHandler()}, opts...)...)
-
 	var currentSize dimensions
+	terminal_size(unsafe.Pointer(&currentSize.w), unsafe.Pointer(&currentSize.h))
+
+	profile := colorprofile.TrueColor
+	if info, err := app.GetTerminalInfo(); err == nil {
+		switch info.ColorMode {
+		case app.TerminalColor16:
+			profile = colorprofile.ANSI
+		case app.TerminalColor256:
+			profile = colorprofile.ANSI256
+		case app.TerminalColorTrueColor:
+			profile = colorprofile.TrueColor
+		}
+	}
+
+	programOpts := append([]tea.ProgramOption{
+		tea.WithInput(fromHost),
+		tea.WithoutSignalHandler(),
+		tea.WithWindowSize(int(currentSize.w), int(currentSize.h)),
+		tea.WithColorProfile(profile),
+	}, opts...)
+	p := tea.NewProgram(model, programOpts...)
+
 	sentQuit := false
 	go func() {
 		for {
@@ -102,128 +115,4 @@ func NewProgram(model tea.Model, opts ...tea.ProgramOption) *tea.Program {
 	}()
 
 	return p
-}
-
-func MakeRenderer() *lipgloss.Renderer {
-	r := lipgloss.NewRenderer(os.Stdout, termenv.WithProfile(termenv.TrueColor))
-
-	info, err := app.GetTerminalInfo()
-	if err == nil {
-		switch info.ColorMode {
-		case app.TerminalColorTrueColor:
-			r.SetColorProfile(termenv.TrueColor)
-		case app.TerminalColor256:
-			r.SetColorProfile(termenv.ANSI256)
-		case app.TerminalColor16:
-			r.SetColorProfile(termenv.ANSI)
-		}
-		if info.HasDarkBackground {
-			r.SetHasDarkBackground(info.DarkBackground)
-		}
-	} else {
-		r.SetColorProfile(termenv.TrueColor)
-	}
-
-	bg := querySessionBackgroundColor(fromHost, os.Stdout)
-	if bg != nil {
-		c, ok := colorful.MakeColor(bg)
-		if ok {
-			_, _, l := c.Hsl()
-			r.SetHasDarkBackground(l < 0.5)
-		}
-	}
-
-	return r
-}
-
-type sshEnviron []string
-
-var _ termenv.Environ = sshEnviron(nil)
-
-// Environ implements termenv.Environ.
-func (e sshEnviron) Environ() []string {
-	return e
-}
-
-// Getenv implements termenv.Environ.
-func (e sshEnviron) Getenv(k string) string {
-	for _, v := range e {
-		if strings.HasPrefix(v, k+"=") {
-			return v[len(k)+1:]
-		}
-	}
-	return ""
-}
-
-// copied from x/term@v0.1.3.
-func querySessionBackgroundColor(in io.Reader, out io.Writer) (bg color.Color) {
-	_ = queryTerminal(in, out, time.Second, func(events []input.Event) bool {
-		for _, e := range events {
-			switch e := e.(type) {
-			case input.BackgroundColorEvent:
-				bg = e.Color
-				continue // we need to consume the next DA1 event
-			case input.PrimaryDeviceAttributesEvent:
-				return false
-			}
-		}
-		return true
-	}, ansi.RequestBackgroundColor+ansi.RequestPrimaryDeviceAttributes)
-	return
-}
-
-// QueryTerminalFilter is a function that filters input events using a type
-// switch. If false is returned, the QueryTerminal function will stop reading
-// input.
-type QueryTerminalFilter func(events []input.Event) bool
-
-// queryTerminal queries the terminal for support of various features and
-// returns a list of response events.
-// Most of the time, you will need to set stdin to raw mode before calling this
-// function.
-// Note: This function will block until the terminal responds or the timeout
-// is reached.
-// copied from x/term@v0.1.3.
-func queryTerminal(
-	in io.Reader,
-	out io.Writer,
-	timeout time.Duration,
-	filter QueryTerminalFilter,
-	query string,
-) error {
-	rd, err := input.NewReader(in, "", 0)
-	if err != nil {
-		return err
-	}
-
-	defer rd.Close() // nolint: errcheck
-
-	done := make(chan struct{}, 1)
-	defer close(done)
-	go func() {
-		select {
-		case <-done:
-		case <-time.After(timeout):
-			rd.Cancel()
-		}
-	}()
-
-	if _, err := io.WriteString(out, query); err != nil {
-		return err
-	}
-
-	for {
-		runtime.Gosched()
-
-		events, err := rd.ReadEvents()
-		if err != nil {
-			return err
-		}
-
-		if !filter(events) {
-			break
-		}
-	}
-
-	return nil
 }
