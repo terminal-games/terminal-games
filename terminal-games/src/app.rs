@@ -382,6 +382,17 @@ impl AppServer {
                         terminal_profile,
                         notification_rx,
                     );
+                    let hard_shutdown_for_timeout = hard_shutdown_token.clone();
+                    let graceful_shutdown_for_timeout = graceful_shutdown_token.clone();
+                    tokio::task::spawn(async move {
+                        graceful_shutdown_for_timeout.cancelled().await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(5000)) => {
+                                hard_shutdown_for_timeout.cancel();
+                            }
+                            _ = hard_shutdown_for_timeout.cancelled() => {}
+                        }
+                    });
 
                     loop {
                         tokio::select! {
@@ -389,17 +400,6 @@ impl AppServer {
 
                             _ = hard_shutdown_token.cancelled() => {
                                 break;
-                            }
-
-                            _ = graceful_shutdown_token.cancelled() => {
-                                tokio::select! {
-                                    _ = tokio::time::sleep(std::time::Duration::from_millis(5000)) => {
-                                        hard_shutdown_token.cancel();
-                                    }
-                                    _ = hard_shutdown_token.cancelled() => {
-                                        break;
-                                    }
-                                }
                             }
 
                             data = app_output_receiver.recv() => {
@@ -446,7 +446,14 @@ impl AppServer {
                                 if !output.is_empty() {
                                     let output = Arc::new(output);
                                     replay_buffer.lock().await.push_output(output.clone());
-                                    let _ = output_sender.send(output).await;
+                                    tokio::select! {
+                                        _ = hard_shutdown_token.cancelled() => break,
+                                        result = output_sender.send(output) => {
+                                            if result.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -468,7 +475,14 @@ impl AppServer {
                                 if !output.is_empty() {
                                     let output = Arc::new(output);
                                     replay_buffer.lock().await.push_output(output.clone());
-                                    let _ = output_sender.send(output).await;
+                                    tokio::select! {
+                                        _ = hard_shutdown_token.cancelled() => break,
+                                        result = output_sender.send(output) => {
+                                            if result.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -478,7 +492,14 @@ impl AppServer {
                                 if !output.is_empty() {
                                     let output = Arc::new(output);
                                     replay_buffer.lock().await.push_output(output.clone());
-                                    let _ = output_sender.send(output).await;
+                                    tokio::select! {
+                                        _ = hard_shutdown_token.cancelled() => break,
+                                        result = output_sender.send(output) => {
+                                            if result.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -489,7 +510,14 @@ impl AppServer {
                                 if !output.is_empty() {
                                     let output = Arc::new(output);
                                     replay_buffer.lock().await.push_output(output.clone());
-                                    let _ = output_sender.send(output).await;
+                                    tokio::select! {
+                                        _ = hard_shutdown_token.cancelled() => break,
+                                        result = output_sender.send(output) => {
+                                            if result.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                             }
 

@@ -325,6 +325,7 @@ async fn main() -> Result<()> {
         locale,
     });
 
+    let graceful_shutdown_token_input = graceful_shutdown_token.clone();
     thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut buf = [0u8; 4096];
@@ -332,6 +333,9 @@ async fn main() -> Result<()> {
             match stdin.lock().read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    if buf[..n].contains(&0x03) {
+                        graceful_shutdown_token_input.cancel();
+                    }
                     if input_tx.blocking_send(SmallVec::from(&buf[..n])).is_err() {
                         break;
                     }
@@ -342,6 +346,7 @@ async fn main() -> Result<()> {
 
     let mut sigwinch =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     enum DelayedData {
         Terminal {
@@ -351,7 +356,7 @@ async fn main() -> Result<()> {
         Audio(Vec<u8>),
     }
 
-    let (delayed_tx, mut delayed_rx) = tokio::sync::mpsc::channel(100);
+    let (delayed_tx, mut delayed_rx) = tokio::sync::mpsc::unbounded_channel();
 
     tokio::spawn(async move {
         let mut rate_limited = RateLimitedStream::with_rate(
@@ -398,6 +403,10 @@ async fn main() -> Result<()> {
                 break;
             }
 
+            _ = sigint.recv() => {
+                graceful_shutdown_token.cancel();
+            }
+
             data = audio_rx.recv(), if audio_enabled => {
                 let Some(data) = data else { break };
 
@@ -405,7 +414,7 @@ async fn main() -> Result<()> {
                 let delay_ms = delay.as_millis() as u64;
                 let deliver_at = tokio::time::Instant::now() + delay;
 
-                let _ = delayed_tx.send((DelayedData::Audio(data), deliver_at, delay_ms)).await;
+                let _ = delayed_tx.send((DelayedData::Audio(data), deliver_at, delay_ms));
             }
 
             data = output_rx.recv() => {
@@ -423,7 +432,7 @@ async fn main() -> Result<()> {
                     data.clone()
                 };
 
-                let _ = delayed_tx.send((DelayedData::Terminal { raw: data, metered: metered_data }, deliver_at, delay_ms)).await;
+                let _ = delayed_tx.send((DelayedData::Terminal { raw: data, metered: metered_data }, deliver_at, delay_ms));
             }
 
             _ = sigwinch.recv() => {

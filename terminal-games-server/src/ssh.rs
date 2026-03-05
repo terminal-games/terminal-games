@@ -904,6 +904,10 @@ impl Handler for SshSession {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if data.contains(&0x03) {
+            self.cancellation_token.cancel();
+        }
+
         match self.input_sender.try_send(data.into()) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
