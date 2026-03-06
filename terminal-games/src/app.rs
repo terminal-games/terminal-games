@@ -92,6 +92,8 @@ const NEXT_APP_READY_NOT_READY: i32 = 0;
 const NEXT_APP_READY_ERR_UNKNOWN_SHORTNAME: i32 = -1;
 const NEXT_APP_READY_ERR_PREPARE_FAILED_OTHER: i32 = -2;
 
+pub type AppExitResult = Result<I32Exit, AppRunError>;
+
 pub struct AppServer {
     linker: Arc<wasmtime::Linker<AppState>>,
     engine: wasmtime::Engine,
@@ -169,7 +171,7 @@ impl AppServer {
     pub fn instantiate_app(
         &self,
         params: AppInstantiationParams,
-    ) -> tokio::sync::oneshot::Receiver<I32Exit> {
+    ) -> tokio::sync::oneshot::Receiver<AppExitResult> {
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
 
         let mesh = self.mesh.clone();
@@ -196,6 +198,7 @@ impl AppServer {
                 user_id,
                 locale,
             } = params;
+            let startup_shortname = first_app_shortname.clone();
 
             let (first_cols, first_rows) = *window_size_receiver.borrow();
             let mut terminal = headless_terminal::Parser::new(first_rows, first_cols, 0);
@@ -221,7 +224,7 @@ impl AppServer {
                 None
             };
 
-            let mut exit_code = I32Exit(0);
+            let mut exit_result = Ok(I32Exit(0));
             let (mut menu_request_tx, mut menu_request_rx) =
                 mpsc::channel::<MenuRequestJob>(MAX_MENU_REQUESTS);
             let (menu_result_tx, mut menu_result_rx) =
@@ -254,8 +257,11 @@ impl AppServer {
             .await
             {
                 Ok(v) => v,
-                Err(_) => {
-                    let _ = exit_tx.send(I32Exit(1));
+                Err(error) => {
+                    let _ = exit_tx.send(Err(AppRunError::new(format!(
+                        "Failed to start app {}: {error:#}",
+                        startup_shortname
+                    ))));
                     return;
                 }
             };
@@ -284,6 +290,7 @@ impl AppServer {
             > = None;
 
             loop {
+                let app_shortname = app.shortname.clone();
                 let state = AppState {
                     app,
                     ctx,
@@ -570,10 +577,13 @@ impl AppServer {
                 if let Some(Err(err)) = call_result {
                     match err.downcast::<wasmtime_wasi::I32Exit>() {
                         Ok(code) => {
-                            exit_code = code;
+                            exit_result = Ok(code);
                         }
                         Err(other) => {
-                            tracing::error!(error = %other, "Module errored");
+                            let error =
+                                AppRunError::new(format!("App {} trapped: {other:#}", app_shortname));
+                            tracing::error!(error = %error, "Module errored");
+                            exit_result = Err(error);
                         }
                     }
                 }
@@ -591,11 +601,22 @@ impl AppServer {
                     let next_app = match next_app {
                         NextAppState::Pending(next_app) => next_app
                             .await
-                            .unwrap_or(Err(NextAppPrepareErrorCode::Other)),
+                            .unwrap_or_else(|_| {
+                                Err(NextAppPrepareError::other(
+                                    "next app preload task closed unexpectedly",
+                                ))
+                            }),
                         NextAppState::Ready(next_app) => Ok(next_app),
-                        NextAppState::Failed(_) => break,
+                        NextAppState::Failed(error) => Err(error),
                     };
                     let Ok((next_app, next_instance_pre)) = next_app else {
+                        let Err(error) = next_app else { unreachable!() };
+                        let error = AppRunError::new(format!(
+                            "Failed to change app: {}",
+                            error.message()
+                        ));
+                        tracing::error!(error = %error, "App change failed");
+                        exit_result = Err(error);
                         break;
                     };
 
@@ -611,7 +632,7 @@ impl AppServer {
             }
 
             hard_shutdown_token.cancel();
-            let _ = exit_tx.send(exit_code);
+            let _ = exit_tx.send(exit_result);
         });
 
         exit_rx
@@ -1146,13 +1167,10 @@ impl AppServer {
                             Ok(next_app)
                         }
                         Err(err) => {
-                            tracing::warn!(error = %err, "change_app preload failed");
+                            let error = NextAppPrepareError::from_anyhow(err);
+                            tracing::warn!(error = %error.message(), "change_app preload failed");
                             has_next_app.store(false, Ordering::Release);
-                            if err.downcast_ref::<UnknownGameShortnameError>().is_some() {
-                                Err(NextAppPrepareErrorCode::UnknownShortname)
-                            } else {
-                                Err(NextAppPrepareErrorCode::Other)
-                            }
+                            Err(error)
                         }
                     };
                 let _ = tx.send(result);
@@ -1177,9 +1195,10 @@ impl AppServer {
                     caller.data_mut().next_app = Some(NextAppState::Ready(next_app));
                     Ok(NEXT_APP_READY_READY)
                 }
-                Ok(Err(error_code)) => {
-                    caller.data_mut().next_app = Some(NextAppState::Failed(error_code));
-                    Ok(error_code.to_i32())
+                Ok(Err(error)) => {
+                    let code = error.code.to_i32();
+                    caller.data_mut().next_app = Some(NextAppState::Failed(error));
+                    Ok(code)
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     caller.data_mut().next_app = Some(NextAppState::Pending(next_app_rx));
@@ -1193,9 +1212,10 @@ impl AppServer {
                 caller.data_mut().next_app = Some(NextAppState::Ready(next_app));
                 Ok(NEXT_APP_READY_READY)
             }
-            NextAppState::Failed(error_code) => {
-                caller.data_mut().next_app = Some(NextAppState::Failed(error_code));
-                Ok(error_code.to_i32())
+            NextAppState::Failed(error) => {
+                let code = error.code.to_i32();
+                caller.data_mut().next_app = Some(NextAppState::Failed(error));
+                Ok(code)
             }
         }
     }
@@ -1953,13 +1973,13 @@ pub struct AppState {
 enum NextAppState {
     Pending(tokio::sync::oneshot::Receiver<NextAppPrepareResult>),
     Ready((PreloadedAppState, wasmtime::InstancePre<AppState>)),
-    Failed(NextAppPrepareErrorCode),
+    Failed(NextAppPrepareError),
 }
 
 type NextAppPrepareResult =
-    Result<(PreloadedAppState, wasmtime::InstancePre<AppState>), NextAppPrepareErrorCode>;
+    Result<(PreloadedAppState, wasmtime::InstancePre<AppState>), NextAppPrepareError>;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum NextAppPrepareErrorCode {
     UnknownShortname,
     Other,
@@ -1973,6 +1993,56 @@ impl NextAppPrepareErrorCode {
         }
     }
 }
+
+#[derive(Debug)]
+struct NextAppPrepareError {
+    code: NextAppPrepareErrorCode,
+    message: String,
+}
+
+impl NextAppPrepareError {
+    fn other(message: impl Into<String>) -> Self {
+        Self {
+            code: NextAppPrepareErrorCode::Other,
+            message: message.into(),
+        }
+    }
+
+    fn from_anyhow(error: anyhow::Error) -> Self {
+        let code = if error.downcast_ref::<UnknownGameShortnameError>().is_some() {
+            NextAppPrepareErrorCode::UnknownShortname
+        } else {
+            NextAppPrepareErrorCode::Other
+        };
+        Self {
+            code,
+            message: format!("{error:#}"),
+        }
+    }
+
+    fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+#[derive(Debug)]
+pub struct AppRunError {
+    message: String,
+}
+
+impl AppRunError {
+    fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
+impl std::fmt::Display for AppRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AppRunError {}
 
 #[derive(Debug)]
 struct UnknownGameShortnameError(String);

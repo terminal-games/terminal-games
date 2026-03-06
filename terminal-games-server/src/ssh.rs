@@ -376,8 +376,16 @@ impl SshServer {
                     biased;
 
                     exit_code = &mut exit_rx => {
-                        if let Ok(exit_code) = exit_code {
-                            tracing::trace!(?exit_code, "App exited");
+                        match exit_code {
+                            Ok(Ok(exit_code)) => {
+                                tracing::trace!(?exit_code, "App exited");
+                            }
+                            Ok(Err(error)) => {
+                                tracing::error!(error = %error, "App failed");
+                            }
+                            Err(error) => {
+                                tracing::error!(?error, "App exit channel dropped");
+                            }
                         }
                         break;
                     }

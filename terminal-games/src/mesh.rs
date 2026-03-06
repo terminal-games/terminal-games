@@ -551,7 +551,7 @@ impl Mesh {
                     result = listener.accept() => {
                         match result {
                             Ok((stream, peer_addr)) => {
-                                tracing::info!(peer = %peer_addr, "Incoming mesh connection");
+                                tracing::trace!(peer = %peer_addr, "Incoming mesh connection");
                                 let inner2 = inner.clone();
                                 inner.tasks.spawn(async move {
                                     inner2.handle_connection(stream, peer_addr, None).await;
@@ -602,11 +602,11 @@ impl Mesh {
     }
 
     pub async fn graceful_shutdown(&self) {
-        tracing::info!("Mesh graceful shutdown initiated");
+        tracing::debug!("Mesh graceful shutdown initiated");
         self.inner.cancel.cancel();
         self.inner.tasks.close();
         self.inner.tasks.wait().await;
-        tracing::info!("Mesh graceful shutdown complete");
+        tracing::debug!("Mesh graceful shutdown complete");
     }
 }
 

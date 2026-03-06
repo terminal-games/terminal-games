@@ -430,8 +430,16 @@ async fn handle_socket(
         }
     });
 
-    if let Ok(exit_code) = exit_rx.await {
-        tracing::trace!(?exit_code, "App exited");
+    match exit_rx.await {
+        Ok(Ok(exit_code)) => {
+            tracing::trace!(?exit_code, "App exited");
+        }
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, "App failed");
+        }
+        Err(error) => {
+            tracing::error!(?error, "App exit channel dropped");
+        }
     }
 
     cancellation_token.cancel();
