@@ -18,7 +18,6 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
-use smallvec::SmallVec;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use terminal_games::{
@@ -276,7 +275,8 @@ async fn main() -> Result<()> {
         crossterm::cursor::Hide
     )?;
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel(1);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(12);
+    let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(crossterm::terminal::size()?);
 
@@ -311,6 +311,7 @@ async fn main() -> Result<()> {
     let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
         args: None,
         input_receiver: input_rx,
+        replay_request_receiver: replay_request_rx,
         output_sender: output_tx,
         audio_sender: audio_player.as_ref().map(|_| audio_tx),
         remote_sshid: "cli".to_string(),
@@ -333,10 +334,18 @@ async fn main() -> Result<()> {
             match stdin.lock().read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if buf[..n].contains(&0x03) {
+                    let data = &buf[..n];
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if data == b"\x03" {
+                        // CTRL+C
                         graceful_shutdown_token_input.cancel();
                     }
-                    if input_tx.blocking_send(SmallVec::from(&buf[..n])).is_err() {
+                    if data == b"\x12" || data == b"\x1b[27;5;114~" {
+                        let _ = replay_request_tx.try_send(());
+                    }
+                    if input_tx.blocking_send(data.into()).is_err() {
                         break;
                     }
                 }

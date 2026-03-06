@@ -327,7 +327,8 @@ async fn handle_socket(
     let remote_sshid = sanitize_user_agent(&user_agent);
     let username = "web".to_string();
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel(20);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(12);
+    let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(initial_size);
     let cancellation_token = CancellationToken::new();
     let token = cancellation_token.clone();
@@ -343,6 +344,7 @@ async fn handle_socket(
         first_app_shortname,
         args,
         input_receiver: input_rx,
+        replay_request_receiver: replay_request_rx,
         output_sender: output_tx,
         audio_sender: Some(audio_tx),
         remote_sshid,
@@ -397,7 +399,14 @@ async fn handle_socket(
         while let Some(msg) = receiver.next().await {
             match msg {
                 Ok(Message::Binary(data)) => {
-                    let data: smallvec::SmallVec<[u8; 16]> = data.as_ref().into();
+                    let mut data: smallvec::SmallVec<[u8; 16]> = data.as_ref().into();
+                    if data.contains(&0x12) {
+                        let _ = replay_request_tx.try_send(());
+                        data.retain(|b| *b != 0x12);
+                    }
+                    if data.is_empty() {
+                        continue;
+                    }
                     if input_tx.send(data).await.is_err() {
                         break;
                     }
