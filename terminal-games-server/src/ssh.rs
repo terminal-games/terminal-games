@@ -300,8 +300,8 @@ impl SshServer {
                 }
             }
 
-            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(8);
-            let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
+            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
+            let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
             if admission_controller.should_require_captcha() {
                 let captcha = generate_captcha(7);
                 if !solve_captcha(

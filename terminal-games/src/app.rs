@@ -15,7 +15,6 @@ use std::{
     u64,
 };
 
-use futures::stream::{FuturesUnordered, StreamExt};
 use hex::ToHex;
 use ipnet::{Ipv4Net, Ipv6Net};
 use rustls_platform_verifier::BuilderVerifierExt;
@@ -82,6 +81,12 @@ const MENU_POLL_ERR_INVALID_REQUEST_ID: i32 = -2;
 const MENU_POLL_ERR_BUFFER_TOO_SMALL: i32 = -4;
 const MENU_POLL_ERR_REQUEST_FAILED: i32 = -5;
 
+const MENU_REQ_GAMES_LIST: i32 = 0;
+const MENU_REQ_PROFILE_GET: i32 = 1;
+const MENU_REQ_PROFILE_SET: i32 = 2;
+const MENU_REQ_REPLAYS_LIST: i32 = 3;
+const MENU_REQ_REPLAY_DELETE: i32 = 4;
+
 const NEXT_APP_READY_READY: i32 = 1;
 const NEXT_APP_READY_NOT_READY: i32 = 0;
 const NEXT_APP_READY_ERR_UNKNOWN_SHORTNAME: i32 = -1;
@@ -92,7 +97,7 @@ pub struct AppServer {
     engine: wasmtime::Engine,
     pub db: libsql::Connection,
     mesh: Mesh,
-    module_cache: Arc<tokio::sync::RwLock<HashMap<u64, Arc<wasmtime::Module>>>>,
+    module_cache: Arc<tokio::sync::RwLock<HashMap<u64, wasmtime::Module>>>,
 }
 
 pub struct AppInstantiationParams {
@@ -148,31 +153,7 @@ impl AppServer {
         linker.func_wrap("terminal_games", "terminal_info", Self::host_terminal_info)?;
         linker.func_wrap("terminal_games", "audio_write", Self::audio_write)?;
         linker.func_wrap("terminal_games", "audio_info", Self::audio_info)?;
-        linker.func_wrap(
-            "terminal_games",
-            "menu_games_list_start",
-            Self::menu_games_list_start,
-        )?;
-        linker.func_wrap(
-            "terminal_games",
-            "menu_profile_get_start",
-            Self::menu_profile_get_start,
-        )?;
-        linker.func_wrap(
-            "terminal_games",
-            "menu_profile_set_start",
-            Self::menu_profile_set_start,
-        )?;
-        linker.func_wrap(
-            "terminal_games",
-            "menu_replays_list_start",
-            Self::menu_replays_list_start,
-        )?;
-        linker.func_wrap(
-            "terminal_games",
-            "menu_replay_delete_start",
-            Self::menu_replay_delete_start,
-        )?;
+        linker.func_wrap("terminal_games", "menu_request", Self::menu_request)?;
         linker.func_wrap("terminal_games", "menu_poll", Self::menu_poll)?;
 
         Ok(Self {
@@ -198,16 +179,23 @@ impl AppServer {
         let module_cache = self.module_cache.clone();
 
         tokio::task::spawn(async move {
-            let mut input_receiver = params.input_receiver;
-            let mut replay_request_receiver = params.replay_request_receiver;
-            let mut window_size_receiver = params.window_size_receiver;
-            let output_sender = params.output_sender;
-            let network_info = params.network_info.clone();
-            let terminal_profile = params.terminal_profile;
-            let term = params.term.clone();
-            let user_id = params.user_id;
-            let first_app_shortname = params.first_app_shortname;
-            let mut graceful_shutdown_token = params.graceful_shutdown_token;
+            let AppInstantiationParams {
+                mut input_receiver,
+                mut replay_request_receiver,
+                output_sender,
+                audio_sender,
+                mut window_size_receiver,
+                mut graceful_shutdown_token,
+                username,
+                remote_sshid,
+                term,
+                args: _args,
+                network_info,
+                terminal_profile,
+                first_app_shortname,
+                user_id,
+                locale,
+            } = params;
 
             let (first_cols, first_rows) = *window_size_receiver.borrow();
             let mut terminal = headless_terminal::Parser::new(first_rows, first_cols, 0);
@@ -220,8 +208,8 @@ impl AppServer {
             let has_next_app_shortname = Arc::new(AtomicBool::new(false));
             let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(1);
 
-            let audio_enabled = params.audio_sender.is_some();
-            let mut audio = if let Some(audio_tx) = params.audio_sender {
+            let audio_enabled = audio_sender.is_some();
+            let mut maybe_mixer = if let Some(audio_tx) = audio_sender {
                 match Mixer::new(audio_tx) {
                     Ok(mixer) => Some(mixer),
                     Err(error) => {
@@ -234,35 +222,43 @@ impl AppServer {
             };
 
             let mut exit_code = I32Exit(0);
-            let (menu_future_tx, mut menu_future_rx) = mpsc::channel(MAX_MENU_REQUESTS);
+            let (mut menu_request_tx, mut menu_request_rx) =
+                mpsc::channel::<MenuRequestJob>(MAX_MENU_REQUESTS);
+            let (menu_result_tx, mut menu_result_rx) =
+                mpsc::channel::<(usize, Result<Vec<u8>, String>, MenuUpdate)>(MAX_MENU_REQUESTS);
+            let (menu_completed_tx, mut menu_completed_rx) =
+                mpsc::channel::<(usize, Result<Vec<u8>, String>)>(MAX_MENU_REQUESTS);
             let mut menu_session = MenuSessionState {
-                locale: params.locale.clone(),
+                locale: locale.clone(),
                 replays: Vec::new(),
             };
-            let mut menu_username = params.username;
+            let mut menu_username = username;
             let mut ctx = AppContext {
                 db: db.clone(),
                 linker,
                 mesh,
                 module_cache,
                 app_output_sender,
-                remote_sshid: params.remote_sshid,
+                remote_sshid,
                 term,
                 audio_enabled,
                 user_id,
-                locale: params.locale,
-                menu_session: menu_session.clone(),
-                menu_username: menu_username.clone(),
-                menu_future_tx: menu_future_tx.clone(),
+                locale,
             };
-            let (mut app, mut instance_pre) =
-                match Self::prepare_instantiate(&ctx, first_app_shortname).await {
-                    Ok(v) => v,
-                    Err(_) => {
-                        let _ = exit_tx.send(I32Exit(1));
-                        return;
-                    }
-                };
+            let (mut app, mut instance_pre) = match Self::prepare_instantiate(
+                &ctx,
+                &menu_session,
+                &menu_username,
+                first_app_shortname,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(_) => {
+                    let _ = exit_tx.send(I32Exit(1));
+                    return;
+                }
+            };
 
             let mut replay_buffer = ReplayBuffer::new(
                 first_cols,
@@ -284,12 +280,8 @@ impl AppServer {
             let mut replay_last_at = Duration::ZERO;
             let mut replay_requests_open = true;
             let mut pending_replay_upload: Option<
-                Pin<Box<dyn Future<Output = (String, Option<MenuSessionState>)> + Send>>,
+                tokio::sync::oneshot::Receiver<(String, Option<MenuSessionState>)>,
             > = None;
-            let mut menu_futures: FuturesUnordered<MenuFutureWrapper> = FuturesUnordered::new();
-            let completed_menu_results: Arc<
-                std::sync::Mutex<HashMap<usize, Result<Vec<u8>, String>>>,
-            > = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
             loop {
                 let state = AppState {
@@ -297,7 +289,11 @@ impl AppServer {
                     ctx,
                     conn_manager: ConnectionManager::default(),
                     menu_requests: Vec::with_capacity(MAX_MENU_REQUESTS),
-                    completed_menu_results: completed_menu_results.clone(),
+                    completed_menu_results: HashMap::new(),
+                    menu_completed_rx,
+                    menu_request_tx,
+                    menu_session: menu_session.clone(),
+                    menu_username: menu_username.clone(),
                     limits: AppLimiter::default(),
                     next_app: None,
                     input_receiver,
@@ -305,7 +301,7 @@ impl AppServer {
                     graceful_shutdown_token: graceful_shutdown_token.clone(),
                     network_info: network_info.clone(),
                     terminal_profile,
-                    audio,
+                    audio: maybe_mixer,
                     terminal_snapshot: terminal_snapshot.clone(),
                 };
 
@@ -422,15 +418,9 @@ impl AppServer {
                                 }
                             }
 
-                            msg = menu_future_rx.recv() => {
-                                if let Some((request_id, future)) = msg {
-                                    menu_futures.push(MenuFutureWrapper { request_id, future });
-                                }
-                            }
-
-                            completion = menu_futures.next(), if !menu_futures.is_empty() => {
-                                if let Some((request_id, result, update)) = completion {
-                                    completed_menu_results.lock().unwrap().insert(request_id, result);
+                            msg = menu_result_rx.recv() => {
+                                if let Some((request_id, result, update)) = msg {
+                                    let _ = menu_completed_tx.try_send((request_id, result));
                                     if let Some(username) = update.username {
                                         menu_username = username;
                                         status_bar.set_username(&menu_username);
@@ -451,6 +441,50 @@ impl AppServer {
                                         }
                                     }
                                 }
+                            }
+
+                            request = menu_request_rx.recv() => {
+                                let Some(request) = request else { continue };
+                                let db = db.clone();
+                                let menu_result_tx = menu_result_tx.clone();
+                                let menu_session = menu_session.clone();
+                                let menu_username = menu_username.clone();
+                                tokio::spawn(async move {
+                                    let (result, update) = match request.kind {
+                                        MenuRequestKind::GamesList { current_shortname } => {
+                                            let result = Self::load_menu_games(db, current_shortname).await;
+                                            (result, MenuUpdate::default())
+                                        }
+                                        MenuRequestKind::ProfileGet => {
+                                            Self::load_menu_profile(
+                                                db,
+                                                user_id,
+                                                menu_session,
+                                                menu_username,
+                                            )
+                                            .await
+                                        }
+                                        MenuRequestKind::ProfileSet { username, locale } => {
+                                            Self::save_menu_profile(
+                                                db,
+                                                user_id,
+                                                menu_session,
+                                                username,
+                                                locale,
+                                            )
+                                            .await
+                                        }
+                                        MenuRequestKind::ReplaysList { locale } => {
+                                            Self::load_menu_replays(db, user_id, menu_session, locale).await
+                                        }
+                                        MenuRequestKind::ReplayDelete { created_at } => {
+                                            Self::delete_menu_replay(db, user_id, menu_session, created_at).await
+                                        }
+                                    };
+                                    let _ = menu_result_tx
+                                        .send((request.request_id, result, update))
+                                        .await;
+                                });
                             }
 
                             replay_req = replay_request_receiver.recv(), if replay_requests_open => {
@@ -479,7 +513,8 @@ impl AppServer {
                                 let db = db.clone();
                                 let menu_session = menu_session.clone();
                                 let username = menu_username.clone();
-                                pending_replay_upload = Some(Box::pin(async move {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                tokio::spawn(async move {
                                     let (notif, session_update) = save_replay(
                                         &db,
                                         menu_session,
@@ -499,8 +534,9 @@ impl AppServer {
                                         }
                                         Err(e) => format!(" {} ", e),
                                     };
-                                    (notif, session_update)
-                                }));
+                                    let _ = tx.send((notif, session_update));
+                                });
+                                pending_replay_upload = Some(rx);
                             }
 
                             _ = graceful_shutdown_token.cancelled(), if graceful_shutdown_timeout.is_none() => {
@@ -518,7 +554,10 @@ impl AppServer {
                                 pending_replay_upload.as_mut().expect("guarded by select").await
                             }, if pending_replay_upload.is_some() => {
                                 pending_replay_upload = None;
-                                let (notif, session_update) = notification;
+                                let (notif, session_update) = match notification {
+                                    Ok(v) => v,
+                                    Err(_) => (" Failed to upload replay. ".to_string(), None),
+                                };
                                 if let Some(session) = session_update {
                                     menu_session = session;
                                 }
@@ -540,13 +579,13 @@ impl AppServer {
                 }
 
                 let mut state = store.into_data();
+                menu_completed_rx = state.menu_completed_rx;
+                menu_request_tx = state.menu_request_tx;
                 graceful_shutdown_token = state.graceful_shutdown_token;
                 input_receiver = state.input_receiver;
                 terminal_snapshot = state.terminal_snapshot;
-                audio = state.audio;
+                maybe_mixer = state.audio;
                 ctx = state.ctx;
-                ctx.menu_session = menu_session.clone();
-                ctx.menu_username = menu_username.clone();
 
                 if let Some(next_app) = state.next_app.take() {
                     let next_app = match next_app {
@@ -580,6 +619,8 @@ impl AppServer {
 
     async fn prepare_instantiate(
         ctx: &AppContext,
+        menu_session: &MenuSessionState,
+        menu_username: &str,
         shortname: String,
     ) -> anyhow::Result<(PreloadedAppState, wasmtime::InstancePre<AppState>)> {
         let mut app_id_rows = ctx
@@ -608,10 +649,10 @@ impl AppServer {
             envs.push((name, value));
         }
         envs.push(("REMOTE_SSHID".to_string(), ctx.remote_sshid.clone()));
-        let username = ctx.menu_username.clone();
+        let username = menu_username.to_string();
         let mut locale = ctx.locale.clone();
-        if !ctx.menu_session.locale.is_empty() {
-            locale = ctx.menu_session.locale.clone();
+        if !menu_session.locale.is_empty() {
+            locale = menu_session.locale.clone();
         }
         envs.push(("USERNAME".to_string(), username));
         envs.push(("PEER_ID".to_string(), peer_id.to_bytes().encode_hex()));
@@ -681,7 +722,7 @@ impl AppServer {
         ctx: &AppContext,
         app_id: u64,
         wasm_path: &str,
-    ) -> anyhow::Result<Arc<wasmtime::Module>> {
+    ) -> anyhow::Result<wasmtime::Module> {
         {
             let cache = ctx.module_cache.read().await;
             if let Some(module) = cache.get(&app_id) {
@@ -689,9 +730,9 @@ impl AppServer {
             }
         }
 
-        let module = Arc::new(wasmtime::Module::from_file(ctx.linker.engine(), wasm_path)?);
+        let module = wasmtime::Module::from_file(ctx.linker.engine(), wasm_path)?;
         let mut cache = ctx.module_cache.write().await;
-        let entry = cache.entry(app_id).or_insert_with(|| module.clone());
+        let entry = cache.entry(app_id).or_insert(module);
         Ok(entry.clone())
     }
 
@@ -1091,24 +1132,29 @@ impl AppServer {
         if should_prepare {
             has_next_app.store(false, Ordering::Release);
             let ctx = caller.data().ctx.clone();
+            let menu_session = caller.data().menu_session.clone();
+            let menu_username = caller.data().menu_username.clone();
             let (tx, rx) = tokio::sync::oneshot::channel();
             caller.data_mut().next_app = Some(NextAppState::Pending(rx));
             tokio::task::spawn(async move {
-                let result = match Self::prepare_instantiate(&ctx, shortname).await {
-                    Ok(next_app) => {
-                        has_next_app.store(true, Ordering::Release);
-                        Ok(next_app)
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "change_app preload failed");
-                        has_next_app.store(false, Ordering::Release);
-                        if err.downcast_ref::<UnknownGameShortnameError>().is_some() {
-                            Err(NextAppPrepareErrorCode::UnknownShortname)
-                        } else {
-                            Err(NextAppPrepareErrorCode::Other)
+                let result =
+                    match Self::prepare_instantiate(&ctx, &menu_session, &menu_username, shortname)
+                        .await
+                    {
+                        Ok(next_app) => {
+                            has_next_app.store(true, Ordering::Release);
+                            Ok(next_app)
                         }
-                    }
-                };
+                        Err(err) => {
+                            tracing::warn!(error = %err, "change_app preload failed");
+                            has_next_app.store(false, Ordering::Release);
+                            if err.downcast_ref::<UnknownGameShortnameError>().is_some() {
+                                Err(NextAppPrepareErrorCode::UnknownShortname)
+                            } else {
+                                Err(NextAppPrepareErrorCode::Other)
+                            }
+                        }
+                    };
                 let _ = tx.send(result);
             });
         }
@@ -1299,138 +1345,94 @@ impl AppServer {
         })
     }
 
-    fn menu_games_list_start(mut caller: wasmtime::Caller<'_, AppState>) -> wasmtime::Result<i32> {
-        if caller.data().app.shortname != "menu" {
-            return Ok(MENU_REQ_ERR_NOT_MENU_APP);
-        }
-        let db = caller.data().ctx.db.clone();
-        let current_shortname = caller.data().app.shortname.clone();
-        let tx = caller.data().ctx.menu_future_tx.clone();
-        let request_id = Self::insert_menu_request_pending(caller.data_mut());
-        if request_id < 0 {
-            return Ok(request_id);
-        }
-        let future = async move {
-            let result = Self::load_menu_games(db, current_shortname).await;
-            (result, MenuUpdate::default())
-        };
-        let _ = tx.try_send((request_id as usize, Box::pin(future)));
-        Ok(request_id)
-    }
-
-    fn menu_profile_get_start(mut caller: wasmtime::Caller<'_, AppState>) -> wasmtime::Result<i32> {
-        if caller.data().app.shortname != "menu" {
-            return Ok(MENU_REQ_ERR_NOT_MENU_APP);
-        }
-        let db = caller.data().ctx.db.clone();
-        let user_id = caller.data().ctx.user_id;
-        let menu_session = caller.data().ctx.menu_session.clone();
-        let menu_username = caller.data().ctx.menu_username.clone();
-        let tx = caller.data().ctx.menu_future_tx.clone();
-        let request_id = Self::insert_menu_request_pending(caller.data_mut());
-        if request_id < 0 {
-            return Ok(request_id);
-        }
-        let future =
-            async move { Self::load_menu_profile(db, user_id, menu_session, menu_username).await };
-        let _ = tx.try_send((request_id as usize, Box::pin(future)));
-        Ok(request_id)
-    }
-
-    fn menu_profile_set_start(
+    fn menu_request(
         mut caller: wasmtime::Caller<'_, AppState>,
-        username_ptr: i32,
-        username_len: u32,
-        locale_ptr: i32,
-        locale_len: u32,
+        typ: i32,
+        ptr1: i32,
+        len1: u32,
+        ptr2: i32,
+        len2: u32,
+        extra: i64,
     ) -> wasmtime::Result<i32> {
         if caller.data().app.shortname != "menu" {
             return Ok(MENU_REQ_ERR_NOT_MENU_APP);
         }
-        if username_len > 1024 || locale_len > 1024 {
-            return Ok(MENU_REQ_ERR_INVALID_INPUT);
-        }
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            wasmtime::bail!("menu_profile_set_start: failed to find host memory");
-        };
-        let mut username_bytes = vec![0u8; username_len as usize];
-        let mut locale_bytes = vec![0u8; locale_len as usize];
-        mem.read(&caller, username_ptr as usize, &mut username_bytes)?;
-        mem.read(&caller, locale_ptr as usize, &mut locale_bytes)?;
-        let Ok(username) = String::from_utf8(username_bytes) else {
-            return Ok(MENU_REQ_ERR_INVALID_INPUT);
-        };
-        let Ok(locale) = String::from_utf8(locale_bytes) else {
-            return Ok(MENU_REQ_ERR_INVALID_INPUT);
-        };
-
-        let db = caller.data().ctx.db.clone();
-        let user_id = caller.data().ctx.user_id;
-        let menu_session = caller.data().ctx.menu_session.clone();
-        let tx = caller.data().ctx.menu_future_tx.clone();
         let request_id = Self::insert_menu_request_pending(caller.data_mut());
         if request_id < 0 {
             return Ok(request_id);
         }
-        let future = async move {
-            Self::save_menu_profile(db, user_id, menu_session, username, locale).await
-        };
-        let _ = tx.try_send((request_id as usize, Box::pin(future)));
-        Ok(request_id)
-    }
+        let request_id_u = request_id as usize;
 
-    fn menu_replays_list_start(
-        mut caller: wasmtime::Caller<'_, AppState>,
-        locale_ptr: i32,
-        locale_len: u32,
-    ) -> wasmtime::Result<i32> {
-        if caller.data().app.shortname != "menu" {
-            return Ok(MENU_REQ_ERR_NOT_MENU_APP);
-        }
-        if locale_len > 64 {
-            return Ok(MENU_REQ_ERR_INVALID_INPUT);
-        }
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            wasmtime::bail!("menu_replays_list_start: failed to find host memory");
-        };
-        let mut locale_bytes = vec![0u8; locale_len as usize];
-        mem.read(&caller, locale_ptr as usize, &mut locale_bytes)?;
-        let Ok(locale) = String::from_utf8(locale_bytes) else {
-            return Ok(MENU_REQ_ERR_INVALID_INPUT);
+        let request = match typ {
+            MENU_REQ_GAMES_LIST => MenuRequestJob {
+                request_id: request_id_u,
+                kind: MenuRequestKind::GamesList {
+                    current_shortname: caller.data().app.shortname.clone(),
+                },
+            },
+            MENU_REQ_PROFILE_GET => MenuRequestJob {
+                request_id: request_id_u,
+                kind: MenuRequestKind::ProfileGet,
+            },
+            MENU_REQ_PROFILE_SET => {
+                if len1 > 1024 || len2 > 1024 {
+                    caller.data_mut().menu_requests[request_id_u] = None;
+                    return Ok(MENU_REQ_ERR_INVALID_INPUT);
+                }
+                let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                    wasmtime::bail!("menu_request: failed to find host memory");
+                };
+                let mut username_bytes = vec![0u8; len1 as usize];
+                let mut locale_bytes = vec![0u8; len2 as usize];
+                mem.read(&caller, ptr1 as usize, &mut username_bytes)?;
+                mem.read(&caller, ptr2 as usize, &mut locale_bytes)?;
+                let Ok(username) = String::from_utf8(username_bytes) else {
+                    caller.data_mut().menu_requests[request_id_u] = None;
+                    return Ok(MENU_REQ_ERR_INVALID_INPUT);
+                };
+                let Ok(locale) = String::from_utf8(locale_bytes) else {
+                    caller.data_mut().menu_requests[request_id_u] = None;
+                    return Ok(MENU_REQ_ERR_INVALID_INPUT);
+                };
+                MenuRequestJob {
+                    request_id: request_id_u,
+                    kind: MenuRequestKind::ProfileSet { username, locale },
+                }
+            }
+            MENU_REQ_REPLAYS_LIST => {
+                if len1 > 64 {
+                    caller.data_mut().menu_requests[request_id_u] = None;
+                    return Ok(MENU_REQ_ERR_INVALID_INPUT);
+                }
+                let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                    wasmtime::bail!("menu_request: failed to find host memory");
+                };
+                let mut locale_bytes = vec![0u8; len1 as usize];
+                mem.read(&caller, ptr1 as usize, &mut locale_bytes)?;
+                let Ok(locale) = String::from_utf8(locale_bytes) else {
+                    caller.data_mut().menu_requests[request_id_u] = None;
+                    return Ok(MENU_REQ_ERR_INVALID_INPUT);
+                };
+                MenuRequestJob {
+                    request_id: request_id_u,
+                    kind: MenuRequestKind::ReplaysList { locale },
+                }
+            }
+            MENU_REQ_REPLAY_DELETE => MenuRequestJob {
+                request_id: request_id_u,
+                kind: MenuRequestKind::ReplayDelete { created_at: extra },
+            },
+            _ => {
+                caller.data_mut().menu_requests[request_id_u] = None;
+                return Ok(MENU_REQ_ERR_INVALID_INPUT);
+            }
         };
 
-        let db = caller.data().ctx.db.clone();
-        let user_id = caller.data().ctx.user_id;
-        let menu_session = caller.data().ctx.menu_session.clone();
-        let tx = caller.data().ctx.menu_future_tx.clone();
-        let request_id = Self::insert_menu_request_pending(caller.data_mut());
-        if request_id < 0 {
-            return Ok(request_id);
+        if caller.data().menu_request_tx.try_send(request).is_err() {
+            caller.data_mut().menu_requests[request_id_u] = None;
+            return Ok(MENU_REQ_ERR_TOO_MANY_REQUESTS);
         }
-        let future =
-            async move { Self::load_menu_replays(db, user_id, menu_session, locale).await };
-        let _ = tx.try_send((request_id as usize, Box::pin(future)));
-        Ok(request_id)
-    }
 
-    fn menu_replay_delete_start(
-        mut caller: wasmtime::Caller<'_, AppState>,
-        created_at: i64,
-    ) -> wasmtime::Result<i32> {
-        if caller.data().app.shortname != "menu" {
-            return Ok(MENU_REQ_ERR_NOT_MENU_APP);
-        }
-        let db = caller.data().ctx.db.clone();
-        let user_id = caller.data().ctx.user_id;
-        let menu_session = caller.data().ctx.menu_session.clone();
-        let tx = caller.data().ctx.menu_future_tx.clone();
-        let request_id = Self::insert_menu_request_pending(caller.data_mut());
-        if request_id < 0 {
-            return Ok(request_id);
-        }
-        let future =
-            async move { Self::delete_menu_replay(db, user_id, menu_session, created_at).await };
-        let _ = tx.try_send((request_id as usize, Box::pin(future)));
         Ok(request_id)
     }
 
@@ -1450,12 +1452,10 @@ impl AppServer {
             }
         }
 
-        let completed_result = caller
-            .data()
-            .completed_menu_results
-            .lock()
-            .unwrap()
-            .remove(&request_id);
+        while let Ok((id, r)) = caller.data_mut().menu_completed_rx.try_recv() {
+            caller.data_mut().completed_menu_results.insert(id, r);
+        }
+        let completed_result = caller.data_mut().completed_menu_results.remove(&request_id);
         if let Some(result) = completed_result {
             caller.data_mut().menu_requests[request_id] = Some(PendingMenuRequest {
                 state: MenuRequestState::Complete(result.map(Vec::into_boxed_slice)),
@@ -1923,16 +1923,10 @@ pub struct AppContext {
     audio_enabled: bool,
     term: Option<String>,
     linker: Arc<wasmtime::Linker<AppState>>,
-    module_cache: Arc<tokio::sync::RwLock<HashMap<u64, Arc<wasmtime::Module>>>>,
+    module_cache: Arc<tokio::sync::RwLock<HashMap<u64, wasmtime::Module>>>,
     app_output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     user_id: Option<u64>,
     locale: String,
-    menu_session: MenuSessionState,
-    menu_username: String,
-    menu_future_tx: mpsc::Sender<(
-        usize,
-        Pin<Box<dyn std::future::Future<Output = (Result<Vec<u8>, String>, MenuUpdate)> + Send>>,
-    )>,
 }
 
 pub struct AppState {
@@ -1940,7 +1934,11 @@ pub struct AppState {
     ctx: AppContext,
     conn_manager: ConnectionManager,
     menu_requests: Vec<Option<PendingMenuRequest>>,
-    completed_menu_results: Arc<std::sync::Mutex<HashMap<usize, Result<Vec<u8>, String>>>>,
+    completed_menu_results: HashMap<usize, Result<Vec<u8>, String>>,
+    menu_completed_rx: mpsc::Receiver<(usize, Result<Vec<u8>, String>)>,
+    menu_request_tx: mpsc::Sender<MenuRequestJob>,
+    menu_session: MenuSessionState,
+    menu_username: String,
     limits: AppLimiter,
     next_app: Option<NextAppState>,
     has_next_app: Arc<AtomicBool>,
@@ -2142,21 +2140,18 @@ pub struct MenuSessionState {
     pub replays: Vec<SessionReplay>,
 }
 
-struct MenuFutureWrapper {
-    request_id: usize,
-    future:
-        Pin<Box<dyn std::future::Future<Output = (Result<Vec<u8>, String>, MenuUpdate)> + Send>>,
+#[derive(Clone)]
+enum MenuRequestKind {
+    GamesList { current_shortname: String },
+    ProfileGet,
+    ProfileSet { username: String, locale: String },
+    ReplaysList { locale: String },
+    ReplayDelete { created_at: i64 },
 }
 
-impl std::future::Future for MenuFutureWrapper {
-    type Output = (usize, Result<Vec<u8>, String>, MenuUpdate);
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.future.as_mut().poll(cx) {
-            Poll::Ready((result, update)) => Poll::Ready((self.request_id, result, update)),
-            Poll::Pending => Poll::Pending,
-        }
-    }
+struct MenuRequestJob {
+    request_id: usize,
+    kind: MenuRequestKind,
 }
 
 struct MenuUpdate {

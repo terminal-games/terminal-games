@@ -334,7 +334,7 @@ async fn handle_socket(
     let token = cancellation_token.clone();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
-    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
     let admission_ticket = server.admission_controller.issue_ticket();
     if !wait_for_admission(&mut sender, &mut receiver, &resize_tx, &admission_ticket).await {
         return;
