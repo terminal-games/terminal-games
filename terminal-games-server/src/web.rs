@@ -43,6 +43,7 @@ use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
 use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
 
@@ -356,6 +357,7 @@ async fn handle_socket(
         terminal_profile: TerminalProfile::web_default(),
         user_id: None,
         locale,
+        log_backend: Arc::new(NoopLogBackend),
     });
 
     let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel(1);

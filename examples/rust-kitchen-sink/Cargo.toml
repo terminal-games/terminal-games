@@ -11,6 +11,7 @@ hyper-util = { version = "0.1", default-features = false, features = [
     "http1",
     "http2",
 ] }
+log = "0.4"
 ratatui = { version = "0.30", default-features = false }
 tachyonfx = { version = "0.22", default-features = false, features = ["wasm"] }
 terminal-games-sdk = { path = "../../terminal-games-sdk", features = [

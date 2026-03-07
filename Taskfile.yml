@@ -23,6 +23,10 @@ tasks:
     cmds:
       - CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -o ./examples/kitchen-sink/kitchen-sink.wasm ./examples/kitchen-sink
       - cargo run --release -p terminal-games-cli -- ./examples/kitchen-sink/kitchen-sink.wasm
+  rust-kitchen-sink:
+    cmds:
+      - cargo build --manifest-path examples/rust-kitchen-sink/Cargo.toml --target wasm32-wasip1 --release
+      - cargo run --release -p terminal-games-cli -- ./target/wasm32-wasip1/release/rust-kitchen-sink.wasm
   menu:
     cmds:
       - CGO_ENABLED=0 GOOS=wasip1 GOARCH=wasm go build -o ./cmd/menu/menu.wasm ./cmd/menu
