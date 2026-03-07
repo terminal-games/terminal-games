@@ -5,6 +5,7 @@
 pub mod ansi_backend;
 pub mod app;
 pub mod audio;
+pub mod log;
 pub mod peer;
 pub mod terminal;
 
@@ -81,5 +82,7 @@ mod internal {
             pts_ptr: *mut u64,
             buffer_available_ptr: *mut u32,
         ) -> i32;
+
+        pub(crate) fn log(level: u32, msg_ptr: *const u8, msg_len: u32) -> i32;
     }
 }

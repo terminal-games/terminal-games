@@ -14,6 +14,7 @@ use russh::{Channel, ChannelId, Pty};
 use tokio_util::sync::CancellationToken;
 
 use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::palette;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
@@ -370,6 +371,7 @@ impl SshServer {
                 terminal_profile,
                 user_id,
                 locale,
+                log_backend: Arc::new(NoopLogBackend),
             });
             loop {
                 tokio::select! {

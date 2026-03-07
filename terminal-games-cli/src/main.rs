@@ -19,14 +19,16 @@ use clap::Parser;
 use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
+use tracing_subscriber::{Layer, filter::LevelFilter, layer::SubscriberExt};
 
 use terminal_games::{
     app::{AppInstantiationParams, AppServer},
+    log_backend::{GuestLogBackend, LogLevel},
     mesh::{LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
     terminal_profile::TerminalProfile,
 };
-use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
 #[command(about = "Run a terminal game from a wasm file")]
@@ -51,29 +53,82 @@ struct Args {
     jitter: u64,
 
     /// Bandwidth token bucket refill rate in bytes per second (default: 50000)
-    #[arg(long, default_value = "50000")]
+    #[arg(long, default_value = "65536")]
     bandwidth: u64,
 
     /// Bandwidth token bucket capacity in bytes (default: 100000)
-    #[arg(long, default_value = "100000")]
+    #[arg(long, default_value = "131072")]
     bandwidth_capacity: u64,
 
     /// Disable audio playback
     #[arg(long)]
     no_audio: bool,
 
-    /// Log verbosity level (off, error, warn, info, debug, trace)
-    #[arg(long, default_value = "warn")]
-    log_level: tracing::Level,
+    /// Log level for the game/app (off, error, warn, info, debug, trace). Only the guest app's logs.
+    #[arg(long = "app-log-level", default_value = "info")]
+    app_log_level: LogLevelFilter,
+
+    /// Log level for the platform (terminal-games, CLI). Other crates stay off.
+    #[arg(long = "platform-log-level", default_value = "warn")]
+    platform_log_level: LogLevelFilter,
 
     /// Username for CLI auth (default: $USER)
     #[arg(long)]
     username: Option<String>,
 }
 
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LogLevelFilter {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
 
-impl Write for LogBuffer {
+impl From<LogLevelFilter> for tracing_subscriber::filter::LevelFilter {
+    fn from(f: LogLevelFilter) -> Self {
+        use tracing_subscriber::filter::LevelFilter;
+        match f {
+            LogLevelFilter::Off => LevelFilter::OFF,
+            LogLevelFilter::Error => LevelFilter::ERROR,
+            LogLevelFilter::Warn => LevelFilter::WARN,
+            LogLevelFilter::Info => LevelFilter::INFO,
+            LogLevelFilter::Debug => LevelFilter::DEBUG,
+            LogLevelFilter::Trace => LevelFilter::TRACE,
+        }
+    }
+}
+
+struct BufferedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+struct FlushGuard(Arc<Mutex<Vec<u8>>>);
+
+impl BufferedLogWriter {
+    fn new() -> (Self, FlushGuard) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        (Self(buf.clone()), FlushGuard(buf))
+    }
+}
+
+impl Clone for BufferedLogWriter {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        let logs = match self.0.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let _ = std::io::stderr().write_all(&logs);
+    }
+}
+
+impl Write for BufferedLogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut locked = match self.0.lock() {
             Ok(locked) => locked,
@@ -84,6 +139,50 @@ impl Write for LogBuffer {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+struct TracingLogBackend;
+
+impl GuestLogBackend for TracingLogBackend {
+    fn log(&self, shortname: &str, user_id: Option<u64>, level: LogLevel, message: &str) {
+        match level {
+            LogLevel::Trace => tracing::trace!(
+                target: "terminal_games_guest",
+                shortname = %shortname,
+                user_id = ?user_id,
+                "{}",
+                message
+            ),
+            LogLevel::Debug => tracing::debug!(
+                target: "terminal_games_guest",
+                shortname = %shortname,
+                user_id = ?user_id,
+                "{}",
+                message
+            ),
+            LogLevel::Info => tracing::info!(
+                target: "terminal_games_guest",
+                shortname = %shortname,
+                user_id = ?user_id,
+                "{}",
+                message
+            ),
+            LogLevel::Warn => tracing::warn!(
+                target: "terminal_games_guest",
+                shortname = %shortname,
+                user_id = ?user_id,
+                "{}",
+                message
+            ),
+            LogLevel::Error => tracing::error!(
+                target: "terminal_games_guest",
+                shortname = %shortname,
+                user_id = ?user_id,
+                "{}",
+                message
+            ),
+        }
     }
 }
 
@@ -140,16 +239,17 @@ async fn upsert_game(
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let log_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let log_buffer_writer = log_buffer.clone();
+    let (log_writer, _flush_guard) = BufferedLogWriter::new();
+    let app_filter: LevelFilter = args.app_log_level.into();
+    let platform_filter: LevelFilter = args.platform_log_level.into();
     let filter = tracing_subscriber::filter::Targets::new()
-        .with_target("terminal_games", args.log_level)
-        .with_target("terminal_games_cli", args.log_level)
-        .with_default(tracing::Level::WARN);
-    use tracing_subscriber::{Layer, layer::SubscriberExt};
+        .with_target("terminal_games_guest", app_filter)
+        .with_target("terminal_games", platform_filter)
+        .with_target("terminal_games_cli", platform_filter)
+        .with_default(LevelFilter::OFF);
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
-            .with_writer(move || LogBuffer(log_buffer_writer.clone()))
+            .with_writer(move || log_writer.clone())
             .with_filter(filter),
     );
     tracing::subscriber::set_global_default(subscriber)?;
@@ -343,6 +443,7 @@ async fn main() -> Result<()> {
         first_app_shortname,
         user_id,
         locale,
+        log_backend: Arc::new(TracingLogBackend),
     });
 
     let graceful_shutdown_token_input = graceful_shutdown_token.clone();
@@ -488,12 +589,6 @@ async fn main() -> Result<()> {
 
     let _ = local_discovery.unregister().await;
     mesh.graceful_shutdown().await;
-
-    let logs = match log_buffer.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
-    std::io::stderr().write_all(&logs)?;
 
     Ok(())
 }

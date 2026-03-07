@@ -4494,6 +4494,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.8.1",
  "hyper-util",
+ "log",
  "ratatui",
  "tachyonfx",
  "terminal-games-sdk",
@@ -5485,6 +5486,7 @@ dependencies = [
 name = "terminal-games-sdk"
 version = "0.1.0"
 dependencies = [
+ "log",
  "ratatui",
  "symphonia",
  "terminput",

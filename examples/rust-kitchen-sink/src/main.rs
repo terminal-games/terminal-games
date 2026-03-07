@@ -76,6 +76,18 @@ struct PeerMessage {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
+    terminal_games_sdk::log::init_current_crate!();
+
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("panic: {}", info);
+        default_hook(info);
+    }));
+
+    log::info!("rust-kitchen-sink starting");
+
+    log::trace!("this should be traced");
+
     let mut terminal = Terminal::new(TerminalGamesBackend::new(std::io::stdout()))?;
     terminal.clear()?;
     std::io::stdout().write(b"\x1b[?1003h")?;
@@ -267,6 +279,7 @@ async fn main() -> std::io::Result<()> {
             if let Ok(peers) = peer::list() {
                 peers_list = peers;
                 peers_list.sort();
+                log::debug!("peers updated: {}", peers_list.len());
             }
             last_peer_update = Instant::now();
         }
