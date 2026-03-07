@@ -399,15 +399,19 @@ async fn handle_socket(
         while let Some(msg) = receiver.next().await {
             match msg {
                 Ok(Message::Binary(data)) => {
-                    let mut data: smallvec::SmallVec<[u8; 16]> = data.as_ref().into();
-                    if data.contains(&0x12) {
-                        let _ = replay_request_tx.try_send(());
-                        data.retain(|b| *b != 0x12);
-                    }
+                    let data = data.as_ref();
                     if data.is_empty() {
                         continue;
                     }
-                    if input_tx.send(data).await.is_err() {
+                    if data == b"\x03" {
+                        // CTRL+C
+                        cancellation_token_clone.cancel();
+                    }
+                    if data == b"\x12" || data == b"\x1b[27;5;114~" {
+                        // CTRL+R
+                        let _ = replay_request_tx.try_send(());
+                    }
+                    if input_tx.send(data.into()).await.is_err() {
                         break;
                     }
                 }

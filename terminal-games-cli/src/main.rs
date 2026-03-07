@@ -6,7 +6,7 @@ mod audio;
 
 use std::{
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -121,32 +121,6 @@ fn compute_jittered_latency(latency_ms: u64, jitter_ms: u64) -> Duration {
     Duration::from_millis((latency_ms as i64 + jitter).max(0) as u64)
 }
 
-fn absolute_wasm_path(path: &str) -> Result<String> {
-    let path = Path::new(path);
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("Failed to get current working directory")?
-            .join(path)
-    };
-    Ok(normalize_path(&absolute).display().to_string())
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
-}
-
 async fn upsert_game(
     conn: &libsql::Connection,
     shortname: &str,
@@ -206,7 +180,11 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to commit migration transaction")?;
 
-    let wasm_path = absolute_wasm_path(&args.wasm_file)?;
+    let wasm_path = Path::new(&args.wasm_file)
+        .canonicalize()
+        .context("Failed to resolve wasm file path")?
+        .display()
+        .to_string();
     let first_app_shortname = Path::new(&wasm_path)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -228,7 +206,11 @@ async fn main() -> Result<()> {
 
     for game in &args.games {
         if let Some((shortname, path)) = game.split_once('=') {
-            let path = absolute_wasm_path(path)?;
+            let path = Path::new(path)
+                .canonicalize()
+                .context("Failed to resolve game path")?
+                .display()
+                .to_string();
             upsert_game(
                 &conn,
                 shortname,
