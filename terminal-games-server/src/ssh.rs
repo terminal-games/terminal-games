@@ -22,6 +22,7 @@ use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
 
 pub struct SshSession {
     input_sender: tokio::sync::mpsc::Sender<smallvec::SmallVec<[u8; 16]>>,
+    replay_request_sender: tokio::sync::mpsc::Sender<()>,
     resize_tx: tokio::sync::watch::Sender<(u16, u16)>,
     auth: Option<tokio::sync::oneshot::Sender<(String, Option<u64>)>>,
     term: Option<tokio::sync::oneshot::Sender<String>>,
@@ -145,7 +146,8 @@ impl SshServer {
         let (ssh_session_sender, ssh_session_receiver) =
             tokio::sync::oneshot::channel::<(Handle, ChannelId, String)>();
 
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(32);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(12);
+        let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
         let (resize_tx, mut resize_rx) = tokio::sync::watch::channel((0, 0));
         let cancellation_token = CancellationToken::new();
         let token = cancellation_token.clone();
@@ -298,8 +300,8 @@ impl SshServer {
                 }
             }
 
-            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(8);
-            let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
+            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
+            let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
             if admission_controller.should_require_captcha() {
                 let captcha = generate_captcha(7);
                 if !solve_captcha(
@@ -356,6 +358,7 @@ impl SshServer {
                 first_app_shortname,
                 args,
                 input_receiver: input_rx,
+                replay_request_receiver: replay_request_rx,
                 output_sender: output_tx,
                 audio_sender: has_audio.then_some(audio_tx),
                 remote_sshid,
@@ -373,8 +376,16 @@ impl SshServer {
                     biased;
 
                     exit_code = &mut exit_rx => {
-                        if let Ok(exit_code) = exit_code {
-                            tracing::trace!(?exit_code, "App exited");
+                        match exit_code {
+                            Ok(Ok(exit_code)) => {
+                                tracing::trace!(?exit_code, "App exited");
+                            }
+                            Ok(Err(error)) => {
+                                tracing::error!(error = %error, "App failed");
+                            }
+                            Err(error) => {
+                                tracing::error!(?error, "App exit channel dropped");
+                            }
                         }
                         break;
                     }
@@ -408,6 +419,7 @@ impl SshServer {
         SshSession {
             cancellation_token,
             input_sender: input_tx,
+            replay_request_sender: replay_request_tx,
             resize_tx,
             auth: Some(auth_sender),
             term: Some(term_sender),
@@ -904,10 +916,17 @@ impl Handler for SshSession {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if data.contains(&0x03) {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if data == b"\x03" {
+            // CTRL+C
             self.cancellation_token.cancel();
         }
-
+        if data == b"\x12" || data == b"\x1b[27;5;114~" {
+            // CTRL+R
+            let _ = self.replay_request_sender.try_send(());
+        }
         match self.input_sender.try_send(data.into()) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}

@@ -221,7 +221,7 @@ pub struct LocalDiscovery {
     self_entry: Mutex<Option<LocalRegistryEntry>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct LocalRegistryEntry {
     region: RegionId,
     port: u16,
@@ -258,7 +258,7 @@ impl LocalDiscovery {
     pub async fn register(&self, region: RegionId, port: u16) -> anyhow::Result<()> {
         let pid = std::process::id();
         let entry = LocalRegistryEntry { region, port, pid };
-        *self.self_entry.lock().await = Some(entry.clone());
+        *self.self_entry.lock().await = Some(entry);
         self.write_entry(&entry).await
     }
 
@@ -364,7 +364,7 @@ impl LocalDiscovery {
 #[async_trait::async_trait]
 impl Discovery for LocalDiscovery {
     async fn discover_peers(&self) -> anyhow::Result<HashSet<(RegionId, SocketAddr)>> {
-        let self_entry = self.self_entry.lock().await.clone();
+        let self_entry = *self.self_entry.lock().await;
         let entries = self.read_entries();
 
         let peers = entries
@@ -551,7 +551,7 @@ impl Mesh {
                     result = listener.accept() => {
                         match result {
                             Ok((stream, peer_addr)) => {
-                                tracing::info!(peer = %peer_addr, "Incoming mesh connection");
+                                tracing::trace!(peer = %peer_addr, "Incoming mesh connection");
                                 let inner2 = inner.clone();
                                 inner.tasks.spawn(async move {
                                     inner2.handle_connection(stream, peer_addr, None).await;
@@ -602,11 +602,11 @@ impl Mesh {
     }
 
     pub async fn graceful_shutdown(&self) {
-        tracing::info!("Mesh graceful shutdown initiated");
+        tracing::debug!("Mesh graceful shutdown initiated");
         self.inner.cancel.cancel();
         self.inner.tasks.close();
         self.inner.tasks.wait().await;
-        tracing::info!("Mesh graceful shutdown complete");
+        tracing::debug!("Mesh graceful shutdown complete");
     }
 }
 

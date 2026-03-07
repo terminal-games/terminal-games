@@ -57,17 +57,17 @@ impl ReplayBuffer {
     pub fn new(
         cols: u16,
         rows: u16,
-        shortname: String,
+        shortname: &str,
         app_id: AppId,
-        term_type: Option<String>,
+        term_type: Option<&str>,
     ) -> Self {
         Self {
             events: VecDeque::with_capacity(1024),
             vt: avt::Vt::new((cols as usize).max(1), (rows as usize).max(1)),
             vt_timestamp: None,
-            initial_shortname: shortname.clone(),
+            initial_shortname: shortname.to_string(),
             initial_app_id: app_id,
-            term_type,
+            term_type: term_type.map(String::from),
         }
     }
 
@@ -89,12 +89,15 @@ impl ReplayBuffer {
         });
     }
 
-    pub fn push_app_switch(&mut self, app_id: AppId, shortname: String) {
+    pub fn push_app_switch(&mut self, app_id: AppId, shortname: &str) {
         let now = Instant::now();
         self.prune(now);
         self.events.push_back(TimestampedEvent {
             timestamp: now,
-            event: ReplayEvent::AppSwitch { app_id, shortname },
+            event: ReplayEvent::AppSwitch {
+                app_id,
+                shortname: shortname.to_string(),
+            },
         });
     }
 

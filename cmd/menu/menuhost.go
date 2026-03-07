@@ -24,25 +24,17 @@ const (
 	menuPollErrRequestError = -5
 )
 
-//go:wasmimport terminal_games menu_games_list_start
-//go:noescape
-func menu_games_list_start() int32
+const (
+	menuReqGamesList    = 0
+	menuReqProfileGet   = 1
+	menuReqProfileSet   = 2
+	menuReqReplaysList  = 3
+	menuReqReplayDelete = 4
+)
 
-//go:wasmimport terminal_games menu_profile_get_start
+//go:wasmimport terminal_games menu_request
 //go:noescape
-func menu_profile_get_start() int32
-
-//go:wasmimport terminal_games menu_profile_set_start
-//go:noescape
-func menu_profile_set_start(usernamePtr unsafe.Pointer, usernameLen uint32, localePtr unsafe.Pointer, localeLen uint32) int32
-
-//go:wasmimport terminal_games menu_replays_list_start
-//go:noescape
-func menu_replays_list_start(localePtr unsafe.Pointer, localeLen uint32) int32
-
-//go:wasmimport terminal_games menu_replay_delete_start
-//go:noescape
-func menu_replay_delete_start(createdAt int64) int32
+func menu_request(typ int32, ptr1 unsafe.Pointer, len1 uint32, ptr2 unsafe.Pointer, len2 uint32, extra int64) int32
 
 //go:wasmimport terminal_games menu_poll
 //go:noescape
@@ -68,7 +60,7 @@ type menuReplay struct {
 }
 
 func menuFetchGames() ([]gameData, error) {
-	data, err := menuWaitFor(menu_games_list_start())
+	data, err := menuWaitFor(menu_request(menuReqGamesList, nil, 0, nil, 0, 0))
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +72,7 @@ func menuFetchGames() ([]gameData, error) {
 }
 
 func menuFetchProfile() (string, string, error) {
-	data, err := menuWaitFor(menu_profile_get_start())
+	data, err := menuWaitFor(menu_request(menuReqProfileGet, nil, 0, nil, 0, 0))
 	if err != nil {
 		return "", "", err
 	}
@@ -100,11 +92,13 @@ func menuSaveProfile(username, locale string) error {
 	if len(localeBytes) == 0 {
 		localeBytes = []byte{0}
 	}
-	requestID := menu_profile_set_start(
+	requestID := menu_request(
+		menuReqProfileSet,
 		unsafe.Pointer(&usernameBytes[0]),
 		uint32(len(username)),
 		unsafe.Pointer(&localeBytes[0]),
 		uint32(len(locale)),
+		0,
 	)
 	_, err := menuWaitFor(requestID)
 	return err
@@ -115,7 +109,7 @@ func menuFetchReplays(locale string) ([]replay, error) {
 	if len(localeBytes) == 0 {
 		localeBytes = []byte{0}
 	}
-	requestID := menu_replays_list_start(unsafe.Pointer(&localeBytes[0]), uint32(len(locale)))
+	requestID := menu_request(menuReqReplaysList, unsafe.Pointer(&localeBytes[0]), uint32(len(locale)), nil, 0, 0)
 	data, err := menuWaitFor(requestID)
 	if err != nil {
 		return nil, err
@@ -136,7 +130,7 @@ func menuFetchReplays(locale string) ([]replay, error) {
 }
 
 func menuDeleteReplay(createdAt int64) error {
-	_, err := menuWaitFor(menu_replay_delete_start(createdAt))
+	_, err := menuWaitFor(menu_request(menuReqReplayDelete, nil, 0, nil, 0, createdAt))
 	return err
 }
 

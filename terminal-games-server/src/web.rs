@@ -327,13 +327,14 @@ async fn handle_socket(
     let remote_sshid = sanitize_user_agent(&user_agent);
     let username = "web".to_string();
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel(20);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(12);
+    let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(initial_size);
     let cancellation_token = CancellationToken::new();
     let token = cancellation_token.clone();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
-    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(1);
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
     let admission_ticket = server.admission_controller.issue_ticket();
     if !wait_for_admission(&mut sender, &mut receiver, &resize_tx, &admission_ticket).await {
         return;
@@ -343,6 +344,7 @@ async fn handle_socket(
         first_app_shortname,
         args,
         input_receiver: input_rx,
+        replay_request_receiver: replay_request_rx,
         output_sender: output_tx,
         audio_sender: Some(audio_tx),
         remote_sshid,
@@ -397,8 +399,19 @@ async fn handle_socket(
         while let Some(msg) = receiver.next().await {
             match msg {
                 Ok(Message::Binary(data)) => {
-                    let data: smallvec::SmallVec<[u8; 16]> = data.as_ref().into();
-                    if input_tx.send(data).await.is_err() {
+                    let data = data.as_ref();
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if data == b"\x03" {
+                        // CTRL+C
+                        cancellation_token_clone.cancel();
+                    }
+                    if data == b"\x12" || data == b"\x1b[27;5;114~" {
+                        // CTRL+R
+                        let _ = replay_request_tx.try_send(());
+                    }
+                    if input_tx.send(data.into()).await.is_err() {
                         break;
                     }
                 }
@@ -421,8 +434,16 @@ async fn handle_socket(
         }
     });
 
-    if let Ok(exit_code) = exit_rx.await {
-        tracing::trace!(?exit_code, "App exited");
+    match exit_rx.await {
+        Ok(Ok(exit_code)) => {
+            tracing::trace!(?exit_code, "App exited");
+        }
+        Ok(Err(error)) => {
+            tracing::error!(error = %error, "App failed");
+        }
+        Err(error) => {
+            tracing::error!(?error, "App exit channel dropped");
+        }
     }
 
     cancellation_token.cancel();

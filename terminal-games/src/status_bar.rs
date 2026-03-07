@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
 use crate::palette::{self, Color};
@@ -25,7 +25,7 @@ struct Notification {
 
 pub struct StatusBar {
     pub shortname: String,
-    username_rx: watch::Receiver<String>,
+    username: String,
     tickers: Vec<String>,
     session_start_time: std::time::Instant,
     prev_size: (u16, u16),
@@ -64,14 +64,14 @@ fn style_inline_fg(text: impl AsRef<str>, fg: Color) -> String {
 impl StatusBar {
     pub fn new(
         shortname: String,
-        username_rx: watch::Receiver<String>,
+        username: &str,
         network_info: Arc<dyn NetworkInfo>,
         terminal_profile: TerminalProfile,
         notification_rx: mpsc::Receiver<String>,
     ) -> Self {
         Self {
             shortname,
-            username_rx,
+            username: username.to_string(),
             tickers: vec!["A".to_string(), "B".to_string(), "C".to_string()],
             session_start_time: std::time::Instant::now(),
             prev_size: (0, 0),
@@ -92,7 +92,7 @@ impl StatusBar {
             true,
         );
         let username = style(
-            format!(" {} ", self.username_rx.borrow().as_str()),
+            format!(" {} ", self.username.as_str()),
             Some(p.text),
             Some(p.surface_bright),
             false,
@@ -159,6 +159,10 @@ impl StatusBar {
 
         let content_str = left + &padding + &right;
         content_str.into_bytes()
+    }
+
+    pub fn set_username(&mut self, username: &str) {
+        self.username = username.to_string();
     }
 
     pub fn maybe_render_into(

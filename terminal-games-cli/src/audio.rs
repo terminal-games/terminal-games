@@ -45,6 +45,7 @@ fn run_audio_player(receiver: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
     };
 
     const BYTES_PER_MS: u32 = SAMPLE_RATE * CHANNELS as u32 * 4 / 1000;
+    const TARGET_CHUNK_MS: u32 = 40;
 
     let socket_path = pulseaudio::socket_path_from_env()
         .ok_or_else(|| anyhow::anyhow!("PulseAudio/PipeWire socket not found"))?;
@@ -98,9 +99,9 @@ fn run_audio_player(receiver: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
             sink_name: Some(protocol::DEFAULT_SINK.to_owned()),
             buffer_attr: BufferAttr {
                 max_length: u32::MAX,
-                target_length: BYTES_PER_MS * 10,
-                pre_buffering: 0,
-                minimum_request_length: BYTES_PER_MS * 2,
+                target_length: BYTES_PER_MS * 40,
+                pre_buffering: BYTES_PER_MS * 20,
+                minimum_request_length: BYTES_PER_MS * 10,
                 ..Default::default()
             },
             flags: StreamFlags {
@@ -119,11 +120,8 @@ fn run_audio_player(receiver: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
     tracing::debug!(channel, "PulseAudio playback stream created");
 
     let mut dec = OggOpusDecoder::new(receiver);
-
-    let initial = dec.read_pcm_bytes(stream_info.requested_bytes as usize)?;
-    if !initial.is_empty() {
-        protocol::write_memblock(sock.get_mut(), channel, &initial, 0)?;
-    }
+    let bootstrap = vec![0u8; (BYTES_PER_MS * TARGET_CHUNK_MS) as usize];
+    protocol::write_memblock(sock.get_mut(), channel, &bootstrap, 0)?;
 
     const DRAIN_TAG: u32 = 100;
     let mut draining = false;
@@ -132,13 +130,14 @@ fn run_audio_player(receiver: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
         let (seq, msg) = protocol::read_command_message(&mut sock, proto_ver)?;
         match msg {
             protocol::Command::Started(_) => {
-                tracing::debug!("PulseAudio playback started");
+                tracing::trace!("PulseAudio playback started");
             }
             protocol::Command::Request(req) if req.channel == channel => {
                 if draining {
                     continue;
                 }
-                let data = dec.read_pcm_bytes(req.length as usize)?;
+                let max_bytes = req.length.min(BYTES_PER_MS * TARGET_CHUNK_MS) as usize;
+                let data = dec.read_pcm_bytes(max_bytes)?;
                 if !data.is_empty() {
                     protocol::write_memblock(sock.get_mut(), channel, &data, 0)?;
                 } else {

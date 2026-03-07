@@ -18,7 +18,6 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
-use smallvec::SmallVec;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use terminal_games::{
@@ -64,7 +63,7 @@ struct Args {
     no_audio: bool,
 
     /// Log verbosity level (off, error, warn, info, debug, trace)
-    #[arg(long, default_value = "debug")]
+    #[arg(long, default_value = "warn")]
     log_level: tracing::Level,
 
     /// Username for CLI auth (default: $USER)
@@ -122,6 +121,21 @@ fn compute_jittered_latency(latency_ms: u64, jitter_ms: u64) -> Duration {
     Duration::from_millis((latency_ms as i64 + jitter).max(0) as u64)
 }
 
+async fn upsert_game(
+    conn: &libsql::Connection,
+    shortname: &str,
+    path: &str,
+    details: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO games (shortname, path, details) VALUES (?1, ?2, json(?3)) ON CONFLICT(shortname) DO UPDATE SET path = excluded.path, details = excluded.details",
+        libsql::params!(shortname, path, details),
+    )
+    .await
+    .with_context(|| format!("Failed to upsert game {shortname}"))?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -166,7 +180,12 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to commit migration transaction")?;
 
-    let first_app_shortname = Path::new(&args.wasm_file)
+    let wasm_path = Path::new(&args.wasm_file)
+        .canonicalize()
+        .context("Failed to resolve wasm file path")?
+        .display()
+        .to_string();
+    let first_app_shortname = Path::new(&wasm_path)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("app")
@@ -177,25 +196,28 @@ async fn main() -> Result<()> {
         )
     };
 
-    let _ = conn
-        .execute(
-            "INSERT INTO games (shortname, path, details) VALUES (?1, ?2, json(?3))",
-            libsql::params!(
-                first_app_shortname.as_str(),
-                args.wasm_file.as_str(),
-                default_details(first_app_shortname.as_str())
-            ),
-        )
-        .await;
+    upsert_game(
+        &conn,
+        first_app_shortname.as_str(),
+        wasm_path.as_str(),
+        default_details(first_app_shortname.as_str()).as_str(),
+    )
+    .await?;
 
     for game in &args.games {
         if let Some((shortname, path)) = game.split_once('=') {
-            let _ = conn
-                .execute(
-                    "INSERT INTO games (shortname, path, details) VALUES (?1, ?2, json(?3))",
-                    libsql::params!(shortname, path, default_details(shortname)),
-                )
-                .await;
+            let path = Path::new(path)
+                .canonicalize()
+                .context("Failed to resolve game path")?
+                .display()
+                .to_string();
+            upsert_game(
+                &conn,
+                shortname,
+                path.as_str(),
+                default_details(shortname).as_str(),
+            )
+            .await?;
         }
     }
 
@@ -276,7 +298,8 @@ async fn main() -> Result<()> {
         crossterm::cursor::Hide
     )?;
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel(1);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(12);
+    let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(crossterm::terminal::size()?);
 
@@ -291,12 +314,8 @@ async fn main() -> Result<()> {
 
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
     let audio_player = if audio_enabled {
-        tracing::debug!("Audio enabled, initializing player");
         match audio::spawn_audio_player() {
-            Ok(player) => {
-                tracing::debug!("Audio player initialized");
-                Some(player)
-            }
+            Ok(player) => Some(player),
             Err(e) => {
                 tracing::error!(?e, "Failed to initialize audio");
                 None
@@ -311,6 +330,7 @@ async fn main() -> Result<()> {
     let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
         args: None,
         input_receiver: input_rx,
+        replay_request_receiver: replay_request_rx,
         output_sender: output_tx,
         audio_sender: audio_player.as_ref().map(|_| audio_tx),
         remote_sshid: "cli".to_string(),
@@ -333,10 +353,18 @@ async fn main() -> Result<()> {
             match stdin.lock().read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if buf[..n].contains(&0x03) {
+                    let data = &buf[..n];
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if data == b"\x03" {
+                        // CTRL+C
                         graceful_shutdown_token_input.cancel();
                     }
-                    if input_tx.blocking_send(SmallVec::from(&buf[..n])).is_err() {
+                    if data == b"\x12" || data == b"\x1b[27;5;114~" {
+                        let _ = replay_request_tx.try_send(());
+                    }
+                    if input_tx.blocking_send(data.into()).is_err() {
                         break;
                     }
                 }
@@ -397,8 +425,16 @@ async fn main() -> Result<()> {
             biased;
 
             exit_code = &mut exit_rx => {
-                if let Ok(exit_code) = exit_code {
-                    tracing::trace!(?exit_code, "App exited");
+                match exit_code {
+                    Ok(Ok(exit_code)) => {
+                        tracing::trace!(?exit_code, "App exited");
+                    }
+                    Ok(Err(error)) => {
+                        tracing::error!(error = %error, "App failed");
+                    }
+                    Err(error) => {
+                        tracing::error!(?error, "App exit channel dropped");
+                    }
                 }
                 break;
             }
