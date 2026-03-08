@@ -52,11 +52,11 @@ struct Args {
     #[arg(long, default_value = "0")]
     jitter: u64,
 
-    /// Bandwidth token bucket refill rate in bytes per second (default: 50000)
+    /// Bandwidth token bucket refill rate in bytes per second
     #[arg(long, default_value = "65536")]
     bandwidth: u64,
 
-    /// Bandwidth token bucket capacity in bytes (default: 100000)
+    /// Bandwidth token bucket capacity in bytes
     #[arg(long, default_value = "131072")]
     bandwidth_capacity: u64,
 
