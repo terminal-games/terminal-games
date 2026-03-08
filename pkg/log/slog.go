@@ -87,7 +87,6 @@ func sliceCopy[T any](s []T) []T {
 	return out
 }
 
-// NewHostHandler returns an slog.Handler that writes structured logs via the host log function.
 func NewHostHandler(level slog.Leveler) slog.Handler {
 	if level == nil {
 		level = SlogLevelTrace
@@ -95,7 +94,6 @@ func NewHostHandler(level slog.Leveler) slog.Handler {
 	return &hostHandler{level: level}
 }
 
-// NewSlogLogger returns an slog.Logger that writes structured logs via the host log function.
 func NewSlogLogger() *slog.Logger {
 	return slog.New(NewHostHandler(nil))
 }

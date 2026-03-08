@@ -1099,7 +1099,7 @@ impl AppServer {
             wasmtime::bail!("host_log: failed to find host memory");
         };
 
-        let read_len = (len as usize).min(4096);
+        let read_len = (len as usize).min(16384);
         let mut buf = vec![0u8; read_len];
         mem.read(&caller, ptr as u32 as usize, &mut buf)?;
 

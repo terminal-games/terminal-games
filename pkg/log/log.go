@@ -48,8 +48,8 @@ func writeJSONLog(level uint32, message string, attrs map[string]any) {
 		return
 	}
 	n := len(data)
-	if n > 4096 {
-		n = 4096
+	if n > 16384 {
+		n = 16384
 	}
 	hostLog(level, unsafe.Pointer(&data[0]), uint32(n))
 }

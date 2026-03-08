@@ -125,7 +125,7 @@ where
                 crate::internal::log(
                     level_to_host(event.metadata().level()),
                     bytes.as_ptr(),
-                    bytes.len().min(4096) as u32,
+                    bytes.len().min(16384) as u32,
                 )
             };
         }
