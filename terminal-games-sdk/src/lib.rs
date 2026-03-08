@@ -84,5 +84,6 @@ mod internal {
         ) -> i32;
 
         pub(crate) fn log(level: u32, msg_ptr: *const u8, msg_len: u32) -> i32;
+
     }
 }

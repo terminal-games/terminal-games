@@ -26,7 +26,7 @@ use wasmtime_wasi::I32Exit;
 
 use crate::{
     audio::{CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
-    log_backend::{GuestLogBackend, LogLevel},
+    log_backend::{GuestLogBackend, parse_guest_log_message},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
     replay::ReplayBuffer,
@@ -157,10 +157,9 @@ impl AppServer {
         linker.func_wrap("terminal_games", "terminal_info", Self::host_terminal_info)?;
         linker.func_wrap("terminal_games", "audio_write", Self::audio_write)?;
         linker.func_wrap("terminal_games", "audio_info", Self::audio_info)?;
+        linker.func_wrap("terminal_games", "log", Self::host_log)?;
         linker.func_wrap("terminal_games", "menu_request", Self::menu_request)?;
         linker.func_wrap("terminal_games", "menu_poll", Self::menu_poll)?;
-        linker.func_wrap("terminal_games", "log", Self::host_log)?;
-
         Ok(Self {
             linker: Arc::new(linker),
             mesh,
@@ -1086,6 +1085,47 @@ impl AppServer {
         }
     }
 
+    fn host_log(
+        mut caller: wasmtime::Caller<'_, AppState>,
+        level: u32,
+        ptr: i32,
+        len: u32,
+    ) -> wasmtime::Result<i32> {
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+            wasmtime::bail!("host_log: failed to find host memory");
+        };
+
+        let read_len = (len as usize).min(4096);
+        let mut buf = vec![0u8; read_len];
+        mem.read(&caller, ptr as usize, &mut buf)?;
+
+        let message = String::from_utf8_lossy(&buf);
+        let trimmed = message.trim_end_matches(['\r', '\n']);
+        let record = match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(serde_json::Value::Object(_)) => parse_guest_log_message(&message),
+            _ => crate::log_backend::GuestLogRecord::new(
+                crate::log_backend::LogLevel::from_u8(level as u8)
+                    .unwrap_or(crate::log_backend::LogLevel::Info),
+                trimmed,
+            ),
+        };
+
+        if record.message.is_empty() && record.attributes.is_empty() {
+            return Ok(0);
+        }
+
+        let state = caller.data();
+        state
+            .ctx
+            .log_backend
+            .log(&state.app.shortname, state.ctx.user_id, &record);
+        Ok(0)
+    }
+
     fn terminal_size(
         mut caller: wasmtime::Caller<'_, AppState>,
         width_ptr: i32,
@@ -1925,37 +1965,6 @@ impl AppServer {
             buffer_available_ptr as usize,
             &(buffer_available as u32).to_le_bytes(),
         )?;
-
-        Ok(0)
-    }
-
-    fn host_log(
-        mut caller: wasmtime::Caller<'_, AppState>,
-        level: u32,
-        msg_ptr: i32,
-        msg_len: u32,
-    ) -> wasmtime::Result<i32> {
-        const MAX_LOG_MESSAGE: usize = 4096;
-        let len = (msg_len as usize).min(MAX_LOG_MESSAGE);
-        if len == 0 {
-            return Ok(0);
-        }
-
-        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-            wasmtime::bail!("log: failed to find host memory");
-        };
-        let mut buf = vec![0u8; len];
-        mem.read(&caller, msg_ptr as usize, &mut buf)?;
-        let message = String::from_utf8_lossy(&buf);
-
-        let level = LogLevel::from_u8(level as u8).unwrap_or(LogLevel::Info);
-        let shortname = caller.data().app.shortname.as_str();
-        let user_id = caller.data().ctx.user_id;
-        caller
-            .data()
-            .ctx
-            .log_backend
-            .log(shortname, user_id, level, &message);
 
         Ok(0)
     }

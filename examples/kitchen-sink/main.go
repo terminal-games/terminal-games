@@ -99,7 +99,7 @@ func main() {
 		}
 	}()
 
-	log.Print("kitchen-sink starting")
+	slog.Info("kitchen-sink starting")
 
 	var initialVolume float32 = 0.8
 	var audioPlaying bool = false

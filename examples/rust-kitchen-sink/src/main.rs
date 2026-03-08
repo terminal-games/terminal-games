@@ -80,13 +80,13 @@ async fn main() -> std::io::Result<()> {
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        log::error!("panic: {}", info);
+        tracing::error!("panic: {}", info);
         default_hook(info);
     }));
 
-    log::info!("rust-kitchen-sink starting");
+    tracing::info!("rust-kitchen-sink starting");
 
-    log::trace!("this should be traced");
+    tracing::trace!("this should be traced");
 
     let mut terminal = Terminal::new(TerminalGamesBackend::new(std::io::stdout()))?;
     terminal.clear()?;
@@ -279,7 +279,7 @@ async fn main() -> std::io::Result<()> {
             if let Ok(peers) = peer::list() {
                 peers_list = peers;
                 peers_list.sort();
-                log::debug!("peers updated: {}", peers_list.len());
+                tracing::debug!("peers updated: {}", peers_list.len());
             }
             last_peer_update = Instant::now();
         }

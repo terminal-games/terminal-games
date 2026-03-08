@@ -6,7 +6,9 @@ package log
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"runtime"
 )
 
 const SlogLevelTrace = slog.Level(-8)
@@ -22,15 +24,24 @@ func (h *hostHandler) Enabled(_ context.Context, level slog.Level) bool {
 
 func (h *hostHandler) Handle(_ context.Context, r slog.Record) error {
 	level := slogLevelToHost(r.Level)
-	msg := r.Message
-	if len(h.attrs) > 0 {
-		msg = msg + " " + sprintAttrs(h.attrs)
+	attrs := make(map[string]any, len(h.attrs)+r.NumAttrs())
+	for _, attr := range h.attrs {
+		appendAttr(attrs, attr)
 	}
 	r.Attrs(func(a slog.Attr) bool {
-		msg = msg + " " + a.String()
+		appendAttr(attrs, a)
 		return true
 	})
-	Log(level, msg)
+	if r.PC != 0 {
+		frame, _ := runtime.CallersFrames([]uintptr{r.PC}).Next()
+		if frame.File != "" {
+			attrs["file"] = frame.File
+		}
+		if frame.Line > 0 {
+			attrs["line"] = frame.Line
+		}
+	}
+	writeJSONLog(level, r.Message, attrs)
 	return nil
 }
 
@@ -63,15 +74,11 @@ func slogLevelToHost(l slog.Level) uint32 {
 	}
 }
 
-func sprintAttrs(attrs []slog.Attr) string {
-	var buf []byte
-	for i, a := range attrs {
-		if i > 0 {
-			buf = append(buf, ' ')
-		}
-		buf = append(buf, a.String()...)
+func appendAttr(attrs map[string]any, attr slog.Attr) {
+	if attr.Key == "" {
+		return
 	}
-	return string(buf)
+	attrs[attr.Key] = fmt.Sprint(attr.Value.Any())
 }
 
 func sliceCopy[T any](s []T) []T {
@@ -80,7 +87,7 @@ func sliceCopy[T any](s []T) []T {
 	return out
 }
 
-// NewHostHandler returns an slog.Handler that forwards log records to the host.
+// NewHostHandler returns an slog.Handler that writes structured logs via the host log function.
 func NewHostHandler(level slog.Leveler) slog.Handler {
 	if level == nil {
 		level = SlogLevelTrace
@@ -88,7 +95,7 @@ func NewHostHandler(level slog.Leveler) slog.Handler {
 	return &hostHandler{level: level}
 }
 
-// NewSlogLogger returns an slog.Logger that forwards log records to the host.
+// NewSlogLogger returns an slog.Logger that writes structured logs via the host log function.
 func NewSlogLogger() *slog.Logger {
 	return slog.New(NewHostHandler(nil))
 }

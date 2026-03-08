@@ -4494,11 +4494,11 @@ dependencies = [
  "http-body-util",
  "hyper 1.8.1",
  "hyper-util",
- "log",
  "ratatui",
  "tachyonfx",
  "terminal-games-sdk",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5473,6 +5473,7 @@ dependencies = [
  "rand_core 0.6.4",
  "russh",
  "serde",
+ "serde_json",
  "smallvec",
  "terminal-games",
  "tokio",
@@ -5486,11 +5487,13 @@ dependencies = [
 name = "terminal-games-sdk"
 version = "0.1.0"
 dependencies = [
- "log",
  "ratatui",
+ "serde_json",
  "symphonia",
  "terminput",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

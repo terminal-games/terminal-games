@@ -46,12 +46,13 @@ func Writer(level uint32) io.Writer {
 	return &hostWriter{level: level}
 }
 
-// SetOutputToHost sets the standard log package's output to the host at the given level.
-// Call at startup to redirect log.Print etc. to the host.
+// SetOutputToHost sets the standard log package's output to the host log function at the given level.
 func SetOutputToHost(level uint32) {
 	log.SetOutput(Writer(level))
 }
 
 func init() {
+	log.SetFlags(0)
+	SetOutputToHost(LevelInfo)
 	slog.SetDefault(NewSlogLogger())
 }
