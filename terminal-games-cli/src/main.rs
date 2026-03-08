@@ -164,8 +164,14 @@ struct CliTimer;
 
 impl FormatTime for CliTimer {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-        let (h, m, s) = ((t.as_secs() / 3600) % 24, (t.as_secs() / 60) % 60, t.as_secs() % 60);
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let (h, m, s) = (
+            (t.as_secs() / 3600) % 24,
+            (t.as_secs() / 60) % 60,
+            t.as_secs() % 60,
+        );
         write!(w, "{h:02}:{m:02}:{s:02}.{:06} ", t.subsec_micros())
     }
 }
@@ -189,8 +195,16 @@ impl GuestLogBackend for CliLogBackend {
         if !self.level_filter.allows(record.level) {
             return;
         }
-        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-        let ts = format!("{:02}:{:02}:{:02}.{:06}", (t.as_secs() / 3600) % 24, (t.as_secs() / 60) % 60, t.as_secs() % 60, t.subsec_micros());
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let ts = format!(
+            "{:02}:{:02}:{:02}.{:06}",
+            (t.as_secs() / 3600) % 24,
+            (t.as_secs() / 60) % 60,
+            t.as_secs() % 60,
+            t.subsec_micros()
+        );
         let (level_color, level) = match record.level {
             LogLevel::Error => (RED, "ERROR"),
             LogLevel::Warn => (YELLOW, "WARN "),
@@ -198,16 +212,36 @@ impl GuestLogBackend for CliLogBackend {
             LogLevel::Debug => (BLUE, "DEBUG"),
             LogLevel::Trace => (PURPLE, "TRACE"),
         };
-        let loc = record.file.as_ref().map(|f| match record.line {
-            Some(l) => format!("{f}:{l}: "),
-            None => format!("{f}: "),
-        }).unwrap_or_default();
-        let attrs: Vec<_> = record.attributes.iter()
+        let loc = record
+            .file
+            .as_ref()
+            .map(|f| match record.line {
+                Some(l) => format!("{f}:{l}: "),
+                None => format!("{f}: "),
+            })
+            .unwrap_or_default();
+        let attrs: Vec<_> = record
+            .attributes
+            .iter()
             .filter(|(k, _)| !matches!(k.as_str(), "shortname" | "module_path" | "file" | "line"))
-            .map(|(k, v)| format!("{ITALIC}{k}{RESET}={}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string())))
+            .map(|(k, v)| {
+                format!(
+                    "{ITALIC}{k}{RESET}={}",
+                    v.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| v.to_string())
+                )
+            })
             .collect();
-        let attrs_str = if attrs.is_empty() { String::new() } else { format!(" {}", attrs.join(" ")) };
-        let line = format!("{DIM}{ts}{RESET} {level_color}{level}{RESET} {shortname}: {DIM}{loc}{RESET}{}{attrs_str}\n", record.message);
+        let attrs_str = if attrs.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", attrs.join(" "))
+        };
+        let line = format!(
+            "{DIM}{ts}{RESET} {level_color}{level}{RESET} {shortname}: {DIM}{loc}{RESET}{}{attrs_str}\n",
+            record.message
+        );
         self.writer.append(line.as_bytes());
     }
 }

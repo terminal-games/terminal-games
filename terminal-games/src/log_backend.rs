@@ -15,7 +15,15 @@ pub enum LogLevel {
 
 impl LogLevel {
     pub fn from_u8(v: u8) -> Option<Self> {
-        [Self::Trace, Self::Debug, Self::Info, Self::Warn, Self::Error].get(v as usize).copied()
+        [
+            Self::Trace,
+            Self::Debug,
+            Self::Info,
+            Self::Warn,
+            Self::Error,
+        ]
+        .get(v as usize)
+        .copied()
     }
     pub fn as_str(self) -> &'static str {
         ["trace", "debug", "info", "warn", "error"][self as usize]
@@ -45,11 +53,10 @@ impl GuestLogRecord {
     }
 }
 
-pub fn parse_guest_log_message(message: &str) -> GuestLogRecord {
-    let trimmed = message.trim_end_matches(['\r', '\n']);
-    let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(trimmed) else {
-        return GuestLogRecord::new(LogLevel::Info, trimmed);
-    };
+pub fn parse_guest_log_object(
+    mut obj: serde_json::Map<String, Value>,
+    fallback_message: &str,
+) -> GuestLogRecord {
     let level = obj
         .remove("level")
         .or_else(|| obj.remove("lvl"))
@@ -75,15 +82,27 @@ pub fn parse_guest_log_message(message: &str) -> GuestLogRecord {
         .remove("message")
         .or_else(|| obj.remove("msg"))
         .as_ref()
-        .map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))
-        .unwrap_or_else(|| trimmed.to_owned());
-    let file = obj.remove("file").as_ref().map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()));
+        .map(|v| {
+            v.as_str()
+                .map(String::from)
+                .unwrap_or_else(|| v.to_string())
+        })
+        .unwrap_or_else(|| fallback_message.to_owned());
+    let file = obj.remove("file").as_ref().map(|v| {
+        v.as_str()
+            .map(String::from)
+            .unwrap_or_else(|| v.to_string())
+    });
     let line = obj.remove("line").as_ref().and_then(|v| match v {
         Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
         Value::String(s) => s.parse().ok(),
         _ => None,
     });
-    let module_path = obj.remove("module_path").as_ref().map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()));
+    let module_path = obj.remove("module_path").as_ref().map(|v| {
+        v.as_str()
+            .map(String::from)
+            .unwrap_or_else(|| v.to_string())
+    });
     let _ = obj.remove("target");
     GuestLogRecord {
         level,
@@ -92,6 +111,14 @@ pub fn parse_guest_log_message(message: &str) -> GuestLogRecord {
         line,
         module_path,
         attributes: obj.into_iter().collect(),
+    }
+}
+
+pub fn parse_guest_log_message(message: &str) -> GuestLogRecord {
+    let trimmed = message.trim_end_matches(['\r', '\n']);
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::Object(obj)) => parse_guest_log_object(obj, trimmed),
+        _ => GuestLogRecord::new(LogLevel::Info, trimmed),
     }
 }
 

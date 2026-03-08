@@ -26,7 +26,7 @@ use wasmtime_wasi::I32Exit;
 
 use crate::{
     audio::{CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
-    log_backend::{GuestLogBackend, parse_guest_log_message},
+    log_backend::{GuestLogBackend, LogLevel, parse_guest_log_object},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
     replay::ReplayBuffer,
@@ -1101,17 +1101,14 @@ impl AppServer {
 
         let read_len = (len as usize).min(4096);
         let mut buf = vec![0u8; read_len];
-        mem.read(&caller, ptr as usize, &mut buf)?;
+        mem.read(&caller, ptr as u32 as usize, &mut buf)?;
 
         let message = String::from_utf8_lossy(&buf);
         let trimmed = message.trim_end_matches(['\r', '\n']);
+        let fallback_level = LogLevel::from_u8(level as u8).unwrap_or(LogLevel::Info);
         let record = match serde_json::from_str::<serde_json::Value>(trimmed) {
-            Ok(serde_json::Value::Object(_)) => parse_guest_log_message(&message),
-            _ => crate::log_backend::GuestLogRecord::new(
-                crate::log_backend::LogLevel::from_u8(level as u8)
-                    .unwrap_or(crate::log_backend::LogLevel::Info),
-                trimmed,
-            ),
+            Ok(serde_json::Value::Object(obj)) => parse_guest_log_object(obj, trimmed),
+            _ => crate::log_backend::GuestLogRecord::new(fallback_level, trimmed),
         };
 
         if record.message.is_empty() && record.attributes.is_empty() {
