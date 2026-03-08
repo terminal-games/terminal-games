@@ -279,7 +279,6 @@ async fn main() -> std::io::Result<()> {
             if let Ok(peers) = peer::list() {
                 peers_list = peers;
                 peers_list.sort();
-                tracing::debug!("peers updated: {}", peers_list.len());
             }
             last_peer_update = Instant::now();
         }

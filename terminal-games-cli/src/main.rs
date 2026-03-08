@@ -5,7 +5,6 @@
 mod audio;
 
 use std::{
-    fmt,
     io::{Read, Write},
     path::Path,
     pin::Pin,
@@ -19,17 +18,9 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
-use serde_json::Value;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
-use tracing::field::Field;
-use tracing_subscriber::{
-    Layer,
-    field::{RecordFields, VisitOutput},
-    filter::LevelFilter,
-    fmt::{FormatFields, format::Writer, time::FormatTime},
-    layer::SubscriberExt,
-};
+use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, layer::SubscriberExt};
 
 use terminal_games::{
     app::{AppInstantiationParams, AppServer},
@@ -168,301 +159,56 @@ impl Write for BufferedLogWriter {
     }
 }
 
-#[derive(Default)]
-struct NativeLikeFields;
-
-impl<'writer> FormatFields<'writer> for NativeLikeFields {
-    fn format_fields<R: RecordFields>(&self, writer: Writer<'writer>, fields: R) -> fmt::Result {
-        let mut visitor = NativeLikeVisitor::new(writer);
-        fields.record(&mut visitor);
-        visitor.finish()
-    }
-}
-
-struct NativeLikeVisitor<'writer> {
-    writer: Writer<'writer>,
-    fields: Vec<(String, String)>,
-    location: Option<String>,
-    message: Option<String>,
-}
-
-const ANSI_RESET: &str = "\x1b[0m";
-const ANSI_DIM: &str = "\x1b[2m";
-const ANSI_ITALIC: &str = "\x1b[3m";
-
-impl<'writer> NativeLikeVisitor<'writer> {
-    fn new(writer: Writer<'writer>) -> Self {
-        Self {
-            writer,
-            fields: Vec::new(),
-            location: None,
-            message: None,
-        }
-    }
-
-    fn push_field(&mut self, name: &str, value: impl fmt::Display) {
-        let name = name.strip_prefix("r#").unwrap_or(name);
-        if matches!(name, "shortname" | "module_path") {
-            return;
-        }
-        self.fields.push((name.to_owned(), value.to_string()));
-    }
-
-    fn record_attributes(&mut self, raw: &str) {
-        let Ok(Value::Object(attributes)) = serde_json::from_str::<Value>(raw) else {
-            self.push_field("attributes", raw);
-            return;
-        };
-
-        let mut flattened = Vec::new();
-        flatten_json_attributes(None, &attributes, &mut flattened);
-
-        let file = take_flattened_value(&mut flattened, "file");
-        let line = take_flattened_value(&mut flattened, "line");
-        let column = take_flattened_value(&mut flattened, "column");
-        if let Some(location) =
-            format_clickable_location(file.as_deref(), line.as_deref(), column.as_deref())
-        {
-            self.location = Some(location);
-        }
-
-        for (key, value) in flattened {
-            self.push_field(&key, value);
-        }
-    }
-
-    fn record_value(&mut self, field: &Field, value: impl fmt::Display) {
-        let name = field.name();
-
-        match name {
-            "message" => self.message = Some(value.to_string()),
-            "attributes" => self.record_attributes(&value.to_string()),
-            _ => self.push_field(name, value),
-        }
-    }
-
-    fn write_spaced(&mut self, first: &mut bool, value: impl fmt::Display) -> fmt::Result {
-        if !*first {
-            write!(self.writer, " ")?;
-        }
-        *first = false;
-        write!(self.writer, "{value}")
-    }
-
-    fn write_location(&mut self, first: &mut bool, value: &str) -> fmt::Result {
-        if !*first {
-            write!(self.writer, " ")?;
-        }
-        *first = false;
-
-        if self.writer.has_ansi_escapes() {
-            write!(self.writer, "{ANSI_DIM}{value}{ANSI_RESET}")
-        } else {
-            write!(self.writer, "{value}")
-        }
-    }
-
-    fn write_field_rendered(&mut self, first: &mut bool, name: &str, value: &str) -> fmt::Result {
-        if !*first {
-            write!(self.writer, " ")?;
-        }
-        *first = false;
-
-        if self.writer.has_ansi_escapes() {
-            write!(
-                self.writer,
-                "{}{}{}",
-                ansi_italic(name),
-                ansi_dim("="),
-                value
-            )
-        } else {
-            write!(self.writer, "{name}={value}")
-        }
-    }
-}
-
-fn ansi_dim(value: &str) -> String {
-    format!("{ANSI_DIM}{value}{ANSI_RESET}")
-}
-
-fn ansi_italic(value: &str) -> String {
-    format!("{ANSI_ITALIC}{value}{ANSI_RESET}")
-}
-
 #[derive(Clone, Copy)]
 struct CliTimer;
 
 impl FormatTime for CliTimer {
-    fn format_time(&self, writer: &mut Writer<'_>) -> fmt::Result {
-        let duration = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| fmt::Error)?;
-        let total_secs = duration.as_secs();
-        let hours = (total_secs / 3600) % 24;
-        let minutes = (total_secs / 60) % 60;
-        let seconds = total_secs % 60;
-        let micros = duration.subsec_micros();
-        write!(writer, "{hours:02}:{minutes:02}:{seconds:02}.{micros:06} ")
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let (h, m, s) = ((t.as_secs() / 3600) % 24, (t.as_secs() / 60) % 60, t.as_secs() % 60);
+        write!(w, "{h:02}:{m:02}:{s:02}.{:06} ", t.subsec_micros())
     }
-}
-
-impl tracing::field::Visit for NativeLikeVisitor<'_> {
-    fn record_str(&mut self, field: &Field, value: &str) {
-        match field.name() {
-            "message" => self.message = Some(value.to_owned()),
-            "attributes" => self.record_attributes(value),
-            _ => self.push_field(field.name(), format!("{value:?}")),
-        }
-    }
-
-    fn record_bool(&mut self, field: &Field, value: bool) {
-        self.record_value(field, value);
-    }
-
-    fn record_i64(&mut self, field: &Field, value: i64) {
-        self.record_value(field, value);
-    }
-
-    fn record_u64(&mut self, field: &Field, value: u64) {
-        self.record_value(field, value);
-    }
-
-    fn record_f64(&mut self, field: &Field, value: f64) {
-        self.record_value(field, value);
-    }
-
-    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
-        self.record_value(field, value);
-    }
-
-    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.record_value(field, format!("{value:?}"));
-    }
-}
-
-impl VisitOutput<fmt::Result> for NativeLikeVisitor<'_> {
-    fn finish(mut self) -> fmt::Result {
-        let mut first = true;
-
-        if let Some(location) = self.location.clone() {
-            self.write_location(&mut first, &location)?;
-        }
-
-        if let Some(message) = self.message.clone() {
-            self.write_spaced(&mut first, message)?;
-        }
-
-        for (name, value) in self.fields.clone() {
-            self.write_field_rendered(&mut first, &name, &value)?;
-        }
-
-        Ok(())
-    }
-}
-
-fn flatten_json_attributes(
-    prefix: Option<&str>,
-    object: &serde_json::Map<String, Value>,
-    out: &mut Vec<(String, String)>,
-) {
-    for (key, value) in object {
-        let key = match prefix {
-            Some(prefix) => format!("{prefix}.{key}"),
-            None => key.clone(),
-        };
-        match value {
-            Value::Object(object) => flatten_json_attributes(Some(&key), object, out),
-            Value::String(value) => out.push((key, value.clone())),
-            Value::Null => out.push((key, "null".to_owned())),
-            _ => out.push((key, value.to_string())),
-        }
-    }
-}
-
-fn take_flattened_value(fields: &mut Vec<(String, String)>, name: &str) -> Option<String> {
-    let index = fields.iter().position(|(key, _)| key == name)?;
-    Some(fields.remove(index).1)
-}
-
-fn format_clickable_location(
-    file: Option<&str>,
-    line: Option<&str>,
-    column: Option<&str>,
-) -> Option<String> {
-    let file = file?;
-    let mut location = file.to_owned();
-    if let Some(line) = line {
-        location.push(':');
-        location.push_str(line);
-        if let Some(column) = column {
-            location.push(':');
-            location.push_str(column);
-        }
-    }
-    location.push(':');
-    Some(location)
 }
 
 struct CliLogBackend {
     level_filter: LogLevelFilter,
+    writer: BufferedLogWriter,
 }
 
+const DIM: &str = "\x1b[2m";
+const ITALIC: &str = "\x1b[3m";
+const PURPLE: &str = "\x1b[35m";
+const BLUE: &str = "\x1b[34m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
+
 impl GuestLogBackend for CliLogBackend {
-    fn log(&self, shortname: &str, _user_id: Option<u64>, record: &GuestLogRecord) {
+    fn log(&self, shortname: &str, _: Option<u64>, record: &GuestLogRecord) {
         if !self.level_filter.allows(record.level) {
             return;
         }
-
-        let attributes = guest_attributes_json(record);
-
-        macro_rules! emit_guest {
-            ($emit:ident) => {{
-                match attributes.as_deref() {
-                    Some(attributes) => tracing::$emit!(
-                        target: "app",
-                        message = %record.message,
-                        shortname = %shortname,
-                        attributes = %attributes,
-                    ),
-                    None => tracing::$emit!(
-                        target: "app",
-                        message = %record.message,
-                        shortname = %shortname,
-                    ),
-                }
-            }};
-        }
-
-        match record.level {
-            LogLevel::Trace => emit_guest!(trace),
-            LogLevel::Debug => emit_guest!(debug),
-            LogLevel::Info => emit_guest!(info),
-            LogLevel::Warn => emit_guest!(warn),
-            LogLevel::Error => emit_guest!(error),
-        }
-    }
-}
-
-fn guest_attributes_json(record: &GuestLogRecord) -> Option<String> {
-    let mut attributes = serde_json::Map::new();
-    if let Some(file) = &record.file {
-        attributes.insert("file".to_owned(), Value::String(file.clone()));
-    }
-    if let Some(line) = record.line {
-        attributes.insert("line".to_owned(), Value::Number(line.into()));
-    }
-    if let Some(module_path) = &record.module_path {
-        attributes.insert("module_path".to_owned(), Value::String(module_path.clone()));
-    }
-    for (key, value) in &record.attributes {
-        attributes.insert(key.clone(), value.clone());
-    }
-
-    if attributes.is_empty() {
-        None
-    } else {
-        serde_json::to_string(&attributes).ok()
+        let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let ts = format!("{:02}:{:02}:{:02}.{:06}", (t.as_secs() / 3600) % 24, (t.as_secs() / 60) % 60, t.as_secs() % 60, t.subsec_micros());
+        let (level_color, level) = match record.level {
+            LogLevel::Error => (RED, "ERROR"),
+            LogLevel::Warn => (YELLOW, "WARN "),
+            LogLevel::Info => (GREEN, "INFO "),
+            LogLevel::Debug => (BLUE, "DEBUG"),
+            LogLevel::Trace => (PURPLE, "TRACE"),
+        };
+        let loc = record.file.as_ref().map(|f| match record.line {
+            Some(l) => format!("{f}:{l}: "),
+            None => format!("{f}: "),
+        }).unwrap_or_default();
+        let attrs: Vec<_> = record.attributes.iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "shortname" | "module_path" | "file" | "line"))
+            .map(|(k, v)| format!("{ITALIC}{k}{RESET}={}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string())))
+            .collect();
+        let attrs_str = if attrs.is_empty() { String::new() } else { format!(" {}", attrs.join(" ")) };
+        let line = format!("{DIM}{ts}{RESET} {level_color}{level}{RESET} {shortname}: {DIM}{loc}{RESET}{}{attrs_str}\n", record.message);
+        self.writer.append(line.as_bytes());
     }
 }
 
@@ -522,22 +268,22 @@ async fn main() -> Result<()> {
     let (log_writer, _flush_guard) = BufferedLogWriter::new();
     let platform_filter: LevelFilter = args.platform_log_level.into();
     let filter = tracing_subscriber::filter::Targets::new()
-        .with_target("app", LevelFilter::TRACE)
         .with_target("terminal_games", platform_filter)
         .with_target("terminal_games_cli", platform_filter)
         .with_default(LevelFilter::OFF);
+    let log_writer_for_sub = log_writer.clone();
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
             .compact()
             .with_ansi(true)
             .with_timer(CliTimer)
-            .fmt_fields(NativeLikeFields)
-            .with_writer(move || log_writer.clone())
+            .with_writer(move || log_writer_for_sub.clone())
             .with_filter(filter),
     );
     tracing::subscriber::set_global_default(subscriber)?;
     let guest_log_backend = Arc::new(CliLogBackend {
         level_filter: args.app_log_level,
+        writer: log_writer,
     });
 
     let data_dir = dirs::data_dir()
