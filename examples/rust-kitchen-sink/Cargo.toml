@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 http-body-util = "0.1"
+tracing = "0.1"
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", default-features = false, features = [
     "tokio",

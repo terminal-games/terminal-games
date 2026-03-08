@@ -26,6 +26,7 @@ use wasmtime_wasi::I32Exit;
 
 use crate::{
     audio::{CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
+    log_backend::{GuestLogBackend, LogLevel, parse_guest_log_object},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
     replay::ReplayBuffer,
@@ -118,6 +119,7 @@ pub struct AppInstantiationParams {
     pub first_app_shortname: String,
     pub user_id: Option<u64>,
     pub locale: String,
+    pub log_backend: Arc<dyn GuestLogBackend>,
 }
 
 impl AppServer {
@@ -155,9 +157,9 @@ impl AppServer {
         linker.func_wrap("terminal_games", "terminal_info", Self::host_terminal_info)?;
         linker.func_wrap("terminal_games", "audio_write", Self::audio_write)?;
         linker.func_wrap("terminal_games", "audio_info", Self::audio_info)?;
+        linker.func_wrap("terminal_games", "log", Self::host_log)?;
         linker.func_wrap("terminal_games", "menu_request", Self::menu_request)?;
         linker.func_wrap("terminal_games", "menu_poll", Self::menu_poll)?;
-
         Ok(Self {
             linker: Arc::new(linker),
             mesh,
@@ -197,6 +199,7 @@ impl AppServer {
                 first_app_shortname,
                 user_id,
                 locale,
+                log_backend,
             } = params;
             let startup_shortname = first_app_shortname.clone();
 
@@ -247,6 +250,7 @@ impl AppServer {
                 audio_enabled,
                 user_id,
                 locale,
+                log_backend,
             };
             let (mut app, mut instance_pre) = match Self::prepare_instantiate(
                 &ctx,
@@ -580,8 +584,10 @@ impl AppServer {
                             exit_result = Ok(code);
                         }
                         Err(other) => {
-                            let error =
-                                AppRunError::new(format!("App {} trapped: {other:#}", app_shortname));
+                            let error = AppRunError::new(format!(
+                                "App {} trapped: {other:#}",
+                                app_shortname
+                            ));
                             tracing::error!(error = %error, "Module errored");
                             exit_result = Err(error);
                         }
@@ -599,22 +605,18 @@ impl AppServer {
 
                 if let Some(next_app) = state.next_app.take() {
                     let next_app = match next_app {
-                        NextAppState::Pending(next_app) => next_app
-                            .await
-                            .unwrap_or_else(|_| {
-                                Err(NextAppPrepareError::other(
-                                    "next app preload task closed unexpectedly",
-                                ))
-                            }),
+                        NextAppState::Pending(next_app) => next_app.await.unwrap_or_else(|_| {
+                            Err(NextAppPrepareError::other(
+                                "next app preload task closed unexpectedly",
+                            ))
+                        }),
                         NextAppState::Ready(next_app) => Ok(next_app),
                         NextAppState::Failed(error) => Err(error),
                     };
                     let Ok((next_app, next_instance_pre)) = next_app else {
                         let Err(error) = next_app else { unreachable!() };
-                        let error = AppRunError::new(format!(
-                            "Failed to change app: {}",
-                            error.message()
-                        ));
+                        let error =
+                            AppRunError::new(format!("Failed to change app: {}", error.message()));
                         tracing::error!(error = %error, "App change failed");
                         exit_result = Err(error);
                         break;
@@ -1081,6 +1083,44 @@ impl AppServer {
             }
             Err(_) => Ok(0),
         }
+    }
+
+    fn host_log(
+        mut caller: wasmtime::Caller<'_, AppState>,
+        level: u32,
+        ptr: i32,
+        len: u32,
+    ) -> wasmtime::Result<i32> {
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+            wasmtime::bail!("host_log: failed to find host memory");
+        };
+
+        let read_len = (len as usize).min(16384);
+        let mut buf = vec![0u8; read_len];
+        mem.read(&caller, ptr as u32 as usize, &mut buf)?;
+
+        let message = String::from_utf8_lossy(&buf);
+        let trimmed = message.trim_end_matches(['\r', '\n']);
+        let fallback_level = LogLevel::from_u8(level as u8).unwrap_or(LogLevel::Info);
+        let record = match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(serde_json::Value::Object(obj)) => parse_guest_log_object(obj, trimmed),
+            _ => crate::log_backend::GuestLogRecord::new(fallback_level, trimmed),
+        };
+
+        if record.message.is_empty() && record.attributes.is_empty() {
+            return Ok(0);
+        }
+
+        let state = caller.data();
+        state
+            .ctx
+            .log_backend
+            .log(&state.app.shortname, state.ctx.user_id, &record);
+        Ok(0)
     }
 
     fn terminal_size(
@@ -1947,6 +1987,7 @@ pub struct AppContext {
     app_output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     user_id: Option<u64>,
     locale: String,
+    log_backend: Arc<dyn GuestLogBackend>,
 }
 
 pub struct AppState {

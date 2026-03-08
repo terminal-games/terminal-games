@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, Mutex},
     task::{Context, Poll},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result};
@@ -19,14 +19,16 @@ use clap::Parser;
 use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
+use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, layer::SubscriberExt};
 
 use terminal_games::{
     app::{AppInstantiationParams, AppServer},
+    log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
     mesh::{LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
     terminal_profile::TerminalProfile,
 };
-use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
 #[command(about = "Run a terminal game from a wasm file")]
@@ -50,40 +52,197 @@ struct Args {
     #[arg(long, default_value = "0")]
     jitter: u64,
 
-    /// Bandwidth token bucket refill rate in bytes per second (default: 50000)
-    #[arg(long, default_value = "50000")]
+    /// Bandwidth token bucket refill rate in bytes per second
+    #[arg(long, default_value = "65536")]
     bandwidth: u64,
 
-    /// Bandwidth token bucket capacity in bytes (default: 100000)
-    #[arg(long, default_value = "100000")]
+    /// Bandwidth token bucket capacity in bytes
+    #[arg(long, default_value = "131072")]
     bandwidth_capacity: u64,
 
     /// Disable audio playback
     #[arg(long)]
     no_audio: bool,
 
-    /// Log verbosity level (off, error, warn, info, debug, trace)
-    #[arg(long, default_value = "warn")]
-    log_level: tracing::Level,
+    /// Log level for the game/app
+    #[arg(long = "app-log-level", default_value = "info")]
+    app_log_level: LogLevelFilter,
+
+    /// Log level for the platform
+    #[arg(long = "platform-log-level", default_value = "warn")]
+    platform_log_level: LogLevelFilter,
 
     /// Username for CLI auth (default: $USER)
     #[arg(long)]
     username: Option<String>,
 }
 
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LogLevelFilter {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
 
-impl Write for LogBuffer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+impl From<LogLevelFilter> for tracing_subscriber::filter::LevelFilter {
+    fn from(f: LogLevelFilter) -> Self {
+        use tracing_subscriber::filter::LevelFilter;
+        match f {
+            LogLevelFilter::Off => LevelFilter::OFF,
+            LogLevelFilter::Error => LevelFilter::ERROR,
+            LogLevelFilter::Warn => LevelFilter::WARN,
+            LogLevelFilter::Info => LevelFilter::INFO,
+            LogLevelFilter::Debug => LevelFilter::DEBUG,
+            LogLevelFilter::Trace => LevelFilter::TRACE,
+        }
+    }
+}
+
+impl LogLevelFilter {
+    fn allows(self, level: LogLevel) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Error => level >= LogLevel::Error,
+            Self::Warn => level >= LogLevel::Warn,
+            Self::Info => level >= LogLevel::Info,
+            Self::Debug => level >= LogLevel::Debug,
+            Self::Trace => true,
+        }
+    }
+}
+
+struct BufferedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+struct FlushGuard(Arc<Mutex<Vec<u8>>>);
+
+impl BufferedLogWriter {
+    fn new() -> (Self, FlushGuard) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        (Self(buf.clone()), FlushGuard(buf))
+    }
+
+    fn append(&self, buf: &[u8]) {
         let mut locked = match self.0.lock() {
             Ok(locked) => locked,
             Err(poisoned) => poisoned.into_inner(),
         };
         locked.extend_from_slice(buf);
+    }
+}
+
+impl Clone for BufferedLogWriter {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        let logs = match self.0.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let _ = std::io::stderr().write_all(&logs);
+    }
+}
+
+impl Write for BufferedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.append(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CliTimer;
+
+impl FormatTime for CliTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let (h, m, s) = (
+            (t.as_secs() / 3600) % 24,
+            (t.as_secs() / 60) % 60,
+            t.as_secs() % 60,
+        );
+        write!(w, "{h:02}:{m:02}:{s:02}.{:06} ", t.subsec_micros())
+    }
+}
+
+struct CliLogBackend {
+    level_filter: LogLevelFilter,
+    writer: BufferedLogWriter,
+}
+
+const DIM: &str = "\x1b[2m";
+const ITALIC: &str = "\x1b[3m";
+const PURPLE: &str = "\x1b[35m";
+const BLUE: &str = "\x1b[34m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
+
+impl GuestLogBackend for CliLogBackend {
+    fn log(&self, shortname: &str, _: Option<u64>, record: &GuestLogRecord) {
+        if !self.level_filter.allows(record.level) {
+            return;
+        }
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let ts = format!(
+            "{:02}:{:02}:{:02}.{:06}",
+            (t.as_secs() / 3600) % 24,
+            (t.as_secs() / 60) % 60,
+            t.as_secs() % 60,
+            t.subsec_micros()
+        );
+        let (level_color, level) = match record.level {
+            LogLevel::Error => (RED, "ERROR"),
+            LogLevel::Warn => (YELLOW, "WARN "),
+            LogLevel::Info => (GREEN, "INFO "),
+            LogLevel::Debug => (BLUE, "DEBUG"),
+            LogLevel::Trace => (PURPLE, "TRACE"),
+        };
+        let loc = record
+            .file
+            .as_ref()
+            .map(|f| match record.line {
+                Some(l) => format!("{f}:{l}: "),
+                None => format!("{f}: "),
+            })
+            .unwrap_or_default();
+        let attrs: Vec<_> = record
+            .attributes
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "shortname" | "module_path" | "file" | "line"))
+            .map(|(k, v)| {
+                format!(
+                    "{ITALIC}{k}{RESET}={}",
+                    v.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| v.to_string())
+                )
+            })
+            .collect();
+        let attrs_str = if attrs.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", attrs.join(" "))
+        };
+        let line = format!(
+            "{DIM}{ts}{RESET} {level_color}{level}{RESET} {shortname}: {DIM}{loc}{RESET}{}{attrs_str}\n",
+            record.message
+        );
+        self.writer.append(line.as_bytes());
     }
 }
 
@@ -140,19 +299,26 @@ async fn upsert_game(
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let log_buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let log_buffer_writer = log_buffer.clone();
+    let (log_writer, _flush_guard) = BufferedLogWriter::new();
+    let platform_filter: LevelFilter = args.platform_log_level.into();
     let filter = tracing_subscriber::filter::Targets::new()
-        .with_target("terminal_games", args.log_level)
-        .with_target("terminal_games_cli", args.log_level)
-        .with_default(tracing::Level::WARN);
-    use tracing_subscriber::{Layer, layer::SubscriberExt};
+        .with_target("terminal_games", platform_filter)
+        .with_target("terminal_games_cli", platform_filter)
+        .with_default(LevelFilter::OFF);
+    let log_writer_for_sub = log_writer.clone();
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
-            .with_writer(move || LogBuffer(log_buffer_writer.clone()))
+            .compact()
+            .with_ansi(true)
+            .with_timer(CliTimer)
+            .with_writer(move || log_writer_for_sub.clone())
             .with_filter(filter),
     );
     tracing::subscriber::set_global_default(subscriber)?;
+    let guest_log_backend = Arc::new(CliLogBackend {
+        level_filter: args.app_log_level,
+        writer: log_writer,
+    });
 
     let data_dir = dirs::data_dir()
         .expect("Failed to determine data directory")
@@ -343,6 +509,7 @@ async fn main() -> Result<()> {
         first_app_shortname,
         user_id,
         locale,
+        log_backend: guest_log_backend,
     });
 
     let graceful_shutdown_token_input = graceful_shutdown_token.clone();
@@ -429,8 +596,8 @@ async fn main() -> Result<()> {
                     Ok(Ok(exit_code)) => {
                         tracing::trace!(?exit_code, "App exited");
                     }
-                    Ok(Err(error)) => {
-                        tracing::error!(error = %error, "App failed");
+                    Ok(Err(_)) => {
+                        // Host already logged "Module errored" with full backtrace
                     }
                     Err(error) => {
                         tracing::error!(?error, "App exit channel dropped");
@@ -488,12 +655,6 @@ async fn main() -> Result<()> {
 
     let _ = local_discovery.unregister().await;
     mesh.graceful_shutdown().await;
-
-    let logs = match log_buffer.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
-    std::io::stderr().write_all(&logs)?;
 
     Ok(())
 }

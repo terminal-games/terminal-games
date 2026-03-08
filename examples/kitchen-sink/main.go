@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math"
 	"math/rand/v2"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"github.com/terminal-games/terminal-games/pkg/app"
 	"github.com/terminal-games/terminal-games/pkg/audio"
 	"github.com/terminal-games/terminal-games/pkg/bubblewrap"
+	_ "github.com/terminal-games/terminal-games/pkg/log"
 	_ "github.com/terminal-games/terminal-games/pkg/net/http"
 	"github.com/terminal-games/terminal-games/pkg/peer"
 )
@@ -90,6 +92,15 @@ func init() {
 }
 
 func main() {
+	defer func() {
+		if err := recover(); err != nil {
+			log.Printf("panic: %v", err)
+			panic(err)
+		}
+	}()
+
+	slog.Info("kitchen-sink starting")
+
 	var initialVolume float32 = 0.8
 	var audioPlaying bool = false
 	song = songResource.NewInstance()
@@ -97,6 +108,7 @@ func main() {
 	song.SetLoop(true)
 	song.Play()
 	audioPlaying = true
+	slog.Debug("audio started", "volume", initialVolume)
 
 	zone.NewGlobal()
 	p := bubblewrap.NewProgram(model{
@@ -163,6 +175,12 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 
 			m.httpBody = fmt.Sprintf("making request... %v", url)
 			return m, func() tea.Msg {
+				defer func() {
+					if err := recover(); err != nil {
+						log.Printf("panic: %v", err)
+						panic(err)
+					}
+				}()
 				resp, err := http.Get(url)
 				if err != nil {
 					panic(err)
