@@ -370,6 +370,7 @@ impl TokenBucket {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn get_tcp_rtt_from_fd(fd: RawFd) -> std::io::Result<std::time::Duration> {
     let mut tcp_info: libc::tcp_info = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
@@ -389,4 +390,34 @@ pub fn get_tcp_rtt_from_fd(fd: RawFd) -> std::io::Result<std::time::Duration> {
     }
 
     Ok(std::time::Duration::from_micros(tcp_info.tcpi_rtt as u64))
+}
+
+#[cfg(target_os = "macos")]
+pub fn get_tcp_rtt_from_fd(fd: RawFd) -> std::io::Result<std::time::Duration> {
+    let mut tcp_info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            &mut tcp_info as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(std::time::Duration::from_millis(tcp_info.tcpi_srtt as u64))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn get_tcp_rtt_from_fd(_fd: RawFd) -> std::io::Result<std::time::Duration> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "TCP RTT retrieval is only supported on linux and macos",
+    ))
 }
