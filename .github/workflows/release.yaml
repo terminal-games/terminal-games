@@ -66,7 +66,6 @@ jobs:
     name: Release CLI (macOS arm64)
     permissions: write-all
     env:
-      CARGO_TERM_COLOR: always
       RUST_TARGET: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v6
@@ -77,45 +76,14 @@ jobs:
           toolchain: 1.91.1
           target: aarch64-apple-darwin
 
-      - name: Cache Cargo registry and git sources
-        uses: actions/cache@v4
+      - name: Cache Cargo (registry + git + target)
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            ~/.cargo/git/checkouts
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Cache build artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            target
-            ~/.cargo/bin/cargo-chef
-          key: ${{ runner.os }}-target-${{ env.RUST_TARGET }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'terminal-games-cli/Cargo.toml', 'terminal-games/Cargo.toml', 'terminal-games-sdk/Cargo.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-target-${{ env.RUST_TARGET }}-
-
-      - name: Install cargo-chef
-        run: |
-          if ! command -v cargo-chef >/dev/null 2>&1; then
-            cargo install cargo-chef --version ^0.1 --locked
-          fi
-
-      - name: Prepare dependency recipe
-        run: |
-          cargo chef prepare --recipe-path recipe.json
-
-      - name: Build dependencies (cached)
-        run: |
-          cargo chef cook --release -p terminal-games-cli --target $RUST_TARGET --recipe-path recipe.json
+          shared-key: macos-${{ env.RUST_TARGET }}
 
       - name: Build
         run: |
-          cargo build --release -p terminal-games-cli --target $RUST_TARGET
+          cargo build --release -p terminal-games-cli --target $RUST_TARGET --locked
 
       - name: Extract
         run: |
