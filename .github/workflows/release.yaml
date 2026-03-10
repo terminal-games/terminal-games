@@ -65,6 +65,9 @@ jobs:
     runs-on: macos-latest
     name: Release CLI (macOS arm64)
     permissions: write-all
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_TARGET: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v6
 
@@ -74,17 +77,49 @@ jobs:
           toolchain: 1.91.1
           target: aarch64-apple-darwin
 
-      - name: Install build dependencies
+      - name: Cache Cargo registry and git sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/git/checkouts
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            target
+            ~/.cargo/bin/cargo-chef
+          key: ${{ runner.os }}-target-${{ env.RUST_TARGET }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'terminal-games-cli/Cargo.toml', 'terminal-games/Cargo.toml', 'terminal-games-sdk/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ env.RUST_TARGET }}-
+
+      - name: Install cargo-chef
         run: |
-          brew install cmake pkg-config
+          if ! command -v cargo-chef >/dev/null 2>&1; then
+            cargo install cargo-chef --version ^0.1 --locked
+          fi
+
+      - name: Prepare dependency recipe
+        run: |
+          cargo chef prepare --recipe-path recipe.json
+
+      - name: Build dependencies (cached)
+        run: |
+          cargo chef cook --release -p terminal-games-cli --target $RUST_TARGET --recipe-path recipe.json
 
       - name: Build
         run: |
-          cargo build --release -p terminal-games-cli --target aarch64-apple-darwin
+          cargo build --release -p terminal-games-cli --target $RUST_TARGET
 
       - name: Extract
         run: |
-          cp target/aarch64-apple-darwin/release/terminal-games-cli terminal-games-cli-aarch64-apple-darwin
+          cp target/$RUST_TARGET/release/terminal-games-cli terminal-games-cli-aarch64-apple-darwin
 
       - uses: actions/upload-artifact@v6
         with:
