@@ -1,5 +1,8 @@
+ARG RUST_TARGET
+
 FROM rust:1.93-alpine AS base
-RUN rustup target add x86_64-unknown-linux-musl
+ARG RUST_TARGET
+RUN rustup target add "${RUST_TARGET}"
 RUN cargo install cargo-chef --version ^0.1
 RUN apk add --no-cache \
     ca-certificates \
@@ -44,13 +47,14 @@ RUN rm rust-toolchain.toml
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM base AS builder
+ARG RUST_TARGET
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release -p terminal-games-cli --target=x86_64-unknown-linux-musl --recipe-path recipe.json
+RUN cargo chef cook --release -p terminal-games-cli --target="${RUST_TARGET}" --recipe-path recipe.json
 COPY . .
 RUN rm rust-toolchain.toml
-RUN cargo build --release -p terminal-games-cli --target=x86_64-unknown-linux-musl
+RUN cargo build --release -p terminal-games-cli --target="${RUST_TARGET}" && cp "target/${RUST_TARGET}/release/terminal-games-cli" /terminal-games-cli
 
-FROM scratch
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/terminal-games-cli /terminal-games-cli
+FROM alpine
+COPY --from=builder /terminal-games-cli /terminal-games-cli
 ENTRYPOINT ["/terminal-games-cli"]

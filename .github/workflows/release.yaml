@@ -3,9 +3,19 @@ on:
   workflow_dispatch:
 
 jobs:
-  release-cli:
-    runs-on: ubuntu-latest
-    name: Release CLI
+  release-cli-linux:
+    name: Release CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux/amd64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            target: aarch64-unknown-linux-musl
     permissions: write-all
     steps:
       - uses: actions/checkout@v6
@@ -21,20 +31,23 @@ jobs:
 
       - name: Docker Build
         run: |
-          docker buildx build -f Dockerfile.cli . -t ghcr.io/terminal-games/terminal-games-cli:latest --load \
-            --cache-from type=registry,ref=ghcr.io/terminal-games/terminal-games-cli:buildcache \
-            --cache-to type=registry,ref=ghcr.io/terminal-games/terminal-games-cli:buildcache,mode=max
+          IMAGE_TAG=ghcr.io/terminal-games/terminal-games-cli:${{ matrix.target }}
+          docker buildx build -f Dockerfile.cli . --platform=${{ matrix.platform }} --build-arg RUST_TARGET=${{ matrix.target }} -t "$IMAGE_TAG" --load \
+            --cache-from type=registry,ref=ghcr.io/terminal-games/terminal-games-cli:buildcache-${{ matrix.target }} \
+            --cache-to type=registry,ref=ghcr.io/terminal-games/terminal-games-cli:buildcache-${{ matrix.target }},mode=max
 
       - name: Extract
         run: |
-          CONTAINER_ID=$(docker create ghcr.io/terminal-games/terminal-games-cli:latest)
-          docker cp $CONTAINER_ID:/terminal-games-cli terminal-games-cli-x86_64-unknown-linux-musl
-          docker rm $CONTAINER_ID
+          IMAGE_TAG=ghcr.io/terminal-games/terminal-games-cli:${{ matrix.target }}
+          ARTIFACT=terminal-games-cli-${{ matrix.target }}
+          CONTAINER_ID=$(docker create "$IMAGE_TAG")
+          docker cp "$CONTAINER_ID":/terminal-games-cli "$ARTIFACT"
+          docker rm "$CONTAINER_ID"
 
       - uses: actions/upload-artifact@v6
         with:
-          name: terminal-games-cli-x86_64-unknown-linux-musl
-          path: terminal-games-cli-x86_64-unknown-linux-musl
+          name: terminal-games-cli-${{ matrix.target }}
+          path: terminal-games-cli-${{ matrix.target }}
 
       # - name: Get tag name
       #   id: tag-name
@@ -47,3 +60,36 @@ jobs:
       #   run: |
       #     gh release create ${{ steps.tag-name.outputs.tagname }} -t "terminal-games-cli" -n "Binary release (${{ steps.tag-name.outputs.tagname }})"
       #     gh release upload ${{ steps.tag-name.outputs.tagname }} terminal-games-cli-x86_64-unknown-linux-musl
+
+  release-cli-macos-arm64:
+    runs-on: macos-latest
+    name: Release CLI (macOS arm64)
+    permissions: write-all
+    env:
+      RUST_TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.1
+          target: aarch64-apple-darwin
+
+      - name: Cache Cargo (registry + git + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-${{ env.RUST_TARGET }}
+
+      - name: Build
+        run: |
+          cargo build --release -p terminal-games-cli --target $RUST_TARGET --locked
+
+      - name: Extract
+        run: |
+          cp target/$RUST_TARGET/release/terminal-games-cli terminal-games-cli-aarch64-apple-darwin
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: terminal-games-cli-aarch64-apple-darwin
+          path: terminal-games-cli-aarch64-apple-darwin

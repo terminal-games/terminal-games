@@ -20,14 +20,42 @@
           inherit system;
           overlays = [(import rust-overlay)];
         };
-        muslCc = pkgs.pkgsStatic.stdenv.cc;
-        muslBin = "${muslCc}/bin";
-        muslPrefix = muslCc.targetPrefix;
 
         rust-toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         rustPlatform = pkgs.makeRustPlatform {
           cargo = rust-toolchain;
           rustc = rust-toolchain;
+        };
+
+        commonShell = pkgs.mkShell {
+          packages = with pkgs; [
+            rust-toolchain
+            go
+            gopls
+            go-tools
+            wasm-tools
+            go-task
+            flyctl
+            openssl
+            opentofu
+            tofu-ls
+            ansible
+            lego
+            alejandra
+          ];
+
+          nativeBuildInputs = with pkgs; [
+            cmake
+            pkg-config
+          ];
+
+          buildInputs = with pkgs; [
+            clang
+            libopus
+          ];
+
+          GOOS = "wasip1";
+          GOARCH = "wasm";
         };
       in rec {
         packages.terminal-games-server = pkgs.rustPlatform.buildRustPackage {
@@ -74,42 +102,33 @@
           program = "${packages.terminal-games-cli}/bin/terminal-games-cli";
         };
 
-        devShells.default = pkgs.mkShell {
-          name = "terminal-games";
-          packages = with pkgs; [
-            rust-toolchain
-            mold
-            go
-            gopls
-            go-tools
-            wasm-tools
-            go-task
-            flyctl
-            muslCc
-            openssl
-            opentofu
-            tofu-ls
-            ansible
-            lego
-          ];
-          nativeBuildInputs = with pkgs; [
-            cmake
-            pkg-config
-          ];
-          buildInputs = with pkgs; [
-            clang
-            pkgsStatic.libopus
-          ];
-          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
-          CMAKE_POLICY_VERSION_MINIMUM = "3.5";
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${muslBin}/${muslPrefix}cc";
-          CC_x86_64_unknown_linux_musl = "${muslBin}/${muslPrefix}cc";
-          CXX_x86_64_unknown_linux_musl = "${muslBin}/${muslPrefix}c++";
-          AR_x86_64_unknown_linux_musl = "${muslBin}/${muslPrefix}ar";
-          PKG_CONFIG_ALLOW_CROSS = "1";
-          GOOS = "wasip1";
-          GOARCH = "wasm";
-        };
+        devShells.default =
+          if pkgs.stdenv.isLinux
+          then
+            pkgs.mkShell {
+              inputsFrom = [commonShell];
+
+              packages = with pkgs; [
+                mold
+                pkgsStatic.stdenv.cc
+              ];
+
+              buildInputs = with pkgs; [
+                pkgsStatic.libopus
+              ];
+
+              LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+              CMAKE_POLICY_VERSION_MINIMUM = "3.5";
+              CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${pkgs.pkgsStatic.stdenv.cc}/bin/${pkgs.pkgsStatic.stdenv.cc.targetPrefix}cc";
+              CC_x86_64_unknown_linux_musl = "${pkgs.pkgsStatic.stdenv.cc}/bin/${pkgs.pkgsStatic.stdenv.cc.targetPrefix}cc";
+              CXX_x86_64_unknown_linux_musl = "${pkgs.pkgsStatic.stdenv.cc}/bin/${pkgs.pkgsStatic.stdenv.cc.targetPrefix}c++";
+              AR_x86_64_unknown_linux_musl = "${pkgs.pkgsStatic.stdenv.cc}/bin/${pkgs.pkgsStatic.stdenv.cc.targetPrefix}ar";
+              PKG_CONFIG_ALLOW_CROSS = "1";
+            }
+          else
+            pkgs.mkShell {
+              inputsFrom = [commonShell];
+            };
       }
     );
 }

@@ -10,6 +10,11 @@ members = [
     "terminal-games",
 ]
 
+default-members = [
+    "terminal-games-cli",
+    "terminal-games-server",
+]
+
 # [profile.release]
 # lto = true
 # codegen-units = 1
