@@ -95,6 +95,10 @@ const NEXT_APP_READY_ERR_PREPARE_FAILED_OTHER: i32 = -2;
 
 pub type AppExitResult = Result<I32Exit, AppRunError>;
 
+pub trait ActiveShortnameTracker: Send + Sync {
+    fn set_active_shortname(&self, shortname: &str);
+}
+
 pub struct AppServer {
     linker: Arc<wasmtime::Linker<AppState>>,
     engine: wasmtime::Engine,
@@ -120,6 +124,7 @@ pub struct AppInstantiationParams {
     pub user_id: Option<u64>,
     pub locale: String,
     pub log_backend: Arc<dyn GuestLogBackend>,
+    pub active_shortname_tracker: Option<Arc<dyn ActiveShortnameTracker>>,
 }
 
 impl AppServer {
@@ -200,6 +205,7 @@ impl AppServer {
                 user_id,
                 locale,
                 log_backend,
+                active_shortname_tracker,
             } = params;
             let startup_shortname = first_app_shortname.clone();
 
@@ -269,6 +275,9 @@ impl AppServer {
                     return;
                 }
             };
+            if let Some(tracker) = &active_shortname_tracker {
+                tracker.set_active_shortname(&app.shortname);
+            }
 
             let mut replay_buffer = ReplayBuffer::new(
                 first_cols,
@@ -624,6 +633,9 @@ impl AppServer {
 
                     let shortname = next_app.shortname.clone();
                     replay_buffer.push_app_switch(next_app.app_id, &shortname);
+                    if let Some(tracker) = &active_shortname_tracker {
+                        tracker.set_active_shortname(&shortname);
+                    }
                     status_bar.shortname = shortname;
                     app = next_app;
                     instance_pre = next_instance_pre;
