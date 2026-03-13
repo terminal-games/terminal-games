@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+audiopus_sys = { version = "0.2", features = ["static"] }
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
@@ -17,7 +18,6 @@ hyper-util = "0.1"
 libsql = "0.9"
 ogg = "0.9"
 opus = "0.3"
-audiopus_sys = { version = "0.2", features = ["static"] }
 rand = "0.9"
 rand_core = "0.6"
 russh = "0.57"

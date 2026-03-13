@@ -79,11 +79,7 @@ impl ControllerState {
     fn enqueue(&mut self, id: u64, transport: Transport, tx: watch::Sender<AdmissionState>) {
         let _ = tx.send(AdmissionState::Queued(self.queue.len() + 1));
         self.increment_queued(transport);
-        self.queue.push_back(QueuedTicket {
-            id,
-            transport,
-            tx,
-        });
+        self.queue.push_back(QueuedTicket { id, transport, tx });
     }
 
     fn dequeue(&mut self) -> Option<QueuedTicket> {

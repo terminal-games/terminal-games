@@ -7,8 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use prometheus::{
-    Encoder, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
-    core::Collector,
+    Encoder, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder, core::Collector,
 };
 use terminal_games::app::ActiveShortnameTracker;
 
@@ -474,11 +473,7 @@ impl ServerMetrics {
 
     pub fn record_bytes(&self, direction: Direction, transport: Transport, bytes: usize) {
         self.bytes_total
-            .with_label_values(&[
-                direction.as_str(),
-                self.region.as_str(),
-                transport.as_str(),
-            ])
+            .with_label_values(&[direction.as_str(), self.region.as_str(), transport.as_str()])
             .inc_by(bytes as u64);
     }
 
