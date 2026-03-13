@@ -20,6 +20,7 @@ use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLa
 use terminal_games::terminal_profile::TerminalProfile;
 
 use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
+use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 pub struct SshSession {
     input_sender: tokio::sync::mpsc::Sender<smallvec::SmallVec<[u8; 16]>>,
@@ -37,6 +38,7 @@ pub struct SshSession {
 pub(crate) struct SshServer {
     app_server: Arc<AppServer>,
     admission_controller: Arc<AdmissionController>,
+    metrics: Arc<ServerMetrics>,
 }
 
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
@@ -47,12 +49,14 @@ impl SshServer {
     pub async fn new(
         app_server: Arc<AppServer>,
         admission_controller: Arc<AdmissionController>,
+        metrics: Arc<ServerMetrics>,
     ) -> anyhow::Result<Self> {
         tracing::info!("Initializing ssh server");
 
         Ok(Self {
             app_server,
             admission_controller,
+            metrics,
         })
     }
 
@@ -154,6 +158,7 @@ impl SshServer {
         let token = cancellation_token.clone();
         let app_server = self.app_server.clone();
         let admission_controller = self.admission_controller.clone();
+        let metrics = self.metrics.clone();
         let input_tx_clone = input_tx.clone();
         tokio::task::spawn(async move {
             let (session_handle, channel_id, remote_sshid) = match ssh_session_receiver.await {
@@ -305,7 +310,7 @@ impl SshServer {
             let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
             if admission_controller.should_require_captcha() {
                 let captcha = generate_captcha(7);
-                if !solve_captcha(
+                let solved = solve_captcha(
                     &session_handle,
                     channel_id,
                     &mut resize_rx,
@@ -313,8 +318,8 @@ impl SshServer {
                     &captcha,
                     terminal_profile,
                 )
-                .await
-                {
+                .await;
+                if !solved {
                     let _ = session_handle
                         .data(channel_id, b"\x1b[?1049l".to_vec().into())
                         .await;
@@ -328,7 +333,7 @@ impl SshServer {
                     return;
                 }
             }
-            let admission_ticket = admission_controller.issue_ticket();
+            let admission_ticket = admission_controller.issue_ticket(Transport::Ssh);
             if !wait_for_admission(
                 &session_handle,
                 channel_id,
@@ -354,6 +359,17 @@ impl SshServer {
             let _ = session_handle
                 .data(channel_id, b"\x1b[2J\x1b[H".to_vec().into())
                 .await;
+            let session_guard = metrics.start_session(
+                Transport::Ssh,
+                if user_id.is_some() {
+                    AuthKind::Authenticated
+                } else {
+                    AuthKind::Anonymous
+                },
+                has_audio,
+                user_id,
+            );
+            let active_shortname_tracker = session_guard.active_shortname_tracker();
 
             let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
                 first_app_shortname,
@@ -372,6 +388,7 @@ impl SshServer {
                 user_id,
                 locale,
                 log_backend: Arc::new(NoopLogBackend),
+                active_shortname_tracker: Some(active_shortname_tracker),
             });
             loop {
                 tokio::select! {
@@ -394,16 +411,19 @@ impl SshServer {
 
                     data = audio_rx.recv(), if has_audio => {
                         let Some(data) = data else { break };
+                        metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
                         let _ = session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, russh::CryptoVec::from_slice(&data)).await;
                     }
 
                     data = output_rx.recv() => {
                         let Some(data) = data else { break };
+                        metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
                         let _ = session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await;
                     }
                 }
             }
             drop(admission_ticket);
+            drop(session_guard);
 
             let _ = session_handle
                 .data(channel_id, b"\x1b[?1049l".to_vec().into())
@@ -921,6 +941,9 @@ impl Handler for SshSession {
         if data.is_empty() {
             return Ok(());
         }
+        self.server
+            .metrics
+            .record_bytes(Direction::In, Transport::Ssh, data.len());
         if data == b"\x03" {
             // CTRL+C
             self.cancellation_token.cancel();

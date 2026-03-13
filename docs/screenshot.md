@@ -1,6 +1,6 @@
 From within tmux:
 
-`ctrl+b :` `resize-window -x80 -x25`
+`ctrl+b :` `resize-window -x80 -y25`
 `ctrl+b :` `capture-pane -e`
 `ctrl+b :` `save-buffer /tmp/screenshot.ansi`
 

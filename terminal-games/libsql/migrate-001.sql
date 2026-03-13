@@ -3,14 +3,15 @@ CREATE TABLE IF NOT EXISTS users (
     pubkey_fingerprint BLOB UNIQUE,
     username TEXT NOT NULL,
     locale TEXT NOT NULL,
-    session_time INTEGER NOT NULL DEFAULT(0)
+    session_time REAL NOT NULL DEFAULT(0)
 );
 
 CREATE TABLE IF NOT EXISTS games (
     id INTEGER PRIMARY KEY,
     shortname TEXT NOT NULL UNIQUE,
     path TEXT NOT NULL,
-    details JSON NOT NULL CHECK(json_valid(details))
+    details JSON NOT NULL CHECK(json_valid(details)),
+    duration_seconds REAL NOT NULL DEFAULT(0)
 );
 
 CREATE TABLE IF NOT EXISTS envs (
@@ -44,3 +45,12 @@ BEGIN
           LIMIT 50
       );
 END;
+
+CREATE TABLE IF NOT EXISTS user_game_durations (
+    user_id INTEGER NOT NULL,
+    game_id INTEGER NOT NULL,
+    duration_seconds REAL NOT NULL DEFAULT(0),
+    PRIMARY KEY(user_id, game_id),
+    FOREIGN KEY(user_id) REFERENCES users(id),
+    FOREIGN KEY(game_id) REFERENCES games(id)
+);

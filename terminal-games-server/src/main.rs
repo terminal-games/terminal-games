@@ -3,6 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 mod admission;
+mod metrics;
 mod ssh;
 mod web;
 
@@ -204,23 +205,35 @@ async fn main() -> Result<()> {
     mesh.start_discovery().await?;
     mesh.serve().await?;
 
-    let app_server = Arc::new(AppServer::new(mesh.clone(), conn)?);
+    let app_server = Arc::new(AppServer::new(mesh.clone(), conn.clone())?);
     let max_active_apps = std::env::var("MAX_ACTIVE_APPS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(usize::MAX);
-    let admission_controller = Arc::new(admission::AdmissionController::new(max_active_apps));
+    let metrics = metrics::ServerMetrics::new(max_active_apps, conn.clone()).await?;
+    let admission_controller = Arc::new(admission::AdmissionController::new(
+        max_active_apps,
+        metrics.clone(),
+    ));
 
     tokio::select! {
         result = async {
-            let mut server = ssh::SshServer::new(app_server.clone(), admission_controller.clone()).await?;
+            let mut server = ssh::SshServer::new(
+                app_server.clone(),
+                admission_controller.clone(),
+                metrics.clone(),
+            ).await?;
             server.run().await
         } => {
             result?;
         }
         result = async {
-            let server = web::WebServer::new(app_server.clone(), admission_controller.clone());
+            let server = web::WebServer::new(
+                app_server.clone(),
+                admission_controller.clone(),
+                metrics.clone(),
+            )?;
             server.run().await
         } => {
             result?;

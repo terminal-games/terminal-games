@@ -22,7 +22,10 @@ use axum::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE},
+    },
     response::{Html, IntoResponse, Response},
     routing::get,
 };
@@ -48,6 +51,7 @@ use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLa
 use terminal_games::terminal_profile::TerminalProfile;
 
 use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
+use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 #[derive(Clone)]
 struct MyConnectInfo {
@@ -65,15 +69,46 @@ pub struct WebServer {
     app_server: Arc<AppServer>,
     admission_controller: Arc<AdmissionController>,
     pow: Arc<PowGate>,
+    metrics: Arc<ServerMetrics>,
+    metrics_bearer_token: Option<Arc<str>>,
 }
 
 impl WebServer {
-    pub fn new(app_server: Arc<AppServer>, admission_controller: Arc<AdmissionController>) -> Self {
-        Self {
+    pub fn new(
+        app_server: Arc<AppServer>,
+        admission_controller: Arc<AdmissionController>,
+        metrics: Arc<ServerMetrics>,
+    ) -> anyhow::Result<Self> {
+        let metrics_bearer_token = match std::env::var("METRICS_BEARER_TOKEN") {
+            Ok(token) => {
+                let token = token.trim().to_string();
+                if token.is_empty() {
+                    tracing::warn!(
+                        "METRICS_BEARER_TOKEN is empty; /metrics will be served without authentication"
+                    );
+                    None
+                } else {
+                    Some(token.into())
+                }
+            }
+            Err(std::env::VarError::NotPresent) => {
+                tracing::warn!(
+                    "METRICS_BEARER_TOKEN is not set; /metrics will be served without authentication"
+                );
+                None
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("METRICS_BEARER_TOKEN is not valid Unicode");
+            }
+        };
+
+        Ok(Self {
             app_server,
             admission_controller,
             pow: Arc::new(PowGate::new(18, Duration::from_secs(90))),
-        }
+            metrics,
+            metrics_bearer_token,
+        })
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -99,6 +134,7 @@ impl WebServer {
                 "/jitter-buffer-processor.js",
                 get(serve_jitter_buffer_processor_js),
             )
+            .route("/metrics", get(serve_metrics))
             .route("/pow/challenge", get(pow_challenge_handler))
             .route("/ws", get(websocket_handler))
             .with_state(self.clone());
@@ -215,32 +251,62 @@ async fn serve_index() -> Html<&'static str> {
 }
 
 async fn serve_styles() -> Response {
-    static_response("text/css", include_str!("../web/styles.css"))
+    static_bytes_response("text/css", include_str!("../web/styles.css"))
 }
 
 async fn serve_main_js() -> Response {
-    static_response("application/javascript", include_str!("../web/main.js"))
+    static_bytes_response("application/javascript", include_str!("../web/main.js"))
 }
 
 async fn serve_opus_audio_player_js() -> Response {
-    static_response(
+    static_bytes_response(
         "application/javascript",
         include_str!("../web/opus-audio-player.js"),
     )
 }
 
 async fn serve_jitter_buffer_processor_js() -> Response {
-    static_response(
+    static_bytes_response(
         "application/javascript",
         include_str!("../web/jitter-buffer-processor.js"),
     )
 }
 
-fn static_response(content_type: &'static str, body: &'static str) -> Response {
+async fn serve_metrics(State(server): State<WebServer>, headers: HeaderMap) -> Response {
+    if !metrics_request_authorized(&headers, server.metrics_bearer_token.as_deref()) {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(WWW_AUTHENTICATE, "Bearer")
+            .body(Body::from("missing or invalid bearer token"))
+            .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response());
+    }
+
+    match server.metrics.render().await {
+        Ok(body) => static_bytes_response("text/plain; version=0.0.4; charset=utf-8", body),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to encode metrics: {err:#}"),
+        )
+            .into_response(),
+    }
+}
+
+fn metrics_request_authorized(headers: &HeaderMap, expected_token: Option<&str>) -> bool {
+    let Some(expected_token) = expected_token else {
+        return true;
+    };
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|token| token == expected_token)
+}
+
+fn static_bytes_response(content_type: &'static str, body: impl Into<Body>) -> Response {
     match Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type)
-        .body(Body::from(body))
+        .body(body.into())
     {
         Ok(response) => response,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -336,10 +402,15 @@ async fn handle_socket(
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
-    let admission_ticket = server.admission_controller.issue_ticket();
+    let admission_ticket = server.admission_controller.issue_ticket(Transport::Web);
     if !wait_for_admission(&mut sender, &mut receiver, &resize_tx, &admission_ticket).await {
         return;
     }
+    let session_guard =
+        server
+            .metrics
+            .start_session(Transport::Web, AuthKind::Anonymous, true, None);
+    let active_shortname_tracker = session_guard.active_shortname_tracker();
 
     let exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
         first_app_shortname,
@@ -358,9 +429,11 @@ async fn handle_socket(
         user_id: None,
         locale,
         log_backend: Arc::new(NoopLogBackend),
+        active_shortname_tracker: Some(active_shortname_tracker),
     });
 
     let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel(1);
+    let send_metrics = server.metrics.clone();
 
     tokio::task::spawn(async move {
         loop {
@@ -375,6 +448,7 @@ async fn handle_socket(
                         }
                     }
                     msg.push(0x00);
+                    send_metrics.record_bytes(Direction::Out, Transport::Web, msg.len());
                     if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
                         break;
                     }
@@ -382,6 +456,7 @@ async fn handle_socket(
                 data = audio_rx.recv() => {
                     let Some(mut data) = data else { break };
                     data.push(0x01);
+                    send_metrics.record_bytes(Direction::Out, Transport::Web, data.len());
                     if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
                         break;
                     }
@@ -397,6 +472,7 @@ async fn handle_socket(
     });
 
     let cancellation_token_clone = cancellation_token.clone();
+    let recv_metrics = server.metrics.clone();
     tokio::task::spawn(async move {
         while let Some(msg) = receiver.next().await {
             match msg {
@@ -405,6 +481,7 @@ async fn handle_socket(
                     if data.is_empty() {
                         continue;
                     }
+                    recv_metrics.record_bytes(Direction::In, Transport::Web, data.len());
                     if data == b"\x03" {
                         // CTRL+C
                         cancellation_token_clone.cancel();
@@ -450,6 +527,7 @@ async fn handle_socket(
 
     cancellation_token.cancel();
     drop(admission_ticket);
+    drop(session_guard);
 }
 
 async fn recv_initial_resize(
@@ -511,7 +589,7 @@ impl PowGate {
             Err(poisoned) => poisoned.into_inner(),
         };
         let now = Instant::now();
-        guard.retain(|_, challenge| challenge.expires_at > now);
+        retain_unexpired(&mut guard, now);
         let id = random_token(16);
         let nonce = random_token(16);
         guard.insert(
@@ -534,6 +612,7 @@ impl PowGate {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            retain_unexpired(&mut guard, Instant::now());
             guard.remove(id)
         };
         let Some(challenge) = challenge else {
@@ -549,6 +628,12 @@ impl PowGate {
         let digest = hasher.finalize();
         leading_zero_bits(&digest) >= self.difficulty as u32
     }
+}
+
+fn retain_unexpired(challenges: &mut HashMap<String, PowChallenge>, now: Instant) -> usize {
+    let before = challenges.len();
+    challenges.retain(|_, challenge| challenge.expires_at > now);
+    before.saturating_sub(challenges.len())
 }
 
 fn random_token(bytes: usize) -> String {

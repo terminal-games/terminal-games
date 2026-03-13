@@ -510,6 +510,7 @@ async fn main() -> Result<()> {
         user_id,
         locale,
         log_backend: guest_log_backend,
+        active_shortname_tracker: None,
     });
 
     let graceful_shutdown_token_input = graceful_shutdown_token.clone();

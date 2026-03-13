@@ -3,7 +3,7 @@
   vars_files:
     - "{{ playbook_dir }}/secrets.yml"
   vars:
-    server_binary_local_path: "{{ playbook_dir }}/../target/x86_64-unknown-linux-musl/release/terminal-games-server"
+    server_binary_local_path: "{{ playbook_dir }}/../terminal-games-server-docker-binary"
     server_binary_remote_path: /opt/terminal-games/bin/terminal-games-server
     game_artifacts_local_dir: "{{ playbook_dir }}/apps"
   tasks:
@@ -16,9 +16,11 @@
           - LIBSQL_AUTH_TOKEN | length > 0
           - LIBSQL_URL is defined
           - LIBSQL_URL | length > 0
+          - METRICS_BEARER_TOKEN is defined
+          - METRICS_BEARER_TOKEN | length > 0
           - SSH_HOST_KEY_BASE64 is defined
           - SSH_HOST_KEY_BASE64 | length > 0
-        fail_msg: "Set MESH_PINNED_PEM, LIBSQL_AUTH_TOKEN, LIBSQL_URL, and SSH_HOST_KEY_BASE64."
+        fail_msg: "Set MESH_PINNED_PEM, LIBSQL_AUTH_TOKEN, LIBSQL_URL, METRICS_BEARER_TOKEN, and SSH_HOST_KEY_BASE64."
       no_log: true
 
     - name: Verify local server binary exists
