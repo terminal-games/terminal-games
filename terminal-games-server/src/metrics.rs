@@ -9,10 +9,8 @@ use anyhow::{Context, Result};
 use prometheus::{
     Encoder, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder, core::Collector,
 };
+use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use terminal_games::app::ActiveShortnameTracker;
-
-#[cfg(target_os = "linux")]
-use std::fs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Transport {
@@ -182,20 +180,19 @@ pub struct ServerMetrics {
     db: libsql::Connection,
     duration_writer: tokio::sync::mpsc::UnboundedSender<DurationRecord>,
 
-    build_info: IntGaugeVec,
     admission_waiting_sessions: IntGaugeVec,
     admission_queue_exits_total: IntCounterVec,
     active_sessions: IntGaugeVec,
     sessions_total: IntCounterVec,
     session_duration_seconds: GaugeVec,
     bytes_total: IntCounterVec,
-    process_resident_memory_bytes: Option<IntGaugeVec>,
-    process_virtual_memory_bytes: Option<IntGaugeVec>,
+    process_resident_memory_bytes: IntGaugeVec,
+    process_virtual_memory_bytes: IntGaugeVec,
     system_cpu_count: IntGaugeVec,
-    system_memory_total_bytes: Option<IntGaugeVec>,
-    system_memory_available_bytes: Option<IntGaugeVec>,
-    system_memory_used_bytes: Option<IntGaugeVec>,
-    system_load_average: Option<GaugeVec>,
+    system_memory_total_bytes: IntGaugeVec,
+    system_memory_available_bytes: IntGaugeVec,
+    system_memory_used_bytes: IntGaugeVec,
+    system_load_average: GaugeVec,
 }
 
 impl ServerMetrics {
@@ -310,8 +307,7 @@ impl ServerMetrics {
             )?,
         )?;
 
-        #[cfg(target_os = "linux")]
-        let process_resident_memory_bytes = Some(register(
+        let process_resident_memory_bytes = register(
             &registry,
             IntGaugeVec::new(
                 Opts::new(
@@ -320,12 +316,9 @@ impl ServerMetrics {
                 ),
                 &["region"],
             )?,
-        )?);
-        #[cfg(not(target_os = "linux"))]
-        let process_resident_memory_bytes = None;
+        )?;
 
-        #[cfg(target_os = "linux")]
-        let process_virtual_memory_bytes = Some(register(
+        let process_virtual_memory_bytes = register(
             &registry,
             IntGaugeVec::new(
                 Opts::new(
@@ -334,9 +327,7 @@ impl ServerMetrics {
                 ),
                 &["region"],
             )?,
-        )?);
-        #[cfg(not(target_os = "linux"))]
-        let process_virtual_memory_bytes = None;
+        )?;
 
         let system_cpu_count = register(
             &registry,
@@ -349,8 +340,7 @@ impl ServerMetrics {
             )?,
         )?;
 
-        #[cfg(target_os = "linux")]
-        let system_memory_total_bytes = Some(register(
+        let system_memory_total_bytes = register(
             &registry,
             IntGaugeVec::new(
                 Opts::new(
@@ -359,12 +349,9 @@ impl ServerMetrics {
                 ),
                 &["region"],
             )?,
-        )?);
-        #[cfg(not(target_os = "linux"))]
-        let system_memory_total_bytes = None;
+        )?;
 
-        #[cfg(target_os = "linux")]
-        let system_memory_available_bytes = Some(register(
+        let system_memory_available_bytes = register(
             &registry,
             IntGaugeVec::new(
                 Opts::new(
@@ -373,12 +360,9 @@ impl ServerMetrics {
                 ),
                 &["region"],
             )?,
-        )?);
-        #[cfg(not(target_os = "linux"))]
-        let system_memory_available_bytes = None;
+        )?;
 
-        #[cfg(target_os = "linux")]
-        let system_memory_used_bytes = Some(register(
+        let system_memory_used_bytes = register(
             &registry,
             IntGaugeVec::new(
                 Opts::new(
@@ -387,12 +371,9 @@ impl ServerMetrics {
                 ),
                 &["region"],
             )?,
-        )?);
-        #[cfg(not(target_os = "linux"))]
-        let system_memory_used_bytes = None;
+        )?;
 
-        #[cfg(unix)]
-        let system_load_average = Some(register(
+        let system_load_average = register(
             &registry,
             GaugeVec::new(
                 Opts::new(
@@ -401,9 +382,7 @@ impl ServerMetrics {
                 ),
                 &["region", "window"],
             )?,
-        )?);
-        #[cfg(not(unix))]
-        let system_load_average = None;
+        )?;
 
         let (duration_writer, duration_rx) = tokio::sync::mpsc::unbounded_channel();
         spawn_duration_writer(db.clone(), duration_rx);
@@ -413,7 +392,6 @@ impl ServerMetrics {
             region,
             db,
             duration_writer,
-            build_info,
             admission_waiting_sessions,
             admission_queue_exits_total,
             active_sessions,
@@ -433,13 +411,6 @@ impl ServerMetrics {
     pub async fn render(&self) -> Result<String> {
         self.update_system_metrics();
         self.refresh_persisted_shortname_durations().await?;
-        self.build_info
-            .with_label_values(&[
-                "terminal-games-server",
-                env!("CARGO_PKG_VERSION"),
-                self.region.as_str(),
-            ])
-            .set(1);
 
         let families = self.registry.gather();
         let encoder = TextEncoder::new();
@@ -509,64 +480,53 @@ impl ServerMetrics {
     }
 
     fn update_system_metrics(&self) {
-        let snapshot = ResourceSnapshot::capture();
+        let mut system = System::new();
+        system.refresh_memory();
+        system.refresh_cpu_list(CpuRefreshKind::nothing());
 
-        if let (Some(metric), Some(value)) = (
-            &self.process_resident_memory_bytes,
-            snapshot.process_resident_memory_bytes,
-        ) {
-            metric
-                .with_label_values(&[self.region.as_str()])
-                .set(value as i64);
-        }
-        if let (Some(metric), Some(value)) = (
-            &self.process_virtual_memory_bytes,
-            snapshot.process_virtual_memory_bytes,
-        ) {
-            metric
-                .with_label_values(&[self.region.as_str()])
-                .set(value as i64);
-        }
+        let pid = Pid::from_u32(std::process::id());
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_memory().without_tasks(),
+        );
+        let (process_resident_memory_bytes, process_virtual_memory_bytes) = system
+            .process(pid)
+            .map(|process| (process.memory(), process.virtual_memory()))
+            .unwrap_or((0, 0));
+
+        let total_memory = system.total_memory();
+        let available_memory = system.available_memory();
+
+        self.process_resident_memory_bytes
+            .with_label_values(&[self.region.as_str()])
+            .set(process_resident_memory_bytes as i64);
+        self.process_virtual_memory_bytes
+            .with_label_values(&[self.region.as_str()])
+            .set(process_virtual_memory_bytes as i64);
         self.system_cpu_count
             .with_label_values(&[self.region.as_str()])
-            .set(snapshot.system_cpu_count as i64);
-        if let (Some(metric), Some(value)) = (
-            &self.system_memory_total_bytes,
-            snapshot.system_memory_total_bytes,
-        ) {
-            metric
-                .with_label_values(&[self.region.as_str()])
-                .set(value as i64);
-        }
-        if let (Some(metric), Some(value)) = (
-            &self.system_memory_available_bytes,
-            snapshot.system_memory_available_bytes,
-        ) {
-            metric
-                .with_label_values(&[self.region.as_str()])
-                .set(value as i64);
-        }
-        if let (Some(metric), Some(value)) = (
-            &self.system_memory_used_bytes,
-            snapshot.system_memory_used_bytes,
-        ) {
-            metric
-                .with_label_values(&[self.region.as_str()])
-                .set(value as i64);
-        }
-        if let (Some(metric), Some(loads)) =
-            (&self.system_load_average, snapshot.system_load_average)
-        {
-            metric
-                .with_label_values(&[self.region.as_str(), "1m"])
-                .set(loads[0]);
-            metric
-                .with_label_values(&[self.region.as_str(), "5m"])
-                .set(loads[1]);
-            metric
-                .with_label_values(&[self.region.as_str(), "15m"])
-                .set(loads[2]);
-        }
+            .set(system.cpus().len() as i64);
+        self.system_memory_total_bytes
+            .with_label_values(&[self.region.as_str()])
+            .set(total_memory as i64);
+        self.system_memory_available_bytes
+            .with_label_values(&[self.region.as_str()])
+            .set(available_memory as i64);
+        self.system_memory_used_bytes
+            .with_label_values(&[self.region.as_str()])
+            .set(total_memory.saturating_sub(available_memory) as i64);
+
+        let loads = System::load_average();
+        self.system_load_average
+            .with_label_values(&[self.region.as_str(), "1m"])
+            .set(loads.one);
+        self.system_load_average
+            .with_label_values(&[self.region.as_str(), "5m"])
+            .set(loads.five);
+        self.system_load_average
+            .with_label_values(&[self.region.as_str(), "15m"])
+            .set(loads.fifteen);
     }
 
     async fn refresh_persisted_shortname_durations(&self) -> Result<()> {
@@ -684,100 +644,4 @@ where
         .register(Box::new(metric.clone()))
         .context("failed to register prometheus collector")?;
     Ok(metric)
-}
-
-struct ResourceSnapshot {
-    process_resident_memory_bytes: Option<u64>,
-    process_virtual_memory_bytes: Option<u64>,
-    system_cpu_count: u64,
-    system_memory_total_bytes: Option<u64>,
-    system_memory_available_bytes: Option<u64>,
-    system_memory_used_bytes: Option<u64>,
-    system_load_average: Option<[f64; 3]>,
-}
-
-impl ResourceSnapshot {
-    fn capture() -> Self {
-        let snapshot = Self {
-            process_resident_memory_bytes: None,
-            process_virtual_memory_bytes: None,
-            system_cpu_count: std::thread::available_parallelism()
-                .map(|value| value.get() as u64)
-                .unwrap_or(0),
-            system_memory_total_bytes: None,
-            system_memory_available_bytes: None,
-            system_memory_used_bytes: None,
-            system_load_average: load_average(),
-        };
-
-        #[cfg(target_os = "linux")]
-        {
-            let mut snapshot = snapshot;
-            snapshot.populate_linux_process_stats();
-            snapshot.populate_linux_memory_stats();
-            snapshot
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            snapshot
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn populate_linux_process_stats(&mut self) {
-        if let Ok(status) = fs::read_to_string("/proc/self/status") {
-            for line in status.lines() {
-                if let Some(value) = parse_proc_kib_value(line, "VmRSS:") {
-                    self.process_resident_memory_bytes = Some(value);
-                } else if let Some(value) = parse_proc_kib_value(line, "VmSize:") {
-                    self.process_virtual_memory_bytes = Some(value);
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn populate_linux_memory_stats(&mut self) {
-        if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
-            for line in meminfo.lines() {
-                if let Some(value) = parse_proc_kib_value(line, "MemTotal:") {
-                    self.system_memory_total_bytes = Some(value);
-                } else if let Some(value) = parse_proc_kib_value(line, "MemAvailable:") {
-                    self.system_memory_available_bytes = Some(value);
-                }
-            }
-        }
-        if let (Some(total), Some(available)) = (
-            self.system_memory_total_bytes,
-            self.system_memory_available_bytes,
-        ) {
-            self.system_memory_used_bytes = Some(total.saturating_sub(available));
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn parse_proc_kib_value(line: &str, prefix: &str) -> Option<u64> {
-    let raw = line.strip_prefix(prefix)?.trim();
-    let value = raw.split_whitespace().next()?.parse::<u64>().ok()?;
-    Some(value.saturating_mul(1024))
-}
-
-#[cfg(unix)]
-fn load_average() -> Option<[f64; 3]> {
-    let mut loads = [0.0f64; 3];
-    // SAFETY: `loads` points to valid memory for three f64 values and remains
-    // alive for the duration of the call.
-    let result = unsafe { libc::getloadavg(loads.as_mut_ptr(), loads.len() as i32) };
-    if result == loads.len() as i32 {
-        Some(loads)
-    } else {
-        None
-    }
-}
-
-#[cfg(not(unix))]
-fn load_average() -> Option<[f64; 3]> {
-    None
 }

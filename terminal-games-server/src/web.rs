@@ -251,22 +251,22 @@ async fn serve_index() -> Html<&'static str> {
 }
 
 async fn serve_styles() -> Response {
-    static_response("text/css", include_str!("../web/styles.css"))
+    static_bytes_response("text/css", include_str!("../web/styles.css"))
 }
 
 async fn serve_main_js() -> Response {
-    static_response("application/javascript", include_str!("../web/main.js"))
+    static_bytes_response("application/javascript", include_str!("../web/main.js"))
 }
 
 async fn serve_opus_audio_player_js() -> Response {
-    static_response(
+    static_bytes_response(
         "application/javascript",
         include_str!("../web/opus-audio-player.js"),
     )
 }
 
 async fn serve_jitter_buffer_processor_js() -> Response {
-    static_response(
+    static_bytes_response(
         "application/javascript",
         include_str!("../web/jitter-buffer-processor.js"),
     )
@@ -300,10 +300,6 @@ fn metrics_request_authorized(headers: &HeaderMap, expected_token: Option<&str>)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .is_some_and(|token| token == expected_token)
-}
-
-fn static_response(content_type: &'static str, body: &'static str) -> Response {
-    static_bytes_response(content_type, body)
 }
 
 fn static_bytes_response(content_type: &'static str, body: impl Into<Body>) -> Response {
