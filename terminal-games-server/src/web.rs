@@ -51,7 +51,7 @@ use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLa
 use terminal_games::terminal_profile::TerminalProfile;
 
 use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
-use crate::metrics::{AuthKind, ServerMetrics, Transport};
+use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 #[derive(Clone)]
 struct MyConnectInfo {
@@ -452,7 +452,7 @@ async fn handle_socket(
                         }
                     }
                     msg.push(0x00);
-                    send_metrics.record_terminal_output_bytes(Transport::Web, msg.len());
+                    send_metrics.record_bytes(Direction::Out, Transport::Web, msg.len());
                     if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
                         break;
                     }
@@ -460,7 +460,7 @@ async fn handle_socket(
                 data = audio_rx.recv() => {
                     let Some(mut data) = data else { break };
                     data.push(0x01);
-                    send_metrics.record_audio_output_bytes(Transport::Web, data.len());
+                    send_metrics.record_bytes(Direction::Out, Transport::Web, data.len());
                     if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
                         break;
                     }
@@ -485,7 +485,7 @@ async fn handle_socket(
                     if data.is_empty() {
                         continue;
                     }
-                    recv_metrics.record_input_bytes(Transport::Web, data.len());
+                    recv_metrics.record_bytes(Direction::In, Transport::Web, data.len());
                     if data == b"\x03" {
                         // CTRL+C
                         cancellation_token_clone.cancel();

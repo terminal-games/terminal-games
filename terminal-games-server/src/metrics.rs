@@ -3,20 +3,17 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
-    TextEncoder, core::Collector,
+    Encoder, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder,
+    core::Collector,
 };
 use terminal_games::app::ActiveShortnameTracker;
 
 #[cfg(target_os = "linux")]
 use std::fs;
-
-const ADMISSION_WAIT_BUCKETS_SECONDS: &[f64] =
-    &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Transport {
@@ -49,7 +46,7 @@ impl AuthKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Direction {
+pub enum Direction {
     In,
     Out,
 }
@@ -188,7 +185,7 @@ pub struct ServerMetrics {
 
     build_info: IntGaugeVec,
     admission_waiting_sessions: IntGaugeVec,
-    admission_wait_seconds: HistogramVec,
+    admission_queue_exits_total: IntCounterVec,
     active_sessions: IntGaugeVec,
     sessions_total: IntCounterVec,
     session_duration_seconds: GaugeVec,
@@ -250,18 +247,16 @@ impl ServerMetrics {
                 &["region", "transport"],
             )?,
         )?;
-        let admission_wait_seconds = register(
+        let admission_queue_exits_total = register(
             &registry,
-            HistogramVec::new(
-                HistogramOpts::new(
-                    "terminal_games_admission_wait_seconds",
-                    "Time spent waiting for admission before a session became active",
-                )
-                .buckets(ADMISSION_WAIT_BUCKETS_SECONDS.to_vec()),
-                &["region", "transport"],
+            IntCounterVec::new(
+                Opts::new(
+                    "terminal_games_admission_queue_exits_total",
+                    "Queued sessions that left the queue, grouped by outcome",
+                ),
+                &["region", "transport", "outcome"],
             )?,
         )?;
-
         let active_sessions = register(
             &registry,
             IntGaugeVec::new(
@@ -421,7 +416,7 @@ impl ServerMetrics {
             duration_writer,
             build_info,
             admission_waiting_sessions,
-            admission_wait_seconds,
+            admission_queue_exits_total,
             active_sessions,
             sessions_total,
             session_duration_seconds,
@@ -456,13 +451,7 @@ impl ServerMetrics {
         String::from_utf8(buffer).context("prometheus metrics were not valid UTF-8")
     }
 
-    pub fn record_admission_state(
-        &self,
-        _running_ssh: usize,
-        _running_web: usize,
-        queued_ssh: usize,
-        queued_web: usize,
-    ) {
+    pub fn record_admission_state(&self, queued_ssh: usize, queued_web: usize) {
         self.admission_waiting_sessions
             .with_label_values(&[self.region.as_str(), Transport::Ssh.as_str()])
             .set(queued_ssh as i64);
@@ -471,34 +460,26 @@ impl ServerMetrics {
             .set(queued_web as i64);
     }
 
-    pub fn record_admission_wait(&self, transport: Transport, duration: Duration) {
-        self.admission_wait_seconds
-            .with_label_values(&[self.region.as_str(), transport.as_str()])
-            .observe(duration.as_secs_f64());
+    pub fn record_admission_joined_from_queue(&self, transport: Transport) {
+        self.admission_queue_exits_total
+            .with_label_values(&[self.region.as_str(), transport.as_str(), "joined"])
+            .inc();
     }
 
-    pub fn record_input_bytes(&self, transport: Transport, bytes: usize) {
+    pub fn record_admission_abandoned_queue(&self, transport: Transport) {
+        self.admission_queue_exits_total
+            .with_label_values(&[self.region.as_str(), transport.as_str(), "abandoned"])
+            .inc();
+    }
+
+    pub fn record_bytes(&self, direction: Direction, transport: Transport, bytes: usize) {
         self.bytes_total
             .with_label_values(&[
-                Direction::In.as_str(),
+                direction.as_str(),
                 self.region.as_str(),
                 transport.as_str(),
             ])
             .inc_by(bytes as u64);
-    }
-
-    pub fn record_terminal_output_bytes(&self, transport: Transport, bytes: usize) {
-        self.bytes_total
-            .with_label_values(&[
-                Direction::Out.as_str(),
-                self.region.as_str(),
-                transport.as_str(),
-            ])
-            .inc_by(bytes as u64);
-    }
-
-    pub fn record_audio_output_bytes(&self, transport: Transport, bytes: usize) {
-        self.record_terminal_output_bytes(transport, bytes);
     }
 
     pub fn start_session(

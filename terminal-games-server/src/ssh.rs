@@ -20,7 +20,7 @@ use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLa
 use terminal_games::terminal_profile::TerminalProfile;
 
 use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
-use crate::metrics::{AuthKind, ServerMetrics, Transport};
+use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 pub struct SshSession {
     input_sender: tokio::sync::mpsc::Sender<smallvec::SmallVec<[u8; 16]>>,
@@ -411,13 +411,13 @@ impl SshServer {
 
                     data = audio_rx.recv(), if has_audio => {
                         let Some(data) = data else { break };
-                        metrics.record_audio_output_bytes(Transport::Ssh, data.len());
+                        metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
                         let _ = session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, russh::CryptoVec::from_slice(&data)).await;
                     }
 
                     data = output_rx.recv() => {
                         let Some(data) = data else { break };
-                        metrics.record_terminal_output_bytes(Transport::Ssh, data.len());
+                        metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
                         let _ = session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await;
                     }
                 }
@@ -943,7 +943,7 @@ impl Handler for SshSession {
         }
         self.server
             .metrics
-            .record_input_bytes(Transport::Ssh, data.len());
+            .record_bytes(Direction::In, Transport::Ssh, data.len());
         if data == b"\x03" {
             // CTRL+C
             self.cancellation_token.cancel();
