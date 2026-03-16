@@ -10,6 +10,7 @@ use std::{
     fs::File,
     future::Future,
     io::BufReader,
+    net::SocketAddr,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -22,7 +23,7 @@ use axum::{
     body::Body,
     extract::{
         Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{
         HeaderMap, StatusCode,
@@ -53,12 +54,13 @@ use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
 
-use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
+use crate::admission::{AdmissionController, AdmissionRejection, AdmissionState, AdmissionTicket};
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 #[derive(Clone)]
 struct MyConnectInfo {
     network_info: Arc<NetworkInformation<TcpLatencyProvider>>,
+    remote_addr: SocketAddr,
 }
 
 impl Connected<MyConnectInfo> for MyConnectInfo {
@@ -145,7 +147,7 @@ impl WebServer {
         let mut make_service = app.into_make_service_with_connect_info::<MyConnectInfo>();
         let listener = tokio::net::TcpListener::bind(listen_addr).await?;
         loop {
-            let (stream, _remote_addr) = match listener.accept().await {
+            let (stream, remote_addr) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("failed to accept web connection: {e}");
@@ -162,6 +164,7 @@ impl WebServer {
                 make_service
                     .call(MyConnectInfo {
                         network_info: network_info.clone(),
+                        remote_addr,
                     })
                     .await,
             );
@@ -407,8 +410,27 @@ async fn handle_socket(
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
-    let admission_ticket = server.admission_controller.issue_ticket(Transport::Web);
-    if !wait_for_admission(&mut sender, &mut receiver, &resize_tx, &admission_ticket).await {
+    let admission_ticket = server
+        .admission_controller
+        .issue_ticket(Transport::Web, connect_info.remote_addr.ip());
+    match wait_for_admission(&mut sender, &mut receiver, &resize_tx, &admission_ticket).await {
+        AdmissionWaitResult::Allowed => {}
+        AdmissionWaitResult::Disconnected => return,
+        AdmissionWaitResult::Rejected(reason) => {
+            tracing::trace!(
+                client_ip = %connect_info.remote_addr.ip(),
+                reason = reason.slug(),
+                "Rejected web admission"
+            );
+            return;
+        }
+    }
+    let mut ban_changes = server.admission_controller.subscribe_ban_changes();
+    if server
+        .admission_controller
+        .is_ip_banned(connect_info.remote_addr.ip())
+    {
+        let _ = send_rejection_and_close(&mut sender, AdmissionRejection::BannedIp).await;
         return;
     }
     let session_guard =
@@ -528,6 +550,15 @@ async fn handle_socket(
                     }
                     _ => {}
                 }
+            }
+
+            changed = ban_changes.changed() => {
+                if changed.is_err() || !server.admission_controller.is_ip_banned(connect_info.remote_addr.ip()) {
+                    continue;
+                }
+                cancellation_token.cancel();
+                let _ = send_rejection_and_close(&mut sender, AdmissionRejection::BannedIp).await;
+                break;
             }
         }
     }
@@ -669,21 +700,32 @@ fn leading_zero_bits(bytes: &[u8]) -> u32 {
     bits
 }
 
+enum AdmissionWaitResult {
+    Allowed,
+    Disconnected,
+    Rejected(AdmissionRejection),
+}
+
 async fn wait_for_admission(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     receiver: &mut futures::stream::SplitStream<WebSocket>,
     resize_tx: &tokio::sync::watch::Sender<(u16, u16)>,
     ticket: &AdmissionTicket,
-) -> bool {
-    let mut updates = ticket.subscribe().await;
+) -> AdmissionWaitResult {
+    let mut updates = ticket.subscribe();
     loop {
         let status = *updates.borrow();
         match status {
             AdmissionState::Allowed => {
-                return sender
+                return if sender
                     .send(Message::Text("queue:allowed".into()))
                     .await
-                    .is_ok();
+                    .is_ok()
+                {
+                    AdmissionWaitResult::Allowed
+                } else {
+                    AdmissionWaitResult::Disconnected
+                };
             }
             AdmissionState::Queued(position) => {
                 if sender
@@ -691,15 +733,19 @@ async fn wait_for_admission(
                     .await
                     .is_err()
                 {
-                    return false;
+                    return AdmissionWaitResult::Disconnected;
                 }
+            }
+            AdmissionState::Rejected(reason) => {
+                let _ = send_rejection_and_close(sender, reason).await;
+                return AdmissionWaitResult::Rejected(reason);
             }
         }
 
         tokio::select! {
             changed = updates.changed() => {
                 if changed.is_err() {
-                    return false;
+                    return AdmissionWaitResult::Disconnected;
                 }
             }
             msg = receiver.next() => {
@@ -707,7 +753,7 @@ async fn wait_for_admission(
                     Some(Ok(Message::Binary(data))) => {
                         if data.contains(&0x03) || data.contains(&b'q') {
                             let _ = sender.send(Message::Close(None)).await;
-                            return false;
+                            return AdmissionWaitResult::Disconnected;
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
@@ -718,16 +764,33 @@ async fn wait_for_admission(
                             }
                         } else if let Some(ts) = text_str.strip_prefix("ping:") {
                             if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
-                                return false;
+                                return AdmissionWaitResult::Disconnected;
                             }
                         }
                     }
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                        return false;
+                        return AdmissionWaitResult::Disconnected;
                     }
                     _ => {}
                 }
             }
         }
     }
+}
+
+async fn send_rejection_and_close(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    reason: AdmissionRejection,
+) -> Result<(), axum::Error> {
+    sender
+        .send(Message::Text(
+            format!("queue:rejected:{}", reason.slug()).into(),
+        ))
+        .await?;
+    sender
+        .send(Message::Close(Some(CloseFrame {
+            code: 1008,
+            reason: format!("rejected:{}", reason.slug()).into(),
+        })))
+        .await
 }

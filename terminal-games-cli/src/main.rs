@@ -348,7 +348,7 @@ async fn main() -> Result<()> {
         .context("Failed to start migration transaction")?;
     tx.execute_batch(include_str!("../../terminal-games/libsql/migrate-001.sql"))
         .await
-        .context("Failed to run migrations")?;
+        .context("Failed to run migrate-001.sql")?;
     tx.commit()
         .await
         .context("Failed to commit migration transaction")?;

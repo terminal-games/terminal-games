@@ -21,7 +21,7 @@ use terminal_games::palette;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
 
-use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
+use crate::admission::{AdmissionController, AdmissionRejection, AdmissionState, AdmissionTicket};
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 pub struct SshSession {
@@ -45,6 +45,8 @@ pub(crate) struct SshServer {
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const CAPTCHA_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const RESTORE_TERMINAL_STATE: &[u8] =
+    b"\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1l\x1b[>4;0m\x1b>\x1b[?1049l\x1b[?25h";
 
 impl SshServer {
     pub async fn new(
@@ -143,7 +145,7 @@ impl SshServer {
 
     fn new_client(
         &self,
-        _addr: std::net::SocketAddr,
+        addr: std::net::SocketAddr,
         network_info: Arc<NetworkInformation<TcpLatencyProvider>>,
     ) -> SshSession {
         let (auth_sender, auth_receiver) = tokio::sync::oneshot::channel::<(String, Option<u64>)>();
@@ -154,6 +156,7 @@ impl SshServer {
 
         let cancellation_token = CancellationToken::new();
         let token = cancellation_token.clone();
+        let shutdown_token = cancellation_token.clone();
         let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
         let (mut input_guard, input_rx, idle_fuel_rx) =
             InputGuard::new(cancellation_token.clone(), replay_request_tx.clone());
@@ -162,6 +165,7 @@ impl SshServer {
         let app_server = self.app_server.clone();
         let admission_controller = self.admission_controller.clone();
         let metrics = self.metrics.clone();
+        let client_ip = addr.ip();
         tokio::task::spawn(async move {
             let mut input_tick = InputGuard::tick_interval();
             let (session_handle, channel_id, remote_sshid) = match ssh_session_receiver.await {
@@ -286,6 +290,7 @@ impl SshServer {
                     Ok(Err(_)) => None,
                     Err(_) => {
                         tracing::trace!("no pty_request received within 500ms");
+                        restore_terminal_state(&session_handle, channel_id).await;
                         let _ = session_handle
                             .disconnect(
                                 russh::Disconnect::ByApplication,
@@ -319,9 +324,7 @@ impl SshServer {
                 )
                 .await;
                 if !solved {
-                    let _ = session_handle
-                        .data(channel_id, b"\x1b[?1049l".to_vec().into())
-                        .await;
+                    restore_terminal_state(&session_handle, channel_id).await;
                     let _ = session_handle
                         .disconnect(
                             russh::Disconnect::ByApplication,
@@ -332,8 +335,8 @@ impl SshServer {
                     return;
                 }
             }
-            let admission_ticket = admission_controller.issue_ticket(Transport::Ssh);
-            if !wait_for_admission(
+            let admission_ticket = admission_controller.issue_ticket(Transport::Ssh, client_ip);
+            match wait_for_admission(
                 &session_handle,
                 channel_id,
                 &mut resize_rx,
@@ -344,13 +347,42 @@ impl SshServer {
             )
             .await
             {
-                let _ = session_handle
-                    .data(channel_id, b"\x1b[?1049l".to_vec().into())
-                    .await;
+                AdmissionWaitResult::Allowed => {}
+                AdmissionWaitResult::Disconnected => {
+                    restore_terminal_state(&session_handle, channel_id).await;
+                    let _ = session_handle
+                        .disconnect(
+                            russh::Disconnect::ByApplication,
+                            "Bye!".to_string(),
+                            "en-US".to_string(),
+                        )
+                        .await;
+                    return;
+                }
+                AdmissionWaitResult::Rejected(reason) => {
+                    tracing::trace!(
+                        client_ip = %client_ip,
+                        reason = reason.slug(),
+                        "Rejected SSH admission"
+                    );
+                    restore_terminal_state(&session_handle, channel_id).await;
+                    let _ = session_handle
+                        .disconnect(
+                            russh::Disconnect::ByApplication,
+                            reason.user_message().to_string(),
+                            "en-US".to_string(),
+                        )
+                        .await;
+                    return;
+                }
+            }
+            let mut ban_changes = admission_controller.subscribe_ban_changes();
+            if admission_controller.is_ip_banned(client_ip) {
+                restore_terminal_state(&session_handle, channel_id).await;
                 let _ = session_handle
                     .disconnect(
                         russh::Disconnect::ByApplication,
-                        "Bye!".to_string(),
+                        AdmissionRejection::BannedIp.user_message().to_string(),
                         "en-US".to_string(),
                     )
                     .await;
@@ -394,6 +426,7 @@ impl SshServer {
                 active_shortname_tracker: Some(active_shortname_tracker),
                 idle_fuel_receiver: Some(idle_fuel_rx),
             });
+            let mut disconnect_message = "Thanks for playing!";
             loop {
                 tokio::select! {
                     biased;
@@ -433,19 +466,26 @@ impl SshServer {
                         metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
                         let _ = session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await;
                     }
+
+                    changed = ban_changes.changed() => {
+                        if changed.is_err() || !admission_controller.is_ip_banned(client_ip) {
+                            continue;
+                        }
+                        disconnect_message = AdmissionRejection::BannedIp.user_message();
+                        shutdown_token.cancel();
+                        break;
+                    }
                 }
             }
             drop(admission_ticket);
             drop(session_guard);
 
-            let _ = session_handle
-                .data(channel_id, b"\x1b[?1049l".to_vec().into())
-                .await;
+            restore_terminal_state(&session_handle, channel_id).await;
 
             let _ = session_handle
                 .disconnect(
                     russh::Disconnect::ByApplication,
-                    "Thanks for playing!".to_string(),
+                    disconnect_message.to_string(),
                     "en-US".to_string(),
                 )
                 .await;
@@ -462,6 +502,12 @@ impl SshServer {
             server: self.clone(),
         }
     }
+}
+
+async fn restore_terminal_state(session_handle: &Handle, channel_id: ChannelId) {
+    let _ = session_handle
+        .data(channel_id, RESTORE_TERMINAL_STATE.to_vec().into())
+        .await;
 }
 
 fn generate_captcha(len: usize) -> String {
@@ -539,6 +585,12 @@ async fn solve_captcha(
     }
 }
 
+enum AdmissionWaitResult {
+    Allowed,
+    Disconnected,
+    Rejected(AdmissionRejection),
+}
+
 async fn wait_for_admission(
     session_handle: &Handle,
     channel_id: ChannelId,
@@ -547,14 +599,16 @@ async fn wait_for_admission(
     input_guard: &mut InputGuard,
     admission_ticket: &AdmissionTicket,
     base_terminal_profile: TerminalProfile,
-) -> bool {
-    let mut updates = admission_ticket.subscribe().await;
+) -> AdmissionWaitResult {
+    let mut updates = admission_ticket.subscribe();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut frame = 0usize;
     let mut status = *updates.borrow();
     loop {
-        if status == AdmissionState::Allowed {
-            return true;
+        match status {
+            AdmissionState::Allowed => return AdmissionWaitResult::Allowed,
+            AdmissionState::Rejected(reason) => return AdmissionWaitResult::Rejected(reason),
+            AdmissionState::Queued(_) => {}
         }
         let window = *resize_rx.borrow();
         if render_loading_screen(
@@ -568,28 +622,28 @@ async fn wait_for_admission(
         .await
         .is_err()
         {
-            return false;
+            return AdmissionWaitResult::Disconnected;
         }
         frame = (frame + 1) % SPINNER_FRAMES.len();
         tokio::select! {
             _ = tick.tick() => {}
             changed = updates.changed() => {
                 if changed.is_err() {
-                    return false;
+                    return AdmissionWaitResult::Disconnected;
                 }
                 status = *updates.borrow();
             }
             changed = resize_rx.changed() => {
                 if changed.is_err() {
-                    return false;
+                    return AdmissionWaitResult::Disconnected;
                 }
             }
             data = raw_input_rx.recv() => {
-                let Some(data) = data else { return false; };
+                let Some(data) = data else { return AdmissionWaitResult::Disconnected; };
                 let pending = input_guard.prepare_input(data.clone());
                 drop(pending);
                 if data.contains(&0x03) || data.contains(&b'q') {
-                    return false;
+                    return AdmissionWaitResult::Disconnected;
                 }
             }
         }
@@ -679,6 +733,7 @@ async fn render_loading_screen(
     let queue_plain = match status {
         AdmissionState::Allowed => "Starting app...".to_string(),
         AdmissionState::Queued(position) => format!("Position in queue: {}", position),
+        AdmissionState::Rejected(reason) => reason.user_message().to_string(),
     };
     let queue_line = styled_regular_text(terminal_profile, &queue_plain);
     let center_row = if height == 0 { 1 } else { height.max(2) / 2 };
