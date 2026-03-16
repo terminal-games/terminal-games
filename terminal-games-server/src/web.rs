@@ -3,10 +3,12 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::os::fd::AsRawFd;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::{
     collections::HashMap,
     fs::File,
+    future::Future,
     io::BufReader,
     sync::Mutex,
     time::{Duration, Instant},
@@ -46,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
 use terminal_games::app::{AppInstantiationParams, AppServer};
-use terminal_games::input_guard::InputGuard;
+use terminal_games::input_guard::{InputGuard, InputGuardError};
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
@@ -399,8 +401,9 @@ async fn handle_socket(
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(initial_size);
     let cancellation_token = CancellationToken::new();
     let token = cancellation_token.clone();
-    let (input_guard, mut input_ticker, input_rx, idle_fuel_rx) =
+    let (mut input_guard, input_rx, idle_fuel_rx) =
         InputGuard::new(cancellation_token.clone(), replay_request_tx.clone());
+    let mut input_tick = InputGuard::tick_interval();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
@@ -413,6 +416,7 @@ async fn handle_socket(
             .metrics
             .start_session(Transport::Web, AuthKind::Anonymous, true, None);
     let active_shortname_tracker = session_guard.active_shortname_tracker();
+    let terminal_parser = input_guard.take_terminal_parser(initial_size.1, initial_size.0);
 
     let mut exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
         first_app_shortname,
@@ -428,12 +432,16 @@ async fn handle_socket(
         graceful_shutdown_token: token,
         network_info: connect_info.network_info,
         terminal_profile: TerminalProfile::web_default(),
+        terminal_parser,
         user_id: None,
         locale,
         log_backend: Arc::new(NoopLogBackend),
         active_shortname_tracker: Some(active_shortname_tracker),
         idle_fuel_receiver: Some(idle_fuel_rx),
     });
+    let mut pending_input: Option<
+        Pin<Box<dyn Future<Output = Result<(), InputGuardError>> + Send>>,
+    > = None;
 
     loop {
         tokio::select! {
@@ -454,8 +462,17 @@ async fn handle_socket(
                 break;
             }
 
-            _ = input_ticker.next_tick() => {
-                input_ticker.handle_tick();
+            result = async {
+                pending_input.as_mut().expect("guarded by select").await
+            }, if pending_input.is_some() => {
+                if result.is_err() {
+                    break;
+                }
+                pending_input = None;
+            }
+
+            _ = input_tick.tick() => {
+                input_guard.tick();
             }
 
             data = output_rx.recv() => {
@@ -485,14 +502,12 @@ async fn handle_socket(
                 }
             }
 
-            msg = receiver.next() => {
+            msg = receiver.next(), if pending_input.is_none() => {
                 let Some(msg) = msg else { break };
                 match msg {
                     Ok(Message::Binary(data)) => {
                         server.metrics.record_bytes(Direction::In, Transport::Web, data.len());
-                        if input_guard.handle_input(data).is_err() {
-                            break;
-                        }
+                        pending_input = Some(Box::pin(input_guard.prepare_input(data).send()));
                     }
                     Ok(Message::Text(text)) => {
                         let text_str = text.to_string();

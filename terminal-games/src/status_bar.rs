@@ -69,7 +69,7 @@ pub struct StatusBar {
     prev_size: (u16, u16),
     prev_status_bar_content: Vec<u8>,
     network_info: Arc<dyn NetworkInfo>,
-    terminal_profile: TerminalProfile,
+    base_terminal_profile: TerminalProfile,
     notification: Option<ActiveNotification>,
     notification_rx: mpsc::Receiver<StatusNotification>,
 }
@@ -115,14 +115,14 @@ impl StatusBar {
             prev_size: (0, 0),
             prev_status_bar_content: Vec::new(),
             network_info,
-            terminal_profile,
+            base_terminal_profile: terminal_profile,
             notification: None,
             notification_rx,
         }
     }
 
-    fn content(&self, width: u16) -> Vec<u8> {
-        let p = palette::palette(self.terminal_profile);
+    fn content(&self, screen: &headless_terminal::Screen, width: u16) -> Vec<u8> {
+        let p = palette::palette(self.terminal_profile(screen));
         let active_tab = style(
             format!(" {} ", self.shortname),
             Some(p.on_primary),
@@ -192,6 +192,15 @@ impl StatusBar {
         content_str.into_bytes()
     }
 
+    fn terminal_profile(&self, screen: &headless_terminal::Screen) -> TerminalProfile {
+        match screen.terminal_background() {
+            Some(headless_terminal::Color::Rgb(r, g, b)) => {
+                self.base_terminal_profile.with_background_rgb((r, g, b))
+            }
+            _ => self.base_terminal_profile,
+        }
+    }
+
     fn render_notification(&self, p: &palette::Palette) -> Option<String> {
         let notif = match &self.notification {
             Some(notif) if Instant::now() < notif.expires => notif,
@@ -244,7 +253,7 @@ impl StatusBar {
             Err(_) => {}
         }
 
-        let content = self.content(width);
+        let content = self.content(screen, width);
         let size_changed = self.prev_size != (height, width);
         let content_changed = self.prev_status_bar_content != content;
         if !force && !size_changed && !content_changed {

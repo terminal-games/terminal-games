@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
@@ -16,6 +16,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use headless_terminal::{Color, Parser};
 use hex::ToHex;
 use ipnet::{Ipv4Net, Ipv6Net};
 use rustls_platform_verifier::BuilderVerifierExt;
@@ -123,6 +124,7 @@ pub struct AppInstantiationParams {
     pub args: Option<Vec<u8>>,
     pub network_info: Arc<dyn NetworkInfo>,
     pub terminal_profile: TerminalProfile,
+    pub terminal_parser: Parser,
     pub first_app_shortname: String,
     pub user_id: Option<u64>,
     pub locale: String,
@@ -205,6 +207,7 @@ impl AppServer {
                 args: _args,
                 network_info,
                 terminal_profile,
+                mut terminal_parser,
                 first_app_shortname,
                 user_id,
                 locale,
@@ -215,9 +218,11 @@ impl AppServer {
             let startup_shortname = first_app_shortname.clone();
 
             let (first_cols, first_rows) = *window_size_receiver.borrow();
-            let mut terminal = headless_terminal::Parser::new(first_rows, first_cols, 0);
-            let mut terminal_snapshot =
-                Arc::new(TerminalSnapshot::new(first_cols, first_rows, 0, 0));
+            terminal_parser
+                .screen_mut()
+                .set_size(first_rows, first_cols);
+            let mut terminal = terminal_parser;
+            let mut terminal_snapshot = Arc::new(TerminalSnapshot::from_screen(terminal.screen()));
             let hard_shutdown_token = CancellationToken::new();
 
             let (app_output_sender, mut app_output_receiver) =
@@ -395,13 +400,12 @@ impl AppServer {
 
                                 terminal.process(&output);
                                 let screen = terminal.screen_mut();
-                                let (height, width) = screen.size();
+                                let (height, _) = screen.size();
                                 let dirty = screen.take_damaged_rows();
                                 if dirty.contains(&(height - 1)) {
                                     status_bar.maybe_render_into(screen, &mut output, true);
                                 }
-                                let (cursor_y, cursor_x) = screen.cursor_position();
-                                terminal_snapshot.set(width, height, cursor_x, cursor_y);
+                                terminal_snapshot.sync_from_screen(screen);
 
                                 if !output.is_empty() {
                                     let output = Arc::new(output);
@@ -423,8 +427,7 @@ impl AppServer {
                                 let screen = terminal.screen_mut();
                                 screen.set_size(height, width);
                                 status_bar.maybe_render_into(screen, &mut output, true);
-                                let (cursor_y, cursor_x) = screen.cursor_position();
-                                terminal_snapshot.set(width, height, cursor_x, cursor_y);
+                                terminal_snapshot.sync_from_screen(screen);
                                 if !output.is_empty() {
                                     let output = Arc::new(output);
                                     replay_buffer.push_output(output.clone());
@@ -1940,11 +1943,17 @@ impl AppServer {
 
         let profile = caller.data().terminal_profile;
         let mode = profile.color_mode as u8;
-        let (has_bg, bg_r, bg_g, bg_b) = match profile.background_rgb {
+        let background_rgb = caller
+            .data()
+            .terminal_snapshot
+            .background_rgb()
+            .or(profile.background_rgb);
+        let (has_bg, bg_r, bg_g, bg_b) = match background_rgb {
             Some((r, g, b)) => (1i32, r, g, b),
             None => (0i32, 0u8, 0u8, 0u8),
         };
-        let (has_dark, dark) = match profile.dark_background {
+        let dark_background = background_rgb.map(is_rgb_dark).or(profile.dark_background);
+        let (has_dark, dark) = match dark_background {
             Some(is_dark) => (1i32, if is_dark { 1i32 } else { 0i32 }),
             None => (0i32, 0i32),
         };
@@ -2167,29 +2176,61 @@ impl std::fmt::Display for UnknownGameShortnameError {
 impl std::error::Error for UnknownGameShortnameError {}
 
 pub struct TerminalSnapshot {
-    packed: AtomicU64,
+    packed_dimensions: AtomicU64,
+    packed_background: AtomicU32,
 }
 
 impl TerminalSnapshot {
-    fn new(width: u16, height: u16, cursor_x: u16, cursor_y: u16) -> Self {
+    fn from_screen(screen: &headless_terminal::Screen) -> Self {
+        let this = Self::new(0, 0, 0, 0, None);
+        this.sync_from_screen(screen);
+        this
+    }
+
+    fn new(
+        width: u16,
+        height: u16,
+        cursor_x: u16,
+        cursor_y: u16,
+        background_rgb: Option<(u8, u8, u8)>,
+    ) -> Self {
         Self {
-            packed: AtomicU64::new(Self::pack(width, height, cursor_x, cursor_y)),
+            packed_dimensions: AtomicU64::new(Self::pack(width, height, cursor_x, cursor_y)),
+            packed_background: AtomicU32::new(Self::pack_background(background_rgb)),
         }
     }
 
     fn size(&self) -> (u16, u16) {
-        let (width, height, _, _) = Self::unpack(self.packed.load(Ordering::Acquire));
+        let (width, height, _, _) = Self::unpack(self.packed_dimensions.load(Ordering::Acquire));
         (width, height)
     }
 
-    fn set(&self, width: u16, height: u16, x: u16, y: u16) {
-        self.packed
+    fn set(&self, width: u16, height: u16, x: u16, y: u16, background_rgb: Option<(u8, u8, u8)>) {
+        self.packed_dimensions
             .store(Self::pack(width, height, x, y), Ordering::Release);
+        self.packed_background
+            .store(Self::pack_background(background_rgb), Ordering::Release);
     }
 
     fn cursor_position(&self) -> (u16, u16) {
-        let (_, _, x, y) = Self::unpack(self.packed.load(Ordering::Acquire));
+        let (_, _, x, y) = Self::unpack(self.packed_dimensions.load(Ordering::Acquire));
         (x, y)
+    }
+
+    fn background_rgb(&self) -> Option<(u8, u8, u8)> {
+        Self::unpack_background(self.packed_background.load(Ordering::Acquire))
+    }
+
+    fn sync_from_screen(&self, screen: &headless_terminal::Screen) {
+        let (rows, cols) = screen.size();
+        let (cursor_y, cursor_x) = screen.cursor_position();
+        self.set(
+            cols,
+            rows,
+            cursor_x,
+            cursor_y,
+            terminal_background_rgb(screen.terminal_background()),
+        );
     }
 
     #[inline]
@@ -2209,6 +2250,36 @@ impl TerminalSnapshot {
             (packed >> 48) as u16,
         )
     }
+
+    #[inline]
+    fn pack_background(background_rgb: Option<(u8, u8, u8)>) -> u32 {
+        background_rgb.map_or(0, |(r, g, b)| {
+            (1 << 24) | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+        })
+    }
+
+    #[inline]
+    fn unpack_background(packed: u32) -> Option<(u8, u8, u8)> {
+        ((packed & (1 << 24)) != 0).then_some((
+            (packed >> 16) as u8,
+            (packed >> 8) as u8,
+            packed as u8,
+        ))
+    }
+}
+
+fn terminal_background_rgb(color: Option<Color>) -> Option<(u8, u8, u8)> {
+    match color {
+        Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
+        _ => None,
+    }
+}
+
+fn is_rgb_dark((r, g, b): (u8, u8, u8)) -> bool {
+    let r = (r as f64) / 255.0;
+    let g = (g as f64) / 255.0;
+    let b = (b as f64) / 255.0;
+    (0.2126 * r + 0.7152 * g + 0.0722 * b) < 0.5
 }
 
 pub struct ConnectionManager {
