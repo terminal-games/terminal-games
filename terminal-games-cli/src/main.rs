@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use bytes::Bytes;
 use clap::Parser;
 use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
@@ -24,6 +25,7 @@ use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, laye
 
 use terminal_games::{
     app::{AppInstantiationParams, AppServer},
+    input_guard::InputGuard,
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
     mesh::{LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
@@ -63,6 +65,10 @@ struct Args {
     /// Disable audio playback
     #[arg(long)]
     no_audio: bool,
+
+    /// Enable the hosted idle-timeout behavior for local debugging
+    #[arg(long)]
+    idle_timeout: bool,
 
     /// Log level for the game/app
     #[arg(long = "app-log-level", default_value = "info")]
@@ -464,12 +470,15 @@ async fn main() -> Result<()> {
         crossterm::cursor::Hide
     )?;
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel(12);
     let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(crossterm::terminal::size()?);
 
     let graceful_shutdown_token = CancellationToken::new();
+    let (input_guard, input_ticker, input_rx, idle_fuel_rx) =
+        InputGuard::new(graceful_shutdown_token.clone(), replay_request_tx.clone());
+    let mut input_ticker = args.idle_timeout.then_some(input_ticker);
+    let idle_fuel_receiver = args.idle_timeout.then_some(idle_fuel_rx);
     let network_info = Arc::new(NetworkInformation::new_simulated(args.latency));
     let compress = args.compress;
     let bandwidth = args.bandwidth;
@@ -511,9 +520,10 @@ async fn main() -> Result<()> {
         locale,
         log_backend: guest_log_backend,
         active_shortname_tracker: None,
+        idle_fuel_receiver,
     });
 
-    let graceful_shutdown_token_input = graceful_shutdown_token.clone();
+    let input_guard_for_thread = input_guard.clone();
     thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut buf = [0u8; 4096];
@@ -522,17 +532,10 @@ async fn main() -> Result<()> {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let data = &buf[..n];
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if data == b"\x03" {
-                        // CTRL+C
-                        graceful_shutdown_token_input.cancel();
-                    }
-                    if data == b"\x12" || data == b"\x1b[27;5;114~" {
-                        let _ = replay_request_tx.try_send(());
-                    }
-                    if input_tx.blocking_send(data.into()).is_err() {
+                    if input_guard_for_thread
+                        .handle_input(Bytes::copy_from_slice(data))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -609,6 +612,19 @@ async fn main() -> Result<()> {
 
             _ = sigint.recv() => {
                 graceful_shutdown_token.cancel();
+            }
+
+            _ = async {
+                input_ticker
+                    .as_mut()
+                    .expect("guarded by select")
+                    .next_tick()
+                    .await;
+            }, if input_ticker.is_some() => {
+                input_ticker
+                    .as_mut()
+                    .expect("guarded by select")
+                    .handle_tick();
             }
 
             data = audio_rx.recv(), if audio_enabled => {

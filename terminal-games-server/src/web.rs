@@ -46,6 +46,7 @@ use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
 use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::input_guard::InputGuard;
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
@@ -394,11 +395,12 @@ async fn handle_socket(
     let remote_sshid = sanitize_user_agent(&user_agent);
     let username = "web".to_string();
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel(12);
     let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(initial_size);
     let cancellation_token = CancellationToken::new();
     let token = cancellation_token.clone();
+    let (input_guard, mut input_ticker, input_rx, idle_fuel_rx) =
+        InputGuard::new(cancellation_token.clone(), replay_request_tx.clone());
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
@@ -412,7 +414,7 @@ async fn handle_socket(
             .start_session(Transport::Web, AuthKind::Anonymous, true, None);
     let active_shortname_tracker = session_guard.active_shortname_tracker();
 
-    let exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
+    let mut exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
         first_app_shortname,
         args,
         input_receiver: input_rx,
@@ -430,98 +432,88 @@ async fn handle_socket(
         locale,
         log_backend: Arc::new(NoopLogBackend),
         active_shortname_tracker: Some(active_shortname_tracker),
+        idle_fuel_receiver: Some(idle_fuel_rx),
     });
 
-    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel(1);
-    let send_metrics = server.metrics.clone();
+    loop {
+        tokio::select! {
+            biased;
 
-    tokio::task::spawn(async move {
-        loop {
-            tokio::select! {
-                data = output_rx.recv() => {
-                    let Some(data) = data else { break };
-                    let mut msg = Vec::with_capacity(data.len() / 2);
-                    {
-                        let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
-                        if encoder.write_all(&data).is_err() || encoder.finish().is_err() {
+            exit_code = &mut exit_rx => {
+                match exit_code {
+                    Ok(Ok(exit_code)) => {
+                        tracing::trace!(?exit_code, "App exited");
+                    }
+                    Ok(Err(error)) => {
+                        tracing::error!(error = %error, "App failed");
+                    }
+                    Err(error) => {
+                        tracing::error!(?error, "App exit channel dropped");
+                    }
+                }
+                break;
+            }
+
+            _ = input_ticker.next_tick() => {
+                input_ticker.handle_tick();
+            }
+
+            data = output_rx.recv() => {
+                let Some(data) = data else { break };
+                let mut msg = Vec::with_capacity(data.len() / 2);
+                {
+                    let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
+                    if encoder.write_all(&data).is_err() || encoder.finish().is_err() {
+                        break;
+                    }
+                }
+                msg.push(0x00);
+                server.metrics.record_bytes(Direction::Out, Transport::Web, msg.len());
+                if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
+                    cancellation_token.cancel();
+                    break;
+                }
+            }
+
+            data = audio_rx.recv() => {
+                let Some(mut data) = data else { break };
+                data.push(0x01);
+                server.metrics.record_bytes(Direction::Out, Transport::Web, data.len());
+                if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
+                    cancellation_token.cancel();
+                    break;
+                }
+            }
+
+            msg = receiver.next() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    Ok(Message::Binary(data)) => {
+                        server.metrics.record_bytes(Direction::In, Transport::Web, data.len());
+                        if input_guard.handle_input(data).is_err() {
                             break;
                         }
                     }
-                    msg.push(0x00);
-                    send_metrics.record_bytes(Direction::Out, Transport::Web, msg.len());
-                    if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
-                        break;
-                    }
-                }
-                data = audio_rx.recv() => {
-                    let Some(mut data) = data else { break };
-                    data.push(0x01);
-                    send_metrics.record_bytes(Direction::Out, Transport::Web, data.len());
-                    if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
-                        break;
-                    }
-                }
-                ts = pong_rx.recv() => {
-                    let Some(ts) = ts else { break };
-                    if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let cancellation_token_clone = cancellation_token.clone();
-    let recv_metrics = server.metrics.clone();
-    tokio::task::spawn(async move {
-        while let Some(msg) = receiver.next().await {
-            match msg {
-                Ok(Message::Binary(data)) => {
-                    let data = data.as_ref();
-                    if data.is_empty() {
-                        continue;
-                    }
-                    recv_metrics.record_bytes(Direction::In, Transport::Web, data.len());
-                    if data == b"\x03" {
-                        // CTRL+C
-                        cancellation_token_clone.cancel();
-                    }
-                    if data == b"\x12" || data == b"\x1b[27;5;114~" {
-                        // CTRL+R
-                        let _ = replay_request_tx.try_send(());
-                    }
-                    if input_tx.send(data.into()).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(Message::Text(text)) => {
-                    let text_str = text.to_string();
-                    if let Some(rest) = text_str.strip_prefix("resize:") {
-                        if let Some((w, h)) = parse_resize(rest) {
-                            let _ = resize_tx.send((w, h));
+                    Ok(Message::Text(text)) => {
+                        let text_str = text.to_string();
+                        if let Some(rest) = text_str.strip_prefix("resize:") {
+                            if let Some((w, h)) = parse_resize(rest) {
+                                let _ = resize_tx.send((w, h));
+                            }
+                        } else if let Some(ts) = text_str.strip_prefix("ping:") {
+                            if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
+                                cancellation_token.cancel();
+                                break;
+                            }
                         }
-                    } else if let Some(ts) = text_str.strip_prefix("ping:") {
-                        let _ = pong_tx.send(ts.to_string()).await;
                     }
+                    Ok(Message::Close(_)) | Err(_) => {
+                        cancellation_token.cancel();
+                        break;
+                    }
+                    _ => {}
                 }
-                Ok(Message::Close(_)) | Err(_) => {
-                    cancellation_token_clone.cancel();
-                    break;
-                }
-                _ => {}
             }
-        }
-    });
-
-    match exit_rx.await {
-        Ok(Ok(exit_code)) => {
-            tracing::trace!(?exit_code, "App exited");
-        }
-        Ok(Err(error)) => {
-            tracing::error!(error = %error, "App failed");
-        }
-        Err(error) => {
-            tracing::error!(?error, "App exit channel dropped");
         }
     }
 

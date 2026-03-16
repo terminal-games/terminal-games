@@ -15,11 +15,11 @@ use std::{
     u64,
 };
 
+use bytes::Bytes;
 use hex::ToHex;
 use ipnet::{Ipv4Net, Ipv6Net};
 use rustls_platform_verifier::BuilderVerifierExt;
-use smallvec::SmallVec;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use wasmtime::InstanceAllocationStrategy;
 use wasmtime_wasi::I32Exit;
@@ -30,7 +30,7 @@ use crate::{
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
     replay::ReplayBuffer,
-    status_bar::StatusBar,
+    status_bar::{StatusBar, StatusNotification},
     terminal_profile::TerminalProfile,
 };
 
@@ -41,6 +41,9 @@ const MAX_CONNECTIONS: usize = 8;
 const MAX_OUTBOUND_BANDWIDTH: u64 = 20 * 1024;
 
 const REPLAY_RATE_LIMIT_SECS: u64 = 10;
+const IDLE_TIMEOUT_WARNING_SECS: i32 = 10;
+const REPLAY_UPLOAD_NOTIFICATION_SECS: u64 = 30;
+const REPLAY_RESULT_NOTIFICATION_SECS: u64 = 15;
 
 // Dial error codes
 const DIAL_ERR_ADDRESS_TOO_LONG: i32 = -1;
@@ -108,7 +111,7 @@ pub struct AppServer {
 }
 
 pub struct AppInstantiationParams {
-    pub input_receiver: tokio::sync::mpsc::Receiver<SmallVec<[u8; 16]>>,
+    pub input_receiver: tokio::sync::mpsc::Receiver<Bytes>,
     pub replay_request_receiver: tokio::sync::mpsc::Receiver<()>,
     pub output_sender: tokio::sync::mpsc::Sender<Arc<Vec<u8>>>,
     pub audio_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
@@ -125,6 +128,7 @@ pub struct AppInstantiationParams {
     pub locale: String,
     pub log_backend: Arc<dyn GuestLogBackend>,
     pub active_shortname_tracker: Option<Arc<dyn ActiveShortnameTracker>>,
+    pub idle_fuel_receiver: Option<watch::Receiver<i32>>,
 }
 
 impl AppServer {
@@ -206,6 +210,7 @@ impl AppServer {
                 locale,
                 log_backend,
                 active_shortname_tracker,
+                idle_fuel_receiver,
             } = params;
             let startup_shortname = first_app_shortname.clone();
 
@@ -218,7 +223,8 @@ impl AppServer {
             let (app_output_sender, mut app_output_receiver) =
                 tokio::sync::mpsc::channel::<Vec<u8>>(1);
             let has_next_app_shortname = Arc::new(AtomicBool::new(false));
-            let (notification_tx, notification_rx) = tokio::sync::mpsc::channel(1);
+            let (notification_tx, notification_rx) =
+                tokio::sync::mpsc::channel::<StatusNotification>(1);
 
             let audio_enabled = audio_sender.is_some();
             let mut maybe_mixer = if let Some(audio_tx) = audio_sender {
@@ -298,8 +304,10 @@ impl AppServer {
             let mut graceful_shutdown_timeout: Option<Pin<Box<tokio::time::Sleep>>> = None;
             let mut replay_last_at = Duration::ZERO;
             let mut replay_requests_open = true;
+            let mut idle_fuel_receiver = idle_fuel_receiver;
+            let mut idle_timeout_warning_sent = false;
             let mut pending_replay_upload: Option<
-                tokio::sync::oneshot::Receiver<(String, Option<MenuSessionState>)>,
+                tokio::sync::oneshot::Receiver<(StatusNotification, Option<MenuSessionState>)>,
             > = None;
 
             loop {
@@ -438,6 +446,35 @@ impl AppServer {
                                 }
                             }
 
+                            result = async {
+                                idle_fuel_receiver
+                                    .as_mut()
+                                    .expect("guarded by select")
+                                    .changed()
+                                    .await
+                            }, if idle_fuel_receiver.is_some() => {
+                                if result.is_err() {
+                                    idle_fuel_receiver = None;
+                                    continue;
+                                }
+
+                                let fuel = *idle_fuel_receiver
+                                    .as_mut()
+                                    .expect("receiver still present")
+                                    .borrow_and_update();
+                                if fuel <= IDLE_TIMEOUT_WARNING_SECS && !idle_timeout_warning_sent {
+                                    let _ = notification_tx.try_send(StatusNotification::warning(
+                                        format!(
+                                            " Idle timeout in {IDLE_TIMEOUT_WARNING_SECS} seconds. "
+                                        ),
+                                        Duration::from_secs(IDLE_TIMEOUT_WARNING_SECS as u64),
+                                    ));
+                                    idle_timeout_warning_sent = true;
+                                } else if fuel > IDLE_TIMEOUT_WARNING_SECS {
+                                    idle_timeout_warning_sent = false;
+                                }
+                            }
+
                             msg = menu_result_rx.recv() => {
                                 if let Some((request_id, result, update)) = msg {
                                     let _ = menu_completed_tx.try_send((request_id, result));
@@ -516,17 +553,26 @@ impl AppServer {
                                     .duration_since(UNIX_EPOCH)
                                     .unwrap_or(Duration::ZERO);
                                 if now.saturating_sub(replay_last_at) < Duration::from_secs(REPLAY_RATE_LIMIT_SECS) {
-                                    let _ = notification_tx.try_send(" Please wait 10 seconds between replays. ".to_string());
+                                    let _ = notification_tx.try_send(StatusNotification::warning(
+                                        " Please wait 10 seconds between replays. ",
+                                        Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
+                                    ));
                                     continue;
                                 }
 
                                 replay_last_at = now;
-                                let _ = notification_tx.try_send(" \x1b[3mUploading replay... ".to_string());
+                                let _ = notification_tx.try_send(StatusNotification::info(
+                                    " \x1b[3mUploading replay... ",
+                                    Duration::from_secs(REPLAY_UPLOAD_NOTIFICATION_SECS),
+                                ));
                                 let (initial_app_id, asciicast) = match replay_buffer.serialize_asciicast() {
                                     Ok(v) => v,
                                     Err(e) => {
                                         tracing::error!(error = %e, "Failed to serialize replay");
-                                        let _ = notification_tx.try_send(" Failed to serialize replay. ".to_string());
+                                        let _ = notification_tx.try_send(StatusNotification::error(
+                                            " Failed to serialize replay. ",
+                                            Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
+                                        ));
                                         continue;
                                     }
                                 };
@@ -547,12 +593,18 @@ impl AppServer {
                                     let notif = match notif {
                                         Ok(url) => {
                                             tracing::info!(%url, "Uploaded replay");
-                                            format!(
-                                                " \x1b[3mReplay saved: \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ",
-                                                url, url
+                                            StatusNotification::info(
+                                                format!(
+                                                    " \x1b[3mReplay saved: \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ",
+                                                    url, url
+                                                ),
+                                                Duration::from_secs(REPLAY_RESULT_NOTIFICATION_SECS),
                                             )
                                         }
-                                        Err(e) => format!(" {} ", e),
+                                        Err(e) => StatusNotification::error(
+                                            format!(" {} ", e),
+                                            Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
+                                        ),
                                     };
                                     let _ = tx.send((notif, session_update));
                                 });
@@ -576,7 +628,13 @@ impl AppServer {
                                 pending_replay_upload = None;
                                 let (notif, session_update) = match notification {
                                     Ok(v) => v,
-                                    Err(_) => (" Failed to upload replay. ".to_string(), None),
+                                    Err(_) => (
+                                        StatusNotification::error(
+                                            " Failed to upload replay. ",
+                                            Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
+                                        ),
+                                        None,
+                                    ),
                                 };
                                 if let Some(session) = session_update {
                                     menu_session = session;
@@ -2015,7 +2073,7 @@ pub struct AppState {
     limits: AppLimiter,
     next_app: Option<NextAppState>,
     has_next_app: Arc<AtomicBool>,
-    input_receiver: tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
+    input_receiver: tokio::sync::mpsc::Receiver<Bytes>,
     graceful_shutdown_token: CancellationToken,
     network_info: Arc<dyn NetworkInfo>,
     terminal_profile: TerminalProfile,

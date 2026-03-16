@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use bytes::Bytes;
 use rand_core::{OsRng, RngCore};
 use russh::keys::ssh_key::{self, PublicKey};
 use russh::server::*;
@@ -14,6 +15,7 @@ use russh::{Channel, ChannelId, Pty};
 use tokio_util::sync::CancellationToken;
 
 use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::input_guard::InputGuard;
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::palette;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
@@ -23,8 +25,7 @@ use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 pub struct SshSession {
-    input_sender: tokio::sync::mpsc::Sender<smallvec::SmallVec<[u8; 16]>>,
-    replay_request_sender: tokio::sync::mpsc::Sender<()>,
+    input_guard: InputGuard,
     resize_tx: tokio::sync::watch::Sender<(u16, u16)>,
     auth: Option<tokio::sync::oneshot::Sender<(String, Option<u64>)>>,
     term: Option<tokio::sync::oneshot::Sender<String>>,
@@ -151,15 +152,16 @@ impl SshServer {
         let (ssh_session_sender, ssh_session_receiver) =
             tokio::sync::oneshot::channel::<(Handle, ChannelId, String)>();
 
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(12);
-        let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
-        let (resize_tx, mut resize_rx) = tokio::sync::watch::channel((0, 0));
         let cancellation_token = CancellationToken::new();
         let token = cancellation_token.clone();
+        let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
+        let (input_guard, mut input_ticker, mut input_rx, idle_fuel_rx) =
+            InputGuard::new(cancellation_token.clone(), replay_request_tx.clone());
+        let (resize_tx, mut resize_rx) = tokio::sync::watch::channel((0, 0));
         let app_server = self.app_server.clone();
         let admission_controller = self.admission_controller.clone();
         let metrics = self.metrics.clone();
-        let input_tx_clone = input_tx.clone();
+        let input_guard_for_task = input_guard.clone();
         tokio::task::spawn(async move {
             let (session_handle, channel_id, remote_sshid) = match ssh_session_receiver.await {
                 Ok(v) => v,
@@ -301,7 +303,7 @@ impl SshServer {
             )
             .await;
             for data in buffered_input {
-                if input_tx_clone.send(data).await.is_err() {
+                if input_guard_for_task.replay_buffered_input(data).is_err() {
                     return;
                 }
             }
@@ -389,6 +391,7 @@ impl SshServer {
                 locale,
                 log_backend: Arc::new(NoopLogBackend),
                 active_shortname_tracker: Some(active_shortname_tracker),
+                idle_fuel_receiver: Some(idle_fuel_rx),
             });
             loop {
                 tokio::select! {
@@ -407,6 +410,10 @@ impl SshServer {
                             }
                         }
                         break;
+                    }
+
+                    _ = input_ticker.next_tick() => {
+                        input_ticker.handle_tick();
                     }
 
                     data = audio_rx.recv(), if has_audio => {
@@ -440,8 +447,7 @@ impl SshServer {
 
         SshSession {
             cancellation_token,
-            input_sender: input_tx,
-            replay_request_sender: replay_request_tx,
+            input_guard,
             resize_tx,
             auth: Some(auth_sender),
             term: Some(term_sender),
@@ -466,7 +472,7 @@ async fn solve_captcha(
     session_handle: &Handle,
     channel_id: ChannelId,
     resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
-    input_rx: &mut tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
+    input_rx: &mut tokio::sync::mpsc::Receiver<Bytes>,
     captcha: &str,
     terminal_profile: TerminalProfile,
 ) -> bool {
@@ -530,7 +536,7 @@ async fn wait_for_admission(
     session_handle: &Handle,
     channel_id: ChannelId,
     resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
-    input_rx: &mut tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
+    input_rx: &mut tokio::sync::mpsc::Receiver<Bytes>,
     admission_ticket: &AdmissionTicket,
     terminal_profile: TerminalProfile,
 ) -> bool {
@@ -806,10 +812,10 @@ fn parse_hex_component(part: &str) -> Option<u8> {
 }
 
 async fn probe_terminal_background(
-    input_rx: &mut tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
+    input_rx: &mut tokio::sync::mpsc::Receiver<Bytes>,
     terminal_profile: &mut TerminalProfile,
     timeout: Duration,
-) -> Vec<smallvec::SmallVec<[u8; 16]>> {
+) -> Vec<Bytes> {
     let deadline = Instant::now() + timeout;
     let mut buffered = Vec::new();
     let mut osc11 = Osc11Parser::default();
@@ -821,9 +827,9 @@ async fn probe_terminal_background(
         }
         match tokio::time::timeout(remaining, input_rx.recv()).await {
             Ok(Some(data)) => {
-                let filtered = osc11.consume(data.as_slice(), terminal_profile);
+                let filtered = osc11.consume(data.as_ref(), terminal_profile);
                 if !filtered.is_empty() {
-                    buffered.push(filtered.into_iter().collect());
+                    buffered.push(filtered.into());
                 }
             }
             Ok(None) => break,
@@ -833,7 +839,7 @@ async fn probe_terminal_background(
 
     let pending = osc11.finish();
     if !pending.is_empty() {
-        buffered.push(pending.into_iter().collect());
+        buffered.push(pending.into());
     }
     buffered
 }
@@ -938,27 +944,11 @@ impl Handler for SshSession {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if data.is_empty() {
-            return Ok(());
-        }
         self.server
             .metrics
             .record_bytes(Direction::In, Transport::Ssh, data.len());
-        if data == b"\x03" {
-            // CTRL+C
-            self.cancellation_token.cancel();
-        }
-        if data == b"\x12" || data == b"\x1b[27;5;114~" {
-            // CTRL+R
-            let _ = self.replay_request_sender.try_send(());
-        }
-        match self.input_sender.try_send(data.into()) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("input channel closed");
-            }
-        }
+        self.input_guard
+            .handle_input(Bytes::copy_from_slice(data))?;
 
         Ok(())
     }

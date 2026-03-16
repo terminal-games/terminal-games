@@ -4,6 +4,7 @@
 
 pub mod app;
 mod audio;
+pub mod input_guard;
 pub mod log_backend;
 pub mod mesh;
 pub mod palette;

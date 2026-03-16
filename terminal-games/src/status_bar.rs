@@ -16,11 +16,49 @@ fn terminal_width(str: &str) -> usize {
     strip_ansi_escapes::strip_str(str).width()
 }
 
-const NOTIFICATION_DURATION: Duration = Duration::from_secs(10);
+#[derive(Clone, Copy)]
+pub enum StatusNotificationKind {
+    Info,
+    Warning,
+    Error,
+}
 
-struct Notification {
+pub struct StatusNotification {
+    content: String,
+    duration: Duration,
+    kind: StatusNotificationKind,
+}
+
+struct ActiveNotification {
     content: String,
     expires: Instant,
+    kind: StatusNotificationKind,
+}
+
+impl StatusNotification {
+    pub fn info(content: impl Into<String>, duration: Duration) -> Self {
+        Self {
+            content: content.into(),
+            duration,
+            kind: StatusNotificationKind::Info,
+        }
+    }
+
+    pub fn warning(content: impl Into<String>, duration: Duration) -> Self {
+        Self {
+            content: content.into(),
+            duration,
+            kind: StatusNotificationKind::Warning,
+        }
+    }
+
+    pub fn error(content: impl Into<String>, duration: Duration) -> Self {
+        Self {
+            content: content.into(),
+            duration,
+            kind: StatusNotificationKind::Error,
+        }
+    }
 }
 
 pub struct StatusBar {
@@ -32,8 +70,8 @@ pub struct StatusBar {
     prev_status_bar_content: Vec<u8>,
     network_info: Arc<dyn NetworkInfo>,
     terminal_profile: TerminalProfile,
-    notification: Option<Notification>,
-    notification_rx: mpsc::Receiver<String>,
+    notification: Option<ActiveNotification>,
+    notification_rx: mpsc::Receiver<StatusNotification>,
 }
 
 fn style(text: impl AsRef<str>, fg: Option<Color>, bg: Option<Color>, bold: bool) -> String {
@@ -67,7 +105,7 @@ impl StatusBar {
         username: &str,
         network_info: Arc<dyn NetworkInfo>,
         terminal_profile: TerminalProfile,
-        notification_rx: mpsc::Receiver<String>,
+        notification_rx: mpsc::Receiver<StatusNotification>,
     ) -> Self {
         Self {
             shortname,
@@ -109,18 +147,7 @@ impl StatusBar {
         };
         let latency = style(latency, Some(p.text), Some(p.surface), false);
 
-        let notification = match &self.notification {
-            Some(notif) if Instant::now() < notif.expires => {
-                format!(
-                    "\x1b[{}m{}",
-                    palette::render_color_code(p.surface, true),
-                    notif.content
-                )
-            }
-            _ => String::new(),
-        };
-
-        let left = active_tab + &username + &net + &latency + &notification;
+        let left = active_tab + &username + &net + &latency;
 
         let ssh_callout = style(
             " ssh -C terminalgames.net ",
@@ -146,7 +173,11 @@ impl StatusBar {
             Some(p.surface_bright),
             false,
         );
-        let right = ticker + &ssh_callout;
+        let notification = self.render_notification(&p);
+        let right = match notification {
+            Some(notification) => notification + &ssh_callout,
+            None => ticker + &ssh_callout,
+        };
 
         let padding = style(
             " ".repeat(
@@ -159,6 +190,39 @@ impl StatusBar {
 
         let content_str = left + &padding + &right;
         content_str.into_bytes()
+    }
+
+    fn render_notification(&self, p: &palette::Palette) -> Option<String> {
+        let notif = match &self.notification {
+            Some(notif) if Instant::now() < notif.expires => notif,
+            _ => return None,
+        };
+
+        Some(match notif.kind {
+            StatusNotificationKind::Info => style(
+                notif.content.as_str(),
+                Some(p.text),
+                Some(p.surface_bright),
+                false,
+            ),
+            StatusNotificationKind::Warning => style(
+                notif.content.as_str(),
+                Some(p.on_primary),
+                Some(p.warning),
+                true,
+            ),
+            StatusNotificationKind::Error => {
+                style(notif.content.as_str(), Some(p.text), Some(p.danger), true)
+            }
+        })
+    }
+
+    fn show_notification(&mut self, notification: StatusNotification) {
+        self.notification = Some(ActiveNotification {
+            content: notification.content,
+            expires: Instant::now() + notification.duration,
+            kind: notification.kind,
+        });
     }
 
     pub fn set_username(&mut self, username: &str) {
@@ -174,11 +238,8 @@ impl StatusBar {
         let (height, width) = screen.size();
 
         match self.notification_rx.try_recv() {
-            Ok(content) => {
-                self.notification = Some(Notification {
-                    content,
-                    expires: Instant::now() + NOTIFICATION_DURATION,
-                });
+            Ok(notification) => {
+                self.show_notification(notification);
             }
             Err(_) => {}
         }
