@@ -5,6 +5,7 @@
 mod audio;
 
 use std::{
+    future::Future,
     io::{Read, Write},
     path::Path,
     pin::Pin,
@@ -15,6 +16,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use bytes::Bytes;
 use clap::Parser;
 use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
@@ -24,6 +26,7 @@ use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, laye
 
 use terminal_games::{
     app::{AppInstantiationParams, AppServer},
+    input_guard::{InputGuard, InputGuardError},
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
     mesh::{LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
@@ -63,6 +66,10 @@ struct Args {
     /// Disable audio playback
     #[arg(long)]
     no_audio: bool,
+
+    /// Enable the hosted idle-timeout behavior for local debugging
+    #[arg(long)]
+    idle_timeout: bool,
 
     /// Log level for the game/app
     #[arg(long = "app-log-level", default_value = "info")]
@@ -341,7 +348,7 @@ async fn main() -> Result<()> {
         .context("Failed to start migration transaction")?;
     tx.execute_batch(include_str!("../../terminal-games/libsql/migrate-001.sql"))
         .await
-        .context("Failed to run migrations")?;
+        .context("Failed to run migrate-001.sql")?;
     tx.commit()
         .await
         .context("Failed to commit migration transaction")?;
@@ -464,12 +471,16 @@ async fn main() -> Result<()> {
         crossterm::cursor::Hide
     )?;
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel(12);
     let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(crossterm::terminal::size()?);
 
     let graceful_shutdown_token = CancellationToken::new();
+    let (mut input_guard, input_rx, idle_fuel_rx) =
+        InputGuard::new(graceful_shutdown_token.clone(), replay_request_tx.clone());
+    let mut input_tick = args.idle_timeout.then(InputGuard::tick_interval);
+    let idle_fuel_receiver = args.idle_timeout.then_some(idle_fuel_rx);
+    let (raw_input_tx, mut raw_input_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
     let network_info = Arc::new(NetworkInformation::new_simulated(args.latency));
     let compress = args.compress;
     let bandwidth = args.bandwidth;
@@ -493,6 +504,37 @@ async fn main() -> Result<()> {
 
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
     let colorterm = std::env::var("COLORTERM").ok();
+
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.lock().read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if raw_input_tx
+                        .blocking_send(Bytes::copy_from_slice(&buf[..n]))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut terminal_profile = TerminalProfile::from_term(Some(&term), colorterm.as_deref());
+    stdout.write_all(b"\x1b]11;?\x07")?;
+    stdout.flush()?;
+    if let Some(rgb) = input_guard
+        .wait_for_terminal_background(&mut raw_input_rx, Duration::from_millis(500))
+        .await?
+    {
+        terminal_profile = terminal_profile.with_background_rgb(rgb);
+    }
+    let (first_cols, first_rows) = *resize_rx.borrow();
+    let terminal_parser = input_guard.take_terminal_parser(first_rows, first_cols);
+
     let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
         args: None,
         input_receiver: input_rx,
@@ -505,40 +547,18 @@ async fn main() -> Result<()> {
         window_size_receiver: resize_rx,
         graceful_shutdown_token: graceful_shutdown_token.clone(),
         network_info: network_info.clone(),
-        terminal_profile: TerminalProfile::from_term(Some(&term), colorterm.as_deref()),
+        terminal_profile,
+        terminal_parser,
         first_app_shortname,
         user_id,
         locale,
         log_backend: guest_log_backend,
         active_shortname_tracker: None,
+        idle_fuel_receiver,
     });
-
-    let graceful_shutdown_token_input = graceful_shutdown_token.clone();
-    thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdin.lock().read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let data = &buf[..n];
-                    if data.is_empty() {
-                        continue;
-                    }
-                    if data == b"\x03" {
-                        // CTRL+C
-                        graceful_shutdown_token_input.cancel();
-                    }
-                    if data == b"\x12" || data == b"\x1b[27;5;114~" {
-                        let _ = replay_request_tx.try_send(());
-                    }
-                    if input_tx.blocking_send(data.into()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
+    let mut pending_input: Option<
+        Pin<Box<dyn Future<Output = Result<(), InputGuardError>> + Send>>,
+    > = None;
 
     let mut sigwinch =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
@@ -607,8 +627,28 @@ async fn main() -> Result<()> {
                 break;
             }
 
+            result = async {
+                pending_input.as_mut().expect("guarded by select").await
+            }, if pending_input.is_some() => {
+                if result.is_err() {
+                    break;
+                }
+                pending_input = None;
+            }
+
             _ = sigint.recv() => {
                 graceful_shutdown_token.cancel();
+            }
+
+            data = raw_input_rx.recv(), if pending_input.is_none() => {
+                let Some(data) = data else { break };
+                pending_input = Some(Box::pin(input_guard.prepare_input(data).send()));
+            }
+
+            _ = async {
+                input_tick.as_mut().expect("guarded by select").tick().await;
+            }, if input_tick.is_some() => {
+                input_guard.tick();
             }
 
             data = audio_rx.recv(), if audio_enabled => {

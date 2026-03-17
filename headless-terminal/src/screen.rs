@@ -58,6 +58,7 @@ pub struct Screen {
 
     attrs: crate::attrs::Attrs,
     saved_attrs: crate::attrs::Attrs,
+    terminal_background: Option<crate::Color>,
 
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
@@ -73,6 +74,7 @@ impl Screen {
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
+            terminal_background: None,
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -306,6 +308,12 @@ impl Screen {
         self.attrs.bgcolor
     }
 
+    /// Returns the terminal's default background color reported via OSC 11.
+    #[must_use]
+    pub fn terminal_background(&self) -> Option<crate::Color> {
+        self.terminal_background
+    }
+
     /// Returns whether newly drawn text should be rendered with the bold text
     /// attribute.
     #[must_use]
@@ -496,6 +504,10 @@ impl Screen {
     // ESC c
     pub(crate) fn ris(&mut self) {
         *self = Self::new(self.grid.size(), 0);
+    }
+
+    pub(crate) fn set_terminal_background(&mut self, color: crate::Color) {
+        self.terminal_background = Some(color);
     }
 
     // csi codes

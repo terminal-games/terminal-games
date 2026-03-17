@@ -42,11 +42,13 @@ let lastTargetBufferMs = 0;
 let pingInterval = null;
 const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const POW_SPINNER_INTERVAL_MS = 120;
-let queuePosition = null;
 let spinnerInterval = null;
 let spinnerFrame = 0;
+let overlay = null;
 const titleLabel = ' Terminal Games ';
 const styledTitle = '\x1b[38;2;23;23;23m\x1b[48;2;152;195;121m Terminal Games \x1b[0m';
+const restoreTerminalState =
+    '\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1l\x1b[>4;0m\x1b>\x1b[?1049l\x1b[?25h';
 
 const measureLatency = () => {
     if (socket && socket.readyState === WebSocket.OPEN) {
@@ -58,16 +60,18 @@ const onSocketMessage = async (event) => {
     if (typeof event.data === 'string') {
         if (event.data.startsWith('queue:')) {
             if (event.data === 'queue:allowed') {
-                queuePosition = null;
+                overlay = null;
                 stopQueueSpinner();
                 term.write('\x1b[2J\x1b[H');
             } else if (event.data.startsWith('queue:queued:')) {
                 const position = Number.parseInt(event.data.substring('queue:queued:'.length), 10);
                 if (Number.isFinite(position) && position >= 1) {
-                    queuePosition = position;
+                    overlay = { type: 'queue', position };
                     startQueueSpinner();
-                    renderQueueScreen();
+                    renderOverlay();
                 }
+            } else if (event.data.startsWith('queue:rejected:')) {
+                showDisconnect(event.data.substring('queue:rejected:'.length));
             }
             return;
         }
@@ -123,12 +127,19 @@ const onSocketMessage = async (event) => {
 
 const onSocketError = (error) => {
     console.error('WebSocket error:', error);
-    term.write('\r\n\x1b[38;2;248;113;113mWebSocket connection error\x1b[0m\r\n');
+    if (overlay?.type === 'disconnect') {
+        return;
+    }
+    showDisconnect('connection_error');
 };
 
-const onSocketClose = () => {
+const onSocketClose = (event) => {
     stopQueueSpinner();
-    term.write('\r\n\x1b[38;2;248;113;113mWebSocket connection closed\x1b[0m\r\n');
+    const rejectedReason =
+        typeof event.reason === 'string' && event.reason.startsWith('rejected:')
+            ? event.reason.substring('rejected:'.length)
+            : null;
+    showDisconnect(rejectedReason ?? 'connection_closed');
     if (pingInterval) {
         clearInterval(pingInterval);
         pingInterval = null;
@@ -136,7 +147,12 @@ const onSocketClose = () => {
     audioPlayer.close();
 };
 
-await startWebSocketSession();
+try {
+    await startWebSocketSession();
+} catch (error) {
+    console.error('Failed to start WebSocket session:', error);
+    showDisconnect('connection_error');
+}
 
 term.onData((data) => {
     if (socket && socket.readyState === WebSocket.OPEN) {
@@ -158,8 +174,10 @@ term.onResize((size) => {
     if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send(`resize:${size.cols}:${size.rows}`);
     }
+    if (overlay !== null) {
+        renderOverlay();
+    }
 });
-
 window.addEventListener('resize', () => fitAddon.fit());
 
 function centeredCol(text) {
@@ -167,20 +185,68 @@ function centeredCol(text) {
 }
 
 function renderQueueScreen() {
-    if (queuePosition === null) {
+    if (overlay?.type !== 'queue') {
         return;
     }
-    const spinnerLine = `${spinnerFrames[spinnerFrame]} Loading...`;
-    const queueLine = `Position in queue: ${queuePosition}`;
-    const centerRow = Math.max(1, Math.floor(term.rows / 2));
-    const titleRow = Math.max(1, centerRow - 1);
-    const queueRow = Math.min(term.rows, centerRow + 1);
+    renderCenteredScreen([
+        styledTitle,
+        `${spinnerFrames[spinnerFrame]} Loading...`,
+        `Position in queue: ${overlay.position}`
+    ]);
+}
 
-    term.write('\x1b[?25l\x1b[2J');
-    term.write(`\x1b[${titleRow};${centeredCol(titleLabel)}H${styledTitle}`);
-    term.write(`\x1b[${centerRow};${centeredCol(spinnerLine)}H${spinnerLine}`);
-    term.write(`\x1b[${queueRow};${centeredCol(queueLine)}H${queueLine}`);
-    term.write('\x1b[H');
+function renderDisconnectScreen(reasonKey) {
+    const { heading, detail, hint } = disconnectMessage(reasonKey);
+    renderCenteredScreen([
+        styledTitle,
+        `\x1b[38;2;248;113;113m${heading}\x1b[0m`,
+        detail,
+        `\x1b[2m${hint}\x1b[0m`
+    ], true);
+}
+
+function renderOverlay() {
+    if (overlay?.type === 'queue') {
+        renderQueueScreen();
+    } else if (overlay?.type === 'disconnect') {
+        renderDisconnectScreen(overlay.reason);
+    }
+}
+
+function showDisconnect(reason) {
+    stopQueueSpinner();
+    overlay = { type: 'disconnect', reason };
+    renderOverlay();
+}
+
+function disconnectMessage(reasonKey) {
+    switch (reasonKey) {
+        case 'banned_ip':
+            return {
+                heading: 'Connection blocked',
+                detail: 'Connections from your IP address are blocked.',
+                hint: 'If this is unexpected, contact the operator.'
+            };
+        case 'too_many_connections_from_ip':
+            return {
+                heading: 'Too many sessions',
+                detail: 'This IP address already has too many active sessions.',
+                hint: 'Close another session or wait a few minutes and try again.'
+            };
+        case 'connection_error':
+            return {
+                heading: 'Connection error',
+                detail: 'The WebSocket connection failed.',
+                hint: 'Check your network connection and try again.'
+            };
+        case 'connection_closed':
+        default:
+            return {
+                heading: 'Disconnected',
+                detail: 'The WebSocket connection closed.',
+                hint: 'Refresh the page to reconnect.'
+            };
+    }
 }
 
 function startQueueSpinner() {
@@ -394,15 +460,19 @@ function countLeadingZeroBits(bytes) {
 }
 
 function renderPowScreen(frame, attempts) {
-    const spinnerLine = `${spinnerFrames[frame]} Computing proof of work...`;
-    const detailLine = `Hash attempts: ${attempts}`;
-    const centerRow = Math.max(1, Math.floor(term.rows / 2));
-    const titleRow = Math.max(1, centerRow - 1);
-    const detailRow = Math.min(term.rows, centerRow + 1);
+    renderCenteredScreen([
+        styledTitle,
+        `${spinnerFrames[frame]} Computing proof of work...`,
+        `\x1b[2mHash attempts: ${attempts}\x1b[0m`
+    ]);
+}
 
-    term.write('\x1b[?25l\x1b[2J');
-    term.write(`\x1b[${titleRow};${centeredCol(titleLabel)}H${styledTitle}`);
-    term.write(`\x1b[${centerRow};${centeredCol(spinnerLine)}H${spinnerLine}`);
-    term.write(`\x1b[${detailRow};${centeredCol(detailLine)}H\x1b[2m${detailLine}\x1b[0m`);
+function renderCenteredScreen(lines, restore = false) {
+    const startRow = Math.max(1, Math.floor(term.rows / 2) - Math.floor((lines.length - 1) / 2));
+    term.write(`${restore ? restoreTerminalState : '\x1b[0m\x1b[?25l'}\x1b[2J`);
+    lines.forEach((line, index) => {
+        const plain = line.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+        term.write(`\x1b[${startRow + index};${centeredCol(plain)}H${line}`);
+    });
     term.write('\x1b[H');
 }

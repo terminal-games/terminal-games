@@ -28,6 +28,7 @@ serde_json = "1"
 smallvec = "1"
 strip-ansi-escapes = "0.2"
 tarpc = { version = "0.37", features = ["serde", "serde-transport", "serde-transport-bincode", "tokio1"] }
+terminput = "0.5"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12",] }
 tokio-util = { version = "0.7", features = ["rt"] }

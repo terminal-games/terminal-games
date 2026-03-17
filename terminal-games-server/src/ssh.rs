@@ -4,9 +4,10 @@
 
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
+use bytes::Bytes;
 use rand_core::{OsRng, RngCore};
 use russh::keys::ssh_key::{self, PublicKey};
 use russh::server::*;
@@ -14,17 +15,17 @@ use russh::{Channel, ChannelId, Pty};
 use tokio_util::sync::CancellationToken;
 
 use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::input_guard::InputGuard;
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::palette;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
 
-use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
+use crate::admission::{AdmissionController, AdmissionRejection, AdmissionState, AdmissionTicket};
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 pub struct SshSession {
-    input_sender: tokio::sync::mpsc::Sender<smallvec::SmallVec<[u8; 16]>>,
-    replay_request_sender: tokio::sync::mpsc::Sender<()>,
+    raw_input_tx: tokio::sync::mpsc::Sender<Bytes>,
     resize_tx: tokio::sync::watch::Sender<(u16, u16)>,
     auth: Option<tokio::sync::oneshot::Sender<(String, Option<u64>)>>,
     term: Option<tokio::sync::oneshot::Sender<String>>,
@@ -44,6 +45,8 @@ pub(crate) struct SshServer {
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const CAPTCHA_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const RESTORE_TERMINAL_STATE: &[u8] =
+    b"\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1l\x1b[>4;0m\x1b>\x1b[?1049l\x1b[?25h";
 
 impl SshServer {
     pub async fn new(
@@ -142,7 +145,7 @@ impl SshServer {
 
     fn new_client(
         &self,
-        _addr: std::net::SocketAddr,
+        addr: std::net::SocketAddr,
         network_info: Arc<NetworkInformation<TcpLatencyProvider>>,
     ) -> SshSession {
         let (auth_sender, auth_receiver) = tokio::sync::oneshot::channel::<(String, Option<u64>)>();
@@ -151,16 +154,20 @@ impl SshServer {
         let (ssh_session_sender, ssh_session_receiver) =
             tokio::sync::oneshot::channel::<(Handle, ChannelId, String)>();
 
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(12);
-        let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
-        let (resize_tx, mut resize_rx) = tokio::sync::watch::channel((0, 0));
         let cancellation_token = CancellationToken::new();
         let token = cancellation_token.clone();
+        let shutdown_token = cancellation_token.clone();
+        let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
+        let (mut input_guard, input_rx, idle_fuel_rx) =
+            InputGuard::new(cancellation_token.clone(), replay_request_tx.clone());
+        let (raw_input_tx, mut raw_input_rx) = tokio::sync::mpsc::channel(12);
+        let (resize_tx, mut resize_rx) = tokio::sync::watch::channel((0, 0));
         let app_server = self.app_server.clone();
         let admission_controller = self.admission_controller.clone();
         let metrics = self.metrics.clone();
-        let input_tx_clone = input_tx.clone();
+        let client_ip = addr.ip();
         tokio::task::spawn(async move {
+            let mut input_tick = InputGuard::tick_interval();
             let (session_handle, channel_id, remote_sshid) = match ssh_session_receiver.await {
                 Ok(v) => v,
                 Err(err) => {
@@ -283,6 +290,7 @@ impl SshServer {
                     Ok(Err(_)) => None,
                     Err(_) => {
                         tracing::trace!("no pty_request received within 500ms");
+                        restore_terminal_state(&session_handle, channel_id).await;
                         let _ = session_handle
                             .disconnect(
                                 russh::Disconnect::ByApplication,
@@ -294,16 +302,11 @@ impl SshServer {
                     }
                 };
             let mut terminal_profile = TerminalProfile::from_term(term.as_deref(), None);
-            let buffered_input = probe_terminal_background(
-                &mut input_rx,
-                &mut terminal_profile,
-                Duration::from_millis(500),
-            )
-            .await;
-            for data in buffered_input {
-                if input_tx_clone.send(data).await.is_err() {
-                    return;
-                }
+            if let Ok(Some(rgb)) = input_guard
+                .wait_for_terminal_background(&mut raw_input_rx, Duration::from_millis(500))
+                .await
+            {
+                terminal_profile = terminal_profile.with_background_rgb(rgb);
             }
 
             let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
@@ -314,15 +317,14 @@ impl SshServer {
                     &session_handle,
                     channel_id,
                     &mut resize_rx,
-                    &mut input_rx,
+                    &mut raw_input_rx,
+                    &mut input_guard,
                     &captcha,
                     terminal_profile,
                 )
                 .await;
                 if !solved {
-                    let _ = session_handle
-                        .data(channel_id, b"\x1b[?1049l".to_vec().into())
-                        .await;
+                    restore_terminal_state(&session_handle, channel_id).await;
                     let _ = session_handle
                         .disconnect(
                             russh::Disconnect::ByApplication,
@@ -333,24 +335,54 @@ impl SshServer {
                     return;
                 }
             }
-            let admission_ticket = admission_controller.issue_ticket(Transport::Ssh);
-            if !wait_for_admission(
+            let admission_ticket = admission_controller.issue_ticket(Transport::Ssh, client_ip);
+            match wait_for_admission(
                 &session_handle,
                 channel_id,
                 &mut resize_rx,
-                &mut input_rx,
+                &mut raw_input_rx,
+                &mut input_guard,
                 &admission_ticket,
                 terminal_profile,
             )
             .await
             {
-                let _ = session_handle
-                    .data(channel_id, b"\x1b[?1049l".to_vec().into())
-                    .await;
+                AdmissionWaitResult::Allowed => {}
+                AdmissionWaitResult::Disconnected => {
+                    restore_terminal_state(&session_handle, channel_id).await;
+                    let _ = session_handle
+                        .disconnect(
+                            russh::Disconnect::ByApplication,
+                            "Bye!".to_string(),
+                            "en-US".to_string(),
+                        )
+                        .await;
+                    return;
+                }
+                AdmissionWaitResult::Rejected(reason) => {
+                    tracing::trace!(
+                        client_ip = %client_ip,
+                        reason = reason.slug(),
+                        "Rejected SSH admission"
+                    );
+                    restore_terminal_state(&session_handle, channel_id).await;
+                    let _ = session_handle
+                        .disconnect(
+                            russh::Disconnect::ByApplication,
+                            reason.user_message().to_string(),
+                            "en-US".to_string(),
+                        )
+                        .await;
+                    return;
+                }
+            }
+            let mut ban_changes = admission_controller.subscribe_ban_changes();
+            if admission_controller.is_ip_banned(client_ip) {
+                restore_terminal_state(&session_handle, channel_id).await;
                 let _ = session_handle
                     .disconnect(
                         russh::Disconnect::ByApplication,
-                        "Bye!".to_string(),
+                        AdmissionRejection::BannedIp.user_message().to_string(),
                         "en-US".to_string(),
                     )
                     .await;
@@ -370,6 +402,8 @@ impl SshServer {
                 user_id,
             );
             let active_shortname_tracker = session_guard.active_shortname_tracker();
+            let (first_cols, first_rows) = *resize_rx.borrow();
+            let terminal_parser = input_guard.take_terminal_parser(first_rows, first_cols);
 
             let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
                 first_app_shortname,
@@ -385,11 +419,14 @@ impl SshServer {
                 graceful_shutdown_token: token,
                 network_info,
                 terminal_profile,
+                terminal_parser,
                 user_id,
                 locale,
                 log_backend: Arc::new(NoopLogBackend),
                 active_shortname_tracker: Some(active_shortname_tracker),
+                idle_fuel_receiver: Some(idle_fuel_rx),
             });
+            let mut disconnect_message = "Thanks for playing!";
             loop {
                 tokio::select! {
                     biased;
@@ -409,6 +446,15 @@ impl SshServer {
                         break;
                     }
 
+                    data = raw_input_rx.recv() => {
+                        let Some(data) = data else { break };
+                        let _ = input_guard.prepare_input(data).try_send();
+                    }
+
+                    _ = input_tick.tick() => {
+                        input_guard.tick();
+                    }
+
                     data = audio_rx.recv(), if has_audio => {
                         let Some(data) = data else { break };
                         metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
@@ -420,19 +466,26 @@ impl SshServer {
                         metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
                         let _ = session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await;
                     }
+
+                    changed = ban_changes.changed() => {
+                        if changed.is_err() || !admission_controller.is_ip_banned(client_ip) {
+                            continue;
+                        }
+                        disconnect_message = AdmissionRejection::BannedIp.user_message();
+                        shutdown_token.cancel();
+                        break;
+                    }
                 }
             }
             drop(admission_ticket);
             drop(session_guard);
 
-            let _ = session_handle
-                .data(channel_id, b"\x1b[?1049l".to_vec().into())
-                .await;
+            restore_terminal_state(&session_handle, channel_id).await;
 
             let _ = session_handle
                 .disconnect(
                     russh::Disconnect::ByApplication,
-                    "Thanks for playing!".to_string(),
+                    disconnect_message.to_string(),
                     "en-US".to_string(),
                 )
                 .await;
@@ -440,8 +493,7 @@ impl SshServer {
 
         SshSession {
             cancellation_token,
-            input_sender: input_tx,
-            replay_request_sender: replay_request_tx,
+            raw_input_tx,
             resize_tx,
             auth: Some(auth_sender),
             term: Some(term_sender),
@@ -450,6 +502,12 @@ impl SshServer {
             server: self.clone(),
         }
     }
+}
+
+async fn restore_terminal_state(session_handle: &Handle, channel_id: ChannelId) {
+    let _ = session_handle
+        .data(channel_id, RESTORE_TERMINAL_STATE.to_vec().into())
+        .await;
 }
 
 fn generate_captcha(len: usize) -> String {
@@ -466,9 +524,10 @@ async fn solve_captcha(
     session_handle: &Handle,
     channel_id: ChannelId,
     resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
-    input_rx: &mut tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
+    raw_input_rx: &mut tokio::sync::mpsc::Receiver<Bytes>,
+    input_guard: &mut InputGuard,
     captcha: &str,
-    terminal_profile: TerminalProfile,
+    base_terminal_profile: TerminalProfile,
 ) -> bool {
     let mut entered = String::with_capacity(captcha.len());
     loop {
@@ -479,7 +538,7 @@ async fn solve_captcha(
             window,
             captcha,
             &entered,
-            terminal_profile,
+            input_guard.terminal_profile(base_terminal_profile),
         )
         .await
         .is_err()
@@ -492,10 +551,10 @@ async fn solve_captcha(
                     return false;
                 }
             }
-            data = input_rx.recv() => {
-                let Some(data) = data else {
-                    return false;
-                };
+            data = raw_input_rx.recv() => {
+                let Some(data) = data else { return false; };
+                let pending = input_guard.prepare_input(data.clone());
+                drop(pending);
                 for byte in data {
                     match byte {
                         0x03 => return false,
@@ -526,21 +585,30 @@ async fn solve_captcha(
     }
 }
 
+enum AdmissionWaitResult {
+    Allowed,
+    Disconnected,
+    Rejected(AdmissionRejection),
+}
+
 async fn wait_for_admission(
     session_handle: &Handle,
     channel_id: ChannelId,
     resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
-    input_rx: &mut tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
+    raw_input_rx: &mut tokio::sync::mpsc::Receiver<Bytes>,
+    input_guard: &mut InputGuard,
     admission_ticket: &AdmissionTicket,
-    terminal_profile: TerminalProfile,
-) -> bool {
-    let mut updates = admission_ticket.subscribe().await;
+    base_terminal_profile: TerminalProfile,
+) -> AdmissionWaitResult {
+    let mut updates = admission_ticket.subscribe();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut frame = 0usize;
     let mut status = *updates.borrow();
     loop {
-        if status == AdmissionState::Allowed {
-            return true;
+        match status {
+            AdmissionState::Allowed => return AdmissionWaitResult::Allowed,
+            AdmissionState::Rejected(reason) => return AdmissionWaitResult::Rejected(reason),
+            AdmissionState::Queued(_) => {}
         }
         let window = *resize_rx.borrow();
         if render_loading_screen(
@@ -549,33 +617,33 @@ async fn wait_for_admission(
             window,
             status,
             frame,
-            terminal_profile,
+            input_guard.terminal_profile(base_terminal_profile),
         )
         .await
         .is_err()
         {
-            return false;
+            return AdmissionWaitResult::Disconnected;
         }
         frame = (frame + 1) % SPINNER_FRAMES.len();
         tokio::select! {
             _ = tick.tick() => {}
             changed = updates.changed() => {
                 if changed.is_err() {
-                    return false;
+                    return AdmissionWaitResult::Disconnected;
                 }
                 status = *updates.borrow();
             }
             changed = resize_rx.changed() => {
                 if changed.is_err() {
-                    return false;
+                    return AdmissionWaitResult::Disconnected;
                 }
             }
-            data = input_rx.recv() => {
-                let Some(data) = data else {
-                    return false;
-                };
+            data = raw_input_rx.recv() => {
+                let Some(data) = data else { return AdmissionWaitResult::Disconnected; };
+                let pending = input_guard.prepare_input(data.clone());
+                drop(pending);
                 if data.contains(&0x03) || data.contains(&b'q') {
-                    return false;
+                    return AdmissionWaitResult::Disconnected;
                 }
             }
         }
@@ -665,6 +733,7 @@ async fn render_loading_screen(
     let queue_plain = match status {
         AdmissionState::Allowed => "Starting app...".to_string(),
         AdmissionState::Queued(position) => format!("Position in queue: {}", position),
+        AdmissionState::Rejected(reason) => reason.user_message().to_string(),
     };
     let queue_line = styled_regular_text(terminal_profile, &queue_plain);
     let center_row = if height == 0 { 1 } else { height.max(2) / 2 };
@@ -715,127 +784,6 @@ fn styled_terminal_games_title(profile: TerminalProfile, text: &str) -> String {
         "\x1b[{}m{text}\x1b[0m",
         palette::render_color_code(p.primary, true)
     )
-}
-
-#[derive(Default)]
-struct Osc11Parser {
-    buffer: Vec<u8>,
-}
-
-impl Osc11Parser {
-    fn consume(&mut self, input: &[u8], terminal_profile: &mut TerminalProfile) -> Vec<u8> {
-        self.buffer.extend_from_slice(input);
-        let mut out = Vec::with_capacity(input.len());
-        let mut i = 0usize;
-
-        while i < self.buffer.len() {
-            if self.buffer[i..].starts_with(b"\x1b]11;") {
-                let Some((consumed, rgb)) = parse_osc11_sequence(&self.buffer[i..]) else {
-                    break;
-                };
-                if let Some(rgb) = rgb {
-                    *terminal_profile = terminal_profile.with_background_rgb(rgb);
-                }
-                i += consumed;
-                continue;
-            }
-            out.push(self.buffer[i]);
-            i += 1;
-        }
-
-        if i > 0 {
-            self.buffer.drain(..i);
-        }
-        out
-    }
-
-    fn finish(mut self) -> Vec<u8> {
-        std::mem::take(&mut self.buffer)
-    }
-}
-
-fn parse_osc11_sequence(data: &[u8]) -> Option<(usize, Option<(u8, u8, u8)>)> {
-    if !data.starts_with(b"\x1b]11;") {
-        return Some((1, None));
-    }
-    let start = 5usize;
-    let mut end = None;
-    let mut consumed = 0usize;
-    for i in start..data.len() {
-        if data[i] == 0x07 {
-            end = Some(i);
-            consumed = i + 1;
-            break;
-        }
-        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'\\' {
-            end = Some(i);
-            consumed = i + 2;
-            break;
-        }
-    }
-    let Some(end) = end else {
-        return None;
-    };
-    let content = &data[start..end];
-    let rgb = parse_rgb_osc_payload(content);
-    Some((consumed, rgb))
-}
-
-fn parse_rgb_osc_payload(payload: &[u8]) -> Option<(u8, u8, u8)> {
-    let s = std::str::from_utf8(payload).ok()?;
-    let value = s.strip_prefix("rgb:")?;
-    let mut parts = value.split('/');
-    let r = parse_hex_component(parts.next()?)?;
-    let g = parse_hex_component(parts.next()?)?;
-    let b = parse_hex_component(parts.next()?)?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((r, g, b))
-}
-
-fn parse_hex_component(part: &str) -> Option<u8> {
-    if part.is_empty() || part.len() > 4 {
-        return None;
-    }
-    let value = u16::from_str_radix(part, 16).ok()?;
-    let bits = (part.len() * 4) as u32;
-    let max = (1u32 << bits).saturating_sub(1);
-    let scaled = ((value as u32) * 255 + (max / 2)) / max;
-    u8::try_from(scaled).ok()
-}
-
-async fn probe_terminal_background(
-    input_rx: &mut tokio::sync::mpsc::Receiver<smallvec::SmallVec<[u8; 16]>>,
-    terminal_profile: &mut TerminalProfile,
-    timeout: Duration,
-) -> Vec<smallvec::SmallVec<[u8; 16]>> {
-    let deadline = Instant::now() + timeout;
-    let mut buffered = Vec::new();
-    let mut osc11 = Osc11Parser::default();
-
-    while terminal_profile.background_rgb.is_none() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, input_rx.recv()).await {
-            Ok(Some(data)) => {
-                let filtered = osc11.consume(data.as_slice(), terminal_profile);
-                if !filtered.is_empty() {
-                    buffered.push(filtered.into_iter().collect());
-                }
-            }
-            Ok(None) => break,
-            Err(_) => break,
-        }
-    }
-
-    let pending = osc11.finish();
-    if !pending.is_empty() {
-        buffered.push(pending.into_iter().collect());
-    }
-    buffered
 }
 
 fn styled_captcha_entered(profile: TerminalProfile, text: &str) -> String {
@@ -938,27 +886,10 @@ impl Handler for SshSession {
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if data.is_empty() {
-            return Ok(());
-        }
         self.server
             .metrics
             .record_bytes(Direction::In, Transport::Ssh, data.len());
-        if data == b"\x03" {
-            // CTRL+C
-            self.cancellation_token.cancel();
-        }
-        if data == b"\x12" || data == b"\x1b[27;5;114~" {
-            // CTRL+R
-            let _ = self.replay_request_sender.try_send(());
-        }
-        match self.input_sender.try_send(data.into()) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("input channel closed");
-            }
-        }
+        let _ = self.raw_input_tx.try_send(Bytes::copy_from_slice(data));
 
         Ok(())
     }

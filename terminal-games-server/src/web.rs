@@ -3,11 +3,14 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::os::fd::AsRawFd;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::{
     collections::HashMap,
     fs::File,
+    future::Future,
     io::BufReader,
+    net::SocketAddr,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -20,7 +23,7 @@ use axum::{
     body::Body,
     extract::{
         Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{
         HeaderMap, StatusCode,
@@ -46,16 +49,18 @@ use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
 use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::input_guard::{InputGuard, InputGuardError};
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
 
-use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
+use crate::admission::{AdmissionController, AdmissionRejection, AdmissionState, AdmissionTicket};
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 #[derive(Clone)]
 struct MyConnectInfo {
     network_info: Arc<NetworkInformation<TcpLatencyProvider>>,
+    remote_addr: SocketAddr,
 }
 
 impl Connected<MyConnectInfo> for MyConnectInfo {
@@ -142,7 +147,7 @@ impl WebServer {
         let mut make_service = app.into_make_service_with_connect_info::<MyConnectInfo>();
         let listener = tokio::net::TcpListener::bind(listen_addr).await?;
         loop {
-            let (stream, _remote_addr) = match listener.accept().await {
+            let (stream, remote_addr) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("failed to accept web connection: {e}");
@@ -159,6 +164,7 @@ impl WebServer {
                 make_service
                     .call(MyConnectInfo {
                         network_info: network_info.clone(),
+                        remote_addr,
                     })
                     .await,
             );
@@ -394,16 +400,37 @@ async fn handle_socket(
     let remote_sshid = sanitize_user_agent(&user_agent);
     let username = "web".to_string();
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel(12);
     let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(initial_size);
     let cancellation_token = CancellationToken::new();
     let token = cancellation_token.clone();
+    let (mut input_guard, input_rx, idle_fuel_rx) =
+        InputGuard::new(cancellation_token.clone(), replay_request_tx.clone());
+    let mut input_tick = InputGuard::tick_interval();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
-    let admission_ticket = server.admission_controller.issue_ticket(Transport::Web);
-    if !wait_for_admission(&mut sender, &mut receiver, &resize_tx, &admission_ticket).await {
+    let admission_ticket = server
+        .admission_controller
+        .issue_ticket(Transport::Web, connect_info.remote_addr.ip());
+    match wait_for_admission(&mut sender, &mut receiver, &resize_tx, &admission_ticket).await {
+        AdmissionWaitResult::Allowed => {}
+        AdmissionWaitResult::Disconnected => return,
+        AdmissionWaitResult::Rejected(reason) => {
+            tracing::trace!(
+                client_ip = %connect_info.remote_addr.ip(),
+                reason = reason.slug(),
+                "Rejected web admission"
+            );
+            return;
+        }
+    }
+    let mut ban_changes = server.admission_controller.subscribe_ban_changes();
+    if server
+        .admission_controller
+        .is_ip_banned(connect_info.remote_addr.ip())
+    {
+        let _ = send_rejection_and_close(&mut sender, AdmissionRejection::BannedIp).await;
         return;
     }
     let session_guard =
@@ -411,8 +438,9 @@ async fn handle_socket(
             .metrics
             .start_session(Transport::Web, AuthKind::Anonymous, true, None);
     let active_shortname_tracker = session_guard.active_shortname_tracker();
+    let terminal_parser = input_guard.take_terminal_parser(initial_size.1, initial_size.0);
 
-    let exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
+    let mut exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
         first_app_shortname,
         args,
         input_receiver: input_rx,
@@ -426,102 +454,112 @@ async fn handle_socket(
         graceful_shutdown_token: token,
         network_info: connect_info.network_info,
         terminal_profile: TerminalProfile::web_default(),
+        terminal_parser,
         user_id: None,
         locale,
         log_backend: Arc::new(NoopLogBackend),
         active_shortname_tracker: Some(active_shortname_tracker),
+        idle_fuel_receiver: Some(idle_fuel_rx),
     });
+    let mut pending_input: Option<
+        Pin<Box<dyn Future<Output = Result<(), InputGuardError>> + Send>>,
+    > = None;
 
-    let (pong_tx, mut pong_rx) = tokio::sync::mpsc::channel(1);
-    let send_metrics = server.metrics.clone();
+    loop {
+        tokio::select! {
+            biased;
 
-    tokio::task::spawn(async move {
-        loop {
-            tokio::select! {
-                data = output_rx.recv() => {
-                    let Some(data) = data else { break };
-                    let mut msg = Vec::with_capacity(data.len() / 2);
-                    {
-                        let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
-                        if encoder.write_all(&data).is_err() || encoder.finish().is_err() {
-                            break;
-                        }
+            exit_code = &mut exit_rx => {
+                match exit_code {
+                    Ok(Ok(exit_code)) => {
+                        tracing::trace!(?exit_code, "App exited");
                     }
-                    msg.push(0x00);
-                    send_metrics.record_bytes(Direction::Out, Transport::Web, msg.len());
-                    if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
-                        break;
+                    Ok(Err(error)) => {
+                        tracing::error!(error = %error, "App failed");
+                    }
+                    Err(error) => {
+                        tracing::error!(?error, "App exit channel dropped");
                     }
                 }
-                data = audio_rx.recv() => {
-                    let Some(mut data) = data else { break };
-                    data.push(0x01);
-                    send_metrics.record_bytes(Direction::Out, Transport::Web, data.len());
-                    if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
-                        break;
-                    }
-                }
-                ts = pong_rx.recv() => {
-                    let Some(ts) = ts else { break };
-                    if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
-                        break;
-                    }
-                }
+                break;
             }
-        }
-    });
 
-    let cancellation_token_clone = cancellation_token.clone();
-    let recv_metrics = server.metrics.clone();
-    tokio::task::spawn(async move {
-        while let Some(msg) = receiver.next().await {
-            match msg {
-                Ok(Message::Binary(data)) => {
-                    let data = data.as_ref();
-                    if data.is_empty() {
-                        continue;
-                    }
-                    recv_metrics.record_bytes(Direction::In, Transport::Web, data.len());
-                    if data == b"\x03" {
-                        // CTRL+C
-                        cancellation_token_clone.cancel();
-                    }
-                    if data == b"\x12" || data == b"\x1b[27;5;114~" {
-                        // CTRL+R
-                        let _ = replay_request_tx.try_send(());
-                    }
-                    if input_tx.send(data.into()).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(Message::Text(text)) => {
-                    let text_str = text.to_string();
-                    if let Some(rest) = text_str.strip_prefix("resize:") {
-                        if let Some((w, h)) = parse_resize(rest) {
-                            let _ = resize_tx.send((w, h));
-                        }
-                    } else if let Some(ts) = text_str.strip_prefix("ping:") {
-                        let _ = pong_tx.send(ts.to_string()).await;
-                    }
-                }
-                Ok(Message::Close(_)) | Err(_) => {
-                    cancellation_token_clone.cancel();
+            result = async {
+                pending_input.as_mut().expect("guarded by select").await
+            }, if pending_input.is_some() => {
+                if result.is_err() {
                     break;
                 }
-                _ => {}
+                pending_input = None;
             }
-        }
-    });
 
-    match exit_rx.await {
-        Ok(Ok(exit_code)) => {
-            tracing::trace!(?exit_code, "App exited");
-        }
-        Ok(Err(error)) => {
-            tracing::error!(error = %error, "App failed");
-        }
-        Err(error) => {
-            tracing::error!(?error, "App exit channel dropped");
+            _ = input_tick.tick() => {
+                input_guard.tick();
+            }
+
+            data = output_rx.recv() => {
+                let Some(data) = data else { break };
+                let mut msg = Vec::with_capacity(data.len() / 2);
+                {
+                    let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
+                    if encoder.write_all(&data).is_err() || encoder.finish().is_err() {
+                        break;
+                    }
+                }
+                msg.push(0x00);
+                server.metrics.record_bytes(Direction::Out, Transport::Web, msg.len());
+                if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
+                    cancellation_token.cancel();
+                    break;
+                }
+            }
+
+            data = audio_rx.recv() => {
+                let Some(mut data) = data else { break };
+                data.push(0x01);
+                server.metrics.record_bytes(Direction::Out, Transport::Web, data.len());
+                if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
+                    cancellation_token.cancel();
+                    break;
+                }
+            }
+
+            msg = receiver.next(), if pending_input.is_none() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    Ok(Message::Binary(data)) => {
+                        server.metrics.record_bytes(Direction::In, Transport::Web, data.len());
+                        pending_input = Some(Box::pin(input_guard.prepare_input(data).send()));
+                    }
+                    Ok(Message::Text(text)) => {
+                        let text_str = text.to_string();
+                        if let Some(rest) = text_str.strip_prefix("resize:") {
+                            if let Some((w, h)) = parse_resize(rest) {
+                                let _ = resize_tx.send((w, h));
+                            }
+                        } else if let Some(ts) = text_str.strip_prefix("ping:") {
+                            if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
+                                cancellation_token.cancel();
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => {
+                        cancellation_token.cancel();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            changed = ban_changes.changed() => {
+                if changed.is_err() || !server.admission_controller.is_ip_banned(connect_info.remote_addr.ip()) {
+                    continue;
+                }
+                cancellation_token.cancel();
+                let _ = send_rejection_and_close(&mut sender, AdmissionRejection::BannedIp).await;
+                break;
+            }
         }
     }
 
@@ -662,21 +700,32 @@ fn leading_zero_bits(bytes: &[u8]) -> u32 {
     bits
 }
 
+enum AdmissionWaitResult {
+    Allowed,
+    Disconnected,
+    Rejected(AdmissionRejection),
+}
+
 async fn wait_for_admission(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     receiver: &mut futures::stream::SplitStream<WebSocket>,
     resize_tx: &tokio::sync::watch::Sender<(u16, u16)>,
     ticket: &AdmissionTicket,
-) -> bool {
-    let mut updates = ticket.subscribe().await;
+) -> AdmissionWaitResult {
+    let mut updates = ticket.subscribe();
     loop {
         let status = *updates.borrow();
         match status {
             AdmissionState::Allowed => {
-                return sender
+                return if sender
                     .send(Message::Text("queue:allowed".into()))
                     .await
-                    .is_ok();
+                    .is_ok()
+                {
+                    AdmissionWaitResult::Allowed
+                } else {
+                    AdmissionWaitResult::Disconnected
+                };
             }
             AdmissionState::Queued(position) => {
                 if sender
@@ -684,15 +733,19 @@ async fn wait_for_admission(
                     .await
                     .is_err()
                 {
-                    return false;
+                    return AdmissionWaitResult::Disconnected;
                 }
+            }
+            AdmissionState::Rejected(reason) => {
+                let _ = send_rejection_and_close(sender, reason).await;
+                return AdmissionWaitResult::Rejected(reason);
             }
         }
 
         tokio::select! {
             changed = updates.changed() => {
                 if changed.is_err() {
-                    return false;
+                    return AdmissionWaitResult::Disconnected;
                 }
             }
             msg = receiver.next() => {
@@ -700,7 +753,7 @@ async fn wait_for_admission(
                     Some(Ok(Message::Binary(data))) => {
                         if data.contains(&0x03) || data.contains(&b'q') {
                             let _ = sender.send(Message::Close(None)).await;
-                            return false;
+                            return AdmissionWaitResult::Disconnected;
                         }
                     }
                     Some(Ok(Message::Text(text))) => {
@@ -711,16 +764,33 @@ async fn wait_for_admission(
                             }
                         } else if let Some(ts) = text_str.strip_prefix("ping:") {
                             if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
-                                return false;
+                                return AdmissionWaitResult::Disconnected;
                             }
                         }
                     }
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                        return false;
+                        return AdmissionWaitResult::Disconnected;
                     }
                     _ => {}
                 }
             }
         }
     }
+}
+
+async fn send_rejection_and_close(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    reason: AdmissionRejection,
+) -> Result<(), axum::Error> {
+    sender
+        .send(Message::Text(
+            format!("queue:rejected:{}", reason.slug()).into(),
+        ))
+        .await?;
+    sender
+        .send(Message::Close(Some(CloseFrame {
+            code: 1008,
+            reason: format!("rejected:{}", reason.slug()).into(),
+        })))
+        .await
 }

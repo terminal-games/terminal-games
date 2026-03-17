@@ -20,6 +20,7 @@ pub enum Color {
 pub struct Palette {
     pub primary: Color,
     pub accent: Color,
+    pub warning: Color,
     pub danger: Color,
     pub on_primary: Color,
     pub text: Color,
@@ -69,6 +70,7 @@ pub fn palette(profile: TerminalProfile) -> Palette {
         // ─────────────────────────────────────────────────────────────────────────
         // primary        #98c379                          #98c379
         // accent         blue-400  #60a5fa                 blue-600   #2563eb
+        // warning        amber-400 #fbbf24                 amber-600  #d97706
         // danger         red-400   #f87171                 red-600    #dc2626
         // on_primary     neutral-900 #171717               neutral-900 #171717
         // text           neutral-100 #f5f5f5               neutral-800 #262626
@@ -83,6 +85,11 @@ pub fn palette(profile: TerminalProfile) -> Palette {
                 dark,
                 Color::Rgb(0x60, 0xa5, 0xfa),
                 Color::Rgb(0x25, 0x63, 0xeb),
+            ),
+            warning: c(
+                dark,
+                Color::Rgb(0xfb, 0xbf, 0x24),
+                Color::Rgb(0xd9, 0x77, 0x06),
             ),
             danger: c(
                 dark,
@@ -124,6 +131,7 @@ pub fn palette(profile: TerminalProfile) -> Palette {
         TerminalColorMode::Color256 => Palette {
             primary: Color::Fixed(114),
             accent: c(dark, Color::Fixed(75), Color::Fixed(27)),
+            warning: c(dark, Color::Fixed(214), Color::Fixed(166)),
             danger: c(dark, Color::Fixed(203), Color::Fixed(160)),
             on_primary: Color::Fixed(234),
             text: c(dark, Color::Fixed(255), Color::Fixed(235)),
@@ -136,6 +144,7 @@ pub fn palette(profile: TerminalProfile) -> Palette {
         TerminalColorMode::Color16 => Palette {
             primary: Color::Basic(10),
             accent: c(dark, Color::Basic(12), Color::Basic(4)),
+            warning: c(dark, Color::Basic(11), Color::Basic(3)),
             danger: c(dark, Color::Basic(9), Color::Basic(1)),
             on_primary: Color::Basic(0),
             text: c(dark, Color::Basic(15), Color::Basic(0)),

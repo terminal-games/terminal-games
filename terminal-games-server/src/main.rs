@@ -8,15 +8,19 @@ mod ssh;
 mod web;
 
 use std::{
+    collections::HashMap,
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use wasmparser::{Parser, Payload};
 
+use crate::admission::AdmissionConfig;
 use terminal_games::{
     app::AppServer,
     mesh::{EnvDiscovery, Mesh},
@@ -162,6 +166,102 @@ async fn sync_games_from_embedded_manifests(conn: &libsql::Connection) -> Result
     Ok(upserted)
 }
 
+async fn load_ip_ban_updates(
+    conn: &libsql::Connection,
+    since: Option<i64>,
+) -> Result<(Vec<(IpAddr, Option<i64>)>, i64)> {
+    let mut rows = match since {
+        Some(last_inserted_at) => {
+            conn.query(
+                "SELECT ip, COALESCE(expires_at, -1), inserted_at FROM ip_bans WHERE inserted_at > ?1 ORDER BY inserted_at ASC",
+                libsql::params!(last_inserted_at),
+            )
+            .await
+        }
+        None => {
+            conn.query(
+                "SELECT ip, COALESCE(expires_at, -1), inserted_at FROM ip_bans ORDER BY inserted_at ASC",
+                (),
+            )
+            .await
+        }
+    }
+    .context("failed to query ip bans")?;
+    let mut updates = Vec::new();
+    let mut newest_inserted_at = since.unwrap_or(0);
+    while let Some(row) = rows.next().await.context("failed to read ip ban row")? {
+        let ip = row
+            .get::<String>(0)
+            .context("failed to decode ip ban value")?;
+        let expires_at = normalize_expires_at(
+            row.get::<i64>(1)
+                .context("failed to decode ip ban expiry")?,
+        );
+        newest_inserted_at = newest_inserted_at.max(
+            row.get::<i64>(2)
+                .context("failed to decode ip ban inserted_at")?,
+        );
+        match ip.parse::<IpAddr>() {
+            Ok(ip) => updates.push((ip, expires_at)),
+            Err(error) => tracing::warn!(ip = %ip, error = ?error, "skipping invalid ip_bans row"),
+        }
+    }
+    Ok((updates, newest_inserted_at))
+}
+
+fn build_ban_snapshot(updates: Vec<(IpAddr, Option<i64>)>) -> HashMap<IpAddr, Option<i64>> {
+    let now = current_unix_seconds();
+    let mut banned_ips = HashMap::new();
+    for (ip, expires_at) in updates {
+        if is_ban_active(expires_at, now) {
+            banned_ips.insert(ip, expires_at);
+        } else {
+            banned_ips.remove(&ip);
+        }
+    }
+    banned_ips
+}
+
+fn spawn_ip_ban_sync_task(
+    conn: libsql::Connection,
+    admission_controller: Arc<admission::AdmissionController>,
+    mut last_inserted_at: i64,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        tracing::debug!(
+            interval_seconds = 5 * 60,
+            last_inserted_at,
+            "Started incremental IP ban sync task"
+        );
+        loop {
+            interval.tick().await;
+            match load_ip_ban_updates(&conn, Some(last_inserted_at)).await {
+                Ok((updates, _)) if updates.is_empty() => {
+                    tracing::trace!(last_inserted_at, "Checked IP bans; no changes detected");
+                }
+                Ok((updates, newest_inserted_at)) => {
+                    last_inserted_at = newest_inserted_at;
+                    let summary = admission_controller.apply_ban_updates(updates);
+                    tracing::debug!(
+                        last_inserted_at,
+                        activated = summary.activated,
+                        deactivated = summary.deactivated,
+                        evicted_from_queue = summary.evicted_from_queue,
+                        active_ban_count = summary.active_ban_count,
+                        "Applied incremental IP ban updates"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(error = ?error, "failed to refresh ip bans");
+                }
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let subscriber = tracing_subscriber::fmt()
@@ -190,7 +290,7 @@ async fn main() -> Result<()> {
         .context("Failed to start migration transaction")?;
     tx.execute_batch(include_str!("../../terminal-games/libsql/migrate-001.sql"))
         .await
-        .context("Failed to run migrations")?;
+        .context("Failed to run migrate-001.sql")?;
     tx.commit()
         .await
         .context("Failed to commit migration transaction")?;
@@ -211,11 +311,43 @@ async fn main() -> Result<()> {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(usize::MAX);
+    let max_active_apps_per_ip = std::env::var("MAX_ACTIVE_APPS_PER_IP")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(max_active_apps.min(3));
+    let max_queued_apps_per_ip = std::env::var("MAX_QUEUED_APPS_PER_IP")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(max_active_apps_per_ip);
+    let (ban_updates, last_ban_inserted_at) = load_ip_ban_updates(&conn, None).await?;
+    let banned_ips = build_ban_snapshot(ban_updates);
+    tracing::debug!(
+        active_ban_count = banned_ips.len(),
+        last_inserted_at = last_ban_inserted_at,
+        "Loaded initial IP ban snapshot"
+    );
     let metrics = metrics::ServerMetrics::new(max_active_apps, conn.clone()).await?;
     let admission_controller = Arc::new(admission::AdmissionController::new(
-        max_active_apps,
+        AdmissionConfig {
+            max_running: max_active_apps,
+            max_running_per_ip: max_active_apps_per_ip,
+            max_queued_per_ip: max_queued_apps_per_ip,
+        },
+        banned_ips,
         metrics.clone(),
     ));
+    spawn_ip_ban_sync_task(
+        conn.clone(),
+        admission_controller.clone(),
+        last_ban_inserted_at,
+    );
+    tracing::info!(
+        max_active_apps,
+        max_active_apps_per_ip,
+        max_queued_apps_per_ip,
+        "Configured admission limits"
+    );
 
     tokio::select! {
         result = async {
@@ -243,4 +375,18 @@ async fn main() -> Result<()> {
     mesh.graceful_shutdown().await;
 
     Ok(())
+}
+fn normalize_expires_at(expires_at_raw: i64) -> Option<i64> {
+    (expires_at_raw >= 0).then_some(expires_at_raw)
+}
+
+fn is_ban_active(expires_at: Option<i64>, now: i64) -> bool {
+    expires_at.is_none_or(|expires_at| expires_at > now)
+}
+
+fn current_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }

@@ -181,6 +181,13 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             [b"2", s] => {
                 self.callbacks.set_window_title(&mut self.screen, s);
             }
+            [b"11", s] => {
+                if let Some(color) = parse_xterm_color(s) {
+                    self.screen.set_terminal_background(color);
+                } else {
+                    self.callbacks.unhandled_osc(&mut self.screen, params);
+                }
+            }
             [b"52", ty, data] => match (ty.iter().all(|c| CLIPBOARD_SELECTOR.contains(c)), *data) {
                 (true, b"?") => {
                     self.callbacks.paste_from_clipboard(&mut self.screen, ty);
@@ -224,4 +231,40 @@ fn canonicalize_params_decstbm(params: &vte::Params, size: crate::grid::Size) ->
     let bottom = if bottom == 0 { size.rows } else { bottom };
 
     (top, bottom)
+}
+
+fn parse_xterm_color(data: &[u8]) -> Option<crate::Color> {
+    let data = std::str::from_utf8(data).ok()?;
+    let value = data.strip_prefix("rgb:")?;
+    let mut parts = value.split('/');
+    let r = scale_hex_component(parts.next()?)?;
+    let g = scale_hex_component(parts.next()?)?;
+    let b = scale_hex_component(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(crate::Color::Rgb(r, g, b))
+}
+
+fn scale_hex_component(part: &str) -> Option<u8> {
+    if part.is_empty() || part.len() > 4 {
+        return None;
+    }
+    let value = u16::from_str_radix(part, 16).ok()?;
+    let bits = (part.len() * 4) as u32;
+    let max = (1u32 << bits).saturating_sub(1);
+    u8::try_from(((value as u32) * 255 + (max / 2)) / max).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tracks_terminal_background_from_osc_11() {
+        let mut parser = crate::Parser::default();
+        parser.process(b"\x1b]11;rgb:12/34/56\x07");
+        assert_eq!(
+            parser.screen().terminal_background(),
+            Some(crate::Color::Rgb(0x12, 0x34, 0x56))
+        );
+    }
 }
