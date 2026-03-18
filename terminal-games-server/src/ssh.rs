@@ -4,11 +4,12 @@
 
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use base64::Engine as _;
 use bytes::Bytes;
-use rand_core::{OsRng, RngCore};
+use rand_core::OsRng;
 use russh::keys::ssh_key::{self, PublicKey};
 use russh::server::*;
 use russh::{Channel, ChannelId, Pty};
@@ -21,7 +22,9 @@ use terminal_games::palette;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
 
-use crate::admission::{AdmissionController, AdmissionRejection, AdmissionState, AdmissionTicket};
+use crate::admission::{
+    AdmissionController, AdmissionRejection, AdmissionState, AdmissionTicket, SessionControl,
+};
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 pub struct SshSession {
@@ -44,9 +47,10 @@ pub(crate) struct SshServer {
 
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const CAPTCHA_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const RESTORE_TERMINAL_STATE: &[u8] =
     b"\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1l\x1b[>4;0m\x1b>\x1b[?1049l\x1b[?25h";
+const HARNESS_MARKER_PREFIX: &str = "\x1b_tg:event=";
+const HARNESS_MARKER_SUFFIX: &str = "\x1b\\";
 
 impl SshServer {
     pub async fn new(
@@ -311,30 +315,6 @@ impl SshServer {
 
             let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
             let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
-            if admission_controller.should_require_captcha() {
-                let captcha = generate_captcha(7);
-                let solved = solve_captcha(
-                    &session_handle,
-                    channel_id,
-                    &mut resize_rx,
-                    &mut raw_input_rx,
-                    &mut input_guard,
-                    &captcha,
-                    terminal_profile,
-                )
-                .await;
-                if !solved {
-                    restore_terminal_state(&session_handle, channel_id).await;
-                    let _ = session_handle
-                        .disconnect(
-                            russh::Disconnect::ByApplication,
-                            "Bye!".to_string(),
-                            "en-US".to_string(),
-                        )
-                        .await;
-                    return;
-                }
-            }
             let admission_ticket = admission_controller.issue_ticket(Transport::Ssh, client_ip);
             match wait_for_admission(
                 &session_handle,
@@ -347,7 +327,9 @@ impl SshServer {
             )
             .await
             {
-                AdmissionWaitResult::Allowed => {}
+                AdmissionWaitResult::Allowed => {
+                    send_harness_marker(&session_handle, channel_id, "admitted").await;
+                }
                 AdmissionWaitResult::Disconnected => {
                     restore_terminal_state(&session_handle, channel_id).await;
                     let _ = session_handle
@@ -365,6 +347,12 @@ impl SshServer {
                         reason = reason.slug(),
                         "Rejected SSH admission"
                     );
+                    send_harness_marker(
+                        &session_handle,
+                        channel_id,
+                        &format!("rejected:{}", reason.slug()),
+                    )
+                    .await;
                     restore_terminal_state(&session_handle, channel_id).await;
                     let _ = session_handle
                         .disconnect(
@@ -378,6 +366,7 @@ impl SshServer {
             }
             let mut ban_changes = admission_controller.subscribe_ban_changes();
             if admission_controller.is_ip_banned(client_ip) {
+                send_harness_marker(&session_handle, channel_id, "rejected:banned_ip").await;
                 restore_terminal_state(&session_handle, channel_id).await;
                 let _ = session_handle
                     .disconnect(
@@ -391,6 +380,8 @@ impl SshServer {
             let _ = session_handle
                 .data(channel_id, b"\x1b[2J\x1b[H".to_vec().into())
                 .await;
+            let mut live_session = admission_ticket.start_live_session();
+            let mut cluster_control = live_session.subscribe_control();
             let session_guard = metrics.start_session(
                 Transport::Ssh,
                 if user_id.is_some() {
@@ -427,6 +418,7 @@ impl SshServer {
                 idle_fuel_receiver: Some(idle_fuel_rx),
             });
             let mut disconnect_message = "Thanks for playing!";
+            let mut disconnect_marker = None::<String>;
             loop {
                 tokio::select! {
                     biased;
@@ -448,6 +440,7 @@ impl SshServer {
 
                     data = raw_input_rx.recv() => {
                         let Some(data) = data else { break };
+                        live_session.record_input(&data);
                         let _ = input_guard.prepare_input(data).try_send();
                     }
 
@@ -457,12 +450,14 @@ impl SshServer {
 
                     data = audio_rx.recv(), if has_audio => {
                         let Some(data) = data else { break };
+                        live_session.record_output(data.len());
                         metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
                         let _ = session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, russh::CryptoVec::from_slice(&data)).await;
                     }
 
                     data = output_rx.recv() => {
                         let Some(data) = data else { break };
+                        live_session.record_output(data.len());
                         metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
                         let _ = session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await;
                     }
@@ -472,14 +467,36 @@ impl SshServer {
                             continue;
                         }
                         disconnect_message = AdmissionRejection::BannedIp.user_message();
+                        disconnect_marker = Some("evicted:banned_ip".to_string());
+                        shutdown_token.cancel();
+                        break;
+                    }
+
+                    changed = cluster_control.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        let SessionControl::Evict(reason) = *cluster_control.borrow() else {
+                            continue;
+                        };
+                        disconnect_message = reason.user_message();
+                        disconnect_marker = Some(format!(
+                            "evicted:{}",
+                            AdmissionRejection::ClusterLimited.slug()
+                        ));
                         shutdown_token.cancel();
                         break;
                     }
                 }
             }
+            live_session.flush();
+            drop(live_session);
             drop(admission_ticket);
             drop(session_guard);
 
+            if let Some(marker) = disconnect_marker.as_deref() {
+                send_harness_marker(&session_handle, channel_id, marker).await;
+            }
             restore_terminal_state(&session_handle, channel_id).await;
 
             let _ = session_handle
@@ -510,79 +527,24 @@ async fn restore_terminal_state(session_handle: &Handle, channel_id: ChannelId) 
         .await;
 }
 
-fn generate_captcha(len: usize) -> String {
-    let mut out = String::with_capacity(len);
-    let mut rng = OsRng;
-    for _ in 0..len {
-        let idx = (rng.next_u32() as usize) % CAPTCHA_ALPHABET.len();
-        out.push(CAPTCHA_ALPHABET[idx] as char);
-    }
-    out
+fn harness_markers_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("TERMINAL_GAMES_HARNESS_MARKERS")
+            .ok()
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    })
 }
 
-async fn solve_captcha(
-    session_handle: &Handle,
-    channel_id: ChannelId,
-    resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
-    raw_input_rx: &mut tokio::sync::mpsc::Receiver<Bytes>,
-    input_guard: &mut InputGuard,
-    captcha: &str,
-    base_terminal_profile: TerminalProfile,
-) -> bool {
-    let mut entered = String::with_capacity(captcha.len());
-    loop {
-        let window = *resize_rx.borrow();
-        if render_captcha_screen(
-            session_handle,
-            channel_id,
-            window,
-            captcha,
-            &entered,
-            input_guard.terminal_profile(base_terminal_profile),
-        )
-        .await
-        .is_err()
-        {
-            return false;
-        }
-        tokio::select! {
-            changed = resize_rx.changed() => {
-                if changed.is_err() {
-                    return false;
-                }
-            }
-            data = raw_input_rx.recv() => {
-                let Some(data) = data else { return false; };
-                let pending = input_guard.prepare_input(data.clone());
-                drop(pending);
-                for byte in data {
-                    match byte {
-                        0x03 => return false,
-                        0x08 | 0x7f => {
-                            entered.pop();
-                        }
-                        b'\r' | b'\n' => {
-                            if entered == captcha {
-                                return true;
-                            }
-                        }
-                        _ if byte.is_ascii_alphanumeric() => {
-                            if entered.len() < captcha.len() {
-                                let next_char = captcha.as_bytes()[entered.len()] as char;
-                                if (byte as char).to_ascii_uppercase() == next_char {
-                                    entered.push(next_char);
-                                    if entered.len() == captcha.len() {
-                                        return true;
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+async fn send_harness_marker(session_handle: &Handle, channel_id: ChannelId, event: &str) {
+    if !harness_markers_enabled() {
+        return;
     }
+    let payload = format!("{HARNESS_MARKER_PREFIX}{event}{HARNESS_MARKER_SUFFIX}");
+    let _ = session_handle
+        .data(channel_id, payload.into_bytes().into())
+        .await;
 }
 
 enum AdmissionWaitResult {
@@ -648,74 +610,6 @@ async fn wait_for_admission(
             }
         }
     }
-}
-
-async fn render_captcha_screen(
-    session_handle: &Handle,
-    channel_id: ChannelId,
-    (width, height): (u16, u16),
-    captcha: &str,
-    entered: &str,
-    terminal_profile: TerminalProfile,
-) -> anyhow::Result<()> {
-    let title_plain = " Terminal Games ";
-    let title = styled_terminal_games_title(terminal_profile, title_plain);
-    let prompt = styled_regular_text(terminal_profile, "Type to continue");
-    let hint = styled_subtle_text(terminal_profile, "Ctrl+C to quit");
-    let entered_styled = styled_captcha_entered(terminal_profile, entered);
-    let remaining = &captcha[entered.len()..];
-    let subtle = styled_subtle_text(terminal_profile, remaining);
-    let captcha_line = format!("{}{}", entered_styled, subtle);
-    let center_row = if height == 0 { 1 } else { height.max(4) / 2 };
-    let title_row = center_row.saturating_sub(2).max(1);
-    let prompt_row = center_row.saturating_sub(1).max(1);
-    let captcha_row = center_row;
-    let hint_row = center_row.saturating_add(1);
-
-    let mut out = Vec::new();
-    out.extend_from_slice(b"\x1b[?25l\x1b[2J");
-    out.extend_from_slice(
-        format!(
-            "\x1b[{};{}H{}",
-            title_row,
-            centered_col(width, title_plain.chars().count()),
-            title
-        )
-        .as_bytes(),
-    );
-    out.extend_from_slice(
-        format!(
-            "\x1b[{};{}H{}",
-            prompt_row,
-            centered_col(width, "Type to continue".chars().count()),
-            prompt
-        )
-        .as_bytes(),
-    );
-    out.extend_from_slice(
-        format!(
-            "\x1b[{};{}H{}",
-            captcha_row,
-            centered_col(width, captcha.chars().count()),
-            captcha_line
-        )
-        .as_bytes(),
-    );
-    out.extend_from_slice(
-        format!(
-            "\x1b[{};{}H{}",
-            hint_row,
-            centered_col(width, "Ctrl+C to quit".chars().count()),
-            hint
-        )
-        .as_bytes(),
-    );
-    out.extend_from_slice(b"\x1b[H");
-    session_handle
-        .data(channel_id, out.into())
-        .await
-        .map_err(|_| anyhow::anyhow!("failed writing captcha frame"))?;
-    Ok(())
 }
 
 async fn render_loading_screen(
@@ -786,13 +680,6 @@ fn styled_terminal_games_title(profile: TerminalProfile, text: &str) -> String {
     )
 }
 
-fn styled_captcha_entered(profile: TerminalProfile, text: &str) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-    styled_regular_text(profile, text)
-}
-
 fn styled_fg(color: palette::Color, text: &str) -> String {
     if text.is_empty() {
         return String::new();
@@ -801,10 +688,6 @@ fn styled_fg(color: palette::Color, text: &str) -> String {
         "\x1b[{}m{text}\x1b[0m",
         palette::render_color_code(color, false)
     )
-}
-
-fn styled_subtle_text(profile: TerminalProfile, text: &str) -> String {
-    styled_fg(palette::palette(profile).text_subtle, text)
 }
 
 fn styled_regular_text(profile: TerminalProfile, text: &str) -> String {

@@ -277,9 +277,9 @@ async fn main() -> Result<()> {
             .await
             .context("Failed to initialize remote libsql client")?
     } else {
-        libsql::Builder::new_local("./terminal-games.db")
-            .build()
-            .await?
+        let db_path = std::env::var("TERMINAL_GAMES_DB_PATH")
+            .unwrap_or_else(|_| "./terminal-games.db".to_string());
+        libsql::Builder::new_local(db_path).build().await?
     };
 
     let conn = db.connect().context("Failed to connect to libsql")?;

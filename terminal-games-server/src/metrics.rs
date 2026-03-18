@@ -182,6 +182,12 @@ pub struct ServerMetrics {
 
     admission_waiting_sessions: IntGaugeVec,
     admission_queue_exits_total: IntCounterVec,
+    ip_ban_events_total: IntCounterVec,
+    ip_bans_active: IntGaugeVec,
+    cluster_enforcement_total: IntCounterVec,
+    cluster_suspect_clusters: IntGaugeVec,
+    cluster_suspect_sessions: IntGaugeVec,
+    cluster_max_score: GaugeVec,
     active_sessions: IntGaugeVec,
     sessions_total: IntCounterVec,
     session_duration_seconds: GaugeVec,
@@ -251,6 +257,63 @@ impl ServerMetrics {
                     "Queued sessions that left the queue, grouped by outcome",
                 ),
                 &["region", "transport", "outcome"],
+            )?,
+        )?;
+        let ip_ban_events_total = register(
+            &registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "terminal_games_ip_ban_events_total",
+                    "IP ban lifecycle events grouped by outcome",
+                ),
+                &["region", "outcome"],
+            )?,
+        )?;
+        let ip_bans_active = register(
+            &registry,
+            IntGaugeVec::new(
+                Opts::new("terminal_games_ip_bans_active", "Currently active IP bans"),
+                &["region"],
+            )?,
+        )?;
+        let cluster_enforcement_total = register(
+            &registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "terminal_games_cluster_enforcement_total",
+                    "Cluster-defense enforcement actions grouped by transport and action",
+                ),
+                &["region", "transport", "action"],
+            )?,
+        )?;
+        let cluster_suspect_clusters = register(
+            &registry,
+            IntGaugeVec::new(
+                Opts::new(
+                    "terminal_games_cluster_suspect_clusters",
+                    "Currently flagged suspicious behavior clusters",
+                ),
+                &["region"],
+            )?,
+        )?;
+        let cluster_suspect_sessions = register(
+            &registry,
+            IntGaugeVec::new(
+                Opts::new(
+                    "terminal_games_cluster_suspect_sessions",
+                    "Currently flagged suspicious sessions grouped by transport",
+                ),
+                &["region", "transport"],
+            )?,
+        )?;
+        let cluster_max_score = register(
+            &registry,
+            GaugeVec::new(
+                Opts::new(
+                    "terminal_games_cluster_max_score",
+                    "Highest active cluster suspicion score",
+                ),
+                &["region"],
             )?,
         )?;
         let active_sessions = register(
@@ -394,6 +457,12 @@ impl ServerMetrics {
             duration_writer,
             admission_waiting_sessions,
             admission_queue_exits_total,
+            ip_ban_events_total,
+            ip_bans_active,
+            cluster_enforcement_total,
+            cluster_suspect_clusters,
+            cluster_suspect_sessions,
+            cluster_max_score,
             active_sessions,
             sessions_total,
             session_duration_seconds,
@@ -439,6 +508,60 @@ impl ServerMetrics {
     pub fn record_admission_abandoned_queue(&self, transport: Transport) {
         self.admission_queue_exits_total
             .with_label_values(&[self.region.as_str(), transport.as_str(), "abandoned"])
+            .inc();
+    }
+
+    pub fn record_ip_ban_update(
+        &self,
+        activated: usize,
+        deactivated: usize,
+        evicted_from_queue: usize,
+        active_ban_count: usize,
+    ) {
+        if activated > 0 {
+            self.ip_ban_events_total
+                .with_label_values(&[self.region.as_str(), "activated"])
+                .inc_by(activated as u64);
+        }
+        if deactivated > 0 {
+            self.ip_ban_events_total
+                .with_label_values(&[self.region.as_str(), "deactivated"])
+                .inc_by(deactivated as u64);
+        }
+        if evicted_from_queue > 0 {
+            self.ip_ban_events_total
+                .with_label_values(&[self.region.as_str(), "queue_evicted"])
+                .inc_by(evicted_from_queue as u64);
+        }
+        self.ip_bans_active
+            .with_label_values(&[self.region.as_str()])
+            .set(active_ban_count as i64);
+    }
+
+    pub fn record_cluster_snapshot(
+        &self,
+        suspicious_clusters: usize,
+        suspicious_ssh_sessions: usize,
+        suspicious_web_sessions: usize,
+        max_score: f64,
+    ) {
+        self.cluster_suspect_clusters
+            .with_label_values(&[self.region.as_str()])
+            .set(suspicious_clusters as i64);
+        self.cluster_suspect_sessions
+            .with_label_values(&[self.region.as_str(), Transport::Ssh.as_str()])
+            .set(suspicious_ssh_sessions as i64);
+        self.cluster_suspect_sessions
+            .with_label_values(&[self.region.as_str(), Transport::Web.as_str()])
+            .set(suspicious_web_sessions as i64);
+        self.cluster_max_score
+            .with_label_values(&[self.region.as_str()])
+            .set(max_score);
+    }
+
+    pub fn record_cluster_enforcement(&self, transport: Transport, action: &'static str) {
+        self.cluster_enforcement_total
+            .with_label_values(&[self.region.as_str(), transport.as_str(), action])
             .inc();
     }
 

@@ -54,7 +54,9 @@ use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
 
-use crate::admission::{AdmissionController, AdmissionRejection, AdmissionState, AdmissionTicket};
+use crate::admission::{
+    AdmissionController, AdmissionRejection, AdmissionState, AdmissionTicket, SessionControl,
+};
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 #[derive(Clone)]
@@ -106,11 +108,15 @@ impl WebServer {
                 anyhow::bail!("METRICS_BEARER_TOKEN is not valid Unicode");
             }
         };
+        let pow_difficulty = std::env::var("WEB_POW_DIFFICULTY")
+            .ok()
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(18);
 
         Ok(Self {
             app_server,
             admission_controller,
-            pow: Arc::new(PowGate::new(18, Duration::from_secs(90))),
+            pow: Arc::new(PowGate::new(pow_difficulty, Duration::from_secs(90))),
             metrics,
             metrics_bearer_token,
         })
@@ -433,6 +439,8 @@ async fn handle_socket(
         let _ = send_rejection_and_close(&mut sender, AdmissionRejection::BannedIp).await;
         return;
     }
+    let mut live_session = admission_ticket.start_live_session();
+    let mut cluster_control = live_session.subscribe_control();
     let session_guard =
         server
             .metrics
@@ -499,6 +507,7 @@ async fn handle_socket(
 
             data = output_rx.recv() => {
                 let Some(data) = data else { break };
+                live_session.record_output(data.len());
                 let mut msg = Vec::with_capacity(data.len() / 2);
                 {
                     let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
@@ -516,6 +525,7 @@ async fn handle_socket(
 
             data = audio_rx.recv() => {
                 let Some(mut data) = data else { break };
+                live_session.record_output(data.len());
                 data.push(0x01);
                 server.metrics.record_bytes(Direction::Out, Transport::Web, data.len());
                 if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
@@ -529,6 +539,7 @@ async fn handle_socket(
                 match msg {
                     Ok(Message::Binary(data)) => {
                         server.metrics.record_bytes(Direction::In, Transport::Web, data.len());
+                        live_session.record_input(&data);
                         pending_input = Some(Box::pin(input_guard.prepare_input(data).send()));
                     }
                     Ok(Message::Text(text)) => {
@@ -560,10 +571,24 @@ async fn handle_socket(
                 let _ = send_rejection_and_close(&mut sender, AdmissionRejection::BannedIp).await;
                 break;
             }
+
+            changed = cluster_control.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                let SessionControl::Evict(_) = *cluster_control.borrow() else {
+                    continue;
+                };
+                cancellation_token.cancel();
+                let _ = send_rejection_and_close(&mut sender, AdmissionRejection::ClusterLimited).await;
+                break;
+            }
         }
     }
 
     cancellation_token.cancel();
+    live_session.flush();
+    drop(live_session);
     drop(admission_ticket);
     drop(session_guard);
 }
