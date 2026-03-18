@@ -380,8 +380,6 @@ impl SshServer {
             let _ = session_handle
                 .data(channel_id, b"\x1b[2J\x1b[H".to_vec().into())
                 .await;
-            let mut live_session = admission_ticket.start_live_session();
-            let mut cluster_control = live_session.subscribe_control();
             let session_guard = metrics.start_session(
                 Transport::Ssh,
                 if user_id.is_some() {
@@ -393,6 +391,8 @@ impl SshServer {
                 user_id,
             );
             let active_shortname_tracker = session_guard.active_shortname_tracker();
+            let mut admitted_session = admission_ticket.start_session(session_guard);
+            let mut cluster_control = admitted_session.subscribe_control();
             let (first_cols, first_rows) = *resize_rx.borrow();
             let terminal_parser = input_guard.take_terminal_parser(first_rows, first_cols);
 
@@ -438,40 +438,6 @@ impl SshServer {
                         break;
                     }
 
-                    data = raw_input_rx.recv() => {
-                        let Some(data) = data else { break };
-                        live_session.record_input(&data);
-                        let _ = input_guard.prepare_input(data).try_send();
-                    }
-
-                    _ = input_tick.tick() => {
-                        input_guard.tick();
-                    }
-
-                    data = audio_rx.recv(), if has_audio => {
-                        let Some(data) = data else { break };
-                        live_session.record_output(data.len());
-                        metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
-                        let _ = session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, russh::CryptoVec::from_slice(&data)).await;
-                    }
-
-                    data = output_rx.recv() => {
-                        let Some(data) = data else { break };
-                        live_session.record_output(data.len());
-                        metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
-                        let _ = session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await;
-                    }
-
-                    changed = ban_changes.changed() => {
-                        if changed.is_err() || !admission_controller.is_ip_banned(client_ip) {
-                            continue;
-                        }
-                        disconnect_message = AdmissionRejection::BannedIp.user_message();
-                        disconnect_marker = Some("evicted:banned_ip".to_string());
-                        shutdown_token.cancel();
-                        break;
-                    }
-
                     changed = cluster_control.changed() => {
                         if changed.is_err() {
                             continue;
@@ -487,12 +453,42 @@ impl SshServer {
                         shutdown_token.cancel();
                         break;
                     }
+
+                    changed = ban_changes.changed() => {
+                        if changed.is_err() || !admission_controller.is_ip_banned(client_ip) {
+                            continue;
+                        }
+                        disconnect_message = AdmissionRejection::BannedIp.user_message();
+                        disconnect_marker = Some("evicted:banned_ip".to_string());
+                        shutdown_token.cancel();
+                        break;
+                    }
+
+                    data = raw_input_rx.recv() => {
+                        let Some(data) = data else { break };
+                        admitted_session.record_input(&data);
+                        let _ = input_guard.prepare_input(data).try_send();
+                    }
+
+                    _ = input_tick.tick() => {
+                        input_guard.tick();
+                    }
+
+                    data = audio_rx.recv(), if has_audio => {
+                        let Some(data) = data else { break };
+                        admitted_session.record_output(data.len());
+                        metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
+                        let _ = session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, russh::CryptoVec::from_slice(&data)).await;
+                    }
+
+                    data = output_rx.recv() => {
+                        let Some(data) = data else { break };
+                        admitted_session.record_output(data.len());
+                        metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
+                        let _ = session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await;
+                    }
                 }
             }
-            live_session.flush();
-            drop(live_session);
-            drop(admission_ticket);
-            drop(session_guard);
 
             if let Some(marker) = disconnect_marker.as_deref() {
                 send_harness_marker(&session_handle, channel_id, marker).await;

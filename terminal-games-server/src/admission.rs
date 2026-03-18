@@ -27,7 +27,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use smallvec::SmallVec;
 use tokio::sync::watch;
 
-use crate::metrics::{ServerMetrics, Transport};
+use crate::metrics::{ServerMetrics, SessionGuard, Transport};
 
 const INPUT_WINDOW_MS: u64 = 8 * 60_000;
 const MAX_INPUT_SAMPLES: usize = 96;
@@ -35,6 +35,7 @@ const MAX_OUTPUT_SAMPLES: usize = 64;
 const MAX_SAMPLE_BYTES: usize = 24;
 const OUTPUT_FLUSH_MS: u64 = 250;
 const OUTPUT_FLUSH_BYTES: usize = 4096;
+const CLUSTER_REEVALUATION_INTERVAL_MS: u64 = 250;
 const IDLE_TIMEOUT_MS: u64 = 60_000;
 const SHORT_WINDOW_MS: u64 = 60_000;
 const MEDIUM_WINDOW_MS: u64 = 3 * 60_000;
@@ -129,9 +130,18 @@ struct ControllerState {
     queued_by_ip: HashMap<IpAddr, usize>,
     live_sessions: HashMap<u64, LiveSessionRecord>,
     recent_signatures: VecDeque<HistoricalSignature>,
+    cluster_dirty: bool,
+    cluster_revision: u64,
+    cluster_eval_in_progress: bool,
+    next_cluster_eval_at_ms: u64,
 }
 
 impl ControllerState {
+    fn mark_cluster_dirty(&mut self) {
+        self.cluster_dirty = true;
+        self.cluster_revision = self.cluster_revision.wrapping_add(1);
+    }
+
     fn enqueue(
         &mut self,
         id: u64,
@@ -209,7 +219,13 @@ pub struct AdmissionTicket {
     controller: Arc<Inner>,
 }
 
-pub struct LiveSessionHandle {
+pub struct AdmittedSession {
+    live_session: LiveSessionHandle,
+    _admission_ticket: AdmissionTicket,
+    _session_guard: SessionGuard,
+}
+
+struct LiveSessionHandle {
     id: u64,
     controller: Arc<Inner>,
     control_rx: watch::Receiver<SessionControl>,
@@ -322,6 +338,15 @@ struct ClusterEvaluation {
 }
 
 #[derive(Clone)]
+struct ClusterEvaluationJob {
+    revision: u64,
+    pressure: f64,
+    now_ms: u64,
+    live_sessions: HashMap<u64, LiveSessionRecord>,
+    recent_signatures: VecDeque<HistoricalSignature>,
+}
+
+#[derive(Clone)]
 struct HistoricalSignature {
     source_session_id: u64,
     recorded_at_ms: u64,
@@ -383,7 +408,7 @@ impl AdmissionController {
         let (tx, rx) = watch::channel(AdmissionState::Queued(1));
         let is_banned = self.is_ip_banned(client_ip);
 
-        {
+        let job = {
             let mut state = match self.inner.state.lock() {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
@@ -423,7 +448,11 @@ impl AdmissionController {
                 ));
             }
             state.record_metrics(&self.inner.metrics);
-            reevaluate_cluster_controls(&self.inner, &mut state, monotonic_millis());
+            state.mark_cluster_dirty();
+            maybe_run_cluster_reevaluation(&self.inner, &mut state, monotonic_millis(), true)
+        };
+        if let Some(job) = job {
+            execute_cluster_reevaluation(&self.inner, job);
         }
 
         AdmissionTicket {
@@ -573,29 +602,36 @@ impl AdmissionTicket {
         self.rx.clone()
     }
 
-    pub fn start_live_session(&self) -> LiveSessionHandle {
+    pub fn start_session(self, session_guard: SessionGuard) -> AdmittedSession {
+        let live_session = self.start_live_session();
+        AdmittedSession {
+            live_session,
+            _admission_ticket: self,
+            _session_guard: session_guard,
+        }
+    }
+
+    fn start_live_session(&self) -> LiveSessionHandle {
         let now_ms = monotonic_millis();
         let (control_tx, control_rx) = watch::channel(SessionControl::Active);
-        {
+        let job = {
             let mut state = match self.controller.state.lock() {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            state
-                .live_sessions
-                .entry(self.id)
-                .or_insert_with(|| LiveSessionRecord {
-                    id: self.id,
-                    client_ip: self.client_ip,
-                    ip_prefix: NetworkPrefix::from_ip(self.client_ip),
-                    transport: self.transport,
-                    started_at_ms: now_ms,
-                    inputs: VecDeque::new(),
-                    outputs: VecDeque::new(),
-                    control: SessionControl::Active,
-                    control_tx,
-                });
-            reevaluate_cluster_controls(&self.controller, &mut state, now_ms);
+            insert_live_session(
+                &mut state,
+                self.id,
+                self.client_ip,
+                self.transport,
+                now_ms,
+                control_tx,
+            );
+            state.mark_cluster_dirty();
+            maybe_run_cluster_reevaluation(&self.controller, &mut state, now_ms, true)
+        };
+        if let Some(job) = job {
+            execute_cluster_reevaluation(&self.controller, job);
         }
 
         LiveSessionHandle {
@@ -610,50 +646,79 @@ impl AdmissionTicket {
 
 impl Drop for AdmissionTicket {
     fn drop(&mut self) {
-        let mut state = match self.controller.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
+        let job = {
+            let mut state = match self.controller.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match *self.rx.borrow() {
+                AdmissionState::Allowed => {
+                    state.running = state.running.saturating_sub(1);
+                    decrement_ip_count(&mut state.running_by_ip, self.client_ip);
+                    if let Some(next) =
+                        state.dequeue_admissible(self.controller.config.max_running_per_ip)
+                    {
+                        state.running += 1;
+                        bump_count(&mut state.running_by_ip, next.client_ip, 1);
+                        let _ = next.tx.send(AdmissionState::Allowed);
+                        self.controller
+                            .metrics
+                            .record_admission_joined_from_queue(next.transport);
+                        state.refresh_queue_positions(0);
+                    }
+                }
+                AdmissionState::Queued(_) => {
+                    if let Some((idx, transport)) = state.remove_queued(self.id) {
+                        self.controller
+                            .metrics
+                            .record_admission_abandoned_queue(transport);
+                        state.refresh_queue_positions(idx);
+                    }
+                }
+                AdmissionState::Rejected(reason) => {
+                    if reason == AdmissionRejection::ClusterLimited {
+                        tracing::warn!(
+                            ticket_id = self.id,
+                            client_ip = %self.client_ip,
+                            transport = self.transport.as_str(),
+                            "Rejected session due to suspected bot cluster"
+                        );
+                        self.controller
+                            .metrics
+                            .record_cluster_enforcement(self.transport, "rejected");
+                    }
+                }
+            }
+            state.record_metrics(&self.controller.metrics);
+            state.mark_cluster_dirty();
+            maybe_run_cluster_reevaluation(&self.controller, &mut state, monotonic_millis(), true)
         };
-        match *self.rx.borrow() {
-            AdmissionState::Allowed => {
-                state.running = state.running.saturating_sub(1);
-                decrement_ip_count(&mut state.running_by_ip, self.client_ip);
-                if let Some(next) =
-                    state.dequeue_admissible(self.controller.config.max_running_per_ip)
-                {
-                    state.running += 1;
-                    bump_count(&mut state.running_by_ip, next.client_ip, 1);
-                    let _ = next.tx.send(AdmissionState::Allowed);
-                    self.controller
-                        .metrics
-                        .record_admission_joined_from_queue(next.transport);
-                    state.refresh_queue_positions(0);
-                }
-            }
-            AdmissionState::Queued(_) => {
-                if let Some((idx, transport)) = state.remove_queued(self.id) {
-                    self.controller
-                        .metrics
-                        .record_admission_abandoned_queue(transport);
-                    state.refresh_queue_positions(idx);
-                }
-            }
-            AdmissionState::Rejected(reason) => {
-                if reason == AdmissionRejection::ClusterLimited {
-                    tracing::warn!(
-                        ticket_id = self.id,
-                        client_ip = %self.client_ip,
-                        transport = self.transport.as_str(),
-                        "Rejected session due to suspected bot cluster"
-                    );
-                    self.controller
-                        .metrics
-                        .record_cluster_enforcement(self.transport, "rejected");
-                }
-            }
+        if let Some(job) = job {
+            execute_cluster_reevaluation(&self.controller, job);
         }
-        state.record_metrics(&self.controller.metrics);
-        reevaluate_cluster_controls(&self.controller, &mut state, monotonic_millis());
+    }
+}
+
+impl AdmittedSession {
+    pub fn subscribe_control(&self) -> watch::Receiver<SessionControl> {
+        self.live_session.subscribe_control()
+    }
+
+    pub fn record_input(&mut self, bytes: &[u8]) {
+        self.live_session.record_input(bytes);
+    }
+
+    pub fn record_output(&mut self, bytes: usize) {
+        self.live_session.record_output(bytes);
+    }
+}
+
+impl Drop for AdmittedSession {
+    fn drop(&mut self) {
+        // Fields are declared in teardown order and Rust drops struct fields in
+        // declaration order after Drop::drop returns, so cleanup is:
+        // live_session -> admission_ticket -> session_guard.
+        self.live_session.flush();
     }
 }
 
@@ -673,19 +738,25 @@ impl LiveSessionHandle {
                 .take(MAX_SAMPLE_BYTES)
                 .collect::<SmallVec<[u8; MAX_SAMPLE_BYTES]>>(),
         };
-        let mut state = match self.controller.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
+        let job = {
+            let mut state = match self.controller.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let Some(record) = state.live_sessions.get_mut(&self.id) else {
+                return;
+            };
+            record.inputs.push_back(sample);
+            while record.inputs.len() > MAX_INPUT_SAMPLES {
+                record.inputs.pop_front();
+            }
+            trim_old_inputs(&mut record.inputs, now_ms);
+            state.mark_cluster_dirty();
+            maybe_run_cluster_reevaluation(&self.controller, &mut state, now_ms, false)
         };
-        let Some(record) = state.live_sessions.get_mut(&self.id) else {
-            return;
-        };
-        record.inputs.push_back(sample);
-        while record.inputs.len() > MAX_INPUT_SAMPLES {
-            record.inputs.pop_front();
+        if let Some(job) = job {
+            execute_cluster_reevaluation(&self.controller, job);
         }
-        trim_old_inputs(&mut record.inputs, now_ms);
-        reevaluate_cluster_controls(&self.controller, &mut state, now_ms);
     }
 
     pub fn record_output(&mut self, bytes: usize) {
@@ -714,35 +785,47 @@ impl LiveSessionHandle {
         self.pending_output_bytes = 0;
         self.pending_output_started_at_ms = None;
 
-        let mut state = match self.controller.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
+        let job = {
+            let mut state = match self.controller.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let Some(record) = state.live_sessions.get_mut(&self.id) else {
+                return;
+            };
+            record.outputs.push_back(OutputSample { at_ms, bytes });
+            while record.outputs.len() > MAX_OUTPUT_SAMPLES {
+                record.outputs.pop_front();
+            }
+            trim_old_outputs(&mut record.outputs, now_ms);
+            state.mark_cluster_dirty();
+            maybe_run_cluster_reevaluation(&self.controller, &mut state, now_ms, false)
         };
-        let Some(record) = state.live_sessions.get_mut(&self.id) else {
-            return;
-        };
-        record.outputs.push_back(OutputSample { at_ms, bytes });
-        while record.outputs.len() > MAX_OUTPUT_SAMPLES {
-            record.outputs.pop_front();
+        if let Some(job) = job {
+            execute_cluster_reevaluation(&self.controller, job);
         }
-        trim_old_outputs(&mut record.outputs, now_ms);
-        reevaluate_cluster_controls(&self.controller, &mut state, now_ms);
     }
 }
 
 impl Drop for LiveSessionHandle {
     fn drop(&mut self) {
         self.flush_output_batch();
-        let mut state = match self.controller.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
         let now_ms = monotonic_millis();
-        if let Some(record) = state.live_sessions.remove(&self.id) {
-            archive_signatures(&record, now_ms, &mut state.recent_signatures);
+        let job = {
+            let mut state = match self.controller.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(record) = state.live_sessions.remove(&self.id) {
+                archive_signatures(&record, now_ms, &mut state.recent_signatures);
+            }
+            trim_recent_signatures(&mut state.recent_signatures, now_ms);
+            state.mark_cluster_dirty();
+            maybe_run_cluster_reevaluation(&self.controller, &mut state, now_ms, true)
+        };
+        if let Some(job) = job {
+            execute_cluster_reevaluation(&self.controller, job);
         }
-        trim_recent_signatures(&mut state.recent_signatures, now_ms);
-        reevaluate_cluster_controls(&self.controller, &mut state, now_ms);
     }
 }
 
@@ -758,6 +841,33 @@ fn decrement_ip_count(counts: &mut HashMap<IpAddr, usize>, ip: IpAddr) {
 
 fn bump_count(counts: &mut HashMap<IpAddr, usize>, ip: IpAddr, delta: usize) {
     *counts.entry(ip).or_default() += delta;
+}
+
+fn insert_live_session(
+    state: &mut ControllerState,
+    id: u64,
+    client_ip: IpAddr,
+    transport: Transport,
+    started_at_ms: u64,
+    control_tx: watch::Sender<SessionControl>,
+) {
+    if state.live_sessions.contains_key(&id) {
+        panic!("live session already exists for admission ticket {id}");
+    }
+    state.live_sessions.insert(
+        id,
+        LiveSessionRecord {
+            id,
+            client_ip,
+            ip_prefix: NetworkPrefix::from_ip(client_ip),
+            transport,
+            started_at_ms,
+            inputs: VecDeque::new(),
+            outputs: VecDeque::new(),
+            control: SessionControl::Active,
+            control_tx,
+        },
+    );
 }
 
 fn is_ban_active(expires_at: Option<i64>, now: i64) -> bool {
@@ -798,15 +908,74 @@ fn trim_old_outputs(outputs: &mut VecDeque<OutputSample>, now_ms: u64) {
     }
 }
 
-fn reevaluate_cluster_controls(inner: &Arc<Inner>, state: &mut ControllerState, now_ms: u64) {
+fn maybe_run_cluster_reevaluation(
+    inner: &Arc<Inner>,
+    state: &mut ControllerState,
+    now_ms: u64,
+    force: bool,
+) -> Option<ClusterEvaluationJob> {
     trim_recent_signatures(&mut state.recent_signatures, now_ms);
     let pressure = compute_pressure(state.running, inner.config.max_running);
-    let evaluation = evaluate_clusters(
-        &state.live_sessions,
-        &state.recent_signatures,
+    if pressure < LOW_PRESSURE_FLOOR || state.live_sessions.len() < MIN_CLUSTER_SIZE {
+        state.cluster_dirty = false;
+        state.next_cluster_eval_at_ms = now_ms.saturating_add(CLUSTER_REEVALUATION_INTERVAL_MS);
+        clear_cluster_controls(inner, state);
+        return None;
+    }
+    if state.cluster_eval_in_progress {
+        state.cluster_dirty = true;
+        return None;
+    }
+    if !force && (!state.cluster_dirty || now_ms < state.next_cluster_eval_at_ms) {
+        return None;
+    }
+    state.cluster_eval_in_progress = true;
+    state.cluster_dirty = false;
+    state.next_cluster_eval_at_ms = now_ms.saturating_add(CLUSTER_REEVALUATION_INTERVAL_MS);
+    Some(ClusterEvaluationJob {
+        revision: state.cluster_revision,
         pressure,
         now_ms,
+        live_sessions: state.live_sessions.clone(),
+        recent_signatures: state.recent_signatures.clone(),
+    })
+}
+
+fn execute_cluster_reevaluation(inner: &Arc<Inner>, job: ClusterEvaluationJob) {
+    let evaluation = evaluate_clusters(
+        &job.live_sessions,
+        &job.recent_signatures,
+        job.pressure,
+        job.now_ms,
     );
+    let mut state = match inner.state.lock() {
+        Ok(state) => state,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    state.cluster_eval_in_progress = false;
+    if state.cluster_revision != job.revision {
+        state.cluster_dirty = true;
+        return;
+    }
+    apply_cluster_evaluation(inner, &mut state, evaluation, job.pressure);
+}
+
+fn clear_cluster_controls(inner: &Arc<Inner>, state: &mut ControllerState) {
+    for session in state.live_sessions.values_mut() {
+        if session.control != SessionControl::Active {
+            let _ = session.control_tx.send(SessionControl::Active);
+            session.control = SessionControl::Active;
+        }
+    }
+    inner.metrics.record_cluster_snapshot(0, 0, 0, 0.0);
+}
+
+fn apply_cluster_evaluation(
+    inner: &Arc<Inner>,
+    state: &mut ControllerState,
+    evaluation: ClusterEvaluation,
+    pressure: f64,
+) {
     let mut suspicious_ssh = 0usize;
     let mut suspicious_web = 0usize;
 
@@ -1082,13 +1251,8 @@ fn cluster_cap(stats: &ComponentStats, pressure: f64, score: f64) -> Option<usiz
     if pressure >= 0.85 && stats.avg_replay >= 0.40 {
         return Some(1);
     }
-    if pressure < 0.60 {
-        Some(8)
-    } else if pressure < 0.80 {
-        Some(4)
-    } else {
-        Some(2)
-    }
+
+    Some(2)
 }
 
 fn required_cluster_score(pressure: f64) -> f64 {

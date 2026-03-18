@@ -59,6 +59,9 @@ use crate::admission::{
 };
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
+const DEFAULT_WEB_POW_DIFFICULTY: u8 = 18;
+const MAX_WEB_POW_DIFFICULTY: u8 = 32;
+
 #[derive(Clone)]
 struct MyConnectInfo {
     network_info: Arc<NetworkInformation<TcpLatencyProvider>>,
@@ -108,10 +111,12 @@ impl WebServer {
                 anyhow::bail!("METRICS_BEARER_TOKEN is not valid Unicode");
             }
         };
-        let pow_difficulty = std::env::var("WEB_POW_DIFFICULTY")
-            .ok()
-            .and_then(|value| value.parse::<u8>().ok())
-            .unwrap_or(18);
+        let pow_difficulty = parse_web_pow_difficulty(std::env::var("WEB_POW_DIFFICULTY"))?;
+        tracing::info!(
+            pow_difficulty,
+            pow_ttl_secs = 90,
+            "Configured web proof-of-work gate"
+        );
 
         Ok(Self {
             app_server,
@@ -439,13 +444,13 @@ async fn handle_socket(
         let _ = send_rejection_and_close(&mut sender, AdmissionRejection::BannedIp).await;
         return;
     }
-    let mut live_session = admission_ticket.start_live_session();
-    let mut cluster_control = live_session.subscribe_control();
     let session_guard =
         server
             .metrics
             .start_session(Transport::Web, AuthKind::Anonymous, true, None);
     let active_shortname_tracker = session_guard.active_shortname_tracker();
+    let mut admitted_session = admission_ticket.start_session(session_guard);
+    let mut cluster_control = admitted_session.subscribe_control();
     let terminal_parser = input_guard.take_terminal_parser(initial_size.1, initial_size.0);
 
     let mut exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
@@ -492,6 +497,27 @@ async fn handle_socket(
                 break;
             }
 
+            changed = cluster_control.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                let SessionControl::Evict(_) = *cluster_control.borrow() else {
+                    continue;
+                };
+                cancellation_token.cancel();
+                let _ = send_rejection_and_close(&mut sender, AdmissionRejection::ClusterLimited).await;
+                break;
+            }
+
+            changed = ban_changes.changed() => {
+                if changed.is_err() || !server.admission_controller.is_ip_banned(connect_info.remote_addr.ip()) {
+                    continue;
+                }
+                cancellation_token.cancel();
+                let _ = send_rejection_and_close(&mut sender, AdmissionRejection::BannedIp).await;
+                break;
+            }
+
             result = async {
                 pending_input.as_mut().expect("guarded by select").await
             }, if pending_input.is_some() => {
@@ -507,7 +533,7 @@ async fn handle_socket(
 
             data = output_rx.recv() => {
                 let Some(data) = data else { break };
-                live_session.record_output(data.len());
+                admitted_session.record_output(data.len());
                 let mut msg = Vec::with_capacity(data.len() / 2);
                 {
                     let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
@@ -525,7 +551,7 @@ async fn handle_socket(
 
             data = audio_rx.recv() => {
                 let Some(mut data) = data else { break };
-                live_session.record_output(data.len());
+                admitted_session.record_output(data.len());
                 data.push(0x01);
                 server.metrics.record_bytes(Direction::Out, Transport::Web, data.len());
                 if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
@@ -539,7 +565,7 @@ async fn handle_socket(
                 match msg {
                     Ok(Message::Binary(data)) => {
                         server.metrics.record_bytes(Direction::In, Transport::Web, data.len());
-                        live_session.record_input(&data);
+                        admitted_session.record_input(&data);
                         pending_input = Some(Box::pin(input_guard.prepare_input(data).send()));
                     }
                     Ok(Message::Text(text)) => {
@@ -562,35 +588,10 @@ async fn handle_socket(
                     _ => {}
                 }
             }
-
-            changed = ban_changes.changed() => {
-                if changed.is_err() || !server.admission_controller.is_ip_banned(connect_info.remote_addr.ip()) {
-                    continue;
-                }
-                cancellation_token.cancel();
-                let _ = send_rejection_and_close(&mut sender, AdmissionRejection::BannedIp).await;
-                break;
-            }
-
-            changed = cluster_control.changed() => {
-                if changed.is_err() {
-                    continue;
-                }
-                let SessionControl::Evict(_) = *cluster_control.borrow() else {
-                    continue;
-                };
-                cancellation_token.cancel();
-                let _ = send_rejection_and_close(&mut sender, AdmissionRejection::ClusterLimited).await;
-                break;
-            }
         }
     }
 
     cancellation_token.cancel();
-    live_session.flush();
-    drop(live_session);
-    drop(admission_ticket);
-    drop(session_guard);
 }
 
 async fn recv_initial_resize(
@@ -710,6 +711,48 @@ fn random_token(bytes: usize) -> String {
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
+}
+
+fn parse_web_pow_difficulty(raw: Result<String, std::env::VarError>) -> anyhow::Result<u8> {
+    let raw = match raw {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(DEFAULT_WEB_POW_DIFFICULTY),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("WEB_POW_DIFFICULTY is not valid Unicode");
+        }
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        tracing::warn!(
+            default_difficulty = DEFAULT_WEB_POW_DIFFICULTY,
+            "WEB_POW_DIFFICULTY is empty; using default"
+        );
+        return Ok(DEFAULT_WEB_POW_DIFFICULTY);
+    }
+
+    let parsed = trimmed.parse::<u8>().map_err(|_| {
+        anyhow::anyhow!(
+            "WEB_POW_DIFFICULTY must be an integer between 0 and {MAX_WEB_POW_DIFFICULTY}"
+        )
+    })?;
+
+    if parsed == 0 {
+        tracing::warn!("WEB_POW_DIFFICULTY=0 disables the web proof-of-work gate");
+        return Ok(0);
+    }
+
+    if parsed > MAX_WEB_POW_DIFFICULTY {
+        tracing::warn!(
+            configured_difficulty = parsed,
+            max_supported_difficulty = MAX_WEB_POW_DIFFICULTY,
+            effective_difficulty = MAX_WEB_POW_DIFFICULTY,
+            "WEB_POW_DIFFICULTY is too high; clamping to supported maximum"
+        );
+        return Ok(MAX_WEB_POW_DIFFICULTY);
+    }
+
+    Ok(parsed)
 }
 
 fn leading_zero_bits(bytes: &[u8]) -> u32 {
