@@ -474,9 +474,7 @@ async fn handle_socket(
     let mut pending_input: Option<
         Pin<Box<dyn Future<Output = Result<(), InputGuardError>> + Send>>,
     > = None;
-    let mut close_reason = SessionEndReason::NormalExit;
-
-    loop {
+    let close_reason = loop {
         tokio::select! {
             biased;
 
@@ -493,9 +491,9 @@ async fn handle_socket(
                     }
                 }
                 if input_guard.is_idle_timed_out() {
-                    close_reason = SessionEndReason::IdleTimeout;
+                    break SessionEndReason::IdleTimeout;
                 }
-                break;
+                break SessionEndReason::NormalExit;
             }
 
             changed = cluster_control.changed() => {
@@ -506,8 +504,7 @@ async fn handle_socket(
                     continue;
                 };
                 cancellation_token.cancel();
-                close_reason = reason;
-                break;
+                break reason;
             }
 
             changed = ban_changes.changed() => {
@@ -515,15 +512,14 @@ async fn handle_socket(
                     continue;
                 }
                 cancellation_token.cancel();
-                close_reason = SessionEndReason::BannedIp;
-                break;
+                break SessionEndReason::BannedIp;
             }
 
             result = async {
                 pending_input.as_mut().expect("guarded by select").await
             }, if pending_input.is_some() => {
                 if result.is_err() {
-                    break;
+                    break SessionEndReason::NormalExit;
                 }
                 pending_input = None;
             }
@@ -533,38 +529,43 @@ async fn handle_socket(
             }
 
             data = output_rx.recv() => {
-                let Some(data) = data else { break };
+                let Some(data) = data else {
+                    break SessionEndReason::NormalExit;
+                };
                 admitted_session.record_output(data.len());
                 let mut msg = Vec::with_capacity(data.len() / 2);
                 {
                     let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
                     if encoder.write_all(&data).is_err() || encoder.finish().is_err() {
-                        break;
+                        break SessionEndReason::NormalExit;
                     }
                 }
                 msg.push(0x00);
                 server.metrics.record_bytes(Direction::Out, Transport::Web, msg.len());
                 if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
                     cancellation_token.cancel();
-                    close_reason = SessionEndReason::ConnectionLost;
-                    break;
+                    break SessionEndReason::ConnectionLost;
                 }
             }
 
             data = audio_rx.recv() => {
-                let Some(mut data) = data else { break };
+                let Some(mut data) = data else {
+                    break SessionEndReason::NormalExit;
+                };
                 admitted_session.record_output(data.len());
                 data.push(0x01);
                 server.metrics.record_bytes(Direction::Out, Transport::Web, data.len());
                 if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
                     cancellation_token.cancel();
-                    close_reason = SessionEndReason::ConnectionLost;
-                    break;
+                    break SessionEndReason::ConnectionLost;
                 }
             }
 
             msg = receiver.next(), if pending_input.is_none() => {
-                let Some(msg) = msg else { break };
+                let Some(msg) = msg else {
+                    cancellation_token.cancel();
+                    break SessionEndReason::ConnectionLost;
+                };
                 match msg {
                     Ok(Message::Binary(data)) => {
                         server.metrics.record_bytes(Direction::In, Transport::Web, data.len());
@@ -580,20 +581,19 @@ async fn handle_socket(
                         } else if let Some(ts) = text_str.strip_prefix("ping:") {
                             if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
                                 cancellation_token.cancel();
-                                break;
+                                break SessionEndReason::ConnectionLost;
                             }
                         }
                     }
                     Ok(Message::Close(_)) | Err(_) => {
                         cancellation_token.cancel();
-                        close_reason = SessionEndReason::ConnectionLost;
-                        break;
+                        break SessionEndReason::ConnectionLost;
                     }
                     _ => {}
                 }
             }
         }
-    }
+    };
 
     cancellation_token.cancel();
     if close_reason.should_notify_web_client() {

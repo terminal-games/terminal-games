@@ -1149,6 +1149,7 @@ fn normalized_bucket_entropy(values: impl IntoIterator<Item = u32>) -> f64 {
         .into_iter()
         .filter(|count| *count > 0)
         .collect::<Vec<_>>();
+    let num_categories = counts.len();
     let total = counts.iter().sum::<u32>() as f64;
     if total <= 0.0 {
         return 0.0;
@@ -1158,7 +1159,7 @@ fn normalized_bucket_entropy(values: impl IntoIterator<Item = u32>) -> f64 {
         let p = count as f64 / total;
         entropy -= p * p.log2();
     }
-    let max_entropy = (total.max(2.0)).log2();
+    let max_entropy = (num_categories.max(2) as f64).log2();
     if max_entropy <= 0.0 {
         0.0
     } else {

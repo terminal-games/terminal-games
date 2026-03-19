@@ -428,8 +428,7 @@ impl SshServer {
                 active_shortname_tracker: Some(active_shortname_tracker),
                 idle_fuel_receiver: Some(idle_fuel_rx),
             });
-            let mut close_reason = SessionEndReason::NormalExit;
-            loop {
+            let close_reason = loop {
                 tokio::select! {
                     biased;
 
@@ -446,9 +445,9 @@ impl SshServer {
                             }
                         }
                         if input_guard.is_idle_timed_out() {
-                            close_reason = SessionEndReason::IdleTimeout;
+                            break SessionEndReason::IdleTimeout;
                         }
-                        break;
+                        break SessionEndReason::NormalExit;
                     }
 
                     changed = cluster_control.changed() => {
@@ -458,24 +457,21 @@ impl SshServer {
                         let SessionControl::Close(reason) = *cluster_control.borrow() else {
                             continue;
                         };
-                        close_reason = reason;
                         shutdown_token.cancel();
-                        break;
+                        break reason;
                     }
 
                     changed = ban_changes.changed() => {
                         if changed.is_err() || !admission_controller.is_ip_banned(client_ip) {
                             continue;
                         }
-                        close_reason = SessionEndReason::BannedIp;
                         shutdown_token.cancel();
-                        break;
+                        break SessionEndReason::BannedIp;
                     }
 
                     data = raw_input_rx.recv() => {
                         let Some(data) = data else {
-                            close_reason = SessionEndReason::ConnectionLost;
-                            break;
+                            break SessionEndReason::ConnectionLost;
                         };
                         admitted_session.record_input(&data);
                         let _ = input_guard.prepare_input(data).try_send();
@@ -486,26 +482,28 @@ impl SshServer {
                     }
 
                     data = audio_rx.recv(), if has_audio => {
-                        let Some(data) = data else { break };
+                        let Some(data) = data else {
+                            break SessionEndReason::NormalExit;
+                        };
                         admitted_session.record_output(data.len());
                         metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
                         if session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, russh::CryptoVec::from_slice(&data)).await.is_err() {
-                            close_reason = SessionEndReason::ConnectionLost;
-                            break;
+                            break SessionEndReason::ConnectionLost;
                         }
                     }
 
                     data = output_rx.recv() => {
-                        let Some(data) = data else { break };
+                        let Some(data) = data else {
+                            break SessionEndReason::NormalExit;
+                        };
                         admitted_session.record_output(data.len());
                         metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
                         if session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await.is_err() {
-                            close_reason = SessionEndReason::ConnectionLost;
-                            break;
+                            break SessionEndReason::ConnectionLost;
                         }
                     }
                 }
-            }
+            };
             restore_terminal_state(&session_handle, channel_id).await;
 
             let _ = session_handle
