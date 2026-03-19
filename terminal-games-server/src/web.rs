@@ -48,20 +48,17 @@ use tokio_rustls::{
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
-use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::app::{AppInstantiationParams, AppServer, SessionControl, SessionEndReason};
 use terminal_games::input_guard::{InputGuard, InputGuardError};
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
 
-use crate::admission::{
-    AdmissionController, AdmissionRejection, AdmissionState, AdmissionTicket, SessionControl,
-};
+use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 const DEFAULT_WEB_POW_DIFFICULTY: u8 = 18;
 const MAX_WEB_POW_DIFFICULTY: u8 = 32;
-
 #[derive(Clone)]
 struct MyConnectInfo {
     network_info: Arc<NetworkInformation<TcpLatencyProvider>>,
@@ -441,7 +438,7 @@ async fn handle_socket(
         .admission_controller
         .is_ip_banned(connect_info.remote_addr.ip())
     {
-        let _ = send_rejection_and_close(&mut sender, AdmissionRejection::BannedIp).await;
+        let _ = send_rejection_and_close(&mut sender, SessionEndReason::BannedIp).await;
         return;
     }
     let session_guard =
@@ -477,6 +474,7 @@ async fn handle_socket(
     let mut pending_input: Option<
         Pin<Box<dyn Future<Output = Result<(), InputGuardError>> + Send>>,
     > = None;
+    let mut close_reason = SessionEndReason::NormalExit;
 
     loop {
         tokio::select! {
@@ -494,6 +492,9 @@ async fn handle_socket(
                         tracing::error!(?error, "App exit channel dropped");
                     }
                 }
+                if input_guard.is_idle_timed_out() {
+                    close_reason = SessionEndReason::IdleTimeout;
+                }
                 break;
             }
 
@@ -501,11 +502,11 @@ async fn handle_socket(
                 if changed.is_err() {
                     continue;
                 }
-                let SessionControl::Evict(_) = *cluster_control.borrow() else {
+                let SessionControl::Close(reason) = *cluster_control.borrow() else {
                     continue;
                 };
                 cancellation_token.cancel();
-                let _ = send_rejection_and_close(&mut sender, AdmissionRejection::ClusterLimited).await;
+                close_reason = reason;
                 break;
             }
 
@@ -514,7 +515,7 @@ async fn handle_socket(
                     continue;
                 }
                 cancellation_token.cancel();
-                let _ = send_rejection_and_close(&mut sender, AdmissionRejection::BannedIp).await;
+                close_reason = SessionEndReason::BannedIp;
                 break;
             }
 
@@ -545,6 +546,7 @@ async fn handle_socket(
                 server.metrics.record_bytes(Direction::Out, Transport::Web, msg.len());
                 if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
                     cancellation_token.cancel();
+                    close_reason = SessionEndReason::ConnectionLost;
                     break;
                 }
             }
@@ -556,6 +558,7 @@ async fn handle_socket(
                 server.metrics.record_bytes(Direction::Out, Transport::Web, data.len());
                 if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
                     cancellation_token.cancel();
+                    close_reason = SessionEndReason::ConnectionLost;
                     break;
                 }
             }
@@ -583,6 +586,7 @@ async fn handle_socket(
                     }
                     Ok(Message::Close(_)) | Err(_) => {
                         cancellation_token.cancel();
+                        close_reason = SessionEndReason::ConnectionLost;
                         break;
                     }
                     _ => {}
@@ -592,6 +596,9 @@ async fn handle_socket(
     }
 
     cancellation_token.cancel();
+    if close_reason.should_notify_web_client() {
+        let _ = send_session_closed_and_close(&mut sender, close_reason).await;
+    }
 }
 
 async fn recv_initial_resize(
@@ -771,7 +778,7 @@ fn leading_zero_bits(bytes: &[u8]) -> u32 {
 enum AdmissionWaitResult {
     Allowed,
     Disconnected,
-    Rejected(AdmissionRejection),
+    Rejected(SessionEndReason),
 }
 
 async fn wait_for_admission(
@@ -848,7 +855,7 @@ async fn wait_for_admission(
 
 async fn send_rejection_and_close(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
-    reason: AdmissionRejection,
+    reason: SessionEndReason,
 ) -> Result<(), axum::Error> {
     sender
         .send(Message::Text(
@@ -859,6 +866,21 @@ async fn send_rejection_and_close(
         .send(Message::Close(Some(CloseFrame {
             code: 1008,
             reason: format!("rejected:{}", reason.slug()).into(),
+        })))
+        .await
+}
+
+async fn send_session_closed_and_close(
+    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    reason: SessionEndReason,
+) -> Result<(), axum::Error> {
+    sender
+        .send(Message::Text(format!("session:closed:{}", reason.slug()).into()))
+        .await?;
+    sender
+        .send(Message::Close(Some(CloseFrame {
+            code: 1000,
+            reason: format!("closed:{}", reason.slug()).into(),
         })))
         .await
 }

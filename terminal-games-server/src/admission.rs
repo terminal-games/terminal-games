@@ -28,6 +28,7 @@ use smallvec::SmallVec;
 use tokio::sync::watch;
 
 use crate::metrics::{ServerMetrics, SessionGuard, Transport};
+use terminal_games::app::{SessionControl, SessionEndReason};
 
 const INPUT_WINDOW_MS: u64 = 8 * 60_000;
 const MAX_INPUT_SAMPLES: usize = 96;
@@ -54,51 +55,7 @@ const MOUSE_MOTION_COALESCE_MS: u64 = 40;
 pub enum AdmissionState {
     Allowed,
     Queued(usize),
-    Rejected(AdmissionRejection),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AdmissionRejection {
-    BannedIp,
-    TooManyConnectionsFromIp,
-    ClusterLimited,
-}
-
-impl AdmissionRejection {
-    pub fn slug(self) -> &'static str {
-        match self {
-            Self::BannedIp => "banned_ip",
-            Self::TooManyConnectionsFromIp => "too_many_connections_from_ip",
-            Self::ClusterLimited => "cluster_limited",
-        }
-    }
-
-    pub fn user_message(self) -> &'static str {
-        match self {
-            Self::BannedIp => "Connections from your IP address are blocked",
-            Self::TooManyConnectionsFromIp => "Too many active sessions from your IP address",
-            Self::ClusterLimited => "Kicked for likely bot activity",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionControl {
-    Active,
-    Evict(SessionEvictionReason),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionEvictionReason {
-    ClusterLimited,
-}
-
-impl SessionEvictionReason {
-    pub fn user_message(self) -> &'static str {
-        match self {
-            Self::ClusterLimited => AdmissionRejection::ClusterLimited.user_message(),
-        }
-    }
+    Rejected(SessionEndReason),
 }
 
 #[derive(Debug, Clone)]
@@ -422,7 +379,7 @@ impl AdmissionController {
                     queued_for_ip = state.queued_for_ip(client_ip),
                     "Rejected client from active IP ban"
                 );
-                let _ = tx.send(AdmissionState::Rejected(AdmissionRejection::BannedIp));
+                let _ = tx.send(AdmissionState::Rejected(SessionEndReason::BannedIp));
             } else if state.running < self.inner.config.max_running
                 && state.running_for_ip(client_ip) < self.inner.config.max_running_per_ip
             {
@@ -444,7 +401,7 @@ impl AdmissionController {
                     "Rejected client due to per-IP admission limit"
                 );
                 let _ = tx.send(AdmissionState::Rejected(
-                    AdmissionRejection::TooManyConnectionsFromIp,
+                    SessionEndReason::TooManyConnectionsFromIp,
                 ));
             }
             state.record_metrics(&self.inner.metrics);
@@ -554,7 +511,7 @@ impl AdmissionController {
                 decrement_ip_count(&mut state.queued_by_ip, ticket.client_ip);
                 let _ = ticket
                     .tx
-                    .send(AdmissionState::Rejected(AdmissionRejection::BannedIp));
+                    .send(AdmissionState::Rejected(SessionEndReason::BannedIp));
                 removed_any = true;
                 evicted_from_queue += 1;
                 continue;
@@ -676,7 +633,7 @@ impl Drop for AdmissionTicket {
                     }
                 }
                 AdmissionState::Rejected(reason) => {
-                    if reason == AdmissionRejection::ClusterLimited {
+                    if reason == SessionEndReason::ClusterLimited {
                         tracing::warn!(
                             ticket_id = self.id,
                             client_ip = %self.client_ip,
@@ -988,12 +945,12 @@ fn apply_cluster_evaluation(
             }
         }
         let next = if evaluation.evicted_session_ids.contains(&session.id) {
-            SessionControl::Evict(SessionEvictionReason::ClusterLimited)
+            SessionControl::Close(SessionEndReason::ClusterLimited)
         } else {
             SessionControl::Active
         };
         if session.control != next {
-            if matches!(next, SessionControl::Evict(_)) {
+            if matches!(next, SessionControl::Close(_)) {
                 tracing::warn!(
                     session_id = session.id,
                     client_ip = %session.client_ip,

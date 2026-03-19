@@ -99,6 +99,50 @@ const NEXT_APP_READY_ERR_PREPARE_FAILED_OTHER: i32 = -2;
 
 pub type AppExitResult = Result<I32Exit, AppRunError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionControl {
+    Active,
+    Close(SessionEndReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndReason {
+    NormalExit,
+    ConnectionLost,
+    IdleTimeout,
+    BannedIp,
+    TooManyConnectionsFromIp,
+    ClusterLimited,
+}
+
+impl SessionEndReason {
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::NormalExit => "normal_exit",
+            Self::ConnectionLost => "connection_lost",
+            Self::IdleTimeout => "idle_timeout",
+            Self::BannedIp => "banned_ip",
+            Self::TooManyConnectionsFromIp => "too_many_connections_from_ip",
+            Self::ClusterLimited => "cluster_limited",
+        }
+    }
+
+    pub fn user_message(self) -> &'static str {
+        match self {
+            Self::NormalExit => "Thanks for playing!",
+            Self::ConnectionLost => "Disconnected because the connection was lost.",
+            Self::IdleTimeout => "Disconnected due to idle timeout.",
+            Self::BannedIp => "Connections from your IP address are blocked",
+            Self::TooManyConnectionsFromIp => "Too many active sessions from your IP address",
+            Self::ClusterLimited => "Kicked for likely bot activity",
+        }
+    }
+
+    pub fn should_notify_web_client(self) -> bool {
+        !matches!(self, Self::ConnectionLost)
+    }
+}
+
 pub trait ActiveShortnameTracker: Send + Sync {
     fn set_active_shortname(&self, shortname: &str);
 }

@@ -75,6 +75,10 @@ const onSocketMessage = async (event) => {
             }
             return;
         }
+        if (event.data.startsWith('session:closed:')) {
+            showDisconnect(event.data.substring('session:closed:'.length));
+            return;
+        }
         if (event.data.startsWith('pong:')) {
             const pingTimestamp = parseFloat(event.data.substring(5));
             const rtt = performance.now() - pingTimestamp;
@@ -139,7 +143,15 @@ const onSocketClose = (event) => {
         typeof event.reason === 'string' && event.reason.startsWith('rejected:')
             ? event.reason.substring('rejected:'.length)
             : null;
-    showDisconnect(rejectedReason ?? 'connection_closed');
+    const closedReason =
+        typeof event.reason === 'string' && event.reason.startsWith('closed:')
+            ? event.reason.substring('closed:'.length)
+            : null;
+    if (rejectedReason || closedReason) {
+        showDisconnect(rejectedReason ?? closedReason);
+    } else if (overlay?.type !== 'disconnect') {
+        showDisconnect('connection_closed');
+    }
     if (pingInterval) {
         clearInterval(pingInterval);
         pingInterval = null;
@@ -238,6 +250,30 @@ function disconnectMessage(reasonKey) {
                 heading: 'Connection error',
                 detail: 'The WebSocket connection failed.',
                 hint: 'Check your network connection and try again.'
+            };
+        case 'connection_lost':
+            return {
+                heading: 'Connection lost',
+                detail: 'The connection to the server was lost.',
+                hint: 'Refresh the page to reconnect.'
+            };
+        case 'normal_exit':
+            return {
+                heading: 'Session ended',
+                detail: 'Thanks for playing!',
+                hint: 'Refresh the page to start a new session.'
+            };
+        case 'idle_timeout':
+            return {
+                heading: 'Idle timeout',
+                detail: 'You were disconnected due to inactivity.',
+                hint: 'Refresh the page to start a new session.'
+            };
+        case 'cluster_limited':
+            return {
+                heading: 'Session closed',
+                detail: 'This session was closed due to likely bot activity.',
+                hint: 'If this is unexpected, contact the operator.'
             };
         case 'connection_closed':
         default:
