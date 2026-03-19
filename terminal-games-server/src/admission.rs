@@ -63,6 +63,7 @@ pub struct AdmissionConfig {
     pub max_running: usize,
     pub max_running_per_ip: usize,
     pub max_queued_per_ip: usize,
+    pub ssh_captcha_threshold: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -419,6 +420,17 @@ impl AdmissionController {
             rx,
             controller: self.inner.clone(),
         }
+    }
+
+    pub fn should_require_captcha(&self) -> bool {
+        let Some(threshold) = self.inner.config.ssh_captcha_threshold else {
+            return false;
+        };
+        let state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        compute_pressure(state.running, self.inner.config.max_running) >= threshold
     }
 
     pub fn subscribe_ban_changes(&self) -> watch::Receiver<()> {

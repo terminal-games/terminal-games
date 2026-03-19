@@ -875,7 +875,9 @@ async fn send_session_closed_and_close(
     reason: SessionEndReason,
 ) -> Result<(), axum::Error> {
     sender
-        .send(Message::Text(format!("session:closed:{}", reason.slug()).into()))
+        .send(Message::Text(
+            format!("session:closed:{}", reason.slug()).into(),
+        ))
         .await?;
     sender
         .send(Message::Close(Some(CloseFrame {
