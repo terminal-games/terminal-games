@@ -28,7 +28,7 @@ use crate::admission::{
     SHORT_WINDOW_MS, SIGNATURE_RETENTION_MS,
 };
 use crate::admission::{InputSample, LiveSessionRecord, OutputSample};
-use crate::metrics::{ServerMetrics, Transport};
+use crate::metrics::ServerMetrics;
 use smallvec::SmallVec;
 use terminal_games::app::{SessionControl, SessionEndReason};
 
@@ -1478,6 +1478,8 @@ impl DisjointSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::Transport;
+
     type Trace = Vec<(u64, Vec<u8>)>;
 
     const REPLAY_OUTPUTS: &[u64] = &[10_000, 38_000, 75_000, 112_000, 148_000, 181_000, 213_000];
