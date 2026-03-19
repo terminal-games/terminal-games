@@ -4,7 +4,6 @@
 
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -48,8 +47,6 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 const CAPTCHA_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const RESTORE_TERMINAL_STATE: &[u8] =
     b"\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1l\x1b[>4;0m\x1b>\x1b[?1049l\x1b[?25h";
-const HARNESS_MARKER_PREFIX: &str = "\x1b_tg:event=";
-const HARNESS_MARKER_SUFFIX: &str = "\x1b\\";
 
 impl SshServer {
     pub async fn new(
@@ -350,9 +347,7 @@ impl SshServer {
             )
             .await
             {
-                AdmissionWaitResult::Allowed => {
-                    send_harness_marker(&session_handle, channel_id, "admitted").await;
-                }
+                AdmissionWaitResult::Allowed => {}
                 AdmissionWaitResult::Disconnected => {
                     restore_terminal_state(&session_handle, channel_id).await;
                     let _ = session_handle
@@ -370,12 +365,6 @@ impl SshServer {
                         reason = reason.slug(),
                         "Rejected SSH admission"
                     );
-                    send_harness_marker(
-                        &session_handle,
-                        channel_id,
-                        &format!("rejected:{}", reason.slug()),
-                    )
-                    .await;
                     restore_terminal_state(&session_handle, channel_id).await;
                     let _ = session_handle
                         .disconnect(
@@ -389,7 +378,6 @@ impl SshServer {
             }
             let mut ban_changes = admission_controller.subscribe_ban_changes();
             if admission_controller.is_ip_banned(client_ip) {
-                send_harness_marker(&session_handle, channel_id, "rejected:banned_ip").await;
                 restore_terminal_state(&session_handle, channel_id).await;
                 let _ = session_handle
                     .disconnect(
@@ -518,16 +506,6 @@ impl SshServer {
                     }
                 }
             }
-
-            let disconnect_marker = match close_reason {
-                SessionEndReason::BannedIp | SessionEndReason::ClusterLimited => {
-                    Some(format!("evicted:{}", close_reason.slug()))
-                }
-                _ => None,
-            };
-            if let Some(marker) = disconnect_marker.as_deref() {
-                send_harness_marker(&session_handle, channel_id, marker).await;
-            }
             restore_terminal_state(&session_handle, channel_id).await;
 
             let _ = session_handle
@@ -631,26 +609,6 @@ async fn solve_captcha(
             }
         }
     }
-}
-
-fn harness_markers_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("TERMINAL_GAMES_HARNESS_MARKERS")
-            .ok()
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false)
-    })
-}
-
-async fn send_harness_marker(session_handle: &Handle, channel_id: ChannelId, event: &str) {
-    if !harness_markers_enabled() {
-        return;
-    }
-    let payload = format!("{HARNESS_MARKER_PREFIX}{event}{HARNESS_MARKER_SUFFIX}");
-    let _ = session_handle
-        .data(channel_id, payload.into_bytes().into())
-        .await;
 }
 
 enum AdmissionWaitResult {
