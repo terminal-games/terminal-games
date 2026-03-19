@@ -3,6 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 mod admission;
+mod cluster_detection;
 mod metrics;
 mod ssh;
 mod web;
