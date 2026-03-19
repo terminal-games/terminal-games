@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 use crate::admission::{
     BURST_BUCKET_MS, CLASS_BUCKETS, GAP_BUCKETS, IDLE_TIMEOUT_MS, INPUT_WINDOW_MS,
@@ -28,9 +29,7 @@ use crate::admission::{
     SHORT_WINDOW_MS, SIGNATURE_RETENTION_MS,
 };
 use crate::admission::{InputSample, LiveSessionRecord, OutputSample};
-use crate::metrics::ServerMetrics;
 use smallvec::SmallVec;
-use terminal_games::app::{SessionControl, SessionEndReason};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum NetworkPrefix {
@@ -94,9 +93,9 @@ struct PairEvidence {
 }
 
 pub(crate) struct ClusterEvaluation {
-    suspicious_cluster_count: usize,
-    evicted_session_ids: HashSet<u64>,
-    max_cluster_score: f64,
+    pub(crate) suspicious_cluster_count: usize,
+    pub(crate) evicted_session_ids: HashSet<u64>,
+    pub(crate) max_cluster_score: f64,
 }
 
 impl ClusterEvaluation {
@@ -111,11 +110,10 @@ impl ClusterEvaluation {
 
 #[derive(Clone)]
 pub(crate) struct ClusterEvaluationJob {
-    pub(crate) revision: u64,
     pub(crate) pressure: f64,
     pub(crate) now_ms: u64,
-    pub(crate) live_sessions: HashMap<u64, LiveSessionRecord>,
-    pub(crate) recent_signatures: VecDeque<HistoricalSignature>,
+    pub(crate) live_sessions: Arc<[Arc<LiveSessionRecord>]>,
+    pub(crate) recent_signatures: Arc<[HistoricalSignature]>,
 }
 
 #[derive(Clone)]
@@ -222,64 +220,24 @@ pub(crate) fn archive_signatures(
     trim_recent_signatures(recent_signatures, now_ms);
 }
 
-pub(crate) fn clear_cluster_controls(live_sessions: &mut HashMap<u64, LiveSessionRecord>) {
-    for session in live_sessions.values_mut() {
-        if session.control != SessionControl::Active {
-            let _ = session.control_tx.send(SessionControl::Active);
-            session.control = SessionControl::Active;
-        }
-    }
-}
-
 pub(crate) fn evaluate_job(job: &ClusterEvaluationJob) -> ClusterEvaluation {
     evaluate_clusters(
-        &job.live_sessions,
-        &job.recent_signatures,
+        job.live_sessions.as_ref(),
+        job.recent_signatures.as_ref(),
         job.pressure,
         job.now_ms,
     )
 }
 
-pub(crate) fn apply_cluster_evaluation(
-    metrics: &ServerMetrics,
-    live_sessions: &mut HashMap<u64, LiveSessionRecord>,
-    evaluation: ClusterEvaluation,
-    pressure: f64,
-) {
-    for session in live_sessions.values_mut() {
-        let next = if evaluation.evicted_session_ids.contains(&session.id) {
-            SessionControl::Close(SessionEndReason::ClusterLimited)
-        } else {
-            SessionControl::Active
-        };
-        if session.control != next {
-            if matches!(next, SessionControl::Close(_)) {
-                tracing::warn!(
-                    session_id = session.id,
-                    client_ip = %session.client_ip,
-                    transport = session.transport.as_str(),
-                    pressure,
-                    suspicious_cluster_count = evaluation.suspicious_cluster_count,
-                    max_cluster_score = evaluation.max_cluster_score,
-                    "Evicting session due to suspected bot cluster"
-                );
-                metrics.record_cluster_enforcement(session.transport, "evicted");
-            }
-            let _ = session.control_tx.send(next);
-            session.control = next;
-        }
-    }
-}
-
 fn evaluate_clusters(
-    live_sessions: &HashMap<u64, LiveSessionRecord>,
-    recent_signatures: &VecDeque<HistoricalSignature>,
+    live_sessions: &[Arc<LiveSessionRecord>],
+    recent_signatures: &[HistoricalSignature],
     pressure: f64,
     now_ms: u64,
 ) -> ClusterEvaluation {
     let mut sessions: Vec<SessionAssessment> = live_sessions
-        .values()
-        .filter_map(|session| SessionAssessment::from_record(session, now_ms))
+        .iter()
+        .filter_map(|session| SessionAssessment::from_record(session.as_ref(), now_ms))
         .collect();
     apply_replay_evidence(&mut sessions, recent_signatures, now_ms);
     if sessions.len() < MIN_CLUSTER_SIZE || pressure < LOW_PRESSURE_FLOOR {
@@ -342,7 +300,7 @@ fn evaluate_clusters(
                             .cmp(&sessions[*right].started_at_ms)
                     })
             });
-            for idx in ranked.into_iter().skip(cap) {
+            for &idx in &ranked[cap..] {
                 evicted_session_ids.insert(sessions[idx].session_id);
             }
         }
@@ -432,9 +390,8 @@ fn cluster_stats(
     }
     let network_cohesion = prefix_counts
         .values()
-        .copied()
         .max()
-        .map(|count| count as f64 / component.len() as f64)
+        .map(|count| *count as f64 / component.len() as f64)
         .unwrap_or(0.0);
     let start_spread_ms = newest.saturating_sub(oldest);
     ComponentStats {
@@ -519,7 +476,7 @@ fn pair_evidence(
         (right.replay_match_count as f64 / 4.0).clamp(0.0, 1.0),
     );
     let coupling_affinity = similarity(left.coupling_deficit, right.coupling_deficit);
-    let spectral_affinity = average_similarity(&[
+    let spectral_affinity = mean([
         similarity(left.spectral_peakiness, right.spectral_peakiness),
         similarity(left.spectral_entropy_norm, right.spectral_entropy_norm),
     ]);
@@ -640,7 +597,7 @@ impl SessionAssessment {
 
 fn apply_replay_evidence(
     sessions: &mut [SessionAssessment],
-    recent_signatures: &VecDeque<HistoricalSignature>,
+    recent_signatures: &[HistoricalSignature],
     now_ms: u64,
 ) {
     if recent_signatures.is_empty() {
@@ -673,16 +630,19 @@ fn apply_replay_evidence(
             .iter()
             .map(|window| {
                 window_weight(window.span_ms)
-                    * best_by_span.get(&window.span_ms).copied().unwrap_or(0.0)
+                    * best_by_span
+                        .get(&window.span_ms)
+                        .map_or(0.0, |score| *score)
             })
             .sum::<f64>();
-        let mut strongest = distinct_sources.values().copied().collect::<Vec<_>>();
+        let mut strongest = distinct_sources.values().collect::<Vec<_>>();
         strongest
             .sort_by(|left, right| right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal));
         let replay_density = if strongest.is_empty() {
             0.0
         } else {
-            strongest.iter().take(3).sum::<f64>() / strongest.len().min(3) as f64
+            strongest.iter().take(3).map(|score| **score).sum::<f64>()
+                / strongest.len().min(3) as f64
         };
         session.replay_match_count = distinct_sources.len();
         session.replay_density = replay_density;
@@ -712,8 +672,8 @@ fn replay_cohort_affinity(sessions: &[SessionAssessment], indices: &[usize]) -> 
 
 fn build_window_fingerprints(record: &LiveSessionRecord, now_ms: u64) -> Vec<WindowFingerprint> {
     [SHORT_WINDOW_MS, MEDIUM_WINDOW_MS, INPUT_WINDOW_MS]
-        .into_iter()
-        .filter_map(|span_ms| build_window_fingerprint(record, now_ms, span_ms))
+        .iter()
+        .filter_map(|span_ms| build_window_fingerprint(record, now_ms, *span_ms))
         .collect()
 }
 
@@ -734,7 +694,6 @@ fn build_window_fingerprint(
     let outputs = record
         .outputs
         .iter()
-        .copied()
         .filter(|sample| sample.at_ms >= window_start)
         .collect::<Vec<_>>();
     let window_anchor = record.started_at_ms.max(window_start);
@@ -866,8 +825,8 @@ fn build_window_fingerprint(
         };
         for byte in &event.bytes {
             byte_counts[*byte as usize] += 1;
-            for (class_idx, present) in class_presence(*byte).into_iter().enumerate() {
-                if present {
+            for (class_idx, present) in class_presence(*byte).iter().enumerate() {
+                if *present {
                     class_counts[class_idx] += 1;
                 }
             }
@@ -878,11 +837,12 @@ fn build_window_fingerprint(
     normalize_bins(&mut response_hist);
     let class_total = class_counts.iter().sum::<u32>().max(1) as f64;
     let mut class_hist = [0.0; CLASS_BUCKETS];
-    for (idx, count) in class_counts.into_iter().enumerate() {
-        class_hist[idx] = count as f64 / class_total;
+    for (idx, count) in class_counts.iter().enumerate() {
+        class_hist[idx] = *count as f64 / class_total;
     }
     let (spectral_peakiness, spectral_entropy_norm) = spectral_features(&bucket_counts);
-    let mouse_coord_entropy = normalized_bucket_entropy(mouse_coord_counts.values().copied());
+    let mouse_coord_entropy =
+        normalized_bucket_entropy(mouse_coord_counts.values().map(|count| *count));
     let mouse_ratio = (mouse_events as f64 / inputs.len() as f64).clamp(0.0, 1.0);
     let mouse_motion_ratio = (mouse_motion_events as f64 / inputs.len() as f64).clamp(0.0, 1.0);
     let mouse_flood_score = if derived_inputs.is_empty() {
@@ -902,7 +862,7 @@ fn build_window_fingerprint(
             .clamp(0.0, 1.0),
         entropy_norm: normalized_entropy(&byte_counts, total_input_bytes.max(1) as f64),
         transition_entropy_norm: normalized_transition_entropy(&transition_counts, &source_counts),
-        ngram_innovation: average_similarity(&[
+        ngram_innovation: mean([
             (token_counts.len() as f64 / derived_inputs.len().max(1) as f64).clamp(0.0, 1.0),
             (distinct_bigrams.len() as f64 / derived_inputs.len().saturating_sub(1).max(1) as f64)
                 .clamp(0.0, 1.0),
@@ -982,18 +942,18 @@ fn session_window_similarity(left: &SessionAssessment, right: &SessionAssessment
 }
 
 fn window_similarity(left: &WindowFingerprint, right: &WindowFingerprint) -> f64 {
-    let hash_similarity = average_similarity(&[
+    let hash_similarity = mean([
         hamming_similarity(left.unigram_hash, right.unigram_hash),
         hamming_similarity(left.bigram_hash, right.bigram_hash),
         hamming_similarity(left.trigram_hash, right.trigram_hash),
         hamming_similarity(left.transition_hash, right.transition_hash),
     ]);
-    let histogram_similarity = average_similarity(&[
+    let histogram_similarity = mean([
         cosine_similarity(&left.gap_hist, &right.gap_hist),
         cosine_similarity(&left.response_hist, &right.response_hist),
         cosine_similarity(&left.class_hist, &right.class_hist),
     ]);
-    let scalar_similarity = average_similarity(&[
+    let scalar_similarity = mean([
         similarity(left.event_rate_norm, right.event_rate_norm),
         similarity(left.entropy_norm, right.entropy_norm),
         similarity(left.transition_entropy_norm, right.transition_entropy_norm),
@@ -1018,26 +978,23 @@ fn window_similarity(left: &WindowFingerprint, right: &WindowFingerprint) -> f64
     .clamp(0.0, 1.0)
 }
 
-fn average_similarity(values: &[f64]) -> f64 {
-    mean(values.iter().copied())
-}
-
 fn mean(values: impl IntoIterator<Item = f64>) -> f64 {
-    let (sum, count) = values
-        .into_iter()
-        .fold((0.0, 0usize), |(sum, count), value| {
-            (sum + value, count + 1)
-        });
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for value in values {
+        sum += value;
+        count += 1;
+    }
     if count == 0 { 0.0 } else { sum / count as f64 }
 }
 
 fn weighted_average(values: impl IntoIterator<Item = (f64, f64)>) -> f64 {
-    let (weighted_sum, total_weight) = values.into_iter().fold(
-        (0.0, 0.0),
-        |(weighted_sum, total_weight), (weight, value)| {
-            (weighted_sum + weight * value, total_weight + weight)
-        },
-    );
+    let mut weighted_sum = 0.0;
+    let mut total_weight = 0.0;
+    for (weight, value) in values {
+        weighted_sum += weight * value;
+        total_weight += weight;
+    }
     if total_weight == 0.0 {
         0.0
     } else {
@@ -1144,21 +1101,23 @@ fn normalize_bins<const N: usize>(bins: &mut [f64; N]) {
     }
 }
 
-fn normalized_bucket_entropy(values: impl IntoIterator<Item = u32>) -> f64 {
-    let counts = values
-        .into_iter()
-        .filter(|count| *count > 0)
-        .collect::<Vec<_>>();
-    let num_categories = counts.len();
-    let total = counts.iter().sum::<u32>() as f64;
+fn normalized_bucket_entropy(values: impl Iterator<Item = u32>) -> f64 {
+    let mut num_categories = 0usize;
+    let mut total = 0u64;
+    let mut weighted_log_sum = 0.0;
+    for count in values {
+        if count == 0 {
+            continue;
+        }
+        num_categories += 1;
+        total += count as u64;
+        weighted_log_sum += count as f64 * (count as f64).log2();
+    }
+    let total = total as f64;
     if total <= 0.0 {
         return 0.0;
     }
-    let mut entropy = 0.0;
-    for count in counts {
-        let p = count as f64 / total;
-        entropy -= p * p.log2();
-    }
+    let entropy = total.log2() - weighted_log_sum / total;
     let max_entropy = (num_categories.max(2) as f64).log2();
     if max_entropy <= 0.0 {
         0.0
@@ -1189,7 +1148,10 @@ fn spectral_features(counts: &[u32]) -> (f64, f64) {
     if total <= 0.0 {
         return (0.0, 0.0);
     }
-    let peak = magnitudes.iter().copied().fold(0.0_f64, f64::max) / total;
+    let peak = magnitudes
+        .iter()
+        .fold(0.0_f64, |peak, magnitude| peak.max(*magnitude))
+        / total;
     let mut entropy = 0.0;
     for magnitude in &magnitudes {
         if *magnitude <= 0.0 {
@@ -1515,23 +1477,24 @@ mod tests {
         input_events: Trace,
         output_offsets: &[u64],
     ) -> LiveSessionRecord {
-        let (tx, _) = tokio::sync::watch::channel(SessionControl::Active);
+        let mut inputs = VecDeque::with_capacity(input_events.len());
+        for (at_ms, bytes) in input_events {
+            let mut sample_bytes = SmallVec::<[u8; MAX_SAMPLE_BYTES]>::new();
+            for byte in bytes.iter().take(MAX_SAMPLE_BYTES) {
+                sample_bytes.push(*byte);
+            }
+            inputs.push_back(InputSample {
+                at_ms,
+                bytes: sample_bytes,
+            });
+        }
         LiveSessionRecord {
             id,
             client_ip: ip,
             ip_prefix: NetworkPrefix::from_ip(ip),
             transport,
             started_at_ms,
-            inputs: input_events
-                .into_iter()
-                .map(|(at_ms, bytes)| InputSample {
-                    at_ms,
-                    bytes: bytes
-                        .into_iter()
-                        .take(MAX_SAMPLE_BYTES)
-                        .collect::<SmallVec<[u8; MAX_SAMPLE_BYTES]>>(),
-                })
-                .collect(),
+            inputs,
             outputs: output_offsets
                 .iter()
                 .map(|offset| OutputSample {
@@ -1539,8 +1502,6 @@ mod tests {
                     bytes: 6_000,
                 })
                 .collect(),
-            control: SessionControl::Active,
-            control_tx: tx,
         }
     }
 
@@ -1572,15 +1533,16 @@ mod tests {
         now_ms: u64,
     ) -> (ClusterEvaluation, String) {
         let debug = debug_summary(&records, &recent_signatures, pressure, now_ms);
-        let evaluation = evaluate_clusters(
-            &records
-                .into_iter()
-                .map(|record| (record.id, record))
-                .collect(),
-            &recent_signatures,
-            pressure,
-            now_ms,
-        );
+        let mut live_sessions = Vec::with_capacity(records.len());
+        for record in records {
+            live_sessions.push(Arc::new(record));
+        }
+        let mut recent_signatures_vec = Vec::with_capacity(recent_signatures.len());
+        for signature in recent_signatures {
+            recent_signatures_vec.push(signature);
+        }
+        let evaluation =
+            evaluate_clusters(&live_sessions, &recent_signatures_vec, pressure, now_ms);
         (evaluation, debug)
     }
 
@@ -1594,7 +1556,8 @@ mod tests {
             .iter()
             .filter_map(|record| SessionAssessment::from_record(record, now_ms))
             .collect::<Vec<_>>();
-        apply_replay_evidence(&mut sessions, recent_signatures, now_ms);
+        let recent_signatures = recent_signatures.iter().cloned().collect::<Vec<_>>();
+        apply_replay_evidence(&mut sessions, &recent_signatures, now_ms);
         let mut lines = sessions
             .iter()
             .map(|session| {
@@ -1737,14 +1700,15 @@ mod tests {
             &[b"\x1b[B", b"q"],
             &[b"1", b"2"],
         ];
-        replay_trace(now_ms, seed)
-            .into_iter()
+        let replay = replay_trace(now_ms, seed);
+        replay
+            .iter()
             .enumerate()
             .map(|(idx, (at_ms, _))| {
                 let noise = splitmix64(seed ^ (idx as u64).wrapping_mul(0x9E37_79B9));
                 let payload = VARIANTS[idx][((noise >> 8) & 1) as usize];
                 (
-                    (((at_ms as i64) + (noise % 1_400) as i64 - 700).max(0)) as u64,
+                    (((*at_ms as i64) + (noise % 1_400) as i64 - 700).max(0)) as u64,
                     payload.to_vec(),
                 )
             })
