@@ -238,10 +238,6 @@ impl AdmissionController {
             .metrics
             .record_ip_ban_update(0, 0, 0, active_bans);
         controller
-            .inner
-            .metrics
-            .record_cluster_snapshot(0, 0, 0, 0.0);
-        controller
     }
 
     pub fn issue_ticket(&self, transport: Transport, client_ip: IpAddr) -> AdmissionTicket {
@@ -735,7 +731,7 @@ fn maybe_run_cluster_reevaluation(
     if pressure < LOW_PRESSURE_FLOOR || state.live_sessions.len() < MIN_CLUSTER_SIZE {
         state.cluster_dirty = false;
         state.next_cluster_eval_at_ms = now_ms.saturating_add(CLUSTER_REEVALUATION_INTERVAL_MS);
-        cluster_detection::clear_cluster_controls(&inner.metrics, &mut state.live_sessions);
+        cluster_detection::clear_cluster_controls(&mut state.live_sessions);
         return None;
     }
     if state.cluster_eval_in_progress {

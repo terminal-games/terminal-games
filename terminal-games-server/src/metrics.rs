@@ -185,9 +185,6 @@ pub struct ServerMetrics {
     ip_ban_events_total: IntCounterVec,
     ip_bans_active: IntGaugeVec,
     cluster_enforcement_total: IntCounterVec,
-    cluster_suspect_clusters: IntGaugeVec,
-    cluster_suspect_sessions: IntGaugeVec,
-    cluster_max_score: GaugeVec,
     active_sessions: IntGaugeVec,
     sessions_total: IntCounterVec,
     session_duration_seconds: GaugeVec,
@@ -284,36 +281,6 @@ impl ServerMetrics {
                     "Cluster-defense enforcement actions grouped by transport and action",
                 ),
                 &["region", "transport", "action"],
-            )?,
-        )?;
-        let cluster_suspect_clusters = register(
-            &registry,
-            IntGaugeVec::new(
-                Opts::new(
-                    "terminal_games_cluster_suspect_clusters",
-                    "Currently flagged suspicious behavior clusters",
-                ),
-                &["region"],
-            )?,
-        )?;
-        let cluster_suspect_sessions = register(
-            &registry,
-            IntGaugeVec::new(
-                Opts::new(
-                    "terminal_games_cluster_suspect_sessions",
-                    "Currently flagged suspicious sessions grouped by transport",
-                ),
-                &["region", "transport"],
-            )?,
-        )?;
-        let cluster_max_score = register(
-            &registry,
-            GaugeVec::new(
-                Opts::new(
-                    "terminal_games_cluster_max_score",
-                    "Highest active cluster suspicion score",
-                ),
-                &["region"],
             )?,
         )?;
         let active_sessions = register(
@@ -460,9 +427,6 @@ impl ServerMetrics {
             ip_ban_events_total,
             ip_bans_active,
             cluster_enforcement_total,
-            cluster_suspect_clusters,
-            cluster_suspect_sessions,
-            cluster_max_score,
             active_sessions,
             sessions_total,
             session_duration_seconds,
@@ -536,27 +500,6 @@ impl ServerMetrics {
         self.ip_bans_active
             .with_label_values(&[self.region.as_str()])
             .set(active_ban_count as i64);
-    }
-
-    pub fn record_cluster_snapshot(
-        &self,
-        suspicious_clusters: usize,
-        suspicious_ssh_sessions: usize,
-        suspicious_web_sessions: usize,
-        max_score: f64,
-    ) {
-        self.cluster_suspect_clusters
-            .with_label_values(&[self.region.as_str()])
-            .set(suspicious_clusters as i64);
-        self.cluster_suspect_sessions
-            .with_label_values(&[self.region.as_str(), Transport::Ssh.as_str()])
-            .set(suspicious_ssh_sessions as i64);
-        self.cluster_suspect_sessions
-            .with_label_values(&[self.region.as_str(), Transport::Web.as_str()])
-            .set(suspicious_web_sessions as i64);
-        self.cluster_max_score
-            .with_label_values(&[self.region.as_str()])
-            .set(max_score);
     }
 
     pub fn record_cluster_enforcement(&self, transport: Transport, action: &'static str) {

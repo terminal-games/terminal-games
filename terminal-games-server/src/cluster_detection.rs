@@ -95,7 +95,6 @@ struct PairEvidence {
 
 pub(crate) struct ClusterEvaluation {
     suspicious_cluster_count: usize,
-    suspicious_session_ids: HashSet<u64>,
     evicted_session_ids: HashSet<u64>,
     max_cluster_score: f64,
 }
@@ -104,7 +103,6 @@ impl ClusterEvaluation {
     fn empty() -> Self {
         Self {
             suspicious_cluster_count: 0,
-            suspicious_session_ids: HashSet::new(),
             evicted_session_ids: HashSet::new(),
             max_cluster_score: 0.0,
         }
@@ -224,17 +222,13 @@ pub(crate) fn archive_signatures(
     trim_recent_signatures(recent_signatures, now_ms);
 }
 
-pub(crate) fn clear_cluster_controls(
-    metrics: &ServerMetrics,
-    live_sessions: &mut HashMap<u64, LiveSessionRecord>,
-) {
+pub(crate) fn clear_cluster_controls(live_sessions: &mut HashMap<u64, LiveSessionRecord>) {
     for session in live_sessions.values_mut() {
         if session.control != SessionControl::Active {
             let _ = session.control_tx.send(SessionControl::Active);
             session.control = SessionControl::Active;
         }
     }
-    metrics.record_cluster_snapshot(0, 0, 0, 0.0);
 }
 
 pub(crate) fn evaluate_job(job: &ClusterEvaluationJob) -> ClusterEvaluation {
@@ -252,17 +246,7 @@ pub(crate) fn apply_cluster_evaluation(
     evaluation: ClusterEvaluation,
     pressure: f64,
 ) {
-    let mut suspicious_ssh = 0usize;
-    let mut suspicious_web = 0usize;
-
     for session in live_sessions.values_mut() {
-        let suspicious = evaluation.suspicious_session_ids.contains(&session.id);
-        if suspicious {
-            match session.transport {
-                Transport::Ssh => suspicious_ssh += 1,
-                Transport::Web => suspicious_web += 1,
-            }
-        }
         let next = if evaluation.evicted_session_ids.contains(&session.id) {
             SessionControl::Close(SessionEndReason::ClusterLimited)
         } else {
@@ -285,13 +269,6 @@ pub(crate) fn apply_cluster_evaluation(
             session.control = next;
         }
     }
-
-    metrics.record_cluster_snapshot(
-        evaluation.suspicious_cluster_count,
-        suspicious_ssh,
-        suspicious_web,
-        evaluation.max_cluster_score,
-    );
 }
 
 fn evaluate_clusters(
@@ -337,7 +314,6 @@ fn evaluate_clusters(
     }
 
     let mut suspicious_cluster_count = 0usize;
-    let mut suspicious_session_ids = HashSet::new();
     let mut evicted_session_ids = HashSet::new();
     let mut max_cluster_score: f64 = 0.0;
 
@@ -352,9 +328,6 @@ fn evaluate_clusters(
         }
         max_cluster_score = max_cluster_score.max(score);
         suspicious_cluster_count += 1;
-        for session_id in component.iter().map(|idx| sessions[*idx].session_id) {
-            suspicious_session_ids.insert(session_id);
-        }
 
         let cap = cluster_cap(&stats, pressure);
         if component.len() > cap {
@@ -377,7 +350,6 @@ fn evaluate_clusters(
 
     ClusterEvaluation {
         suspicious_cluster_count,
-        suspicious_session_ids,
         evicted_session_ids,
         max_cluster_score,
     }
