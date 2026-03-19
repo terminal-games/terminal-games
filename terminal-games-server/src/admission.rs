@@ -1,8 +1,3 @@
-// Admission control is split into two layers:
-// 1. Classic queueing and per-IP caps decide which sessions are allowed to start.
-// 2. The passive cluster detector in `cluster_detection.rs` fingerprints live sessions and
-//    evicts correlated bot swarms under pressure.
-//
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
@@ -10,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use smallvec::SmallVec;
@@ -235,10 +230,7 @@ impl AdmissionController {
             }),
         };
         let active_bans = {
-            let guard = match controller.inner.banned_ips.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let guard = lock(&controller.inner.banned_ips);
             guard.len()
         };
         controller
@@ -258,10 +250,7 @@ impl AdmissionController {
         let is_banned = self.is_ip_banned(client_ip);
 
         let job = {
-            let mut state = match self.inner.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut state = lock(&self.inner.state);
             if is_banned {
                 tracing::warn!(
                     client_ip = %client_ip,
@@ -317,10 +306,7 @@ impl AdmissionController {
         let Some(threshold) = self.inner.config.ssh_captcha_threshold else {
             return false;
         };
-        let state = match self.inner.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let state = lock(&self.inner.state);
         cluster_detection::compute_pressure(state.running, self.inner.config.max_running)
             >= threshold
     }
@@ -330,10 +316,7 @@ impl AdmissionController {
     }
 
     pub fn is_ip_banned(&self, client_ip: IpAddr) -> bool {
-        let mut banned_ips = match self.inner.banned_ips.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut banned_ips = lock(&self.inner.banned_ips);
         match banned_ips.get(&client_ip).copied() {
             Some(expires_at) if is_ban_active(expires_at, current_unix_seconds()) => true,
             Some(_) => {
@@ -353,10 +336,7 @@ impl AdmissionController {
         let mut activated = 0usize;
         let active_ban_count;
         {
-            let mut current = match self.inner.banned_ips.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut current = lock(&self.inner.banned_ips);
             for (ip, expires_at) in updates {
                 let was_active = current
                     .get(&ip)
@@ -402,10 +382,7 @@ impl AdmissionController {
             return summary;
         }
         let _ = self.inner.ban_changes.send(());
-        let mut state = match self.inner.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut state = lock(&self.inner.state);
         let mut idx = 0usize;
         let mut removed_any = false;
         let mut evicted_from_queue = 0usize;
@@ -476,10 +453,7 @@ impl AdmissionTicket {
         let now_ms = monotonic_millis();
         let (control_tx, control_rx) = watch::channel(SessionControl::Active);
         let job = {
-            let mut state = match self.controller.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut state = lock(&self.controller.state);
             insert_live_session(
                 &mut state,
                 self.id,
@@ -508,10 +482,7 @@ impl AdmissionTicket {
 impl Drop for AdmissionTicket {
     fn drop(&mut self) {
         let job = {
-            let mut state = match self.controller.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut state = lock(&self.controller.state);
             match *self.rx.borrow() {
                 AdmissionState::Allowed => {
                     state.running = state.running.saturating_sub(1);
@@ -600,10 +571,7 @@ impl LiveSessionHandle {
                 .collect::<SmallVec<[u8; MAX_SAMPLE_BYTES]>>(),
         };
         let job = {
-            let mut state = match self.controller.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut state = lock(&self.controller.state);
             let Some(record) = state.live_sessions.get_mut(&self.id) else {
                 return;
             };
@@ -611,7 +579,7 @@ impl LiveSessionHandle {
             while record.inputs.len() > MAX_INPUT_SAMPLES {
                 record.inputs.pop_front();
             }
-            trim_old_inputs(&mut record.inputs, now_ms);
+            cluster_detection::trim_old_inputs(&mut record.inputs, now_ms);
             state.mark_cluster_dirty();
             maybe_run_cluster_reevaluation(&self.controller, &mut state, now_ms, false)
         };
@@ -647,10 +615,7 @@ impl LiveSessionHandle {
         self.pending_output_started_at_ms = None;
 
         let job = {
-            let mut state = match self.controller.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut state = lock(&self.controller.state);
             let Some(record) = state.live_sessions.get_mut(&self.id) else {
                 return;
             };
@@ -658,7 +623,7 @@ impl LiveSessionHandle {
             while record.outputs.len() > MAX_OUTPUT_SAMPLES {
                 record.outputs.pop_front();
             }
-            trim_old_outputs(&mut record.outputs, now_ms);
+            cluster_detection::trim_old_outputs(&mut record.outputs, now_ms);
             state.mark_cluster_dirty();
             maybe_run_cluster_reevaluation(&self.controller, &mut state, now_ms, false)
         };
@@ -673,10 +638,7 @@ impl Drop for LiveSessionHandle {
         self.flush_output_batch();
         let now_ms = monotonic_millis();
         let job = {
-            let mut state = match self.controller.state.lock() {
-                Ok(state) => state,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+            let mut state = lock(&self.controller.state);
             if let Some(record) = state.live_sessions.remove(&self.id) {
                 cluster_detection::archive_signatures(
                     &record,
@@ -755,12 +717,11 @@ fn monotonic_millis() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-fn trim_old_inputs(inputs: &mut VecDeque<InputSample>, now_ms: u64) {
-    cluster_detection::trim_old_inputs(inputs, now_ms);
-}
-
-fn trim_old_outputs(outputs: &mut VecDeque<OutputSample>, now_ms: u64) {
-    cluster_detection::trim_old_outputs(outputs, now_ms);
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 fn maybe_run_cluster_reevaluation(
@@ -798,10 +759,7 @@ fn maybe_run_cluster_reevaluation(
 
 fn execute_cluster_reevaluation(inner: &Arc<Inner>, job: ClusterEvaluationJob) {
     let evaluation = cluster_detection::evaluate_job(&job);
-    let mut state = match inner.state.lock() {
-        Ok(state) => state,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut state = lock(&inner.state);
     state.cluster_eval_in_progress = false;
     if state.cluster_revision != job.revision {
         state.cluster_dirty = true;

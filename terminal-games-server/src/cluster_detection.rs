@@ -1,22 +1,22 @@
-// Passive cluster detection for admission control.
-//
-// The detector fingerprints live sessions using only host-visible terminal I/O. Each session is
-// modeled as a stochastic control process over several rolling windows. The model combines
-// event-rate and entropy measures, burst and periodicity statistics, byte-class distributions,
-// sequence n-gram simhashes, short-range autocorrelation, spectral features, and
-// output-conditioned response timing. Those independent views are fused into per-window
-// similarities, then into pairwise evidence between sessions. We also archive recent window
-// signatures from prior sessions so the detector can score replay/template reuse across time
-// rather than only comparing currently active sessions. Pairwise evidence induces a correlation
-// graph; connected components become suspicious clusters when their aggregate likelihood remains
-// strong under current server pressure. As pressure rises, the allowed size of a suspicious
-// cluster shrinks from observation-only to soft capping and finally targeted eviction of the
-// lowest-retention sessions in that cluster. Isolated sessions are never evicted by this logic;
-// enforcement only applies to correlated groups.
-//
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+//! Passive cluster detection for admission control.
+//!
+//! The detector fingerprints live sessions using only host-visible terminal I/O. Each session is
+//! modeled as a stochastic control process over several rolling windows. The model combines
+//! event-rate and entropy measures, burst and periodicity statistics, byte-class distributions,
+//! sequence n-gram simhashes, short-range autocorrelation, spectral features, and
+//! output-conditioned response timing. Those independent views are fused into per-window
+//! similarities, then into pairwise evidence between sessions. We also archive recent window
+//! signatures from prior sessions so the detector can score replay and template reuse across time
+//! rather than only comparing currently active sessions. Pairwise evidence induces a correlation
+//! graph; connected components become suspicious clusters when their aggregate likelihood remains
+//! strong under current server pressure. As pressure rises, the allowed size of a suspicious
+//! cluster shrinks from observation-only to soft capping and finally targeted eviction of the
+//! lowest-retention sessions in that cluster. Isolated sessions are never evicted by this logic;
+//! enforcement only applies to correlated groups.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -98,6 +98,17 @@ pub(crate) struct ClusterEvaluation {
     suspicious_session_ids: HashSet<u64>,
     evicted_session_ids: HashSet<u64>,
     max_cluster_score: f64,
+}
+
+impl ClusterEvaluation {
+    fn empty() -> Self {
+        Self {
+            suspicious_cluster_count: 0,
+            suspicious_session_ids: HashSet::new(),
+            evicted_session_ids: HashSet::new(),
+            max_cluster_score: 0.0,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -295,12 +306,7 @@ fn evaluate_clusters(
         .collect();
     apply_replay_evidence(&mut sessions, recent_signatures, now_ms);
     if sessions.len() < MIN_CLUSTER_SIZE || pressure < LOW_PRESSURE_FLOOR {
-        return ClusterEvaluation {
-            suspicious_cluster_count: 0,
-            suspicious_session_ids: HashSet::new(),
-            evicted_session_ids: HashSet::new(),
-            max_cluster_score: 0.0,
-        };
+        return ClusterEvaluation::empty();
     }
 
     let mut edges = Vec::new();
@@ -316,12 +322,7 @@ fn evaluate_clusters(
     materialize_replay_cohort(&sessions, pressure, &mut dsu, &mut edges);
 
     if edges.is_empty() {
-        return ClusterEvaluation {
-            suspicious_cluster_count: 0,
-            suspicious_session_ids: HashSet::new(),
-            evicted_session_ids: HashSet::new(),
-            max_cluster_score: 0.0,
-        };
+        return ClusterEvaluation::empty();
     }
 
     let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -355,26 +356,21 @@ fn evaluate_clusters(
             suspicious_session_ids.insert(session_id);
         }
 
-        if let Some(cap) = cluster_cap(&stats, pressure, score) {
-            if component.len() > cap {
-                let mut ranked = component.clone();
-                ranked.sort_by(|left, right| {
-                    let left_priority =
-                        sessions[*left].retention_score - 0.65 * sessions[*left].replay_score;
-                    let right_priority =
-                        sessions[*right].retention_score - 0.65 * sessions[*right].replay_score;
-                    right_priority
-                        .partial_cmp(&left_priority)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| {
-                            sessions[*left]
-                                .started_at_ms
-                                .cmp(&sessions[*right].started_at_ms)
-                        })
-                });
-                for idx in ranked.into_iter().skip(cap) {
-                    evicted_session_ids.insert(sessions[idx].session_id);
-                }
+        let cap = cluster_cap(&stats, pressure);
+        if component.len() > cap {
+            let mut ranked = component.clone();
+            ranked.sort_by(|left, right| {
+                retention_priority(&sessions[*right])
+                    .partial_cmp(&retention_priority(&sessions[*left]))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        sessions[*left]
+                            .started_at_ms
+                            .cmp(&sessions[*right].started_at_ms)
+                    })
+            });
+            for idx in ranked.into_iter().skip(cap) {
+                evicted_session_ids.insert(sessions[idx].session_id);
             }
         }
     }
@@ -485,18 +481,14 @@ fn cluster_stats(
     }
 }
 
-fn cluster_cap(stats: &ComponentStats, pressure: f64, score: f64) -> Option<usize> {
-    if pressure < LOW_PRESSURE_FLOOR || score < required_cluster_score(pressure) {
-        return None;
-    }
+fn cluster_cap(stats: &ComponentStats, pressure: f64) -> usize {
     if pressure >= 0.90 && stats.avg_replay_density >= 0.75 && stats.avg_edge >= 0.80 {
-        return Some(0);
+        return 0;
     }
     if pressure >= 0.85 && stats.avg_replay >= 0.40 {
-        return Some(1);
+        return 1;
     }
-
-    Some(2)
+    2
 }
 
 fn required_cluster_score(pressure: f64) -> f64 {
@@ -529,6 +521,10 @@ fn cluster_score(stats: &ComponentStats, pressure: f64) -> f64 {
         + 0.04 * pressure
         + 0.08 * (stats.avg_edge * stats.avg_low_engagement))
         .clamp(0.0, 1.0)
+}
+
+fn retention_priority(session: &SessionAssessment) -> f64 {
+    session.retention_score - 0.65 * session.replay_score
 }
 
 fn pair_evidence(
@@ -617,19 +613,16 @@ impl SessionAssessment {
         if windows.is_empty() {
             return None;
         }
-        let avg_event_rate = weighted_window_average(&windows, |window| window.event_rate_norm);
-        let avg_entropy = weighted_window_average(&windows, |window| window.entropy_norm);
-        let avg_innovation = weighted_window_average(&windows, |window| window.ngram_innovation);
-        let avg_coupling = weighted_window_average(&windows, |window| window.output_coupling);
-        let avg_balance = weighted_window_average(&windows, |window| window.input_output_balance);
-        let avg_mouse_motion =
-            weighted_window_average(&windows, |window| window.mouse_motion_ratio);
-        let avg_mouse_coord_entropy =
-            weighted_window_average(&windows, |window| window.mouse_coord_entropy);
-        let avg_spectral_peak =
-            weighted_window_average(&windows, |window| window.spectral_peakiness);
-        let avg_spectral_entropy =
-            weighted_window_average(&windows, |window| window.spectral_entropy_norm);
+        let avg = |f: fn(&WindowFingerprint) -> f64| weighted_window_average(&windows, f);
+        let avg_event_rate = avg(|window| window.event_rate_norm);
+        let avg_entropy = avg(|window| window.entropy_norm);
+        let avg_innovation = avg(|window| window.ngram_innovation);
+        let avg_coupling = avg(|window| window.output_coupling);
+        let avg_balance = avg(|window| window.input_output_balance);
+        let avg_mouse_motion = avg(|window| window.mouse_motion_ratio);
+        let avg_mouse_coord_entropy = avg(|window| window.mouse_coord_entropy);
+        let avg_spectral_peak = avg(|window| window.spectral_peakiness);
+        let avg_spectral_entropy = avg(|window| window.spectral_entropy_norm);
         let coupling_deficit = (1.0 - avg_coupling).clamp(0.0, 1.0);
         let mouse_liveness = (avg_mouse_motion
             * (0.35 + 0.65 * avg_mouse_coord_entropy)
@@ -739,21 +732,9 @@ fn replay_session_threshold(pressure: f64) -> f64 {
 }
 
 fn replay_cohort_affinity(sessions: &[SessionAssessment], indices: &[usize]) -> f64 {
-    let avg_replay = indices
-        .iter()
-        .map(|idx| sessions[*idx].replay_score)
-        .sum::<f64>()
-        / indices.len() as f64;
-    let avg_density = indices
-        .iter()
-        .map(|idx| sessions[*idx].replay_density)
-        .sum::<f64>()
-        / indices.len() as f64;
-    let avg_coupling_deficit = indices
-        .iter()
-        .map(|idx| sessions[*idx].coupling_deficit)
-        .sum::<f64>()
-        / indices.len() as f64;
+    let avg_replay = mean(indices.iter().map(|idx| sessions[*idx].replay_score));
+    let avg_density = mean(indices.iter().map(|idx| sessions[*idx].replay_density));
+    let avg_coupling_deficit = mean(indices.iter().map(|idx| sessions[*idx].coupling_deficit));
     (0.62 * avg_replay + 0.22 * avg_density + 0.16 * avg_coupling_deficit).clamp(0.0, 1.0)
 }
 
@@ -992,24 +973,12 @@ fn prefix_v6(addr: Ipv6Addr) -> u64 {
 }
 
 fn min_session_confidence(left: &SessionAssessment, right: &SessionAssessment) -> f64 {
-    let mut confidence = 0.0;
-    let mut total_weight = 0.0;
-    for left_window in &left.windows {
-        if let Some(right_window) = right
-            .windows
-            .iter()
-            .find(|window| window.span_ms == left_window.span_ms)
-        {
-            let weight = window_weight(left_window.span_ms);
-            confidence += weight * (left_window.confidence * right_window.confidence).sqrt();
-            total_weight += weight;
-        }
-    }
-    if total_weight == 0.0 {
-        0.0
-    } else {
-        confidence / total_weight
-    }
+    matching_window_average(
+        &left.windows,
+        &right.windows,
+        |left, _| window_weight(left.span_ms),
+        |left, right| (left.confidence * right.confidence).sqrt(),
+    )
 }
 
 fn min_window_confidence(windows: &[WindowFingerprint]) -> f64 {
@@ -1023,41 +992,21 @@ fn weighted_window_average(
     windows: &[WindowFingerprint],
     f: impl Fn(&WindowFingerprint) -> f64,
 ) -> f64 {
-    let mut total = 0.0;
-    let mut total_weight = 0.0;
-    for window in windows {
-        let weight = window_weight(window.span_ms) * window.confidence.max(0.1);
-        total += weight * f(window);
-        total_weight += weight;
-    }
-    if total_weight == 0.0 {
-        0.0
-    } else {
-        total / total_weight
-    }
+    weighted_average(windows.iter().map(|window| {
+        (
+            window_weight(window.span_ms) * window.confidence.max(0.1),
+            f(window),
+        )
+    }))
 }
 
 fn session_window_similarity(left: &SessionAssessment, right: &SessionAssessment) -> f64 {
-    let mut total = 0.0;
-    let mut total_weight = 0.0;
-    for left_window in &left.windows {
-        if let Some(right_window) = right
-            .windows
-            .iter()
-            .find(|window| window.span_ms == left_window.span_ms)
-        {
-            let weight = window_weight(left_window.span_ms)
-                * left_window.confidence
-                * right_window.confidence;
-            total += weight * window_similarity(left_window, right_window);
-            total_weight += weight;
-        }
-    }
-    if total_weight == 0.0 {
-        0.0
-    } else {
-        total / total_weight
-    }
+    matching_window_average(
+        &left.windows,
+        &right.windows,
+        |left, right| window_weight(left.span_ms) * left.confidence * right.confidence,
+        window_similarity,
+    )
 }
 
 fn window_similarity(left: &WindowFingerprint, right: &WindowFingerprint) -> f64 {
@@ -1098,11 +1047,49 @@ fn window_similarity(left: &WindowFingerprint, right: &WindowFingerprint) -> f64
 }
 
 fn average_similarity(values: &[f64]) -> f64 {
-    if values.is_empty() {
+    mean(values.iter().copied())
+}
+
+fn mean(values: impl IntoIterator<Item = f64>) -> f64 {
+    let (sum, count) = values
+        .into_iter()
+        .fold((0.0, 0usize), |(sum, count), value| {
+            (sum + value, count + 1)
+        });
+    if count == 0 { 0.0 } else { sum / count as f64 }
+}
+
+fn weighted_average(values: impl IntoIterator<Item = (f64, f64)>) -> f64 {
+    let (weighted_sum, total_weight) = values.into_iter().fold(
+        (0.0, 0.0),
+        |(weighted_sum, total_weight), (weight, value)| {
+            (weighted_sum + weight * value, total_weight + weight)
+        },
+    );
+    if total_weight == 0.0 {
         0.0
     } else {
-        values.iter().sum::<f64>() / values.len() as f64
+        weighted_sum / total_weight
     }
+}
+
+fn matching_window_average(
+    left: &[WindowFingerprint],
+    right: &[WindowFingerprint],
+    weight: impl Fn(&WindowFingerprint, &WindowFingerprint) -> f64,
+    value: impl Fn(&WindowFingerprint, &WindowFingerprint) -> f64,
+) -> f64 {
+    weighted_average(left.iter().filter_map(|left_window| {
+        right
+            .iter()
+            .find(|right_window| right_window.span_ms == left_window.span_ms)
+            .map(|right_window| {
+                (
+                    weight(left_window, right_window),
+                    value(left_window, right_window),
+                )
+            })
+    }))
 }
 
 fn similarity(left: f64, right: f64) -> f64 {
@@ -1519,6 +1506,15 @@ impl DisjointSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    type Trace = Vec<(u64, Vec<u8>)>;
+
+    const REPLAY_OUTPUTS: &[u64] = &[10_000, 38_000, 75_000, 112_000, 148_000, 181_000, 213_000];
+    const BOT_OUTPUTS: &[u64] = &[
+        10_000, 39_000, 71_000, 104_000, 138_000, 173_000, 209_000, 243_000,
+    ];
+    const HUMAN_OUTPUTS: &[u64] = &[
+        9_000, 28_000, 49_000, 73_000, 98_000, 126_000, 154_000, 183_000,
+    ];
 
     fn ipv4(value: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, value))
@@ -1528,96 +1524,89 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(198, 51, subnet, host))
     }
 
-    fn build_session(
+    fn transport(idx: usize) -> Transport {
+        if idx % 2 == 0 {
+            Transport::Ssh
+        } else {
+            Transport::Web
+        }
+    }
+
+    fn session(
         id: u64,
         ip: IpAddr,
         transport: Transport,
         started_at_ms: u64,
-        input_events: &[(u64, &'static [u8])],
+        input_events: Trace,
         output_offsets: &[u64],
     ) -> LiveSessionRecord {
         let (tx, _) = tokio::sync::watch::channel(SessionControl::Active);
-        let inputs = input_events
-            .iter()
-            .map(|(at_ms, bytes)| InputSample {
-                at_ms: *at_ms,
-                bytes: bytes
-                    .iter()
-                    .copied()
-                    .take(MAX_SAMPLE_BYTES)
-                    .collect::<SmallVec<[u8; MAX_SAMPLE_BYTES]>>(),
-            })
-            .collect::<VecDeque<_>>();
-        let outputs = output_offsets
-            .iter()
-            .map(|offset| OutputSample {
-                at_ms: started_at_ms + *offset,
-                bytes: 6_000,
-            })
-            .collect::<VecDeque<_>>();
         LiveSessionRecord {
             id,
             client_ip: ip,
             ip_prefix: NetworkPrefix::from_ip(ip),
             transport,
             started_at_ms,
-            inputs,
-            outputs,
+            inputs: input_events
+                .into_iter()
+                .map(|(at_ms, bytes)| InputSample {
+                    at_ms,
+                    bytes: bytes
+                        .into_iter()
+                        .take(MAX_SAMPLE_BYTES)
+                        .collect::<SmallVec<[u8; MAX_SAMPLE_BYTES]>>(),
+                })
+                .collect(),
+            outputs: output_offsets
+                .iter()
+                .map(|offset| OutputSample {
+                    at_ms: started_at_ms + *offset,
+                    bytes: 6_000,
+                })
+                .collect(),
             control: SessionControl::Active,
             control_tx: tx,
         }
     }
 
-    fn build_session_owned(
-        id: u64,
-        ip: IpAddr,
-        transport: Transport,
-        started_at_ms: u64,
-        input_events: Vec<(u64, Vec<u8>)>,
+    fn swarm(
+        count: usize,
+        base_id: u64,
         output_offsets: &[u64],
-    ) -> LiveSessionRecord {
-        let (tx, _) = tokio::sync::watch::channel(SessionControl::Active);
-        let inputs = input_events
-            .into_iter()
-            .map(|(at_ms, bytes)| InputSample {
-                at_ms,
-                bytes: bytes
-                    .into_iter()
-                    .take(MAX_SAMPLE_BYTES)
-                    .collect::<SmallVec<[u8; MAX_SAMPLE_BYTES]>>(),
+        mut build: impl FnMut(usize) -> (IpAddr, Transport, u64, Trace),
+    ) -> Vec<LiveSessionRecord> {
+        (0..count)
+            .map(|idx| {
+                let (ip, transport, started_at_ms, trace) = build(idx);
+                session(
+                    base_id + idx as u64,
+                    ip,
+                    transport,
+                    started_at_ms,
+                    trace,
+                    output_offsets,
+                )
             })
-            .collect::<VecDeque<_>>();
-        let outputs = output_offsets
-            .iter()
-            .map(|offset| OutputSample {
-                at_ms: started_at_ms + *offset,
-                bytes: 6_000,
-            })
-            .collect::<VecDeque<_>>();
-        LiveSessionRecord {
-            id,
-            client_ip: ip,
-            ip_prefix: NetworkPrefix::from_ip(ip),
-            transport,
-            started_at_ms,
-            inputs,
-            outputs,
-            control: SessionControl::Active,
-            control_tx: tx,
-        }
+            .collect()
     }
 
-    fn evaluate(
+    fn evaluate_case(
         records: Vec<LiveSessionRecord>,
         recent_signatures: VecDeque<HistoricalSignature>,
         pressure: f64,
         now_ms: u64,
-    ) -> ClusterEvaluation {
-        let map = records
-            .into_iter()
-            .map(|record| (record.id, record))
-            .collect();
-        evaluate_clusters(&map, &recent_signatures, pressure, now_ms)
+    ) -> (ClusterEvaluation, String) {
+        let debug = debug_summary(&records, &recent_signatures, pressure, now_ms);
+        let evaluation = evaluate_clusters(
+            &records
+                .into_iter()
+                .map(|record| (record.id, record))
+                .collect(),
+            &recent_signatures,
+            pressure,
+            now_ms,
+        );
+        (evaluation, debug)
     }
 
     fn debug_summary(
@@ -1631,38 +1620,35 @@ mod tests {
             .filter_map(|record| SessionAssessment::from_record(record, now_ms))
             .collect::<Vec<_>>();
         apply_replay_evidence(&mut sessions, recent_signatures, now_ms);
-        let mut lines = Vec::new();
-        for session in &sessions {
-            lines.push(format!(
-                "session={} retain={:.3} low={:.3} replay={:.3} matches={} density={:.3} coupling_deficit={:.3} mouse={:.3}/{:.3} mouse_entropy={:.3} spectral={:.3}/{:.3}",
-                session.session_id,
-                session.retention_score,
-                session.low_engagement,
-                session.replay_score,
-                session.replay_match_count,
-                session.replay_density,
-                session.coupling_deficit,
-                session.mouse_motion_ratio,
-                session.mouse_coord_entropy,
-                session.mouse_coord_entropy,
-                session.spectral_peakiness,
-                session.spectral_entropy_norm,
-            ));
-        }
+        let mut lines = sessions
+            .iter()
+            .map(|session| {
+                format!(
+                    "session={} retain={:.3} low={:.3} replay={:.3} matches={} density={:.3} coupling={:.3} mouse={:.3}/{:.3} spectral={:.3}/{:.3}",
+                    session.session_id,
+                    session.retention_score,
+                    session.low_engagement,
+                    session.replay_score,
+                    session.replay_match_count,
+                    session.replay_density,
+                    session.coupling_deficit,
+                    session.mouse_motion_ratio,
+                    session.mouse_coord_entropy,
+                    session.spectral_peakiness,
+                    session.spectral_entropy_norm,
+                )
+            })
+            .collect::<Vec<_>>();
         for i in 0..sessions.len() {
             for j in (i + 1)..sessions.len() {
-                let similarity = session_window_similarity(&sessions[i], &sessions[j]);
-                let min_confidence = min_session_confidence(&sessions[i], &sessions[j]);
-                let edge = pair_evidence(&sessions[i], &sessions[j], pressure)
-                    .map(|edge| edge.score)
-                    .unwrap_or(0.0);
                 lines.push(format!(
                     "pair={}-{} sim={:.3} conf={:.3} edge={:.3}",
                     sessions[i].session_id,
                     sessions[j].session_id,
-                    similarity,
-                    min_confidence,
-                    edge,
+                    session_window_similarity(&sessions[i], &sessions[j]),
+                    min_session_confidence(&sessions[i], &sessions[j]),
+                    pair_evidence(&sessions[i], &sessions[j], pressure)
+                        .map_or(0.0, |edge| edge.score),
                 ));
             }
         }
@@ -1677,126 +1663,151 @@ mod tests {
         signatures
     }
 
-    fn replay_trace(now_ms: u64, seed: u64) -> Vec<(u64, &'static [u8])> {
+    fn assert_detected(
+        label: &str,
+        records: Vec<LiveSessionRecord>,
+        history: VecDeque<HistoricalSignature>,
+        pressure: f64,
+        now_ms: u64,
+        min_evictions: usize,
+    ) {
+        let (evaluation, debug) = evaluate_case(records, history, pressure, now_ms);
+        assert_eq!(evaluation.suspicious_cluster_count, 1, "{label}\n{debug}");
+        assert!(
+            evaluation.evicted_session_ids.len() >= min_evictions,
+            "{label}\n{debug}"
+        );
+    }
+
+    fn assert_clean(
+        label: &str,
+        records: Vec<LiveSessionRecord>,
+        history: VecDeque<HistoricalSignature>,
+        pressure: f64,
+        now_ms: u64,
+    ) {
+        let (evaluation, debug) = evaluate_case(records, history, pressure, now_ms);
+        assert_eq!(evaluation.suspicious_cluster_count, 0, "{label}\n{debug}");
+        assert!(
+            evaluation.evicted_session_ids.is_empty(),
+            "{label}\n{debug}"
+        );
+    }
+
+    fn fixed_trace(now_ms: u64, events: &[(u64, &[u8])]) -> Trace {
+        events
+            .iter()
+            .map(|(offset, bytes)| (now_ms - *offset, bytes.to_vec()))
+            .collect()
+    }
+
+    fn replay_trace(now_ms: u64, seed: u64) -> Trace {
         vec![
-            (now_ms - 220_000 + seed * 3, b"\x1b[A"),
-            (now_ms - 205_000 + seed * 5, b"d"),
-            (now_ms - 191_000 + seed * 2, b" "),
-            (now_ms - 170_000 + seed * 4, b"\x1b[C"),
-            (now_ms - 151_000 + seed * 3, b"w"),
-            (now_ms - 122_000 + seed * 4, b"\r"),
-            (now_ms - 96_000 + seed * 2, b"a"),
-            (now_ms - 72_000 + seed * 3, b"s"),
-            (now_ms - 44_000 + seed * 2, b"\x1b[B"),
-            (now_ms - 19_000 + seed * 4, b"1"),
+            (now_ms - 220_000 + seed * 3, b"\x1b[A".to_vec()),
+            (now_ms - 205_000 + seed * 5, b"d".to_vec()),
+            (now_ms - 191_000 + seed * 2, b" ".to_vec()),
+            (now_ms - 170_000 + seed * 4, b"\x1b[C".to_vec()),
+            (now_ms - 151_000 + seed * 3, b"w".to_vec()),
+            (now_ms - 122_000 + seed * 4, b"\r".to_vec()),
+            (now_ms - 96_000 + seed * 2, b"a".to_vec()),
+            (now_ms - 72_000 + seed * 3, b"s".to_vec()),
+            (now_ms - 44_000 + seed * 2, b"\x1b[B".to_vec()),
+            (now_ms - 19_000 + seed * 4, b"1".to_vec()),
         ]
     }
 
-    fn jittered_random_trace(now_ms: u64, family: u64, variant: u64) -> Vec<(u64, &'static [u8])> {
-        let alphabet: [&'static [u8]; 10] =
-            [b"a", b"s", b"d", b"f", b"j", b"k", b"l", b";", b"1", b"2"];
+    fn jittered_random_trace(now_ms: u64, family: u64, variant: u64) -> Trace {
+        const ALPHABET: &[u8] = b"asdfjkl;12";
         let mut at_ms = now_ms - 250_000;
-        let mut events = Vec::new();
-        for step in 0..8 {
-            let noise = splitmix64(family ^ ((variant + 1) << 8) ^ step as u64);
-            let gap = 18_000 + family * 1_300 + (noise % 24_000) + variant * 90;
-            at_ms += gap;
-            let bytes = alphabet[((noise >> 8) as usize + step) % alphabet.len()];
-            events.push((at_ms, bytes));
-        }
-        events
+        (0..8)
+            .map(|step| {
+                let noise = splitmix64(family ^ ((variant + 1) << 8) ^ step as u64);
+                at_ms += 18_000 + family * 1_300 + (noise % 24_000) + variant * 90;
+                let token = ALPHABET[((noise >> 8) as usize + step) % ALPHABET.len()];
+                (at_ms, vec![token])
+            })
+            .collect()
     }
 
-    fn burst_macro_trace(now_ms: u64, family: u64, variant: u64) -> Vec<(u64, &'static [u8])> {
-        let bursts: [[&'static [u8]; 3]; 3] = [
-            [b"\x1b[A", b" ", b"\r"],
-            [b"\x1b[C", b"\x1b[C", b"z"],
-            [b"\x1b[B", b"x", b"1"],
+    fn burst_macro_trace(now_ms: u64, family: u64, variant: u64) -> Trace {
+        const BURSTS: &[&[&[u8]]] = &[
+            &[b"\x1b[A", b" ", b"\r"],
+            &[b"\x1b[C", b"\x1b[C", b"z"],
+            &[b"\x1b[B", b"x", b"1"],
         ];
-        let mut events = Vec::new();
         let mut anchor = now_ms - 210_000;
-        for (burst_idx, burst) in bursts.into_iter().enumerate() {
-            let base_gap = 52_000 + family * 1_400 + variant * 110;
-            anchor += base_gap + burst_idx as u64 * 1_700;
-            for (event_idx, bytes) in burst.into_iter().enumerate() {
-                events.push((anchor + event_idx as u64 * (90 + variant * 3), bytes));
+        let mut events = Vec::new();
+        for (burst_idx, burst) in BURSTS.iter().enumerate() {
+            anchor += 52_000 + family * 1_400 + variant * 110 + burst_idx as u64 * 1_700;
+            for (event_idx, bytes) in burst.iter().enumerate() {
+                events.push((
+                    anchor + event_idx as u64 * (90 + variant * 3),
+                    bytes.to_vec(),
+                ));
             }
         }
         events
     }
 
-    fn noise_injected_replay_trace(now_ms: u64, seed: u64) -> Vec<(u64, &'static [u8])> {
-        let payload_variants: [[&'static [u8]; 2]; 10] = [
-            [b"\x1b[A", b"w"],
-            [b"d", b"\x1b[C"],
-            [b" ", b"\r"],
-            [b"\x1b[C", b"e"],
-            [b"w", b"\x1b[A"],
-            [b"\r", b" "],
-            [b"a", b"\x1b[D"],
-            [b"s", b"x"],
-            [b"\x1b[B", b"q"],
-            [b"1", b"2"],
+    fn noise_injected_replay_trace(now_ms: u64, seed: u64) -> Trace {
+        const VARIANTS: &[&[&[u8]]] = &[
+            &[b"\x1b[A", b"w"],
+            &[b"d", b"\x1b[C"],
+            &[b" ", b"\r"],
+            &[b"\x1b[C", b"e"],
+            &[b"w", b"\x1b[A"],
+            &[b"\r", b" "],
+            &[b"a", b"\x1b[D"],
+            &[b"s", b"x"],
+            &[b"\x1b[B", b"q"],
+            &[b"1", b"2"],
         ];
         replay_trace(now_ms, seed)
             .into_iter()
             .enumerate()
             .map(|(idx, (at_ms, _))| {
                 let noise = splitmix64(seed ^ (idx as u64).wrapping_mul(0x9E37_79B9));
-                let jitter = (noise % 1_400) as i64 - 700;
-                let payload = payload_variants[idx][((noise >> 8) & 1) as usize];
-                (((at_ms as i64) + jitter).max(0) as u64, payload)
+                let payload = VARIANTS[idx][((noise >> 8) & 1) as usize];
+                (
+                    (((at_ms as i64) + (noise % 1_400) as i64 - 700).max(0)) as u64,
+                    payload.to_vec(),
+                )
             })
             .collect()
     }
 
-    fn human_random_trace(now_ms: u64, seed: u64) -> Vec<(u64, &'static [u8])> {
-        let palette: [&'static [u8]; 18] = [
+    fn human_random_trace(now_ms: u64, seed: u64) -> Trace {
+        const PALETTE: &[&[u8]] = &[
             b"w", b"a", b"s", b"d", b"q", b"e", b"r", b" ", b"\r", b"\x1b[A", b"\x1b[B", b"\x1b[C",
             b"\x1b[D", b"1", b"2", b"3", b"z", b"x",
         ];
         let mut at_ms = now_ms - 210_000 - seed * 1_500;
-        let mut events = Vec::new();
-        for step in 0..14 {
-            let noise = splitmix64(seed.rotate_left(9) ^ (step as u64).wrapping_mul(0xBF58_476D));
-            let gap = 3_500 + (noise % 19_000) + (step as u64 % 3) * 1_700;
-            at_ms += gap;
-            let bytes = palette[((noise >> 11) as usize + step * 3) % palette.len()];
-            events.push((at_ms, bytes));
-        }
-        events
+        (0..14)
+            .map(|step| {
+                let noise =
+                    splitmix64(seed.rotate_left(9) ^ (step as u64).wrapping_mul(0xBF58_476D));
+                at_ms += 3_500 + (noise % 19_000) + (step as u64 % 3) * 1_700;
+                (
+                    at_ms,
+                    PALETTE[((noise >> 11) as usize + step * 3) % PALETTE.len()].to_vec(),
+                )
+            })
+            .collect()
     }
 
     fn rich_token(seed: u64) -> Vec<u8> {
-        let bucket = (seed % 82) as u8;
-        match bucket {
-            0..=25 => vec![b'a' + bucket],
-            26..=51 => vec![b'A' + (bucket - 26)],
-            52..=61 => vec![b'0' + (bucket - 52)],
-            62 => b" ".to_vec(),
-            63 => b"\r".to_vec(),
-            64 => b"\t".to_vec(),
-            65 => b"\x1b[A".to_vec(),
-            66 => b"\x1b[B".to_vec(),
-            67 => b"\x1b[C".to_vec(),
-            68 => b"\x1b[D".to_vec(),
-            69 => b"!".to_vec(),
-            70 => b"?".to_vec(),
-            71 => b"#".to_vec(),
-            72 => b"@".to_vec(),
-            73 => b"%".to_vec(),
-            74 => b"&".to_vec(),
-            75 => b"*".to_vec(),
-            76 => b"(".to_vec(),
-            77 => b")".to_vec(),
-            78 => b"=".to_vec(),
-            79 => b"+".to_vec(),
-            80 => b"/".to_vec(),
-            _ => b"-".to_vec(),
+        const SINGLE_BYTES: &[u8] =
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 !?#@%&*()=+/-";
+        const ESCAPES: &[&[u8]] = &[b"\r", b"\t", b"\x1b[A", b"\x1b[B", b"\x1b[C", b"\x1b[D"];
+        let idx = (seed % (SINGLE_BYTES.len() + ESCAPES.len()) as u64) as usize;
+        if idx < SINGLE_BYTES.len() {
+            vec![SINGLE_BYTES[idx]]
+        } else {
+            ESCAPES[idx - SINGLE_BYTES.len()].to_vec()
         }
     }
 
-    fn full_alphabet_bot_trace(now_ms: u64, family: u64, variant: u64) -> Vec<(u64, Vec<u8>)> {
+    fn full_alphabet_bot_trace(now_ms: u64, family: u64, variant: u64) -> Trace {
         let mut at_ms = now_ms - 320_000 + variant * 37;
         let mut events = Vec::new();
         for step in 0..24 {
@@ -1806,8 +1817,7 @@ mod tests {
                     ^ (step as u64).wrapping_mul(0xBF58_476D),
             );
             let lane = (step % 4) as u64;
-            let gap = 4_800 + family * 420 + lane * 1_350 + (noise % 4_600);
-            at_ms += gap;
+            at_ms += 4_800 + family * 420 + lane * 1_350 + (noise % 4_600);
             let token_seed =
                 family * 113 + lane * 29 + (step / 3) as u64 * 41 + ((noise >> 12) & 0x0f);
             events.push((at_ms, rich_token(token_seed)));
@@ -1818,19 +1828,12 @@ mod tests {
         events
     }
 
-    fn full_alphabet_human_trace(now_ms: u64, seed: u64) -> Vec<(u64, Vec<u8>)> {
+    fn full_alphabet_human_trace(now_ms: u64, seed: u64) -> Trace {
         let mut at_ms = now_ms - 260_000 - seed * 1_200;
         let mut events = Vec::new();
         for step in 0..30 {
             let noise = splitmix64(seed.rotate_left(11) ^ (step as u64).wrapping_mul(0x94D0_49BB));
-            let base_gap = match step % 5 {
-                0 => 1_300,
-                1 => 4_800,
-                2 => 9_200,
-                3 => 2_200,
-                _ => 14_500,
-            };
-            at_ms += base_gap + (noise % 8_200);
+            at_ms += [1_300, 4_800, 9_200, 2_200, 14_500][step % 5] + (noise % 8_200);
             events.push((at_ms, rich_token(seed ^ noise ^ ((step as u64) << 6))));
             if step % 7 == 2 {
                 events.push((
@@ -1845,42 +1848,34 @@ mod tests {
         events
     }
 
-    fn full_alphabet_sparse_keepalive_trace(
-        now_ms: u64,
-        family: u64,
-        variant: u64,
-    ) -> Vec<(u64, Vec<u8>)> {
+    fn full_alphabet_sparse_keepalive_trace(now_ms: u64, family: u64, variant: u64) -> Trace {
         let mut at_ms = now_ms - 310_000 + variant * 33;
-        let mut events = Vec::new();
-        for step in 0..6 {
-            let noise = splitmix64(family.rotate_left(5) ^ variant.rotate_left(17) ^ step as u64);
-            let gap = 58_000 + family * 190 + (noise % 2_700);
-            at_ms += gap;
-            events.push((
-                at_ms,
-                rich_token(family * 31 + variant * 7 + step as u64 * 13),
-            ));
-        }
-        events
+        (0..6)
+            .map(|step| {
+                let noise =
+                    splitmix64(family.rotate_left(5) ^ variant.rotate_left(17) ^ step as u64);
+                at_ms += 58_000 + family * 190 + (noise % 2_700);
+                (
+                    at_ms,
+                    rich_token(family * 31 + variant * 7 + step as u64 * 13),
+                )
+            })
+            .collect()
     }
 
     fn mouse_sgr_motion(x: u16, y: u16) -> Vec<u8> {
         format!("\x1b[<35;{};{}M", x, y).into_bytes()
     }
 
-    fn human_mouse_hover_trace(now_ms: u64, seed: u64) -> Vec<(u64, Vec<u8>)> {
+    fn human_mouse_hover_trace(now_ms: u64, seed: u64) -> Trace {
         let mut at_ms = now_ms - 110_000 - seed * 800;
-        let mut x = 18 + (seed as u16 % 9);
-        let mut y = 10 + (seed as u16 % 7);
+        let (mut x, mut y) = (18 + (seed as u16 % 9), 10 + (seed as u16 % 7));
         let mut events = Vec::new();
         for step in 0..56 {
             let noise = splitmix64(seed.rotate_left(5) ^ (step as u64).wrapping_mul(0x94D0_49BB));
-            let gap = 42 + (noise % 37) + (step as u64 % 5) * 6;
-            at_ms += gap;
-            let dx = ((noise & 0x0f) as i16) - 7;
-            let dy = (((noise >> 4) & 0x0f) as i16) - 7;
-            x = (x as i16 + dx).clamp(2, 120) as u16;
-            y = (y as i16 + dy).clamp(2, 50) as u16;
+            at_ms += 42 + (noise % 37) + (step as u64 % 5) * 6;
+            x = (x as i16 + ((noise & 0x0f) as i16) - 7).clamp(2, 120) as u16;
+            y = (y as i16 + (((noise >> 4) & 0x0f) as i16) - 7).clamp(2, 50) as u16;
             events.push((at_ms, mouse_sgr_motion(x, y)));
             if step % 11 == 0 {
                 events.push((at_ms + 14, b" ".to_vec()));
@@ -1892,17 +1887,17 @@ mod tests {
         events
     }
 
-    fn mouse_sweep_bot_trace(now_ms: u64, family: u64, variant: u64) -> Vec<(u64, Vec<u8>)> {
+    fn mouse_sweep_bot_trace(now_ms: u64, family: u64, variant: u64) -> Trace {
         let mut at_ms = now_ms - 120_000 + variant * 9;
         let mut events = Vec::new();
         for lap in 0..5 {
-            let base_x = 12 + family as u16 * 3;
-            let base_y = 8 + ((variant + lap) % 3) as u16 * 2;
+            let (base_x, base_y) = (12 + family as u16 * 3, 8 + ((variant + lap) % 3) as u16 * 2);
             for step in 0..14 {
                 at_ms += 28 + (lap % 2) * 2;
-                let x = base_x + step as u16 * 3;
-                let y = base_y + ((step / 3) % 4) as u16;
-                events.push((at_ms, mouse_sgr_motion(x, y)));
+                events.push((
+                    at_ms,
+                    mouse_sgr_motion(base_x + step as u16 * 3, base_y + ((step / 3) % 4) as u16),
+                ));
             }
             at_ms += 1_200 + family * 15;
             events.push((at_ms, b"\r".to_vec()));
@@ -1911,544 +1906,412 @@ mod tests {
     }
 
     #[test]
-    fn replay_library_cohort_is_evicted_under_high_pressure() {
+    fn replay_evidence_respects_pressure_and_cluster_size() {
         let now_ms = 900_000;
-        let history_records = (0..6)
-            .map(|idx| {
-                let started = now_ms - 600_000 - idx as u64 * 4_000;
-                let trace = replay_trace(now_ms - 300_000, idx as u64);
-                build_session(
-                    idx + 1,
+        let history = archive(
+            &swarm(6, 1, REPLAY_OUTPUTS, |idx| {
+                (
                     ipv4((idx + 1) as u8),
-                    if idx % 2 == 0 {
-                        Transport::Ssh
-                    } else {
-                        Transport::Web
-                    },
-                    started,
-                    &trace,
-                    &[10_000, 38_000, 75_000, 112_000, 148_000, 181_000, 213_000],
+                    transport(idx),
+                    now_ms - 600_000 - idx as u64 * 4_000,
+                    replay_trace(now_ms - 300_000, idx as u64),
                 )
-            })
-            .collect::<Vec<_>>();
-        let history = archive(&history_records, now_ms - 240_000);
+            }),
+            now_ms - 240_000,
+        );
 
-        let active_records = (0..6)
-            .map(|idx| {
-                let trace = replay_trace(now_ms, (5 - idx) as u64);
-                build_session(
-                    100 + idx as u64,
-                    IpAddr::V4(Ipv4Addr::new(198, 51, 100, (idx + 10) as u8)),
-                    if idx % 2 == 0 {
-                        Transport::Web
-                    } else {
-                        Transport::Ssh
-                    },
+        assert_detected(
+            "replay cohort under pressure",
+            swarm(6, 100, REPLAY_OUTPUTS, |idx| {
+                (
+                    ipv4_in(100, 10 + idx as u8),
+                    transport(idx + 1),
                     now_ms - 260_000,
-                    &trace,
-                    &[9_000, 36_000, 74_000, 109_000, 145_000, 179_000, 214_000],
+                    replay_trace(now_ms, (5 - idx) as u64),
                 )
-            })
-            .collect::<Vec<_>>();
+            }),
+            history.clone(),
+            0.96,
+            now_ms,
+            6,
+        );
 
-        let debug = debug_summary(&active_records, &history, 0.96, now_ms);
-        let evaluation = evaluate(active_records, history, 0.96, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 1, "{debug}");
-        assert_eq!(evaluation.evicted_session_ids.len(), 6, "{debug}");
-    }
-
-    #[test]
-    fn replay_library_is_observed_but_not_evicted_at_low_pressure() {
-        let now_ms = 900_000;
-        let history_records = (0..4)
-            .map(|idx| {
-                build_session(
-                    idx + 1,
-                    ipv4((idx + 1) as u8),
-                    Transport::Ssh,
-                    now_ms - 500_000,
-                    &replay_trace(now_ms - 200_000, idx as u64),
-                    &[12_000, 44_000, 81_000, 126_000, 173_000],
-                )
-            })
-            .collect::<Vec<_>>();
-        let history = archive(&history_records, now_ms - 180_000);
-        let active_records = (0..4)
-            .map(|idx| {
-                build_session(
-                    100 + idx as u64,
+        assert_clean(
+            "replay cohort at low pressure",
+            swarm(4, 200, &[12_000, 44_000, 81_000, 126_000, 173_000], |idx| {
+                (
                     ipv4((idx + 20) as u8),
                     Transport::Web,
                     now_ms - 240_000,
-                    &replay_trace(now_ms, idx as u64),
-                    &[12_000, 44_000, 81_000, 126_000, 173_000],
+                    replay_trace(now_ms, idx as u64),
                 )
-            })
-            .collect::<Vec<_>>();
-
-        let evaluation = evaluate(active_records, history, 0.20, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 0);
-        assert!(evaluation.evicted_session_ids.is_empty());
-    }
-
-    #[test]
-    fn isolated_replay_match_does_not_trigger_singleton_eviction() {
-        let now_ms = 600_000;
-        let history_record = build_session(
-            1,
-            ipv4(1),
-            Transport::Ssh,
-            now_ms - 400_000,
-            &replay_trace(now_ms - 200_000, 0),
-            &[10_000, 40_000, 80_000, 120_000, 160_000],
-        );
-        let history = archive(&[history_record], now_ms - 180_000);
-        let active = build_session(
-            2,
-            ipv4(33),
-            Transport::Web,
-            now_ms - 220_000,
-            &replay_trace(now_ms, 0),
-            &[10_000, 40_000, 80_000, 120_000, 160_000],
+            }),
+            history,
+            0.20,
+            now_ms,
         );
 
-        let evaluation = evaluate(vec![active], history, 0.98, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 0);
-        assert!(evaluation.evicted_session_ids.is_empty());
-    }
-
-    #[test]
-    fn sparse_keepalive_swarm_is_still_detected() {
-        let now_ms = 500_000;
-        let records = (0..6)
-            .map(|idx| {
-                build_session(
-                    idx + 1,
-                    ipv4((idx + 1) as u8),
+        assert_clean(
+            "singleton replay match",
+            vec![session(
+                500,
+                ipv4(33),
+                Transport::Web,
+                now_ms - 220_000,
+                replay_trace(now_ms, 0),
+                &[10_000, 40_000, 80_000, 120_000, 160_000],
+            )],
+            archive(
+                &[session(
+                    1,
+                    ipv4(1),
                     Transport::Ssh,
-                    now_ms - 6 * 60_000,
-                    &[
-                        (now_ms - 300_000 + idx as u64 * 40, b"a"),
-                        (now_ms - 240_500 + idx as u64 * 35, b"9"),
-                        (now_ms - 180_250 + idx as u64 * 45, b"b"),
-                        (now_ms - 120_400 + idx as u64 * 30, b"1"),
-                        (now_ms - 60_350 + idx as u64 * 50, b"c"),
-                    ],
-                    &[20_000, 80_000, 140_000, 200_000, 260_000, 320_000],
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let history = VecDeque::new();
-        let debug = debug_summary(&records, &history, 0.92, now_ms);
-        let evaluation = evaluate(records, history, 0.92, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 1, "{debug}");
-        assert_eq!(evaluation.evicted_session_ids.len(), 4, "{debug}");
+                    now_ms - 400_000,
+                    replay_trace(now_ms - 200_000, 0),
+                    &[10_000, 40_000, 80_000, 120_000, 160_000],
+                )],
+                now_ms - 180_000,
+            ),
+            0.98,
+            now_ms,
+        );
     }
 
     #[test]
-    fn randomized_interval_keypress_swarm_is_detected() {
-        let now_ms = 1_000_000;
-        let records = (0..8)
-            .map(|idx| {
-                let trace = jittered_random_trace(now_ms, 3, idx as u64);
-                build_session(
-                    idx + 1,
-                    IpAddr::V4(Ipv4Addr::new(198, 51, 100, (idx + 30) as u8)),
-                    if idx % 2 == 0 {
-                        Transport::Ssh
-                    } else {
-                        Transport::Web
-                    },
+    fn bot_families_are_detected_under_pressure() {
+        let now_ms = 1_600_000;
+        assert_detected(
+            "sparse keepalive",
+            swarm(
+                6,
+                1,
+                &[20_000, 80_000, 140_000, 200_000, 260_000, 320_000],
+                |idx| {
+                    (
+                        ipv4((idx + 1) as u8),
+                        Transport::Ssh,
+                        now_ms - 6 * 60_000,
+                        vec![
+                            (now_ms - 300_000 + idx as u64 * 40, b"a".to_vec()),
+                            (now_ms - 240_500 + idx as u64 * 35, b"9".to_vec()),
+                            (now_ms - 180_250 + idx as u64 * 45, b"b".to_vec()),
+                            (now_ms - 120_400 + idx as u64 * 30, b"1".to_vec()),
+                            (now_ms - 60_350 + idx as u64 * 50, b"c".to_vec()),
+                        ],
+                    )
+                },
+            ),
+            VecDeque::new(),
+            0.92,
+            now_ms,
+            4,
+        );
+
+        assert_detected(
+            "random interval keypresses",
+            swarm(8, 100, BOT_OUTPUTS, |idx| {
+                (
+                    ipv4_in(100, 30 + idx as u8),
+                    transport(idx),
                     now_ms - 280_000,
-                    &trace,
-                    &[
-                        12_000, 44_000, 72_000, 110_000, 144_000, 177_000, 208_000, 241_000,
-                    ],
+                    jittered_random_trace(now_ms, 3, idx as u64),
                 )
-            })
-            .collect::<Vec<_>>();
+            }),
+            VecDeque::new(),
+            0.91,
+            now_ms,
+            4,
+        );
 
-        let history = VecDeque::new();
-        let debug = debug_summary(&records, &history, 0.91, now_ms);
-        let evaluation = evaluate(records, history, 0.91, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 1, "{debug}");
-        assert!(evaluation.evicted_session_ids.len() >= 4, "{debug}");
-    }
+        assert_detected(
+            "burst macro family",
+            swarm(
+                6,
+                200,
+                &[
+                    8_000, 24_000, 41_000, 66_000, 91_000, 117_000, 143_000, 168_000, 194_000,
+                ],
+                |idx| {
+                    (
+                        ipv4((idx + 50) as u8),
+                        Transport::Ssh,
+                        now_ms - 240_000,
+                        burst_macro_trace(now_ms, 5, idx as u64),
+                    )
+                },
+            ),
+            VecDeque::new(),
+            0.88,
+            now_ms,
+            2,
+        );
 
-    #[test]
-    fn randomized_interval_keypress_swarm_is_detected_across_prefixes() {
-        let now_ms = 1_040_000;
-        let records = (0..8)
-            .map(|idx| {
-                let trace = jittered_random_trace(now_ms, 4, idx as u64);
-                build_session(
-                    idx + 1,
-                    ipv4_in(40 + idx as u8, 10 + idx as u8),
-                    if idx % 2 == 0 {
-                        Transport::Web
-                    } else {
-                        Transport::Ssh
-                    },
-                    now_ms - 290_000 + idx as u64 * 900,
-                    &trace,
-                    &[
-                        10_000, 39_000, 71_000, 104_000, 138_000, 173_000, 209_000, 243_000,
-                    ],
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let history = VecDeque::new();
-        let debug = debug_summary(&records, &history, 0.94, now_ms);
-        let evaluation = evaluate(records, history, 0.94, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 1, "{debug}");
-        assert!(evaluation.evicted_session_ids.len() >= 4, "{debug}");
-    }
-
-    #[test]
-    fn burst_macro_bot_family_is_detected() {
-        let now_ms = 1_200_000;
-        let records = (0..6)
-            .map(|idx| {
-                let trace = burst_macro_trace(now_ms, 5, idx as u64);
-                build_session(
-                    idx + 1,
-                    ipv4((idx + 50) as u8),
-                    Transport::Ssh,
-                    now_ms - 240_000,
-                    &trace,
-                    &[
-                        8_000, 24_000, 41_000, 66_000, 91_000, 117_000, 143_000, 168_000, 194_000,
-                    ],
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let history = VecDeque::new();
-        let debug = debug_summary(&records, &history, 0.88, now_ms);
-        let evaluation = evaluate(records, history, 0.88, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 1, "{debug}");
-        assert!(evaluation.evicted_session_ids.len() >= 2, "{debug}");
-    }
-
-    #[test]
-    fn noise_injected_replay_family_is_detected() {
-        let now_ms = 1_250_000;
-        let history_records = (0..5)
-            .map(|idx| {
-                build_session(
-                    idx + 1,
+        let history = archive(
+            &swarm(5, 300, REPLAY_OUTPUTS, |idx| {
+                (
                     ipv4_in(60 + idx as u8, 20 + idx as u8),
-                    if idx % 2 == 0 {
-                        Transport::Ssh
-                    } else {
-                        Transport::Web
-                    },
+                    transport(idx),
                     now_ms - 700_000 - idx as u64 * 5_500,
-                    &noise_injected_replay_trace(now_ms - 330_000, idx as u64),
-                    &[9_000, 37_000, 74_000, 111_000, 149_000, 184_000, 219_000],
+                    noise_injected_replay_trace(now_ms - 330_000, idx as u64),
                 )
-            })
-            .collect::<Vec<_>>();
-        let history = archive(&history_records, now_ms - 260_000);
+            }),
+            now_ms - 260_000,
+        );
+        assert_detected(
+            "noise injected replay",
+            swarm(
+                6,
+                400,
+                &[11_000, 36_000, 72_000, 107_000, 143_000, 179_000, 214_000],
+                |idx| {
+                    (
+                        ipv4_in(90 + idx as u8, 30 + idx as u8),
+                        transport(idx + 1),
+                        now_ms - 300_000 + idx as u64 * 700,
+                        noise_injected_replay_trace(now_ms, (idx % 5) as u64),
+                    )
+                },
+            ),
+            history,
+            0.95,
+            now_ms,
+            4,
+        );
 
-        let active_records = (0..6)
-            .map(|idx| {
-                build_session(
-                    100 + idx as u64,
-                    ipv4_in(90 + idx as u8, 30 + idx as u8),
-                    if idx % 2 == 0 {
-                        Transport::Web
-                    } else {
-                        Transport::Ssh
-                    },
-                    now_ms - 300_000 + idx as u64 * 700,
-                    &noise_injected_replay_trace(now_ms, (idx % 5) as u64),
-                    &[11_000, 36_000, 72_000, 107_000, 143_000, 179_000, 214_000],
-                )
-            })
-            .collect::<Vec<_>>();
+        assert_detected(
+            "mouse sweep bot",
+            swarm(
+                6,
+                500,
+                &[
+                    9_000, 31_000, 54_000, 76_000, 99_000, 121_000, 145_000, 167_000,
+                ],
+                |idx| {
+                    (
+                        ipv4_in(180 + idx as u8, 80 + idx as u8),
+                        transport(idx),
+                        now_ms - 200_000 + idx as u64 * 500,
+                        mouse_sweep_bot_trace(now_ms, 4, idx as u64),
+                    )
+                },
+            ),
+            VecDeque::new(),
+            0.95,
+            now_ms,
+            4,
+        );
 
-        let debug = debug_summary(&active_records, &history, 0.95, now_ms);
-        let evaluation = evaluate(active_records, history, 0.95, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 1, "{debug}");
-        assert!(evaluation.evicted_session_ids.len() >= 4, "{debug}");
+        assert_detected(
+            "full alphabet randomized bot",
+            swarm(
+                10,
+                600,
+                &[
+                    10_000, 33_000, 57_000, 81_000, 108_000, 136_000, 163_000, 191_000,
+                ],
+                |idx| {
+                    (
+                        ipv4_in(200 + idx as u8, 20 + idx as u8),
+                        transport(idx),
+                        now_ms - 280_000 + idx as u64 * 700,
+                        full_alphabet_bot_trace(now_ms, 9, idx as u64),
+                    )
+                },
+            ),
+            VecDeque::new(),
+            0.95,
+            now_ms,
+            4,
+        );
+
+        assert_detected(
+            "full alphabet sparse keepalive",
+            swarm(
+                8,
+                700,
+                &[18_000, 77_000, 136_000, 194_000, 253_000, 311_000],
+                |idx| {
+                    (
+                        ipv4_in(220 + idx as u8, 40 + idx as u8),
+                        Transport::Ssh,
+                        now_ms - 7 * 60_000,
+                        full_alphabet_sparse_keepalive_trace(now_ms, 6, idx as u64),
+                    )
+                },
+            ),
+            VecDeque::new(),
+            0.94,
+            now_ms,
+            4,
+        );
     }
 
     #[test]
-    fn human_mouse_hover_flood_is_not_clustered() {
-        let now_ms = 1_420_000;
-        let records = (0..4)
-            .map(|idx| {
-                build_session_owned(
-                    idx + 1,
-                    ipv4_in(150 + idx as u8, 60 + idx as u8),
-                    if idx % 2 == 0 {
-                        Transport::Ssh
-                    } else {
-                        Transport::Web
-                    },
-                    now_ms - 180_000 - idx as u64 * 2_000,
-                    human_mouse_hover_trace(now_ms, 200 + idx as u64 * 13),
-                    &[
-                        6_000, 24_000, 43_000, 66_000, 91_000, 117_000, 142_000, 168_000,
-                    ],
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let history = VecDeque::new();
-        let debug = debug_summary(&records, &history, 0.96, now_ms);
-        let evaluation = evaluate(records, history, 0.96, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 0, "{debug}");
-        assert!(evaluation.evicted_session_ids.is_empty(), "{debug}");
-    }
-
-    #[test]
-    fn deterministic_mouse_motion_bot_family_is_detected() {
-        let now_ms = 1_480_000;
-        let records = (0..6)
-            .map(|idx| {
-                build_session_owned(
-                    idx + 1,
-                    ipv4_in(180 + idx as u8, 80 + idx as u8),
-                    if idx % 2 == 0 {
-                        Transport::Ssh
-                    } else {
-                        Transport::Web
-                    },
-                    now_ms - 200_000 + idx as u64 * 500,
-                    mouse_sweep_bot_trace(now_ms, 4, idx as u64),
-                    &[
-                        9_000, 31_000, 54_000, 76_000, 99_000, 121_000, 145_000, 167_000,
-                    ],
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let history = VecDeque::new();
-        let debug = debug_summary(&records, &history, 0.95, now_ms);
-        let evaluation = evaluate(records, history, 0.95, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 1, "{debug}");
-        assert!(evaluation.evicted_session_ids.len() >= 4, "{debug}");
-    }
-
-    #[test]
-    fn full_alphabet_randomized_bot_swarm_is_detected() {
-        let now_ms = 1_560_000;
-        let records = (0..10)
-            .map(|idx| {
-                build_session_owned(
-                    idx + 1,
-                    ipv4_in(200 + idx as u8, 20 + idx as u8),
-                    if idx % 2 == 0 {
-                        Transport::Ssh
-                    } else {
-                        Transport::Web
-                    },
-                    now_ms - 280_000 + idx as u64 * 700,
-                    full_alphabet_bot_trace(now_ms, 9, idx as u64),
-                    &[
-                        10_000, 33_000, 57_000, 81_000, 108_000, 136_000, 163_000, 191_000,
-                    ],
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let history = VecDeque::new();
-        let debug = debug_summary(&records, &history, 0.95, now_ms);
-        let evaluation = evaluate(records, history, 0.95, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 1, "{debug}");
-        assert!(evaluation.evicted_session_ids.len() >= 4, "{debug}");
-    }
-
-    #[test]
-    fn full_alphabet_sparse_idle_renewal_swarm_is_detected() {
-        let now_ms = 1_620_000;
-        let records = (0..8)
-            .map(|idx| {
-                build_session_owned(
-                    idx + 1,
-                    ipv4_in(220 + idx as u8, 40 + idx as u8),
-                    Transport::Ssh,
-                    now_ms - 7 * 60_000,
-                    full_alphabet_sparse_keepalive_trace(now_ms, 6, idx as u64),
-                    &[18_000, 77_000, 136_000, 194_000, 253_000, 311_000],
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let history = VecDeque::new();
-        let debug = debug_summary(&records, &history, 0.94, now_ms);
-        let evaluation = evaluate(records, history, 0.94, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 1, "{debug}");
-        assert!(evaluation.evicted_session_ids.len() >= 4, "{debug}");
-    }
-
-    #[test]
-    fn independent_full_alphabet_humans_are_not_clustered() {
+    fn human_families_stay_clean_under_pressure() {
         let now_ms = 1_680_000;
-        let records = (0..8)
-            .map(|idx| {
-                build_session_owned(
-                    idx + 1,
+        assert_clean(
+            "human mouse hover",
+            swarm(
+                4,
+                1,
+                &[
+                    6_000, 24_000, 43_000, 66_000, 91_000, 117_000, 142_000, 168_000,
+                ],
+                |idx| {
+                    (
+                        ipv4_in(150 + idx as u8, 60 + idx as u8),
+                        transport(idx),
+                        now_ms - 180_000 - idx as u64 * 2_000,
+                        human_mouse_hover_trace(now_ms, 200 + idx as u64 * 13),
+                    )
+                },
+            ),
+            VecDeque::new(),
+            0.96,
+            now_ms,
+        );
+
+        assert_clean(
+            "randomized humans",
+            swarm(
+                6,
+                100,
+                &[
+                    7_000, 24_000, 43_000, 61_000, 84_000, 102_000, 129_000, 151_000, 176_000,
+                ],
+                |idx| {
+                    (
+                        ipv4_in(120 + idx as u8, 40 + idx as u8),
+                        transport(idx),
+                        now_ms - 240_000 - idx as u64 * 3_000,
+                        human_random_trace(now_ms, 100 + idx as u64 * 17),
+                    )
+                },
+            ),
+            VecDeque::new(),
+            0.97,
+            now_ms,
+        );
+
+        assert_clean(
+            "full alphabet humans",
+            swarm(8, 200, HUMAN_OUTPUTS, |idx| {
+                (
                     ipv4_in(240 + idx as u8, 60 + idx as u8),
-                    if idx % 2 == 0 {
-                        Transport::Ssh
-                    } else {
-                        Transport::Web
-                    },
+                    transport(idx),
                     now_ms - 260_000 - idx as u64 * 1_500,
                     full_alphabet_human_trace(now_ms, 300 + idx as u64 * 23),
-                    &[
-                        9_000, 28_000, 49_000, 73_000, 98_000, 126_000, 154_000, 183_000,
-                    ],
                 )
-            })
-            .collect::<Vec<_>>();
+            }),
+            VecDeque::new(),
+            0.97,
+            now_ms,
+        );
 
-        let history = VecDeque::new();
-        let debug = debug_summary(&records, &history, 0.97, now_ms);
-        let evaluation = evaluate(records, history, 0.97, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 0, "{debug}");
-        assert!(evaluation.evicted_session_ids.is_empty(), "{debug}");
+        assert_clean(
+            "mixed active humans",
+            vec![
+                session(
+                    1,
+                    ipv4(1),
+                    Transport::Ssh,
+                    now_ms - 150_000,
+                    fixed_trace(
+                        now_ms,
+                        &[
+                            (145_000, b"\x1b[A"),
+                            (141_200, b"d"),
+                            (134_000, b" "),
+                            (121_000, b"\x1b[C"),
+                            (108_000, b"\r"),
+                            (92_500, b"a"),
+                            (76_000, b"s"),
+                            (51_500, b"\x1b[B"),
+                            (27_000, b"1"),
+                            (9_000, b"\x1b[D"),
+                        ],
+                    ),
+                    &[5_000, 22_000, 39_000, 61_000, 79_000, 103_000, 129_000],
+                ),
+                session(
+                    2,
+                    ipv4(2),
+                    Transport::Web,
+                    now_ms - 155_000,
+                    fixed_trace(
+                        now_ms,
+                        &[
+                            (147_000, b"w"),
+                            (139_000, b"\x1b[D"),
+                            (131_000, b" "),
+                            (118_000, b"e"),
+                            (97_500, b"\x1b[A"),
+                            (88_000, b"q"),
+                            (63_000, b"r"),
+                            (45_000, b"\r"),
+                            (24_000, b"2"),
+                            (6_000, b"\x1b[C"),
+                        ],
+                    ),
+                    &[8_000, 28_000, 46_000, 68_000, 90_000, 114_000, 136_000],
+                ),
+                session(
+                    3,
+                    ipv4(3),
+                    Transport::Ssh,
+                    now_ms - 160_000,
+                    fixed_trace(
+                        now_ms,
+                        &[
+                            (149_000, b"\x1b[C"),
+                            (144_500, b"z"),
+                            (132_000, b"x"),
+                            (116_000, b" "),
+                            (100_000, b"\x1b[A"),
+                            (78_000, b"c"),
+                            (57_000, b"v"),
+                            (34_000, b"\r"),
+                            (17_000, b"\x1b[B"),
+                            (4_000, b"3"),
+                        ],
+                    ),
+                    &[11_000, 32_000, 54_000, 72_000, 93_000, 119_000, 143_000],
+                ),
+            ],
+            VecDeque::new(),
+            0.94,
+            now_ms,
+        );
     }
 
     #[test]
-    fn active_human_like_sessions_do_not_cluster() {
-        let now_ms = 700_000;
-        let records = vec![
-            build_session(
-                1,
-                ipv4(1),
-                Transport::Ssh,
-                now_ms - 150_000,
-                &[
-                    (now_ms - 145_000, b"\x1b[A"),
-                    (now_ms - 141_200, b"d"),
-                    (now_ms - 134_000, b" "),
-                    (now_ms - 121_000, b"\x1b[C"),
-                    (now_ms - 108_000, b"\r"),
-                    (now_ms - 92_500, b"a"),
-                    (now_ms - 76_000, b"s"),
-                    (now_ms - 51_500, b"\x1b[B"),
-                    (now_ms - 27_000, b"1"),
-                    (now_ms - 9_000, b"\x1b[D"),
-                ],
-                &[5_000, 22_000, 39_000, 61_000, 79_000, 103_000, 129_000],
-            ),
-            build_session(
-                2,
-                ipv4(2),
-                Transport::Web,
-                now_ms - 155_000,
-                &[
-                    (now_ms - 147_000, b"w"),
-                    (now_ms - 139_000, b"\x1b[D"),
-                    (now_ms - 131_000, b" "),
-                    (now_ms - 118_000, b"e"),
-                    (now_ms - 97_500, b"\x1b[A"),
-                    (now_ms - 88_000, b"q"),
-                    (now_ms - 63_000, b"r"),
-                    (now_ms - 45_000, b"\r"),
-                    (now_ms - 24_000, b"2"),
-                    (now_ms - 6_000, b"\x1b[C"),
-                ],
-                &[8_000, 28_000, 46_000, 68_000, 90_000, 114_000, 136_000],
-            ),
-            build_session(
-                3,
-                ipv4(3),
-                Transport::Ssh,
-                now_ms - 160_000,
-                &[
-                    (now_ms - 149_000, b"\x1b[C"),
-                    (now_ms - 144_500, b"z"),
-                    (now_ms - 132_000, b"x"),
-                    (now_ms - 116_000, b" "),
-                    (now_ms - 100_000, b"\x1b[A"),
-                    (now_ms - 78_000, b"c"),
-                    (now_ms - 57_000, b"v"),
-                    (now_ms - 34_000, b"\r"),
-                    (now_ms - 17_000, b"\x1b[B"),
-                    (now_ms - 4_000, b"3"),
-                ],
-                &[11_000, 32_000, 54_000, 72_000, 93_000, 119_000, 143_000],
-            ),
-        ];
-
-        let history = VecDeque::new();
-        let debug = debug_summary(&records, &history, 0.94, now_ms);
-        let evaluation = evaluate(records, history, 0.94, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 0, "{debug}");
-        assert!(evaluation.evicted_session_ids.is_empty(), "{debug}");
-    }
-
-    #[test]
-    fn independent_randomized_humans_are_not_clustered() {
-        let now_ms = 1_300_000;
-        let records = (0..6)
-            .map(|idx| {
-                build_session(
-                    idx + 1,
-                    ipv4_in(120 + idx as u8, 40 + idx as u8),
-                    if idx % 2 == 0 {
-                        Transport::Ssh
-                    } else {
-                        Transport::Web
-                    },
-                    now_ms - 240_000 - idx as u64 * 3_000,
-                    &human_random_trace(now_ms, 100 + idx as u64 * 17),
-                    &[
-                        7_000, 24_000, 43_000, 61_000, 84_000, 102_000, 129_000, 151_000, 176_000,
-                    ],
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let history = VecDeque::new();
-        let debug = debug_summary(&records, &history, 0.97, now_ms);
-        let evaluation = evaluate(records, history, 0.97, now_ms);
-        assert_eq!(evaluation.suspicious_cluster_count, 0, "{debug}");
-        assert!(evaluation.evicted_session_ids.is_empty(), "{debug}");
-    }
-
-    #[test]
-    fn older_session_survives_when_cluster_is_shrunk() {
+    fn older_sessions_have_retention_priority_when_clusters_shrink() {
         let now_ms = 800_000;
-        let history_records = (0..6)
-            .map(|idx| {
-                build_session(
-                    idx + 1,
+        let history = archive(
+            &swarm(6, 1, REPLAY_OUTPUTS, |idx| {
+                (
                     ipv4((idx + 1) as u8),
-                    if idx % 2 == 0 {
-                        Transport::Ssh
-                    } else {
-                        Transport::Web
-                    },
+                    transport(idx),
                     now_ms - 620_000 - idx as u64 * 3_000,
-                    &replay_trace(now_ms - 250_000, (idx % 3) as u64),
-                    &[10_000, 38_000, 75_000, 112_000, 148_000, 181_000, 213_000],
+                    replay_trace(now_ms - 250_000, (idx % 3) as u64),
                 )
-            })
-            .collect::<Vec<_>>();
-        let history = archive(&history_records, now_ms - 210_000);
-        let active_records = (0..5)
-            .map(|idx| {
-                build_session(
-                    100 + idx as u64,
+            }),
+            now_ms - 210_000,
+        );
+        let records = swarm(
+            5,
+            100,
+            &[9_000, 36_000, 74_000, 109_000, 145_000, 179_000, 214_000],
+            |idx| {
+                (
                     ipv4((40 + idx) as u8),
                     Transport::Ssh,
                     now_ms - 300_000 + idx as u64 * 40_000,
-                    &replay_trace(now_ms, (idx % 3) as u64),
-                    &[9_000, 36_000, 74_000, 109_000, 145_000, 179_000, 214_000],
+                    replay_trace(now_ms, (idx % 3) as u64),
                 )
-            })
-            .collect::<Vec<_>>();
-
-        let debug = debug_summary(&active_records, &history, 0.95, now_ms);
-        let evaluation = evaluate(active_records, history, 0.95, now_ms);
+            },
+        );
+        let (evaluation, debug) = evaluate_case(records, history, 0.95, now_ms);
         assert_eq!(evaluation.suspicious_cluster_count, 1, "{debug}");
         assert!(!evaluation.evicted_session_ids.contains(&100), "{debug}");
         assert!(evaluation.evicted_session_ids.len() >= 3, "{debug}");
