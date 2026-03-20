@@ -3,6 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 mod admission;
+mod cluster_detection;
 mod metrics;
 mod ssh;
 mod web;
@@ -277,9 +278,9 @@ async fn main() -> Result<()> {
             .await
             .context("Failed to initialize remote libsql client")?
     } else {
-        libsql::Builder::new_local("./terminal-games.db")
-            .build()
-            .await?
+        let db_path = std::env::var("TERMINAL_GAMES_DB_PATH")
+            .unwrap_or_else(|_| "./terminal-games.db".to_string());
+        libsql::Builder::new_local(db_path).build().await?
     };
 
     let conn = db.connect().context("Failed to connect to libsql")?;
@@ -320,6 +321,8 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(max_active_apps_per_ip);
+    let ssh_captcha_threshold =
+        parse_ssh_captcha_threshold(std::env::var("SSH_CAPTCHA_THRESHOLD"))?;
     let (ban_updates, last_ban_inserted_at) = load_ip_ban_updates(&conn, None).await?;
     let banned_ips = build_ban_snapshot(ban_updates);
     tracing::debug!(
@@ -333,6 +336,7 @@ async fn main() -> Result<()> {
             max_running: max_active_apps,
             max_running_per_ip: max_active_apps_per_ip,
             max_queued_per_ip: max_queued_apps_per_ip,
+            ssh_captcha_threshold,
         },
         banned_ips,
         metrics.clone(),
@@ -346,6 +350,9 @@ async fn main() -> Result<()> {
         max_active_apps,
         max_active_apps_per_ip,
         max_queued_apps_per_ip,
+        ssh_captcha_threshold = ssh_captcha_threshold
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "disabled".to_string()),
         "Configured admission limits"
     );
 
@@ -376,6 +383,39 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+fn parse_ssh_captcha_threshold(raw: Result<String, std::env::VarError>) -> Result<Option<f64>> {
+    let raw = match raw {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(Some(0.5)),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("SSH_CAPTCHA_THRESHOLD is not valid Unicode");
+        }
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("SSH_CAPTCHA_THRESHOLD cannot be empty");
+    }
+
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "off" | "none" | "disabled" | "false"
+    ) {
+        return Ok(None);
+    }
+
+    let threshold = trimmed.parse::<f64>().map_err(|_| {
+        anyhow::anyhow!(
+            "SSH_CAPTCHA_THRESHOLD must be a number between 0.0 and 1.0, or one of: off, none, disabled"
+        )
+    })?;
+    if !(0.0..=1.0).contains(&threshold) {
+        anyhow::bail!("SSH_CAPTCHA_THRESHOLD must be between 0.0 and 1.0");
+    }
+    Ok(Some(threshold))
+}
+
 fn normalize_expires_at(expires_at_raw: i64) -> Option<i64> {
     (expires_at_raw >= 0).then_some(expires_at_raw)
 }

@@ -182,6 +182,9 @@ pub struct ServerMetrics {
 
     admission_waiting_sessions: IntGaugeVec,
     admission_queue_exits_total: IntCounterVec,
+    ip_ban_events_total: IntCounterVec,
+    ip_bans_active: IntGaugeVec,
+    cluster_enforcement_total: IntCounterVec,
     active_sessions: IntGaugeVec,
     sessions_total: IntCounterVec,
     session_duration_seconds: GaugeVec,
@@ -251,6 +254,33 @@ impl ServerMetrics {
                     "Queued sessions that left the queue, grouped by outcome",
                 ),
                 &["region", "transport", "outcome"],
+            )?,
+        )?;
+        let ip_ban_events_total = register(
+            &registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "terminal_games_ip_ban_events_total",
+                    "IP ban lifecycle events grouped by outcome",
+                ),
+                &["region", "outcome"],
+            )?,
+        )?;
+        let ip_bans_active = register(
+            &registry,
+            IntGaugeVec::new(
+                Opts::new("terminal_games_ip_bans_active", "Currently active IP bans"),
+                &["region"],
+            )?,
+        )?;
+        let cluster_enforcement_total = register(
+            &registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "terminal_games_cluster_enforcement_total",
+                    "Cluster-defense enforcement actions grouped by transport and action",
+                ),
+                &["region", "transport"],
             )?,
         )?;
         let active_sessions = register(
@@ -394,6 +424,9 @@ impl ServerMetrics {
             duration_writer,
             admission_waiting_sessions,
             admission_queue_exits_total,
+            ip_ban_events_total,
+            ip_bans_active,
+            cluster_enforcement_total,
             active_sessions,
             sessions_total,
             session_duration_seconds,
@@ -439,6 +472,39 @@ impl ServerMetrics {
     pub fn record_admission_abandoned_queue(&self, transport: Transport) {
         self.admission_queue_exits_total
             .with_label_values(&[self.region.as_str(), transport.as_str(), "abandoned"])
+            .inc();
+    }
+
+    pub fn record_ip_ban_update(
+        &self,
+        activated: usize,
+        deactivated: usize,
+        evicted_from_queue: usize,
+        active_ban_count: usize,
+    ) {
+        if activated > 0 {
+            self.ip_ban_events_total
+                .with_label_values(&[self.region.as_str(), "activated"])
+                .inc_by(activated as u64);
+        }
+        if deactivated > 0 {
+            self.ip_ban_events_total
+                .with_label_values(&[self.region.as_str(), "deactivated"])
+                .inc_by(deactivated as u64);
+        }
+        if evicted_from_queue > 0 {
+            self.ip_ban_events_total
+                .with_label_values(&[self.region.as_str(), "queue_evicted"])
+                .inc_by(evicted_from_queue as u64);
+        }
+        self.ip_bans_active
+            .with_label_values(&[self.region.as_str()])
+            .set(active_ban_count as i64);
+    }
+
+    pub fn record_cluster_enforcement(&self, transport: Transport) {
+        self.cluster_enforcement_total
+            .with_label_values(&[self.region.as_str(), transport.as_str()])
             .inc();
     }
 

@@ -14,14 +14,14 @@ use russh::server::*;
 use russh::{Channel, ChannelId, Pty};
 use tokio_util::sync::CancellationToken;
 
-use terminal_games::app::{AppInstantiationParams, AppServer};
+use terminal_games::app::{AppInstantiationParams, AppServer, SessionControl, SessionEndReason};
 use terminal_games::input_guard::InputGuard;
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::palette;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
 
-use crate::admission::{AdmissionController, AdmissionRejection, AdmissionState, AdmissionTicket};
+use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 
 pub struct SshSession {
@@ -382,7 +382,7 @@ impl SshServer {
                 let _ = session_handle
                     .disconnect(
                         russh::Disconnect::ByApplication,
-                        AdmissionRejection::BannedIp.user_message().to_string(),
+                        SessionEndReason::BannedIp.user_message().to_string(),
                         "en-US".to_string(),
                     )
                     .await;
@@ -402,6 +402,8 @@ impl SshServer {
                 user_id,
             );
             let active_shortname_tracker = session_guard.active_shortname_tracker();
+            let mut admitted_session = admission_ticket.start_session(session_guard);
+            let mut cluster_control = admitted_session.subscribe_control();
             let (first_cols, first_rows) = *resize_rx.borrow();
             let terminal_parser = input_guard.take_terminal_parser(first_rows, first_cols);
 
@@ -426,8 +428,7 @@ impl SshServer {
                 active_shortname_tracker: Some(active_shortname_tracker),
                 idle_fuel_receiver: Some(idle_fuel_rx),
             });
-            let mut disconnect_message = "Thanks for playing!";
-            loop {
+            let close_reason = loop {
                 tokio::select! {
                     biased;
 
@@ -443,11 +444,36 @@ impl SshServer {
                                 tracing::error!(?error, "App exit channel dropped");
                             }
                         }
-                        break;
+                        if input_guard.is_idle_timed_out() {
+                            break SessionEndReason::IdleTimeout;
+                        }
+                        break SessionEndReason::NormalExit;
+                    }
+
+                    changed = cluster_control.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        let SessionControl::Close(reason) = *cluster_control.borrow() else {
+                            continue;
+                        };
+                        shutdown_token.cancel();
+                        break reason;
+                    }
+
+                    changed = ban_changes.changed() => {
+                        if changed.is_err() || !admission_controller.is_ip_banned(client_ip) {
+                            continue;
+                        }
+                        shutdown_token.cancel();
+                        break SessionEndReason::BannedIp;
                     }
 
                     data = raw_input_rx.recv() => {
-                        let Some(data) = data else { break };
+                        let Some(data) = data else {
+                            break SessionEndReason::ConnectionLost;
+                        };
+                        admitted_session.record_input(&data);
                         let _ = input_guard.prepare_input(data).try_send();
                     }
 
@@ -456,36 +482,34 @@ impl SshServer {
                     }
 
                     data = audio_rx.recv(), if has_audio => {
-                        let Some(data) = data else { break };
+                        let Some(data) = data else {
+                            break SessionEndReason::NormalExit;
+                        };
+                        admitted_session.record_output(data.len());
                         metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
-                        let _ = session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, russh::CryptoVec::from_slice(&data)).await;
+                        if session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, russh::CryptoVec::from_slice(&data)).await.is_err() {
+                            break SessionEndReason::ConnectionLost;
+                        }
                     }
 
                     data = output_rx.recv() => {
-                        let Some(data) = data else { break };
+                        let Some(data) = data else {
+                            break SessionEndReason::NormalExit;
+                        };
+                        admitted_session.record_output(data.len());
                         metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
-                        let _ = session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await;
-                    }
-
-                    changed = ban_changes.changed() => {
-                        if changed.is_err() || !admission_controller.is_ip_banned(client_ip) {
-                            continue;
+                        if session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await.is_err() {
+                            break SessionEndReason::ConnectionLost;
                         }
-                        disconnect_message = AdmissionRejection::BannedIp.user_message();
-                        shutdown_token.cancel();
-                        break;
                     }
                 }
-            }
-            drop(admission_ticket);
-            drop(session_guard);
-
+            };
             restore_terminal_state(&session_handle, channel_id).await;
 
             let _ = session_handle
                 .disconnect(
                     russh::Disconnect::ByApplication,
-                    disconnect_message.to_string(),
+                    close_reason.user_message().to_string(),
                     "en-US".to_string(),
                 )
                 .await;
@@ -588,7 +612,7 @@ async fn solve_captcha(
 enum AdmissionWaitResult {
     Allowed,
     Disconnected,
-    Rejected(AdmissionRejection),
+    Rejected(SessionEndReason),
 }
 
 async fn wait_for_admission(

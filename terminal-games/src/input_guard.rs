@@ -161,6 +161,10 @@ impl InputGuard {
         }
     }
 
+    pub fn is_idle_timed_out(&self) -> bool {
+        self.current_fuel == 0
+    }
+
     fn observe_input(&mut self, data: &[u8]) {
         if is_interrupt(data) {
             self.cancellation_token.cancel();
