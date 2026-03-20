@@ -2,12 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use ipnet::IpNet;
 use smallvec::SmallVec;
 use tokio::sync::{mpsc, watch};
 
@@ -60,7 +61,7 @@ pub struct AdmissionController {
 
 struct Inner {
     config: AdmissionConfig,
-    banned_ips: Mutex<HashMap<IpAddr, Option<i64>>>,
+    banned_ips: Mutex<HashMap<String, StoredBan>>,
     ban_changes: watch::Sender<()>,
     metrics: Arc<ServerMetrics>,
     next_id: AtomicU64,
@@ -163,6 +164,42 @@ pub struct BanUpdateSummary {
     pub active_ban_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BanRule {
+    pub(crate) key: String,
+    pub(crate) matcher: IpNet,
+}
+
+impl BanRule {
+    pub(crate) fn parse(raw: impl Into<String>) -> Result<Self, String> {
+        let key = raw.into();
+        let value = key.trim();
+        if value.is_empty() {
+            return Err("ban rule is empty".to_string());
+        }
+        if let Ok(network) = value.parse::<IpNet>() {
+            return Ok(Self {
+                key,
+                matcher: network,
+            });
+        }
+        Err("ban rule must be a valid CIDR range".to_string())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StoredBan {
+    pub(crate) matcher: IpNet,
+    pub(crate) reason: Option<String>,
+    pub(crate) expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MatchedBan {
+    pub(crate) rule: String,
+    pub(crate) reason: Option<String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct LiveSessionRecord {
     pub(crate) id: u64,
@@ -219,7 +256,7 @@ struct ClusterManager {
 impl AdmissionController {
     pub fn new(
         config: AdmissionConfig,
-        initial_banned_ips: HashMap<IpAddr, Option<i64>>,
+        initial_banned_ips: HashMap<String, StoredBan>,
         metrics: Arc<ServerMetrics>,
     ) -> Self {
         let (ban_changes, _) = watch::channel(());
@@ -249,14 +286,16 @@ impl AdmissionController {
     pub fn issue_ticket(&self, transport: Transport, client_ip: IpAddr) -> AdmissionTicket {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = watch::channel(AdmissionState::Queued(1));
-        let is_banned = self.is_ip_banned(client_ip);
+        let matched_ban = self.matching_ip_ban(client_ip);
 
         {
             let mut state = lock(&self.inner.state);
-            if is_banned {
+            if let Some(ban) = matched_ban {
                 tracing::warn!(
                     client_ip = %client_ip,
                     transport = transport.as_str(),
+                    ban_rule = %ban.rule,
+                    ban_reason = ban.reason.as_deref().unwrap_or("<none>"),
                     running = state.running.len(),
                     running_for_ip = state.running_for_ip(client_ip),
                     queued_for_ip = state.queued_for_ip(client_ip),
@@ -315,60 +354,64 @@ impl AdmissionController {
         self.inner.ban_changes.subscribe()
     }
 
-    pub fn is_ip_banned(&self, client_ip: IpAddr) -> bool {
+    pub fn matching_ip_ban(&self, client_ip: IpAddr) -> Option<MatchedBan> {
         let mut banned_ips = lock(&self.inner.banned_ips);
-        match banned_ips.get(&client_ip).copied() {
-            Some(expires_at) if is_ban_active(expires_at, current_unix_seconds()) => true,
-            Some(_) => {
-                banned_ips.remove(&client_ip);
-                false
-            }
-            None => false,
-        }
+        matching_ban_for_ip(&mut banned_ips, client_ip)
     }
 
-    pub fn apply_ban_updates(&self, updates: Vec<(IpAddr, Option<i64>)>) -> BanUpdateSummary {
+    pub fn is_ip_banned(&self, client_ip: IpAddr) -> bool {
+        self.matching_ip_ban(client_ip).is_some()
+    }
+
+    pub fn apply_ban_updates(
+        &self,
+        updates: Vec<(BanRule, Option<String>, Option<i64>)>,
+    ) -> BanUpdateSummary {
         let now = current_unix_seconds();
-        let mut newly_banned = HashSet::new();
-        let mut newly_banned_entries = Vec::new();
-        let mut deactivated_ips = Vec::new();
+        let mut newly_banned_rules = Vec::new();
+        let mut deactivated_rules = Vec::new();
         let mut deactivated = 0usize;
         let mut activated = 0usize;
         let active_ban_count;
         {
             let mut current = lock(&self.inner.banned_ips);
-            for (ip, expires_at) in updates {
+            for (rule, reason, expires_at) in updates {
                 let was_active = current
-                    .get(&ip)
-                    .copied()
-                    .is_some_and(|expires_at| is_ban_active(expires_at, now));
+                    .get(&rule.key)
+                    .is_some_and(|entry| is_ban_active(entry.expires_at, now));
                 if is_ban_active(expires_at, now) {
-                    current.insert(ip, expires_at);
+                    current.insert(
+                        rule.key.clone(),
+                        StoredBan {
+                            matcher: rule.matcher.clone(),
+                            reason: reason.clone(),
+                            expires_at,
+                        },
+                    );
                     if !was_active {
-                        newly_banned.insert(ip);
-                        newly_banned_entries.push((ip, expires_at));
+                        newly_banned_rules.push((rule, reason, expires_at));
                         activated += 1;
                     }
                 } else {
-                    if current.remove(&ip).is_some() {
+                    if current.remove(&rule.key).is_some() {
                         deactivated += 1;
-                        deactivated_ips.push(ip);
+                        deactivated_rules.push(rule);
                     }
                 }
             }
             active_ban_count = current.len();
         }
 
-        if newly_banned.is_empty() {
+        if newly_banned_rules.is_empty() {
             let summary = BanUpdateSummary {
                 activated,
                 deactivated,
                 evicted_from_queue: 0,
                 active_ban_count,
             };
-            for ip in deactivated_ips {
+            for rule in deactivated_rules {
                 tracing::info!(
-                    client_ip = %ip,
+                    ban_rule = %rule.key,
                     active_ban_count = summary.active_ban_count,
                     "Deactivated IP ban"
                 );
@@ -387,7 +430,10 @@ impl AdmissionController {
         let mut removed_any = false;
         let mut evicted_from_queue = 0usize;
         while idx < state.queue.len() {
-            if newly_banned.contains(&state.queue[idx].client_ip) {
+            if newly_banned_rules
+                .iter()
+                .any(|(rule, _, _)| rule.matcher.contains(&state.queue[idx].client_ip))
+            {
                 let ticket = state.queue.remove(idx).expect("index checked against len");
                 let _ = ticket
                     .tx
@@ -408,18 +454,19 @@ impl AdmissionController {
             evicted_from_queue,
             active_ban_count,
         };
-        for (ip, expires_at) in newly_banned_entries {
+        for (rule, reason, expires_at) in newly_banned_rules {
             tracing::warn!(
-                client_ip = %ip,
+                ban_rule = %rule.key,
+                ban_reason = reason.as_deref().unwrap_or("<none>"),
                 expires_at,
                 evicted_from_queue,
                 active_ban_count = summary.active_ban_count,
                 "Activated IP ban"
             );
         }
-        for ip in deactivated_ips {
+        for rule in deactivated_rules {
             tracing::info!(
-                client_ip = %ip,
+                ban_rule = %rule.key,
                 active_ban_count = summary.active_ban_count,
                 "Deactivated IP ban"
             );
@@ -783,6 +830,39 @@ fn update_session_control(
 
 fn is_ban_active(expires_at: Option<i64>, now: i64) -> bool {
     expires_at.is_none_or(|expires_at| expires_at > now)
+}
+
+fn matching_ban_for_ip(
+    banned_ips: &mut HashMap<String, StoredBan>,
+    client_ip: IpAddr,
+) -> Option<MatchedBan> {
+    let now = current_unix_seconds();
+    let mut expired_keys = Vec::new();
+    let mut best_match: Option<(MatchedBan, u8)> = None;
+    for (key, entry) in banned_ips.iter() {
+        if !is_ban_active(entry.expires_at, now) {
+            expired_keys.push(key.clone());
+            continue;
+        }
+        if !entry.matcher.contains(&client_ip) {
+            continue;
+        }
+        let candidate = MatchedBan {
+            rule: key.clone(),
+            reason: entry.reason.clone(),
+        };
+        let specificity = entry.matcher.prefix_len();
+        if best_match.as_ref().is_none_or(|(current, current_specificity)| {
+            specificity > *current_specificity
+                || (specificity == *current_specificity && candidate.rule < current.rule)
+        }) {
+            best_match = Some((candidate, specificity));
+        }
+    }
+    for key in expired_keys {
+        banned_ips.remove(&key);
+    }
+    best_match.map(|(ban, _)| ban)
 }
 
 fn current_unix_seconds() -> i64 {

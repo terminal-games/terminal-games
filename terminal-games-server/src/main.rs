@@ -11,7 +11,6 @@ mod web;
 use std::{
     collections::HashMap,
     fs,
-    net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -21,7 +20,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use wasmparser::{Parser, Payload};
 
-use crate::admission::AdmissionConfig;
+use crate::admission::{AdmissionConfig, BanRule, StoredBan};
 use terminal_games::{
     app::AppServer,
     mesh::{EnvDiscovery, Mesh},
@@ -170,18 +169,18 @@ async fn sync_games_from_embedded_manifests(conn: &libsql::Connection) -> Result
 async fn load_ip_ban_updates(
     conn: &libsql::Connection,
     since: Option<i64>,
-) -> Result<(Vec<(IpAddr, Option<i64>)>, i64)> {
+) -> Result<(Vec<(BanRule, Option<String>, Option<i64>)>, i64)> {
     let mut rows = match since {
         Some(last_inserted_at) => {
             conn.query(
-                "SELECT ip, COALESCE(expires_at, -1), inserted_at FROM ip_bans WHERE inserted_at > ?1 ORDER BY inserted_at ASC",
+                "SELECT ip, reason, COALESCE(expires_at, -1), inserted_at FROM ip_bans WHERE inserted_at > ?1 ORDER BY inserted_at ASC",
                 libsql::params!(last_inserted_at),
             )
             .await
         }
         None => {
             conn.query(
-                "SELECT ip, COALESCE(expires_at, -1), inserted_at FROM ip_bans ORDER BY inserted_at ASC",
+                "SELECT ip, reason, COALESCE(expires_at, -1), inserted_at FROM ip_bans ORDER BY inserted_at ASC",
                 (),
             )
             .await
@@ -194,30 +193,44 @@ async fn load_ip_ban_updates(
         let ip = row
             .get::<String>(0)
             .context("failed to decode ip ban value")?;
+        let reason = row
+            .get::<Option<String>>(1)
+            .context("failed to decode ip ban reason")?
+            .map(|reason| reason.trim().to_string())
+            .filter(|reason| !reason.is_empty());
         let expires_at = normalize_expires_at(
-            row.get::<i64>(1)
+            row.get::<i64>(2)
                 .context("failed to decode ip ban expiry")?,
         );
         newest_inserted_at = newest_inserted_at.max(
-            row.get::<i64>(2)
+            row.get::<i64>(3)
                 .context("failed to decode ip ban inserted_at")?,
         );
-        match ip.parse::<IpAddr>() {
-            Ok(ip) => updates.push((ip, expires_at)),
-            Err(error) => tracing::warn!(ip = %ip, error = ?error, "skipping invalid ip_bans row"),
+        match BanRule::parse(ip.clone()) {
+            Ok(rule) => updates.push((rule, reason, expires_at)),
+            Err(error) => tracing::warn!(ip = %ip, error = %error, "skipping invalid ip_bans row"),
         }
     }
     Ok((updates, newest_inserted_at))
 }
 
-fn build_ban_snapshot(updates: Vec<(IpAddr, Option<i64>)>) -> HashMap<IpAddr, Option<i64>> {
+fn build_ban_snapshot(
+    updates: Vec<(BanRule, Option<String>, Option<i64>)>,
+) -> HashMap<String, StoredBan> {
     let now = current_unix_seconds();
     let mut banned_ips = HashMap::new();
-    for (ip, expires_at) in updates {
+    for (rule, reason, expires_at) in updates {
         if is_ban_active(expires_at, now) {
-            banned_ips.insert(ip, expires_at);
+            banned_ips.insert(
+                rule.key,
+                StoredBan {
+                    matcher: rule.matcher,
+                    reason,
+                    expires_at,
+                },
+            );
         } else {
-            banned_ips.remove(&ip);
+            banned_ips.remove(&rule.key);
         }
     }
     banned_ips

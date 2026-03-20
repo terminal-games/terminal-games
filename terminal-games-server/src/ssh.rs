@@ -377,7 +377,14 @@ impl SshServer {
                 }
             }
             let mut ban_changes = admission_controller.subscribe_ban_changes();
-            if admission_controller.is_ip_banned(client_ip) {
+            if let Some(ban) = admission_controller.matching_ip_ban(client_ip) {
+                tracing::warn!(
+                    client_ip = %client_ip,
+                    transport = Transport::Ssh.as_str(),
+                    ban_rule = %ban.rule,
+                    ban_reason = ban.reason.as_deref().unwrap_or("<none>"),
+                    "Rejected client from active IP ban after admission"
+                );
                 restore_terminal_state(&session_handle, channel_id).await;
                 let _ = session_handle
                     .disconnect(
