@@ -553,19 +553,7 @@ impl Drop for AdmissionTicket {
                     state.refresh_queue_positions();
                 }
             }
-            AdmissionState::Rejected(reason) => {
-                if reason == SessionEndReason::ClusterLimited {
-                    tracing::warn!(
-                        ticket_id = self.id,
-                        client_ip = %self.client_ip,
-                        transport = self.transport.as_str(),
-                        "Rejected session due to suspected bot cluster"
-                    );
-                    self.controller
-                        .metrics
-                        .record_cluster_enforcement(self.transport, "rejected");
-                }
-            }
+            AdmissionState::Rejected(_reason) => {}
         }
         state.record_metrics(&self.controller.metrics);
     }
@@ -768,8 +756,7 @@ impl ClusterManager {
                             summary.contributions.edge_low_engagement_interaction,
                         "Evicting session due to suspected bot cluster"
                     );
-                    self.metrics
-                        .record_cluster_enforcement(session.transport, "evicted");
+                    self.metrics.record_cluster_enforcement(session.transport);
                 }
             }
         }

@@ -280,7 +280,7 @@ impl ServerMetrics {
                     "terminal_games_cluster_enforcement_total",
                     "Cluster-defense enforcement actions grouped by transport and action",
                 ),
-                &["region", "transport", "action"],
+                &["region", "transport"],
             )?,
         )?;
         let active_sessions = register(
@@ -502,9 +502,9 @@ impl ServerMetrics {
             .set(active_ban_count as i64);
     }
 
-    pub fn record_cluster_enforcement(&self, transport: Transport, action: &'static str) {
+    pub fn record_cluster_enforcement(&self, transport: Transport) {
         self.cluster_enforcement_total
-            .with_label_values(&[self.region.as_str(), transport.as_str(), action])
+            .with_label_values(&[self.region.as_str(), transport.as_str()])
             .inc();
     }
 

@@ -304,12 +304,7 @@ fn evaluate_clusters(
         max_cluster_score = max_cluster_score.max(score);
         suspicious_cluster_count += 1;
 
-        let summary = cluster_eviction_summary(
-            factors,
-            component.len(),
-            score,
-            required_score,
-        );
+        let summary = cluster_eviction_summary(factors, component.len(), score, required_score);
         for &idx in &component {
             let session_id = sessions[idx].session_id;
             evicted_session_ids.insert(session_id);
