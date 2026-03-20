@@ -13,9 +13,8 @@
 //! signatures from prior sessions so the detector can score replay and template reuse across time
 //! rather than only comparing currently active sessions. Pairwise evidence induces a correlation
 //! graph; connected components become suspicious clusters when their aggregate likelihood remains
-//! strong under current server pressure. As pressure rises, the allowed size of a suspicious
-//! cluster shrinks from observation-only to soft capping and finally targeted eviction of the
-//! lowest-retention sessions in that cluster. Isolated sessions are never evicted by this logic;
+//! strong under current server pressure. Once a correlated cluster clears the suspicion threshold,
+//! enforcement evicts the whole cluster. Isolated sessions are never evicted by this logic;
 //! enforcement only applies to correlated groups.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -43,7 +42,6 @@ struct SessionAssessment {
     client_ip: IpAddr,
     ip_prefix: NetworkPrefix,
     started_at_ms: u64,
-    retention_score: f64,
     low_engagement: f64,
     replay_score: f64,
     replay_match_count: usize,
@@ -92,9 +90,34 @@ struct PairEvidence {
     score: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClusterScores {
+    pub(crate) avg_edge: f64,
+    pub(crate) avg_replay: f64,
+    pub(crate) avg_replay_density: f64,
+    pub(crate) avg_low_engagement: f64,
+    pub(crate) avg_coupling_deficit: f64,
+    pub(crate) network_cohesion: f64,
+    pub(crate) start_sync: f64,
+    pub(crate) size_factor: f64,
+    pub(crate) pressure: f64,
+    pub(crate) edge_low_engagement_interaction: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClusterEvictionSummary {
+    pub(crate) cluster_size: usize,
+    pub(crate) score: f64,
+    pub(crate) required_score: f64,
+    pub(crate) score_margin: f64,
+    pub(crate) factors: ClusterScores,
+    pub(crate) contributions: ClusterScores,
+}
+
 pub(crate) struct ClusterEvaluation {
     pub(crate) suspicious_cluster_count: usize,
     pub(crate) evicted_session_ids: HashSet<u64>,
+    pub(crate) eviction_summaries: HashMap<u64, ClusterEvictionSummary>,
     pub(crate) max_cluster_score: f64,
 }
 
@@ -103,6 +126,7 @@ impl ClusterEvaluation {
         Self {
             suspicious_cluster_count: 0,
             evicted_session_ids: HashSet::new(),
+            eviction_summaries: HashMap::new(),
             max_cluster_score: 0.0,
         }
     }
@@ -136,18 +160,6 @@ struct DerivedInputEvent {
 struct ParsedMouseEvent {
     motion: bool,
     coord_bucket: u16,
-}
-
-#[derive(Clone)]
-struct ComponentStats {
-    avg_edge: f64,
-    avg_low_engagement: f64,
-    avg_replay: f64,
-    avg_replay_density: f64,
-    avg_coupling_deficit: f64,
-    network_cohesion: f64,
-    start_sync: f64,
-    size_factor: f64,
 }
 
 struct DisjointSet {
@@ -268,47 +280,47 @@ fn evaluate_clusters(
 
     let mut edge_scores: HashMap<(u64, u64), f64> = HashMap::new();
     for edge in &edges {
-        edge_scores.insert(edge_key(edge.a, edge.b), edge.score);
+        edge_scores
+            .entry(edge_key(edge.a, edge.b))
+            .and_modify(|score| *score = score.max(edge.score))
+            .or_insert(edge.score);
     }
 
     let mut suspicious_cluster_count = 0usize;
     let mut evicted_session_ids = HashSet::new();
+    let mut eviction_summaries = HashMap::new();
     let mut max_cluster_score: f64 = 0.0;
+    let required_score = required_cluster_score(pressure);
 
     for component in components.into_values() {
         if component.len() < MIN_CLUSTER_SIZE {
             continue;
         }
-        let stats = cluster_stats(&sessions, &component, &edge_scores);
-        let score = cluster_score(&stats, pressure);
-        if score < required_cluster_score(pressure) {
+        let factors = cluster_scores(&sessions, &component, &edge_scores, pressure);
+        let score = factors.score();
+        if score < required_score {
             continue;
         }
         max_cluster_score = max_cluster_score.max(score);
         suspicious_cluster_count += 1;
 
-        let cap = cluster_cap(&stats, pressure);
-        if component.len() > cap {
-            let mut ranked = component.clone();
-            ranked.sort_by(|left, right| {
-                retention_priority(&sessions[*right])
-                    .partial_cmp(&retention_priority(&sessions[*left]))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| {
-                        sessions[*left]
-                            .started_at_ms
-                            .cmp(&sessions[*right].started_at_ms)
-                    })
-            });
-            for &idx in &ranked[cap..] {
-                evicted_session_ids.insert(sessions[idx].session_id);
-            }
+        let summary = cluster_eviction_summary(
+            factors,
+            component.len(),
+            score,
+            required_score,
+        );
+        for &idx in &component {
+            let session_id = sessions[idx].session_id;
+            evicted_session_ids.insert(session_id);
+            eviction_summaries.insert(session_id, summary);
         }
     }
 
     ClusterEvaluation {
         suspicious_cluster_count,
         evicted_session_ids,
+        eviction_summaries,
         max_cluster_score,
     }
 }
@@ -354,11 +366,12 @@ fn materialize_replay_cohort(
     }
 }
 
-fn cluster_stats(
+fn cluster_scores(
     sessions: &[SessionAssessment],
     component: &[usize],
     edge_scores: &HashMap<(u64, u64), f64>,
-) -> ComponentStats {
+    pressure: f64,
+) -> ClusterScores {
     let mut edge_sum = 0.0;
     let mut edge_count = 0usize;
     let mut low_engagement_sum = 0.0;
@@ -394,66 +407,89 @@ fn cluster_stats(
         .map(|count| *count as f64 / component.len() as f64)
         .unwrap_or(0.0);
     let start_spread_ms = newest.saturating_sub(oldest);
-    ComponentStats {
-        avg_edge: if edge_count == 0 {
-            0.0
-        } else {
-            edge_sum / edge_count as f64
-        },
-        avg_low_engagement: low_engagement_sum / component.len() as f64,
+    let avg_edge = if edge_count == 0 {
+        0.0
+    } else {
+        edge_sum / edge_count as f64
+    };
+    let avg_low_engagement = low_engagement_sum / component.len() as f64;
+    ClusterScores {
+        avg_edge,
         avg_replay: replay_sum / component.len() as f64,
         avg_replay_density: replay_density_sum / component.len() as f64,
+        avg_low_engagement,
         avg_coupling_deficit: coupling_deficit_sum / component.len() as f64,
         network_cohesion,
         start_sync: (1.0 - start_spread_ms as f64 / (5.0 * 60_000.0)).clamp(0.0, 1.0),
         size_factor: ((component.len() as f64 - 1.0) / 6.0).clamp(0.0, 1.0),
+        pressure,
+        edge_low_engagement_interaction: avg_edge * avg_low_engagement,
     }
-}
-
-fn cluster_cap(stats: &ComponentStats, pressure: f64) -> usize {
-    if pressure >= 0.90 && stats.avg_replay_density >= 0.75 && stats.avg_edge >= 0.80 {
-        return 0;
-    }
-    if pressure >= 0.85 && stats.avg_replay >= 0.40 {
-        return 1;
-    }
-    2
 }
 
 fn required_cluster_score(pressure: f64) -> f64 {
     (0.82 - (pressure - LOW_PRESSURE_FLOOR).max(0.0) * 0.42).clamp(0.56, 0.82)
 }
 
-fn cluster_score(stats: &ComponentStats, pressure: f64) -> f64 {
-    if stats.size_factor <= 0.34
-        && stats.avg_low_engagement < 0.48
-        && stats.avg_replay < 0.84
-        && stats.avg_edge < 0.73
-    {
-        return 0.0;
+impl ClusterScores {
+    fn score(&self) -> f64 {
+        if self.size_factor <= 0.34
+            && self.avg_low_engagement < 0.48
+            && self.avg_replay < 0.84
+            && self.avg_edge < 0.73
+        {
+            return 0.0;
+        }
+        if self.avg_replay < 0.55 && self.avg_low_engagement < 0.70 && self.avg_edge < 0.73 {
+            return 0.0;
+        }
+        if self.network_cohesion < 0.4 && self.avg_low_engagement < 0.44 && self.avg_replay < 0.88 {
+            return 0.0;
+        }
+        let base = 0.48 * self.avg_edge
+            + 0.20 * self.avg_replay
+            + 0.09 * self.avg_replay_density
+            + 0.09 * self.avg_low_engagement
+            + 0.05 * self.avg_coupling_deficit
+            + 0.04 * self.network_cohesion
+            + 0.03 * self.start_sync;
+        (base
+            + 0.07 * self.size_factor
+            + 0.04 * self.pressure
+            + 0.08 * self.edge_low_engagement_interaction)
+            .clamp(0.0, 1.0)
     }
-    if stats.avg_replay < 0.55 && stats.avg_low_engagement < 0.70 && stats.avg_edge < 0.73 {
-        return 0.0;
+
+    fn contributions(&self) -> Self {
+        Self {
+            avg_edge: 0.48 * self.avg_edge,
+            avg_replay: 0.20 * self.avg_replay,
+            avg_replay_density: 0.09 * self.avg_replay_density,
+            avg_low_engagement: 0.09 * self.avg_low_engagement,
+            avg_coupling_deficit: 0.05 * self.avg_coupling_deficit,
+            network_cohesion: 0.04 * self.network_cohesion,
+            start_sync: 0.03 * self.start_sync,
+            size_factor: 0.07 * self.size_factor,
+            pressure: 0.04 * self.pressure,
+            edge_low_engagement_interaction: 0.08 * self.edge_low_engagement_interaction,
+        }
     }
-    if stats.network_cohesion < 0.4 && stats.avg_low_engagement < 0.44 && stats.avg_replay < 0.88 {
-        return 0.0;
-    }
-    let base = 0.48 * stats.avg_edge
-        + 0.20 * stats.avg_replay
-        + 0.09 * stats.avg_replay_density
-        + 0.09 * stats.avg_low_engagement
-        + 0.05 * stats.avg_coupling_deficit
-        + 0.04 * stats.network_cohesion
-        + 0.03 * stats.start_sync;
-    (base
-        + 0.07 * stats.size_factor
-        + 0.04 * pressure
-        + 0.08 * (stats.avg_edge * stats.avg_low_engagement))
-        .clamp(0.0, 1.0)
 }
 
-fn retention_priority(session: &SessionAssessment) -> f64 {
-    session.retention_score - 0.65 * session.replay_score
+fn cluster_eviction_summary(
+    factors: ClusterScores,
+    cluster_size: usize,
+    score: f64,
+    required_score: f64,
+) -> ClusterEvictionSummary {
+    ClusterEvictionSummary {
+        cluster_size,
+        score,
+        required_score,
+        score_margin: score - required_score,
+        factors,
+        contributions: factors.contributions(),
+    }
 }
 
 fn pair_evidence(
@@ -568,19 +604,11 @@ impl SessionAssessment {
             + 0.10 * avg_spectral_entropy
             + 0.10 * mouse_liveness;
         let low_engagement = (1.0 - interactivity + 0.30 * mechanicality).clamp(0.0, 1.0);
-        let age_norm = ((now_ms.saturating_sub(record.started_at_ms)) as f64
-            / INPUT_WINDOW_MS as f64)
-            .clamp(0.0, 1.0);
-        let retention_score = 0.44 * age_norm
-            + 0.34 * (1.0 - low_engagement)
-            + 0.12 * min_window_confidence(&windows)
-            + 0.10 * (avg_entropy + avg_innovation) * 0.5;
         Some(Self {
             session_id: record.id,
             client_ip: record.client_ip,
             ip_prefix: record.ip_prefix,
             started_at_ms: record.started_at_ms,
-            retention_score,
             low_engagement,
             replay_score: 0.0,
             replay_match_count: 0,
@@ -911,13 +939,6 @@ fn min_session_confidence(left: &SessionAssessment, right: &SessionAssessment) -
         |left, _| window_weight(left.span_ms),
         |left, right| (left.confidence * right.confidence).sqrt(),
     )
-}
-
-fn min_window_confidence(windows: &[WindowFingerprint]) -> f64 {
-    windows
-        .iter()
-        .map(|window| window.confidence)
-        .fold(1.0, f64::min)
 }
 
 fn weighted_window_average(
@@ -1562,9 +1583,8 @@ mod tests {
             .iter()
             .map(|session| {
                 format!(
-                    "session={} retain={:.3} low={:.3} replay={:.3} matches={} density={:.3} coupling={:.3} mouse={:.3}/{:.3} spectral={:.3}/{:.3}",
+                    "session={}  low={:.3} replay={:.3} matches={} density={:.3} coupling={:.3} mouse={:.3}/{:.3} spectral={:.3}/{:.3}",
                     session.session_id,
-                    session.retention_score,
                     session.low_engagement,
                     session.replay_score,
                     session.replay_match_count,
@@ -2224,7 +2244,7 @@ mod tests {
     }
 
     #[test]
-    fn older_sessions_have_retention_priority_when_clusters_shrink() {
+    fn suspicious_clusters_are_fully_evicted() {
         let now_ms = 800_000;
         let history = archive(
             &swarm(6, 1, REPLAY_OUTPUTS, |idx| {
@@ -2252,7 +2272,7 @@ mod tests {
         );
         let (evaluation, debug) = evaluate_case(records, history, 0.95, now_ms);
         assert_eq!(evaluation.suspicious_cluster_count, 1, "{debug}");
-        assert!(!evaluation.evicted_session_ids.contains(&100), "{debug}");
-        assert!(evaluation.evicted_session_ids.len() >= 3, "{debug}");
+        assert_eq!(evaluation.evicted_session_ids.len(), 5, "{debug}");
+        assert!(evaluation.evicted_session_ids.contains(&100), "{debug}");
     }
 }

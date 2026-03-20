@@ -712,14 +712,7 @@ impl ClusterManager {
 
     fn clear_controls(&mut self) {
         for (_, control_tx) in self.live_sessions.values_mut() {
-            let _ = control_tx.send_if_modified(|current| {
-                if *current == SessionControl::Active {
-                    false
-                } else {
-                    *current = SessionControl::Active;
-                    true
-                }
-            });
+            let _ = update_session_control(control_tx, SessionControl::Active);
         }
     }
 
@@ -730,15 +723,13 @@ impl ClusterManager {
             } else {
                 SessionControl::Active
             };
-            if control_tx.send_if_modified(|current| {
-                if *current == next {
-                    false
-                } else {
-                    *current = next;
-                    true
-                }
-            }) {
+            if update_session_control(control_tx, next) {
                 if matches!(next, SessionControl::Close(_)) {
+                    let summary = evaluation
+                        .eviction_summaries
+                        .get(&session.id)
+                        .copied()
+                        .expect("evicted session missing cluster summary");
                     tracing::warn!(
                         session_id = session.id,
                         client_ip = %session.client_ip,
@@ -746,6 +737,35 @@ impl ClusterManager {
                         pressure,
                         suspicious_cluster_count = evaluation.suspicious_cluster_count,
                         max_cluster_score = evaluation.max_cluster_score,
+                        cluster_score = summary.score,
+                        required_cluster_score = summary.required_score,
+                        cluster_score_margin = summary.score_margin,
+                        cluster_size = summary.cluster_size,
+                        avg_edge = summary.factors.avg_edge,
+                        avg_replay = summary.factors.avg_replay,
+                        avg_replay_density = summary.factors.avg_replay_density,
+                        avg_low_engagement = summary.factors.avg_low_engagement,
+                        avg_coupling_deficit = summary.factors.avg_coupling_deficit,
+                        network_cohesion = summary.factors.network_cohesion,
+                        start_sync = summary.factors.start_sync,
+                        size_factor = summary.factors.size_factor,
+                        edge_low_engagement_interaction =
+                            summary.factors.edge_low_engagement_interaction,
+                        avg_edge_contribution = summary.contributions.avg_edge,
+                        avg_replay_contribution = summary.contributions.avg_replay,
+                        avg_replay_density_contribution =
+                            summary.contributions.avg_replay_density,
+                        avg_low_engagement_contribution =
+                            summary.contributions.avg_low_engagement,
+                        avg_coupling_deficit_contribution =
+                            summary.contributions.avg_coupling_deficit,
+                        network_cohesion_contribution =
+                            summary.contributions.network_cohesion,
+                        start_sync_contribution = summary.contributions.start_sync,
+                        size_factor_contribution = summary.contributions.size_factor,
+                        pressure_contribution = summary.contributions.pressure,
+                        edge_low_engagement_interaction_contribution =
+                            summary.contributions.edge_low_engagement_interaction,
                         "Evicting session due to suspected bot cluster"
                     );
                     self.metrics
@@ -754,6 +774,24 @@ impl ClusterManager {
             }
         }
     }
+}
+
+fn update_session_control(
+    control_tx: &watch::Sender<SessionControl>,
+    next: SessionControl,
+) -> bool {
+    control_tx.send_if_modified(|current| {
+        if matches!(
+            (*current, next),
+            (SessionControl::Close(_), SessionControl::Active)
+        ) || *current == next
+        {
+            false
+        } else {
+            *current = next;
+            true
+        }
+    })
 }
 
 fn is_ban_active(expires_at: Option<i64>, now: i64) -> bool {
