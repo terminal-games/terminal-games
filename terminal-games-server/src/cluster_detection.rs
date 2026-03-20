@@ -30,6 +30,8 @@ use crate::admission::{
 use crate::admission::{InputSample, LiveSessionRecord, OutputSample};
 use smallvec::SmallVec;
 
+const PRESSURE_SATURATION_OCCUPANCY: f64 = 0.70;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum NetworkPrefix {
     V4(u32),
@@ -178,10 +180,10 @@ impl NetworkPrefix {
 
 pub(crate) fn compute_pressure(running: usize, max_running: usize) -> f64 {
     if max_running == 0 || max_running == usize::MAX {
-        0.0
-    } else {
-        (running as f64 / max_running as f64).clamp(0.0, 1.0)
+        return 0.0;
     }
+
+    ((running as f64 / max_running as f64) / PRESSURE_SATURATION_OCCUPANCY).clamp(0.0, 1.0)
 }
 
 pub(crate) fn trim_old_inputs(inputs: &mut VecDeque<InputSample>, now_ms: u64) {
