@@ -42,6 +42,8 @@ func resolveLocalized(preferred []language.Tag, localized map[string]string, fal
 }
 
 type gameDetails struct {
+	Author        string                           `json:"author"`
+	Version       string                           `json:"version"`
 	Name          map[string]string                `json:"name"`
 	Description   map[string]string                `json:"description"`
 	Details       map[string]string                `json:"details"`
@@ -57,6 +59,8 @@ type gameData struct {
 type gameItem struct {
 	ID          int64
 	Shortname   string
+	Author      string
+	Version     string
 	Name        string
 	Description string
 	Details     string
@@ -378,6 +382,8 @@ func (m *gamesModel) applyLocalization(localizer localizer, preferred []language
 		item := gameItem{
 			ID:          m.rawGames[i].ID,
 			Shortname:   m.rawGames[i].Shortname,
+			Author:      d.Author,
+			Version:     d.Version,
 			Name:        resolveLocalized(m.preferred, d.Name, m.rawGames[i].Shortname),
 			Description: resolveLocalized(m.preferred, d.Description, ""),
 			Details:     resolveLocalized(m.preferred, d.Details, ""),
@@ -457,12 +463,18 @@ func (m *gamesModel) renderGameDetailsContent(width, height int, allowInlineScre
 
 func (m *gamesModel) buildGameDetailsParts(item gameItem, width int, inlineScreenshots bool) []string {
 	details := clampUTF8Bytes(item.Details, maxDetailsRenderBytes)
-	parts := []string{
-		m.styles.Title.Render(item.Name),
-		m.styles.Subtle.Render(item.Description),
-		"",
-		m.styles.Body.Render(details),
+	title := m.styles.Title.Render(item.Name)
+	if item.Version != "" {
+		title += m.styles.Subtle.Render(" " + item.Version)
 	}
+	parts := []string{title}
+	if item.Description != "" {
+		parts = append(parts, m.styles.Subtle.Render(item.Description))
+	}
+	if item.Author != "" {
+		parts = append(parts, m.styles.Subtle.Render("by "+item.Author))
+	}
+	parts = append(parts, "", m.styles.Body.Render(details))
 
 	if len(item.Screenshots) > 0 {
 		switch {

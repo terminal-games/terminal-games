@@ -3,9 +3,11 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 pub mod app;
+pub mod control;
 mod audio;
 pub mod input_guard;
 pub mod log_backend;
+pub mod manifest;
 pub mod mesh;
 pub mod palette;
 pub mod rate_limiting;

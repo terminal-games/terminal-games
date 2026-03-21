@@ -22,7 +22,7 @@ use tarpc::{client, context, server};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Notify},
+    sync::{Mutex, Notify, broadcast},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector, rustls};
 use tokio_util::{
@@ -39,6 +39,7 @@ enum Message {
     PeerListSync(PeerListSyncMessage),
     PeerAdded(PeerChangeMessage),
     PeerRemoved(PeerChangeMessage),
+    GameVersionUpdated(GameVersionUpdateMessage),
 }
 
 #[tarpc::service]
@@ -47,6 +48,7 @@ trait MeshRpc {
     async fn peer_list_sync(msg: PeerListSyncMessage);
     async fn peer_added(msg: PeerChangeMessage);
     async fn peer_removed(msg: PeerChangeMessage);
+    async fn game_version_updated(msg: GameVersionUpdateMessage);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +61,13 @@ struct PeerListSyncMessage {
 struct PeerChangeMessage {
     peer_id: PeerId,
     app_id: AppId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameVersionUpdateMessage {
+    pub shortname: String,
+    pub game_id: u64,
+    pub version: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -138,12 +147,15 @@ pub struct PeerMessage {
     data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash)]
-pub struct AppId(pub u64);
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash, PartialOrd, Ord)]
+pub struct AppId {
+    pub game_id: u64,
+    pub version: u64,
+}
 
 impl Display for AppId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(f, "{}:{}", self.game_id, self.version)
     }
 }
 
@@ -415,6 +427,7 @@ struct MeshInner {
     cancel: CancellationToken,
     tasks: TaskTracker,
     heal_now: Notify,
+    game_version_updates: broadcast::Sender<GameVersionUpdateMessage>,
 }
 
 #[derive(Clone)]
@@ -435,6 +448,7 @@ impl Mesh {
     pub fn with_region(discovery: Arc<dyn Discovery>, region: RegionId) -> Self {
         Self {
             inner: Arc::new(MeshInner {
+                game_version_updates: broadcast::channel(64).0,
                 region,
                 regions: Default::default(),
                 peers: Default::default(),
@@ -601,12 +615,37 @@ impl Mesh {
             .and_then(|conn| get_tcp_rtt_from_fd(conn.conn_fd).ok())
     }
 
+    pub async fn discover_regions(&self) -> anyhow::Result<Vec<RegionId>> {
+        let mut regions = self
+            .inner
+            .discovery
+            .discover_peers()
+            .await?
+            .into_iter()
+            .map(|(region, _)| region)
+            .collect::<Vec<_>>();
+        regions.push(self.inner.region);
+        regions.sort_unstable();
+        regions.dedup();
+        Ok(regions)
+    }
+
     pub async fn graceful_shutdown(&self) {
         tracing::debug!("Mesh graceful shutdown initiated");
         self.inner.cancel.cancel();
         self.inner.tasks.close();
         self.inner.tasks.wait().await;
         tracing::debug!("Mesh graceful shutdown complete");
+    }
+
+    pub fn subscribe_game_version_updates(&self) -> broadcast::Receiver<GameVersionUpdateMessage> {
+        self.inner.game_version_updates.subscribe()
+    }
+
+    pub async fn propagate_game_version_update(&self, update: GameVersionUpdateMessage) {
+        self.inner
+            .broadcast(Message::GameVersionUpdated(update))
+            .await;
     }
 }
 
@@ -892,6 +931,7 @@ impl MeshInner {
                                 Message::PeerListSync(msg) => rpc_client.peer_list_sync(context::current(), msg).await,
                                 Message::PeerAdded(msg) => rpc_client.peer_added(context::current(), msg).await,
                                 Message::PeerRemoved(msg) => rpc_client.peer_removed(context::current(), msg).await,
+                                Message::GameVersionUpdated(msg) => rpc_client.game_version_updated(context::current(), msg).await,
                             };
                             if let Err(error) = send_result {
                                 tracing::warn!(region=%their_region, ?error, "RPC send failed");
@@ -1065,6 +1105,10 @@ impl MeshInner {
                 }
             }
         }
+    }
+
+    async fn handle_game_version_updated(&self, msg: GameVersionUpdateMessage) {
+        let _ = self.game_version_updates.send(msg);
     }
 }
 
@@ -1353,5 +1397,9 @@ impl MeshRpc for MeshRpcServer {
 
     async fn peer_removed(self, _: context::Context, msg: PeerChangeMessage) {
         self.inner.handle_peer_removed(msg).await;
+    }
+
+    async fn game_version_updated(self, _: context::Context, msg: GameVersionUpdateMessage) {
+        self.inner.handle_game_version_updated(msg).await;
     }
 }

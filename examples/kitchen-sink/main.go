@@ -30,24 +30,25 @@ import (
 )
 
 type model struct {
-	timeLeft          int
-	lastChar          string
-	w                 int
-	h                 int
-	mainStyle         lipgloss.Style
-	httpStyle         lipgloss.Style
-	x                 int
-	y                 int
-	isHoveringZone    bool
-	httpBody          string
-	hasDarkBackground bool
-	peerID            peer.ID
-	peers             []peer.ID
-	selectedPeerIdx   int
-	recentMessages    []peerMessage
-	networkInfo       app.NetworkInfo
-	audioPlaying      bool
-	audioVolume       float32
+	timeLeft            int
+	lastChar            string
+	w                   int
+	h                   int
+	mainStyle           lipgloss.Style
+	httpStyle           lipgloss.Style
+	x                   int
+	y                   int
+	isHoveringZone      bool
+	httpBody            string
+	hasDarkBackground   bool
+	peerID              peer.ID
+	peers               []peer.ID
+	selectedPeerIdx     int
+	recentMessages      []peerMessage
+	networkInfo         app.NetworkInfo
+	newVersionAvailable bool
+	audioPlaying        bool
+	audioVolume         float32
 }
 
 type httpBodyMsg string
@@ -235,6 +236,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tickMsg:
 		m.timeLeft--
+		m.newVersionAvailable = app.IsNewVersionAvailable()
 		if m.timeLeft <= 0 {
 			return m, tea.Quit
 		}
@@ -346,6 +348,7 @@ func (m model) View() tea.View {
 	content := m.mainStyle.Render(fmt.Sprintf(
 		"Hi. Last char: %v. Size: %vx%v Mouse: %v %v %v %s This program will exit in %d seconds...\n\n"+
 			"Peer ID: %s\n\n"+
+			"New Version Available: %v\n\n"+
 			"Audio: %s\n"+
 			"  [Space]=Play/Pause  [+/-]=Volume  [M]=Mute\n\n"+
 			"Network: ↑%.0f B/s ↓%.0f B/s RTT %dms throttled: %s\n\n"+
@@ -354,6 +357,7 @@ func (m model) View() tea.View {
 			"%v\n\n%+v\nhasDarkBackground=%v",
 		m.lastChar, m.w, m.h, m.x, m.y, markedZone, TerminalOSC8Link("https://example.com", "example"), m.timeLeft,
 		m.peerID.String(),
+		m.newVersionAvailable,
 		audioStatus,
 		m.networkInfo.BytesPerSecIn, m.networkInfo.BytesPerSecOut, m.networkInfo.LatencyMs, lastThrottledStr,
 		peerListText,

@@ -6,6 +6,7 @@ pub mod ansi_backend;
 pub mod app;
 pub mod audio;
 pub mod log;
+pub mod manifest;
 pub mod peer;
 pub mod terminal;
 
@@ -24,6 +25,7 @@ mod internal {
         pub(crate) fn change_app(address_ptr: *const u8, address_len: u32) -> i32;
         pub(crate) fn next_app_ready() -> i32;
         pub(crate) fn graceful_shutdown_poll() -> i32;
+        pub(crate) fn new_version_available_poll() -> i32;
 
         #[cfg(feature = "network")]
         pub(crate) fn dial(address_ptr: *const u8, address_len: u32, mode: u32) -> i32;

@@ -55,7 +55,9 @@ use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLa
 use terminal_games::terminal_profile::TerminalProfile;
 
 use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
+use crate::control::ControlPlane;
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
+use crate::sessions::{FanoutTracker, SessionAdminControl, SessionRegistry};
 
 const DEFAULT_WEB_POW_DIFFICULTY: u8 = 18;
 const MAX_WEB_POW_DIFFICULTY: u8 = 32;
@@ -78,6 +80,8 @@ pub struct WebServer {
     pow: Arc<PowGate>,
     metrics: Arc<ServerMetrics>,
     metrics_bearer_token: Option<Arc<str>>,
+    session_registry: Arc<SessionRegistry>,
+    control: ControlPlane,
 }
 
 impl WebServer {
@@ -85,6 +89,8 @@ impl WebServer {
         app_server: Arc<AppServer>,
         admission_controller: Arc<AdmissionController>,
         metrics: Arc<ServerMetrics>,
+        session_registry: Arc<SessionRegistry>,
+        control: ControlPlane,
     ) -> anyhow::Result<Self> {
         let metrics_bearer_token = match std::env::var("METRICS_BEARER_TOKEN") {
             Ok(token) => {
@@ -121,6 +127,8 @@ impl WebServer {
             pow: Arc::new(PowGate::new(pow_difficulty, Duration::from_secs(90))),
             metrics,
             metrics_bearer_token,
+            session_registry,
+            control,
         })
     }
 
@@ -150,7 +158,8 @@ impl WebServer {
             .route("/metrics", get(serve_metrics))
             .route("/pow/challenge", get(pow_challenge_handler))
             .route("/ws", get(websocket_handler))
-            .with_state(self.clone());
+            .with_state(self.clone())
+            .nest("/control", crate::control::router(self.control.clone()));
 
         let mut make_service = app.into_make_service_with_connect_info::<MyConnectInfo>();
         let listener = tokio::net::TcpListener::bind(listen_addr).await?;
@@ -448,11 +457,27 @@ async fn handle_socket(
         let _ = send_rejection_and_close(&mut sender, SessionEndReason::BannedIp).await;
         return;
     }
+    let local_session_id = admission_ticket.id();
+    let session_registration = server.session_registry.register(
+        local_session_id,
+        None,
+        username.clone(),
+        connect_info.remote_addr.ip(),
+        Transport::Web,
+        first_app_shortname.clone(),
+        initial_size.0,
+        initial_size.1,
+    );
+    let mut admin_control = session_registration.control_rx;
+    let mut admin_input_rx = session_registration.admin_input_rx;
     let session_guard =
         server
             .metrics
             .start_session(Transport::Web, AuthKind::Anonymous, true, None);
-    let active_shortname_tracker = session_guard.active_shortname_tracker();
+    let active_shortname_tracker = FanoutTracker::new(vec![
+        session_guard.active_shortname_tracker(),
+        session_registration.tracker,
+    ]);
     let mut admitted_session = admission_ticket.start_session(session_guard);
     let mut cluster_control = admitted_session.subscribe_control();
     let terminal_parser = input_guard.take_terminal_parser(initial_size.1, initial_size.0);
@@ -522,6 +547,17 @@ async fn handle_socket(
                 break SessionEndReason::BannedIp;
             }
 
+            changed = admin_control.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                let SessionAdminControl::Kick = *admin_control.borrow() else {
+                    continue;
+                };
+                cancellation_token.cancel();
+                break SessionEndReason::KickedByAdmin;
+            }
+
             result = async {
                 pending_input.as_mut().expect("guarded by select").await
             }, if pending_input.is_some() => {
@@ -540,6 +576,7 @@ async fn handle_socket(
                     break SessionEndReason::NormalExit;
                 };
                 admitted_session.record_output(data.len());
+                server.session_registry.record_output(local_session_id, &data);
                 let mut msg = Vec::with_capacity(data.len() / 2);
                 {
                     let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
@@ -549,6 +586,7 @@ async fn handle_socket(
                 }
                 msg.push(0x00);
                 server.metrics.record_bytes(Direction::Out, Transport::Web, msg.len());
+                server.control.record_bytes(msg.len());
                 if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
                     cancellation_token.cancel();
                     break SessionEndReason::ConnectionLost;
@@ -562,10 +600,19 @@ async fn handle_socket(
                 admitted_session.record_output(data.len());
                 data.push(0x01);
                 server.metrics.record_bytes(Direction::Out, Transport::Web, data.len());
+                server.control.record_bytes(data.len());
                 if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
                     cancellation_token.cancel();
                     break SessionEndReason::ConnectionLost;
                 }
+            }
+
+            data = admin_input_rx.recv(), if pending_input.is_none() => {
+                let Some(data) = data else {
+                    continue;
+                };
+                admitted_session.record_input(&data);
+                pending_input = Some(Box::pin(input_guard.prepare_input(data).send()));
             }
 
             msg = receiver.next(), if pending_input.is_none() => {
@@ -576,7 +623,9 @@ async fn handle_socket(
                 match msg {
                     Ok(Message::Binary(data)) => {
                         server.metrics.record_bytes(Direction::In, Transport::Web, data.len());
+                        server.control.record_bytes(data.len());
                         admitted_session.record_input(&data);
+                        server.session_registry.record_input(local_session_id, &data);
                         pending_input = Some(Box::pin(input_guard.prepare_input(data).send()));
                     }
                     Ok(Message::Text(text)) => {
@@ -584,6 +633,7 @@ async fn handle_socket(
                         if let Some(rest) = text_str.strip_prefix("resize:") {
                             if let Some((w, h)) = parse_resize(rest) {
                                 let _ = resize_tx.send((w, h));
+                                server.session_registry.record_resize(local_session_id, w, h);
                             }
                         } else if let Some(ts) = text_str.strip_prefix("ping:") {
                             if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
@@ -603,6 +653,8 @@ async fn handle_socket(
     };
 
     cancellation_token.cancel();
+    server.session_registry.finish(local_session_id, close_reason);
+    server.session_registry.remove(local_session_id);
     if close_reason.should_notify_web_client() {
         let _ = send_session_closed_and_close(&mut sender, close_reason).await;
     }

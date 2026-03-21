@@ -4,25 +4,24 @@
 
 mod admission;
 mod cluster_detection;
+mod control;
 mod metrics;
+mod sessions;
 mod ssh;
 mod web;
 
 use std::{
     collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
-use wasmparser::{Parser, Payload};
 
 use crate::admission::{AdmissionConfig, BanRule, StoredBan};
 use terminal_games::{
     app::AppServer,
+    manifest::extract_manifest_from_wasm,
     mesh::{EnvDiscovery, Mesh},
 };
 
@@ -32,138 +31,47 @@ use terminal_games::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-async fn upsert_game(
-    conn: &libsql::Connection,
-    shortname: &str,
-    path: &str,
-    details_json: &str,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO games (shortname, path, details) VALUES (?1, ?2, json(?3)) ON CONFLICT(shortname) DO UPDATE SET path = excluded.path, details = excluded.details",
-        libsql::params!(shortname, path, details_json),
-    )
-    .await?;
+async fn ensure_builtin_menu(conn: &libsql::Connection) -> Result<()> {
+    static MENU_WASM: &[u8] = include_bytes!("../../cmd/menu/menu.wasm");
+
+    let Some(manifest) = extract_manifest_from_wasm(MENU_WASM)? else {
+        anyhow::bail!("embedded menu.wasm is missing terminal-games manifest");
+    };
+    let manifest = manifest.sanitized()?;
+    let details_json = serde_json::to_string(&manifest.details)?;
+
+    let tx = conn.transaction().await?;
+    let mut rows = tx
+        .query(
+            "SELECT id, wasm, details, current_version FROM games WHERE shortname = ?1 LIMIT 1",
+            libsql::params!(manifest.shortname.as_str()),
+        )
+        .await?;
+    if let Some(row) = rows.next().await? {
+        let game_id = row.get::<u64>(0)?;
+        let current_wasm = row.get::<Vec<u8>>(1)?;
+        let current_details = row.get::<String>(2)?;
+        let current_version = row.get::<u64>(3)?;
+        if current_wasm != MENU_WASM || current_details != details_json {
+            let next_version = current_version + 1;
+            tx.execute(
+                "UPDATE games
+                 SET wasm = ?2, details = json(?3), current_version = ?4
+                 WHERE id = ?1",
+                libsql::params!(game_id, MENU_WASM.to_vec(), details_json.as_str(), next_version),
+            )
+            .await?;
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO games (shortname, wasm, details, current_version)
+             VALUES (?1, ?2, json(?3), 1)",
+            libsql::params!(manifest.shortname.as_str(), MENU_WASM.to_vec(), details_json.as_str()),
+        )
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
-}
-
-#[derive(Deserialize)]
-struct TerminalGamesManifest {
-    terminal_games_manifest_version: u32,
-    shortname: String,
-    details: serde_json::Value,
-}
-
-const MANIFEST_VERSION: u32 = 1;
-const MANIFEST_MARKER: &[u8] = br#""terminal_games_manifest_version""#;
-
-fn find_subslice(haystack: &[u8], needle: &[u8], start_at: usize) -> Option<usize> {
-    if needle.is_empty() || start_at >= haystack.len() {
-        return None;
-    }
-    haystack[start_at..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|idx| start_at + idx)
-}
-
-fn extract_manifest_from_blob(bytes: &[u8]) -> Option<TerminalGamesManifest> {
-    let mut marker_search_from = 0usize;
-    while let Some(marker_pos) = find_subslice(bytes, MANIFEST_MARKER, marker_search_from) {
-        marker_search_from = marker_pos + MANIFEST_MARKER.len();
-        let scan_start = marker_pos.saturating_sub(128 * 1024);
-        for start in (scan_start..=marker_pos).rev() {
-            if bytes[start] != b'{' {
-                continue;
-            }
-            let mut stream = serde_json::Deserializer::from_slice(&bytes[start..])
-                .into_iter::<TerminalGamesManifest>();
-            let Some(Ok(manifest)) = stream.next() else {
-                continue;
-            };
-            let consumed = stream.byte_offset();
-            if start + consumed <= marker_pos {
-                continue;
-            };
-            if manifest.terminal_games_manifest_version != MANIFEST_VERSION {
-                continue;
-            }
-            if manifest.shortname.trim().is_empty() {
-                continue;
-            }
-            return Some(manifest);
-        }
-    }
-    None
-}
-
-fn extract_manifest_from_wasm(bytes: &[u8]) -> Result<Option<TerminalGamesManifest>> {
-    for payload in Parser::new(0).parse_all(bytes) {
-        match payload? {
-            Payload::CustomSection(section) => {
-                if let Some(manifest) = extract_manifest_from_blob(section.data()) {
-                    return Ok(Some(manifest));
-                }
-            }
-            Payload::DataSection(reader) => {
-                for data in reader {
-                    let data = data?;
-                    if let Some(manifest) = extract_manifest_from_blob(data.data) {
-                        return Ok(Some(manifest));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(None)
-}
-
-fn collect_wasm_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_dir() {
-            collect_wasm_files(&path, out)?;
-            continue;
-        }
-        if file_type.is_file() && path.extension().is_some_and(|ext| ext == "wasm") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-async fn sync_games_from_embedded_manifests(conn: &libsql::Connection) -> Result<usize> {
-    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
-    let mut wasm_files = Vec::new();
-    collect_wasm_files(&cwd, &mut wasm_files)?;
-    wasm_files.sort();
-
-    let mut upserted = 0usize;
-    for wasm_path in wasm_files {
-        let bytes = fs::read(&wasm_path)
-            .with_context(|| format!("failed to read {}", wasm_path.display()))?;
-        let Some(manifest) = extract_manifest_from_wasm(&bytes)
-            .with_context(|| format!("failed to parse wasm {}", wasm_path.display()))?
-        else {
-            continue;
-        };
-        let details_json = serde_json::to_string(&manifest.details)
-            .context("failed to serialize manifest details")?;
-        let db_path = wasm_path
-            .strip_prefix(&cwd)
-            .unwrap_or(&wasm_path)
-            .to_string_lossy()
-            .to_string();
-        upsert_game(conn, &manifest.shortname, &db_path, &details_json).await?;
-        upserted += 1;
-        tracing::info!(shortname = %manifest.shortname, path = %db_path, "Upserted game from wasm manifest");
-    }
-    Ok(upserted)
 }
 
 async fn load_ip_ban_updates(
@@ -309,17 +217,33 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to commit migration transaction")?;
 
-    let upserted = sync_games_from_embedded_manifests(&conn).await?;
-    tracing::info!(
-        count = upserted,
-        "Synchronized games from embedded wasm manifests"
-    );
+    ensure_builtin_menu(&conn).await?;
+    tracing::info!("Ensured builtin menu is installed");
 
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
     mesh.start_discovery().await?;
     mesh.serve().await?;
 
     let app_server = Arc::new(AppServer::new(mesh.clone(), conn.clone())?);
+    {
+        let app_server = app_server.clone();
+        let mut updates = mesh.subscribe_game_version_updates();
+        tokio::spawn(async move {
+            loop {
+                match updates.recv().await {
+                    Ok(update) => {
+                        app_server
+                            .apply_uploaded_version(update.game_id, update.version)
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "lagged mesh game version updates");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
     let max_active_apps = std::env::var("MAX_ACTIVE_APPS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -368,6 +292,19 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "disabled".to_string()),
         "Configured admission limits"
     );
+    let region_id = std::env::var("REGION_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| mesh.region().to_string());
+    let session_registry = sessions::SessionRegistry::new(region_id);
+    let control_plane = control::ControlPlane::new(
+        app_server.clone(),
+        admission_controller.clone(),
+        session_registry.clone(),
+        mesh.clone(),
+        max_active_apps,
+    );
 
     tokio::select! {
         result = async {
@@ -375,6 +312,8 @@ async fn main() -> Result<()> {
                 app_server.clone(),
                 admission_controller.clone(),
                 metrics.clone(),
+                session_registry.clone(),
+                control_plane.clone(),
             ).await?;
             server.run().await
         } => {
@@ -385,6 +324,8 @@ async fn main() -> Result<()> {
                 app_server.clone(),
                 admission_controller.clone(),
                 metrics.clone(),
+                session_registry.clone(),
+                control_plane.clone(),
             )?;
             server.run().await
         } => {

@@ -22,7 +22,9 @@ use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLa
 use terminal_games::terminal_profile::TerminalProfile;
 
 use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
+use crate::control::ControlPlane;
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
+use crate::sessions::{FanoutTracker, SessionAdminControl, SessionRegistry};
 
 pub struct SshSession {
     raw_input_tx: tokio::sync::mpsc::Sender<Bytes>,
@@ -40,19 +42,23 @@ pub(crate) struct SshServer {
     app_server: Arc<AppServer>,
     admission_controller: Arc<AdmissionController>,
     metrics: Arc<ServerMetrics>,
+    session_registry: Arc<SessionRegistry>,
+    control: ControlPlane,
 }
 
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const CAPTCHA_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const RESTORE_TERMINAL_STATE: &[u8] =
-    b"\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1l\x1b[>4;0m\x1b>\x1b[?1049l\x1b[?25h";
+    b"\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1l\x1b[>4;0m\x1b[<u\x1b>\x1b[?1049l\x1b[?25h";
 
 impl SshServer {
     pub async fn new(
         app_server: Arc<AppServer>,
         admission_controller: Arc<AdmissionController>,
         metrics: Arc<ServerMetrics>,
+        session_registry: Arc<SessionRegistry>,
+        control: ControlPlane,
     ) -> anyhow::Result<Self> {
         tracing::info!("Initializing ssh server");
 
@@ -60,6 +66,8 @@ impl SshServer {
             app_server,
             admission_controller,
             metrics,
+            session_registry,
+            control,
         })
     }
 
@@ -165,6 +173,8 @@ impl SshServer {
         let app_server = self.app_server.clone();
         let admission_controller = self.admission_controller.clone();
         let metrics = self.metrics.clone();
+        let session_registry = self.session_registry.clone();
+        let control = self.control.clone();
         let client_ip = addr.ip();
         tokio::task::spawn(async move {
             let mut input_tick = InputGuard::tick_interval();
@@ -290,14 +300,13 @@ impl SshServer {
                     Ok(Err(_)) => None,
                     Err(_) => {
                         tracing::trace!("no pty_request received within 500ms");
-                        restore_terminal_state(&session_handle, channel_id).await;
-                        let _ = session_handle
-                            .disconnect(
-                                russh::Disconnect::ByApplication,
-                                "Bad terminal or ping too high (>500ms)".to_string(),
-                                "en-US".to_string(),
-                            )
-                            .await;
+                        close_terminal_session(
+                            &session_handle,
+                            channel_id,
+                            Some("Bad terminal or ping too high (>500ms)"),
+                            1,
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -324,14 +333,7 @@ impl SshServer {
                 )
                 .await;
                 if !solved {
-                    restore_terminal_state(&session_handle, channel_id).await;
-                    let _ = session_handle
-                        .disconnect(
-                            russh::Disconnect::ByApplication,
-                            "Bye!".to_string(),
-                            "en-US".to_string(),
-                        )
-                        .await;
+                    close_terminal_session(&session_handle, channel_id, Some("Bye!"), 1).await;
                     return;
                 }
             }
@@ -349,14 +351,7 @@ impl SshServer {
             {
                 AdmissionWaitResult::Allowed => {}
                 AdmissionWaitResult::Disconnected => {
-                    restore_terminal_state(&session_handle, channel_id).await;
-                    let _ = session_handle
-                        .disconnect(
-                            russh::Disconnect::ByApplication,
-                            "Bye!".to_string(),
-                            "en-US".to_string(),
-                        )
-                        .await;
+                    close_terminal_session(&session_handle, channel_id, Some("Bye!"), 1).await;
                     return;
                 }
                 AdmissionWaitResult::Rejected(reason) => {
@@ -365,14 +360,13 @@ impl SshServer {
                         reason = reason.slug(),
                         "Rejected SSH admission"
                     );
-                    restore_terminal_state(&session_handle, channel_id).await;
-                    let _ = session_handle
-                        .disconnect(
-                            russh::Disconnect::ByApplication,
-                            reason.user_message().to_string(),
-                            "en-US".to_string(),
-                        )
-                        .await;
+                    close_terminal_session(
+                        &session_handle,
+                        channel_id,
+                        Some(reason.user_message()),
+                        1,
+                    )
+                    .await;
                     return;
                 }
             }
@@ -385,19 +379,33 @@ impl SshServer {
                     ban_reason = ban.reason.as_deref().unwrap_or("<none>"),
                     "Rejected client from active IP ban after admission"
                 );
-                restore_terminal_state(&session_handle, channel_id).await;
-                let _ = session_handle
-                    .disconnect(
-                        russh::Disconnect::ByApplication,
-                        SessionEndReason::BannedIp.user_message().to_string(),
-                        "en-US".to_string(),
-                    )
-                    .await;
+                close_terminal_session(
+                    &session_handle,
+                    channel_id,
+                    Some(SessionEndReason::BannedIp.user_message()),
+                    1,
+                )
+                .await;
                 return;
             }
             let _ = session_handle
                 .data(channel_id, b"\x1b[2J\x1b[H".to_vec().into())
                 .await;
+            let local_session_id = admission_ticket.id();
+            let (first_cols, first_rows) = *resize_rx.borrow();
+            let session_registration = session_registry.register(
+                local_session_id,
+                user_id,
+                username.clone(),
+                client_ip,
+                Transport::Ssh,
+                first_app_shortname.clone(),
+                first_cols,
+                first_rows,
+            );
+            let mut admin_control = session_registration.control_rx;
+            let mut admin_input_rx = session_registration.admin_input_rx;
+            let mut spy_resize_rx = resize_rx.clone();
             let session_guard = metrics.start_session(
                 Transport::Ssh,
                 if user_id.is_some() {
@@ -408,10 +416,12 @@ impl SshServer {
                 has_audio,
                 user_id,
             );
-            let active_shortname_tracker = session_guard.active_shortname_tracker();
+            let active_shortname_tracker = FanoutTracker::new(vec![
+                session_guard.active_shortname_tracker(),
+                session_registration.tracker,
+            ]);
             let mut admitted_session = admission_ticket.start_session(session_guard);
             let mut cluster_control = admitted_session.subscribe_control();
-            let (first_cols, first_rows) = *resize_rx.borrow();
             let terminal_parser = input_guard.take_terminal_parser(first_rows, first_cols);
 
             let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
@@ -476,9 +486,30 @@ impl SshServer {
                         break SessionEndReason::BannedIp;
                     }
 
+                    changed = admin_control.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        let SessionAdminControl::Kick = *admin_control.borrow() else {
+                            continue;
+                        };
+                        shutdown_token.cancel();
+                        break SessionEndReason::KickedByAdmin;
+                    }
+
                     data = raw_input_rx.recv() => {
                         let Some(data) = data else {
                             break SessionEndReason::ConnectionLost;
+                        };
+                        admitted_session.record_input(&data);
+                        control.record_bytes(data.len());
+                        session_registry.record_input(local_session_id, &data);
+                        let _ = input_guard.prepare_input(data).try_send();
+                    }
+
+                    data = admin_input_rx.recv() => {
+                        let Some(data) = data else {
+                            continue;
                         };
                         admitted_session.record_input(&data);
                         let _ = input_guard.prepare_input(data).try_send();
@@ -488,12 +519,21 @@ impl SshServer {
                         input_guard.tick();
                     }
 
+                    changed = spy_resize_rx.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        let (cols, rows) = *spy_resize_rx.borrow_and_update();
+                        session_registry.record_resize(local_session_id, cols, rows);
+                    }
+
                     data = audio_rx.recv(), if has_audio => {
                         let Some(data) = data else {
                             break SessionEndReason::NormalExit;
                         };
                         admitted_session.record_output(data.len());
                         metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
+                        control.record_bytes(data.len());
                         if session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, russh::CryptoVec::from_slice(&data)).await.is_err() {
                             break SessionEndReason::ConnectionLost;
                         }
@@ -505,21 +545,28 @@ impl SshServer {
                         };
                         admitted_session.record_output(data.len());
                         metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
+                        control.record_bytes(data.len());
+                        session_registry.record_output(local_session_id, &data);
                         if session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await.is_err() {
                             break SessionEndReason::ConnectionLost;
                         }
                     }
                 }
             };
-            restore_terminal_state(&session_handle, channel_id).await;
-
-            let _ = session_handle
-                .disconnect(
-                    russh::Disconnect::ByApplication,
-                    close_reason.user_message().to_string(),
-                    "en-US".to_string(),
-                )
-                .await;
+            session_registry.finish(local_session_id, close_reason);
+            session_registry.remove(local_session_id);
+            close_terminal_session(
+                &session_handle,
+                channel_id,
+                (close_reason != SessionEndReason::NormalExit)
+                    .then_some(close_reason.user_message()),
+                if close_reason == SessionEndReason::NormalExit {
+                    0
+                } else {
+                    1
+                },
+            )
+            .await;
         });
 
         SshSession {
@@ -539,6 +586,27 @@ async fn restore_terminal_state(session_handle: &Handle, channel_id: ChannelId) 
     let _ = session_handle
         .data(channel_id, RESTORE_TERMINAL_STATE.to_vec().into())
         .await;
+}
+
+async fn close_terminal_session(
+    session_handle: &Handle,
+    channel_id: ChannelId,
+    reason: Option<&str>,
+    exit_status: u32,
+) {
+    restore_terminal_state(session_handle, channel_id).await;
+    if let Some(reason) = reason {
+        let mut out = Vec::with_capacity(reason.len() + 4);
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(reason.as_bytes());
+        out.extend_from_slice(b"\r\n");
+        let _ = session_handle.data(channel_id, out.into()).await;
+    }
+    let _ = session_handle.exit_status_request(channel_id, exit_status).await;
+    let _ = session_handle.eof(channel_id).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let _ = session_handle.close(channel_id).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
 }
 
 fn generate_captcha(len: usize) -> String {

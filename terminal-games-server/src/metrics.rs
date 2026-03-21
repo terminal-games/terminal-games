@@ -692,10 +692,19 @@ async fn load_persisted_shortname_durations(db: &libsql::Connection) -> Result<V
     let mut durations = Vec::new();
     while let Some(row) = rows.next().await.context("failed to read duration row")? {
         let shortname = row.get::<String>(0).context("missing duration shortname")?;
-        let seconds = row.get::<f64>(1).context("missing duration seconds")?;
+        let seconds = decode_sql_f64(&row, 1).context("missing duration seconds")?;
         durations.push((shortname, seconds));
     }
     Ok(durations)
+}
+
+fn decode_sql_f64(row: &libsql::Row, idx: i32) -> Result<f64> {
+    match row.get_value(idx).context("failed to fetch SQL value")? {
+        libsql::Value::Real(value) => Ok(value),
+        libsql::Value::Integer(value) => Ok(value as f64),
+        libsql::Value::Null => Ok(0.0),
+        other => anyhow::bail!("expected numeric SQL value at column {idx}, got {other:?}"),
+    }
 }
 
 fn bool_label(value: bool) -> &'static str {

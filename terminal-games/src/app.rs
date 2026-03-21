@@ -113,6 +113,7 @@ pub enum SessionEndReason {
     BannedIp,
     TooManyConnectionsFromIp,
     ClusterLimited,
+    KickedByAdmin,
 }
 
 impl SessionEndReason {
@@ -124,6 +125,7 @@ impl SessionEndReason {
             Self::BannedIp => "banned_ip",
             Self::TooManyConnectionsFromIp => "too_many_connections_from_ip",
             Self::ClusterLimited => "cluster_limited",
+            Self::KickedByAdmin => "kicked_by_admin",
         }
     }
 
@@ -135,6 +137,7 @@ impl SessionEndReason {
             Self::BannedIp => "Connections from your IP address are blocked",
             Self::TooManyConnectionsFromIp => "Too many active sessions from your IP address",
             Self::ClusterLimited => "Kicked for likely bot activity",
+            Self::KickedByAdmin => "Disconnected by an administrator.",
         }
     }
 
@@ -145,6 +148,8 @@ impl SessionEndReason {
 
 pub trait ActiveShortnameTracker: Send + Sync {
     fn set_active_shortname(&self, shortname: &str);
+
+    fn set_username(&self, _username: &str) {}
 }
 
 pub struct AppServer {
@@ -152,7 +157,8 @@ pub struct AppServer {
     engine: wasmtime::Engine,
     pub db: libsql::Connection,
     mesh: Mesh,
-    module_cache: Arc<tokio::sync::RwLock<HashMap<u64, wasmtime::Module>>>,
+    module_cache: Arc<tokio::sync::RwLock<HashMap<AppId, wasmtime::Module>>>,
+    latest_versions: Arc<tokio::sync::RwLock<HashMap<u64, Arc<AtomicU64>>>>,
 }
 
 pub struct AppInstantiationParams {
@@ -208,6 +214,11 @@ impl AppServer {
             "graceful_shutdown_poll",
             Self::graceful_shutdown_poll,
         )?;
+        linker.func_wrap(
+            "terminal_games",
+            "new_version_available_poll",
+            Self::new_version_available_poll,
+        )?;
         linker.func_wrap("terminal_games", "network_info", Self::host_network_info)?;
         linker.func_wrap("terminal_games", "terminal_info", Self::host_terminal_info)?;
         linker.func_wrap("terminal_games", "audio_write", Self::audio_write)?;
@@ -221,7 +232,56 @@ impl AppServer {
             db,
             engine,
             module_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            latest_versions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         })
+    }
+
+    pub async fn invalidate_shortname_cache(&self, shortname: &str) {
+        let mut game_rows = match self
+            .db
+            .query(
+                "SELECT id FROM games WHERE shortname = ?1 LIMIT 1",
+                libsql::params!(shortname),
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(shortname, error = ?error, "failed to query cache invalidation game id");
+                return;
+            }
+        };
+        let game_id = match game_rows.next().await {
+            Ok(Some(row)) => match row.get::<u64>(0) {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::warn!(shortname, error = ?error, "failed to decode game id");
+                    return;
+                }
+            },
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(shortname, error = ?error, "failed reading game id row");
+                return;
+            }
+        };
+        let mut cache = self.module_cache.write().await;
+        cache.retain(|app_id, _| app_id.game_id != game_id);
+    }
+
+    pub async fn apply_uploaded_version(&self, game_id: u64, version: u64) {
+        let should_invalidate = {
+            let latest = self.track_game_version(game_id, version).await;
+            update_atomic_max(&latest, version)
+        };
+        if should_invalidate {
+            let mut cache = self.module_cache.write().await;
+            cache.retain(|app_id, _| app_id.game_id != game_id);
+        }
+    }
+
+    async fn track_game_version(&self, game_id: u64, version: u64) -> Arc<AtomicU64> {
+        track_game_version(&self.latest_versions, game_id, version).await
     }
 
     /// Run an app with IO defined in [`params`] in the background
@@ -236,6 +296,7 @@ impl AppServer {
         let engine = self.engine.clone();
         let linker = self.linker.clone();
         let module_cache = self.module_cache.clone();
+        let latest_versions = self.latest_versions.clone();
 
         tokio::task::spawn(async move {
             let AppInstantiationParams {
@@ -305,6 +366,7 @@ impl AppServer {
                 linker,
                 mesh,
                 module_cache,
+                latest_versions,
                 app_output_sender,
                 remote_sshid,
                 term,
@@ -332,6 +394,7 @@ impl AppServer {
             };
             if let Some(tracker) = &active_shortname_tracker {
                 tracker.set_active_shortname(&app.shortname);
+                tracker.set_username(&menu_username);
             }
 
             let mut replay_buffer = ReplayBuffer::new(
@@ -528,6 +591,9 @@ impl AppServer {
                                     if let Some(username) = update.username {
                                         menu_username = username;
                                         status_bar.set_username(&menu_username);
+                                        if let Some(tracker) = &active_shortname_tracker {
+                                            tracker.set_username(&menu_username);
+                                        }
                                     }
                                     if let Some(locale) = update.locale {
                                         menu_session.locale = locale;
@@ -763,25 +829,30 @@ impl AppServer {
         menu_username: &str,
         shortname: String,
     ) -> anyhow::Result<(PreloadedAppState, wasmtime::InstancePre<AppState>)> {
-        let mut app_id_rows = ctx
+        let mut app_rows = ctx
             .db
             .query(
-                "SELECT id FROM games WHERE shortname = ?1",
+                "SELECT id, wasm, current_version FROM games WHERE shortname = ?1 AND current_version > 0 LIMIT 1",
                 [shortname.as_str()],
             )
             .await?;
-        let app_id_row = app_id_rows
+        let app_row = app_rows
             .next()
             .await?
             .ok_or_else(|| UnknownGameShortnameError(shortname.clone()))?;
-        let app_id = app_id_row.get::<u64>(0)?;
+        let game_id = app_row.get::<u64>(0)?;
+        let wasm_bytes = app_row.get::<Vec<u8>>(1)?;
+        let version = app_row.get::<u64>(2)?;
+        let app_id = AppId { game_id, version };
+        let latest_version = track_game_version(&ctx.latest_versions, game_id, version).await;
+        update_atomic_max(&latest_version, version);
 
-        let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(AppId(app_id)).await;
+        let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(app_id).await;
 
         let mut envs = vec![];
         let mut rows = ctx
             .db
-            .query("SELECT name, value FROM envs WHERE game_id = ?1", [app_id])
+            .query("SELECT name, value FROM envs WHERE game_id = ?1", [game_id])
             .await?;
         while let Some(row) = rows.next().await? {
             let name = row.get(0)?;
@@ -797,6 +868,7 @@ impl AppServer {
         envs.push(("USERNAME".to_string(), username));
         envs.push(("PEER_ID".to_string(), peer_id.to_bytes().encode_hex()));
         envs.push(("APP_SHORTNAME".to_string(), shortname.to_string()));
+        envs.push(("APP_VERSION_ID".to_string(), version.to_string()));
         envs.push((
             "AUDIO_ENABLED".to_string(),
             if ctx.audio_enabled { "1" } else { "0" }.to_string(),
@@ -830,20 +902,7 @@ impl AppServer {
             .envs(&envs)
             .build_p1();
 
-        let mut rows = ctx
-            .db
-            .query(
-                "SELECT path FROM games WHERE id = ?1",
-                libsql::params![app_id],
-            )
-            .await?;
-
-        let row = rows
-            .next()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Missing wasm path for game id {app_id}"))?;
-        let wasm_path: String = row.get(0)?;
-        let module = Self::load_or_compile_module(ctx, app_id, &wasm_path).await?;
+        let module = Self::load_or_compile_module(ctx, app_id, &wasm_bytes).await?;
         let instance_pre = ctx.linker.instantiate_pre(&module)?;
 
         Ok((
@@ -851,7 +910,8 @@ impl AppServer {
                 wasi_ctx,
                 peer_rx,
                 peer_tx,
-                app_id: AppId(app_id),
+                app_id,
+                latest_version,
                 shortname,
             },
             instance_pre,
@@ -860,8 +920,8 @@ impl AppServer {
 
     async fn load_or_compile_module(
         ctx: &AppContext,
-        app_id: u64,
-        wasm_path: &str,
+        app_id: AppId,
+        wasm_bytes: &[u8],
     ) -> anyhow::Result<wasmtime::Module> {
         {
             let cache = ctx.module_cache.read().await;
@@ -870,7 +930,7 @@ impl AppServer {
             }
         }
 
-        let module = wasmtime::Module::from_file(ctx.linker.engine(), wasm_path)?;
+        let module = wasmtime::Module::from_binary(ctx.linker.engine(), wasm_bytes)?;
         let mut cache = ctx.module_cache.write().await;
         let entry = cache.entry(app_id).or_insert(module);
         Ok(entry.clone())
@@ -1925,6 +1985,19 @@ impl AppServer {
         Ok(if is_cancelled { 1 } else { 0 })
     }
 
+    fn new_version_available_poll(
+        caller: wasmtime::Caller<'_, AppState>,
+    ) -> wasmtime::Result<i32> {
+        let current_version = caller.data().app.app_id.version;
+        let latest = caller
+            .data()
+            .app
+            .latest_version
+            .load(Ordering::Acquire);
+        let has_update = latest != 0 && latest != current_version;
+        Ok(if has_update { 1 } else { 0 })
+    }
+
     fn host_network_info(
         mut caller: wasmtime::Caller<'_, AppState>,
         bytes_per_sec_in_ptr: i32,
@@ -2090,11 +2163,35 @@ impl AppServer {
     }
 }
 
+async fn track_game_version(
+    latest_versions: &tokio::sync::RwLock<HashMap<u64, Arc<AtomicU64>>>,
+    game_id: u64,
+    version: u64,
+) -> Arc<AtomicU64> {
+    let mut guard = latest_versions.write().await;
+    guard
+        .entry(game_id)
+        .or_insert_with(|| Arc::new(AtomicU64::new(version)))
+        .clone()
+}
+
+fn update_atomic_max(value: &AtomicU64, next: u64) -> bool {
+    let mut current = value.load(Ordering::Acquire);
+    while next > current {
+        match value.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+    false
+}
+
 pub struct PreloadedAppState {
     wasi_ctx: wasmtime_wasi::p1::WasiP1Ctx,
     peer_rx: tokio::sync::mpsc::Receiver<PeerMessageApp>,
     peer_tx: tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>,
     app_id: AppId,
+    latest_version: Arc<AtomicU64>,
     shortname: String,
 }
 
@@ -2106,7 +2203,8 @@ pub struct AppContext {
     audio_enabled: bool,
     term: Option<String>,
     linker: Arc<wasmtime::Linker<AppState>>,
-    module_cache: Arc<tokio::sync::RwLock<HashMap<u64, wasmtime::Module>>>,
+    module_cache: Arc<tokio::sync::RwLock<HashMap<AppId, wasmtime::Module>>>,
+    latest_versions: Arc<tokio::sync::RwLock<HashMap<u64, Arc<AtomicU64>>>>,
     app_output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     user_id: Option<u64>,
     locale: String,
@@ -2838,7 +2936,7 @@ async fn save_replay(
         let _ = db
             .execute(
                 "INSERT INTO replays (asciinema_url, user_id, game_id, created_at) VALUES (?1, ?2, ?3, ?4)",
-                libsql::params!(url.as_str(), uid, app_id.0, now),
+                libsql::params!(url.as_str(), uid, app_id.game_id, now),
             )
             .await;
         (Ok(url), None)
@@ -2849,7 +2947,7 @@ async fn save_replay(
             .as_secs() as i64;
         menu_session.replays.push(SessionReplay {
             created_at: now,
-            game_id: app_id.0,
+            game_id: app_id.game_id,
             asciinema_url: url.clone(),
         });
         (Ok(url), Some(menu_session))

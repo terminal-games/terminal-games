@@ -9,8 +9,9 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS games (
     id INTEGER PRIMARY KEY,
     shortname TEXT NOT NULL UNIQUE,
-    path TEXT NOT NULL,
+    wasm BLOB NOT NULL,
     details JSON NOT NULL CHECK(json_valid(details)),
+    current_version INTEGER NOT NULL DEFAULT(0),
     duration_seconds REAL NOT NULL DEFAULT(0)
 );
 
@@ -19,7 +20,14 @@ CREATE TABLE IF NOT EXISTS envs (
     name TEXT NOT NULL,
     value TEXT NOT NULL,
     PRIMARY KEY(game_id, name),
-    FOREIGN KEY(game_id) REFERENCES games(id)
+    FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS authors (
+    id INTEGER PRIMARY KEY,
+    shortname TEXT NOT NULL UNIQUE,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
 CREATE TABLE IF NOT EXISTS replays (
@@ -28,7 +36,7 @@ CREATE TABLE IF NOT EXISTS replays (
     game_id INTEGER NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     FOREIGN KEY(user_id) REFERENCES users(id),
-    FOREIGN KEY(game_id) REFERENCES games(id),
+    FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE,
     PRIMARY KEY(user_id, created_at DESC)
 );
 
@@ -52,7 +60,7 @@ CREATE TABLE IF NOT EXISTS user_game_durations (
     duration_seconds REAL NOT NULL DEFAULT(0),
     PRIMARY KEY(user_id, game_id),
     FOREIGN KEY(user_id) REFERENCES users(id),
-    FOREIGN KEY(game_id) REFERENCES games(id)
+    FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS ip_bans (

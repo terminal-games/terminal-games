@@ -2,9 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+mod admin;
 mod audio;
+mod author;
+mod config;
 
 use std::{
+    fs,
     future::Future,
     io::{Read, Write},
     path::Path,
@@ -17,7 +21,8 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
-use clap::Parser;
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::{ArgValueCompleter, CompleteEnv, PathCompleter};
 use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -33,11 +38,11 @@ use terminal_games::{
     terminal_profile::TerminalProfile,
 };
 
-#[derive(Parser)]
-#[command(about = "Run a terminal game from a wasm file")]
-struct Args {
+#[derive(Args)]
+struct RunArgs {
     /// Path to the wasm file to run
-    wasm_file: String,
+    #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
+    wasm_file: Option<String>,
 
     /// Additional games in shortname=path format
     #[arg(short, long = "game", value_name = "SHORTNAME=PATH")]
@@ -82,6 +87,28 @@ struct Args {
     /// Username for CLI auth (default: $USER)
     #[arg(long)]
     username: Option<String>,
+}
+
+#[derive(Parser)]
+#[command(
+    about = "Terminal Games CLI",
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Administer running terminal games servers.
+    Admin(admin::AdminCli),
+    /// Upload and manage games as an author.
+    Author(author::AuthorCli),
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -293,18 +320,40 @@ async fn upsert_game(
     path: &str,
     details: &str,
 ) -> Result<()> {
+    let wasm = fs::read(path).with_context(|| format!("Failed to read wasm for {shortname}"))?;
     conn.execute(
-        "INSERT INTO games (shortname, path, details) VALUES (?1, ?2, json(?3)) ON CONFLICT(shortname) DO UPDATE SET path = excluded.path, details = excluded.details",
-        libsql::params!(shortname, path, details),
+        "INSERT INTO games (shortname, wasm, details, current_version)
+         VALUES (?1, ?2, json(?3), 1)
+         ON CONFLICT(shortname) DO UPDATE
+         SET wasm = excluded.wasm, details = excluded.details, current_version = games.current_version + 1",
+        libsql::params!(shortname, wasm, details),
     )
     .await
     .with_context(|| format!("Failed to upsert game {shortname}"))?;
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
+fn main() -> Result<()> {
+    CompleteEnv::with_factory(Cli::command).complete();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
+    let cli = Cli::parse();
+    if let Some(command) = cli.command {
+        return match command {
+            Command::Admin(cli) => admin::run(cli).await,
+            Command::Author(cli) => author::run(cli).await,
+        };
+    }
+    let args = cli.run;
+    let wasm_file = args
+        .wasm_file
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("missing wasm file"))?;
 
     let (log_writer, _flush_guard) = BufferedLogWriter::new();
     let platform_filter: LevelFilter = args.platform_log_level.into();
@@ -353,7 +402,7 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to commit migration transaction")?;
 
-    let wasm_path = Path::new(&args.wasm_file)
+    let wasm_path = Path::new(wasm_file)
         .canonicalize()
         .context("Failed to resolve wasm file path")?
         .display()
@@ -365,7 +414,7 @@ async fn main() -> Result<()> {
         .to_string();
     let default_details = |shortname: &str| {
         format!(
-            r#"{{"name":{{"en":"{shortname}"}},"description":{{"en":""}},"details":{{"en":""}},"screenshots":{{}}}}"#
+            r#"{{"author":"Local","version":"dev","name":{{"en":"{shortname}"}},"description":{{"en":""}},"details":{{"en":""}},"screenshots":{{}}}}"#
         )
     };
 

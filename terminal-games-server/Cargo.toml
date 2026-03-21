@@ -5,11 +5,13 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+avt = "0.17"
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 bytes = "1"
 flate2 = "1"
 futures = "0.3"
+hex = "0.4"
 hyper = "1"
 hyper-util = "0.1"
 ipnet = "2"

@@ -2,6 +2,8 @@
   "terminal_games_manifest_version": 1,
   "shortname": "kitchen-sink",
   "details": {
+    "author": "mbund",
+    "version": "1.0.0",
     "name": {
       "en": "Kitchen Sink",
       "de": "Kuechenbecken"

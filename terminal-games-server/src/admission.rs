@@ -183,7 +183,11 @@ impl BanRule {
                 matcher: network,
             });
         }
-        Err("ban rule must be a valid CIDR range".to_string())
+        if let Ok(ip) = value.parse::<IpAddr>() {
+            let matcher = IpNet::from(ip);
+            return Ok(Self { key, matcher });
+        }
+        Err("ban rule must be a valid IPv4/IPv6 address or CIDR range".to_string())
     }
 }
 
@@ -482,6 +486,10 @@ impl AdmissionController {
 }
 
 impl AdmissionTicket {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<AdmissionState> {
         self.rx.clone()
     }
