@@ -90,16 +90,6 @@ pub fn list_admin_profile_names() -> Result<Vec<String>> {
     Ok(profiles.profile.into_keys().collect())
 }
 
-pub fn list_author_profile_names() -> Result<Vec<String>> {
-    let mut names = list_stored_author_tokens()?
-        .into_iter()
-        .map(|entry| entry.profile)
-        .collect::<Vec<_>>();
-    names.sort();
-    names.dedup();
-    Ok(names)
-}
-
 pub fn list_admin_profiles() -> Result<Vec<(String, AdminProfile)>> {
     let profiles: AdminProfilesFile = read_toml(admin_profiles_path())?;
     Ok(profiles.profile.into_iter().collect())
@@ -132,7 +122,8 @@ pub fn load_author_token_for_shortname(
     profile_override: Option<&str>,
 ) -> Result<Option<AuthorTokenClaims>> {
     if let Ok(token) = std::env::var("TERMINAL_GAMES_AUTHOR_TOKEN") {
-        return Ok(Some(AuthorTokenClaims::decode(token.trim())?));
+        let claims = AuthorTokenClaims::decode(token.trim())?;
+        return Ok((claims.shortname == shortname).then_some(claims));
     }
     let profile_name = profile_override
         .map(str::to_string)
@@ -180,14 +171,25 @@ pub fn load_author_tokens_for_listing(
     Ok(entries)
 }
 
-pub fn list_author_shortnames() -> Result<Vec<String>> {
-    let mut shortnames = load_author_tokens_for_listing(None)?
+pub fn list_author_refs() -> Result<Vec<String>> {
+    let mut refs = load_author_tokens_for_listing(None)?
         .into_iter()
-        .map(|entry| entry.claims.shortname)
+        .map(|entry| format!("{}:{}", entry.profile, entry.claims.shortname))
         .collect::<Vec<_>>();
-    shortnames.sort();
-    shortnames.dedup();
-    Ok(shortnames)
+    refs.sort();
+    refs.dedup();
+    Ok(refs)
+}
+
+pub fn parse_author_ref(value: &str) -> Result<(String, String)> {
+    let (profile, shortname) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("author target must be PROFILE:SHORTNAME"))?;
+    let profile = profile.trim();
+    let shortname = shortname.trim();
+    anyhow::ensure!(!profile.is_empty(), "author target profile cannot be empty");
+    anyhow::ensure!(!shortname.is_empty(), "author target shortname cannot be empty");
+    Ok((profile.to_string(), shortname.to_string()))
 }
 
 pub fn save_author_token(profile: &str, claims: &AuthorTokenClaims) -> Result<()> {

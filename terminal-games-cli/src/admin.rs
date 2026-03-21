@@ -6,16 +6,18 @@ use std::{collections::VecDeque, time::Instant};
 
 use anyhow::{Context, Result};
 use avt::{Color, Pen};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use clap_complete::{ArgValueCandidates, CompletionCandidate};
 use dialoguer::{Confirm, Input, Password};
 use futures::{SinkExt, StreamExt, future::join_all};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::de::DeserializeOwned;
 use terminal_games::control::{
-    AuthorSummary, BanIpRequest, CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest,
-    DeleteShortnameResponse, KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus, SessionSummary,
-    SpyControlMessage,
+    AuthorSummary, BanEntry, BanIpAddRequest, BanIpRemoveRequest, BroadcastLevel,
+    BroadcastRequest, CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest,
+    DeleteShortnameResponse, KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus,
+    RotateAuthorTokenRequest, RotateAuthorTokenResponse, SessionSummary, SpyControlMessage,
+    TickerAddRequest, TickerEntry, TickerRemoveRequest,
 };
 use terminal_games::palette::{self, Color as PaletteColor};
 use terminal_games::terminal_profile::TerminalProfile;
@@ -46,8 +48,14 @@ pub struct AdminCli {
 enum AdminCommand {
     /// Configure an admin profile with server URL and shared secret.
     Auth(AdminAuthArgs),
-    /// Ban an IP address or CIDR range across the fleet.
-    BanIp(AdminBanIpArgs),
+    #[command(subcommand)]
+    /// Manage IP bans across the fleet.
+    BanIp(AdminBanIpCommand),
+    #[command(subcommand)]
+    /// Manage status-bar tickers across the fleet.
+    Ticker(AdminTickerCommand),
+    /// Show a temporary broadcast notification to users.
+    Broadcast(AdminBroadcastArgs),
     /// Show runtime status for each region.
     Regions,
     #[command(subcommand)]
@@ -69,9 +77,81 @@ struct AdminAuthArgs {
 }
 
 #[derive(Args)]
-struct AdminBanIpArgs {
+struct AdminBanIpExpiryArgs {
+    /// Relative duration like 1h, 1 day, or 1 week.
+    #[arg(long)]
+    duration: Option<String>,
+    /// Absolute UTC expiry in RFC3339 format.
+    #[arg(long = "expires-at")]
+    expires_at: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum AdminBanIpCommand {
+    /// Add or update an IP/CIDR ban.
+    Add(AdminBanIpAddArgs),
+    /// List active IP bans.
+    #[command(visible_alias = "ls")]
+    List,
+    /// Remove an IP/CIDR ban.
+    #[command(visible_alias = "rm")]
+    Remove(AdminBanIpRemoveArgs),
+}
+
+#[derive(Args)]
+struct AdminBanIpAddArgs {
     ip: String,
     reason: String,
+    #[command(flatten)]
+    expiry: AdminBanIpExpiryArgs,
+}
+
+#[derive(Args)]
+struct AdminBanIpRemoveArgs {
+    ip: String,
+}
+
+#[derive(Subcommand)]
+enum AdminTickerCommand {
+    /// List active tickers.
+    #[command(visible_alias = "ls")]
+    List,
+    /// Add a ticker entry.
+    Add(AdminTickerAddArgs),
+    /// Remove a ticker entry by id.
+    #[command(visible_alias = "rm")]
+    Remove(AdminTickerRemoveArgs),
+}
+
+#[derive(Args)]
+struct AdminTickerAddArgs {
+    content: String,
+    #[command(flatten)]
+    expiry: AdminBanIpExpiryArgs,
+}
+
+#[derive(Args)]
+struct AdminTickerRemoveArgs {
+    ticker_id: u64,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BroadcastLevelArg {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Args)]
+struct AdminBroadcastArgs {
+    /// Notification level. Defaults to info.
+    #[arg(long, value_enum, default_value = "info")]
+    level: BroadcastLevelArg,
+    /// Comma-separated region ids. Defaults to all regions.
+    #[arg(long)]
+    regions: Option<String>,
+    message: String,
+    duration: String,
 }
 
 #[derive(Subcommand)]
@@ -110,6 +190,8 @@ enum AdminAuthorCommand {
     /// List all reserved author shortnames and their playtime.
     #[command(visible_alias = "ls")]
     List,
+    /// Rotate an author token and print the new value.
+    RotateToken(AdminAuthorRotateTokenArgs),
     /// Delete an author reservation and its shortname permanently.
     Delete(AdminAuthorDeleteArgs),
 }
@@ -123,6 +205,12 @@ struct AdminAuthorCreateArgs {
 struct AdminAuthorDeleteArgs {
     #[arg(long)]
     force: bool,
+    #[arg(add = ArgValueCandidates::new(complete_author_id_candidates))]
+    author_id: u64,
+}
+
+#[derive(Args)]
+struct AdminAuthorRotateTokenArgs {
     #[arg(add = ArgValueCandidates::new(complete_author_id_candidates))]
     author_id: u64,
 }
@@ -205,7 +293,9 @@ pub async fn run(cli: AdminCli) -> Result<()> {
     let profile = cli.profile;
     match cli.command {
         AdminCommand::Auth(args) => auth(args, profile).await,
-        AdminCommand::BanIp(args) => ban_ip(args, profile).await,
+        AdminCommand::BanIp(command) => ban_ip(command, profile).await,
+        AdminCommand::Ticker(command) => ticker(command, profile).await,
+        AdminCommand::Broadcast(args) => broadcast(args, profile).await,
         AdminCommand::Regions => regions(profile).await,
         AdminCommand::Session(command) => session(command, profile).await,
         AdminCommand::Author(command) => author(command, profile).await,
@@ -323,13 +413,23 @@ async fn auth(args: AdminAuthArgs, profile_override: Option<String>) -> Result<(
     Ok(())
 }
 
-async fn ban_ip(args: AdminBanIpArgs, profile: Option<String>) -> Result<()> {
+async fn ban_ip(command: AdminBanIpCommand, profile: Option<String>) -> Result<()> {
+    match command {
+        AdminBanIpCommand::Add(args) => ban_ip_add(args, profile).await,
+        AdminBanIpCommand::List => ban_ip_list(profile).await,
+        AdminBanIpCommand::Remove(args) => ban_ip_remove(args, profile).await,
+    }
+}
+
+async fn ban_ip_add(args: AdminBanIpAddArgs, profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
-    let request = BanIpRequest {
+    let request = BanIpAddRequest {
         ip: args.ip,
         reason: args.reason,
+        duration: args.expiry.duration,
+        expires_at: args.expiry.expires_at,
     };
-    api.post_empty(&api.profile.url, "/control/admin/ban-ip", &request)
+    api.post_empty(&api.profile.url, "/control/admin/ban-ip/add", &request)
         .await?;
     let (_, region_urls) = api.discover().await?;
     let futures = region_urls
@@ -339,6 +439,126 @@ async fn ban_ip(args: AdminBanIpArgs, profile: Option<String>) -> Result<()> {
         result?;
     }
     println!("Applied ban across {} regions", region_urls.len());
+    Ok(())
+}
+
+async fn ban_ip_list(profile: Option<String>) -> Result<()> {
+    let api = load_api(profile.as_deref())?;
+    let bans: Vec<BanEntry> = api
+        .get_json(&api.profile.url, "/control/admin/ban-ip/list")
+        .await?;
+    let rows = bans
+        .into_iter()
+        .map(|ban| {
+            vec![
+                ban.ip,
+                if ban.reason.trim().is_empty() {
+                    "-".to_string()
+                } else {
+                    ban.reason
+                },
+                format_optional_unix(ban.expires_at),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&["IP", "Reason", "Expires"], &rows);
+    Ok(())
+}
+
+async fn ban_ip_remove(args: AdminBanIpRemoveArgs, profile: Option<String>) -> Result<()> {
+    let api = load_api(profile.as_deref())?;
+    let request = BanIpRemoveRequest { ip: args.ip };
+    api.post_empty(&api.profile.url, "/control/admin/ban-ip/remove", &request)
+        .await?;
+    let (_, region_urls) = api.discover().await?;
+    let futures = region_urls
+        .values()
+        .map(|base_url| api.post_empty(base_url, "/control/admin/apply-ban-remove", &request));
+    for result in join_all(futures).await {
+        result?;
+    }
+    println!("Removed ban across {} regions", region_urls.len());
+    Ok(())
+}
+
+async fn ticker(command: AdminTickerCommand, profile: Option<String>) -> Result<()> {
+    match command {
+        AdminTickerCommand::List => ticker_list(profile).await,
+        AdminTickerCommand::Add(args) => ticker_add(args, profile).await,
+        AdminTickerCommand::Remove(args) => ticker_remove(args, profile).await,
+    }
+}
+
+async fn ticker_list(profile: Option<String>) -> Result<()> {
+    let api = load_api(profile.as_deref())?;
+    let tickers: Vec<TickerEntry> = api
+        .get_json(&api.profile.url, "/control/admin/ticker/list")
+        .await?;
+    let rows = tickers
+        .into_iter()
+        .map(|ticker| {
+            vec![
+                ticker.ticker_id.to_string(),
+                ticker.content,
+                format_optional_unix(ticker.expires_at),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&["Ticker ID", "Content", "Expires"], &rows);
+    Ok(())
+}
+
+async fn ticker_add(args: AdminTickerAddArgs, profile: Option<String>) -> Result<()> {
+    let api = load_api(profile.as_deref())?;
+    api.post_empty(
+        &api.profile.url,
+        "/control/admin/ticker/add",
+        &TickerAddRequest {
+            content: args.content,
+            duration: args.expiry.duration,
+            expires_at: args.expiry.expires_at,
+        },
+    )
+    .await?;
+    refresh_status_bar_state(&api).await?;
+    println!("Added ticker");
+    Ok(())
+}
+
+async fn ticker_remove(args: AdminTickerRemoveArgs, profile: Option<String>) -> Result<()> {
+    let api = load_api(profile.as_deref())?;
+    api.post_empty(
+        &api.profile.url,
+        "/control/admin/ticker/remove",
+        &TickerRemoveRequest {
+            ticker_id: args.ticker_id,
+        },
+    )
+    .await?;
+    refresh_status_bar_state(&api).await?;
+    println!("Removed ticker {}", args.ticker_id);
+    Ok(())
+}
+
+async fn broadcast(args: AdminBroadcastArgs, profile: Option<String>) -> Result<()> {
+    let api = load_api(profile.as_deref())?;
+    api.post_empty(
+        &api.profile.url,
+        "/control/admin/broadcast",
+        &BroadcastRequest {
+            level: match args.level {
+                BroadcastLevelArg::Info => BroadcastLevel::Info,
+                BroadcastLevelArg::Warning => BroadcastLevel::Warning,
+                BroadcastLevelArg::Error => BroadcastLevel::Error,
+            },
+            regions: parse_regions_arg(args.regions),
+            message: args.message,
+            duration: args.duration,
+        },
+    )
+    .await?;
+    refresh_status_bar_state(&api).await?;
+    println!("Broadcast applied");
     Ok(())
 }
 
@@ -640,6 +860,7 @@ async fn author(command: AdminAuthorCommand, profile: Option<String>) -> Result<
     match command {
         AdminAuthorCommand::Create(args) => author_create(args, profile).await,
         AdminAuthorCommand::List => author_list(profile).await,
+        AdminAuthorCommand::RotateToken(args) => author_rotate_token(args, profile).await,
         AdminAuthorCommand::Delete(args) => author_delete(args, profile).await,
     }
 }
@@ -686,6 +907,24 @@ async fn author_list(profile: Option<String>) -> Result<()> {
     Ok(())
 }
 
+async fn author_rotate_token(args: AdminAuthorRotateTokenArgs, profile: Option<String>) -> Result<()> {
+    let api = load_api(profile.as_deref())?;
+    let response: RotateAuthorTokenResponse = api
+        .post_json(
+            &api.profile.url,
+            "/control/admin/author/rotate-token",
+            &RotateAuthorTokenRequest {
+                author_id: args.author_id,
+                base_url: api.profile.url.clone(),
+            },
+        )
+        .await?;
+    println!("Author ID: {}", response.author.author_id);
+    println!("Shortname: {}", response.author.shortname);
+    println!("Token: {}", response.token);
+    Ok(())
+}
+
 async fn author_delete(args: AdminAuthorDeleteArgs, profile: Option<String>) -> Result<()> {
     if !args.force
         && !Confirm::new()
@@ -729,6 +968,18 @@ fn load_api(profile_override: Option<&str>) -> Result<AdminApi> {
     AdminApi::new(profile_name, profile)
 }
 
+async fn refresh_status_bar_state(api: &AdminApi) -> Result<()> {
+    let (_, region_urls) = api.discover().await?;
+    let payload = serde_json::json!({});
+    let futures = region_urls
+        .values()
+        .map(|base_url| api.post_empty(base_url, "/control/admin/status-bar/refresh", &payload));
+    for result in join_all(futures).await {
+        result?;
+    }
+    Ok(())
+}
+
 fn completion_runtime() -> Option<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -767,6 +1018,22 @@ fn websocket_url(base_url: &str, path: &str, query: Option<&str>) -> Result<Stri
     url.set_path(path);
     url.set_query(query);
     Ok(url.to_string())
+}
+
+fn parse_regions_arg(value: Option<String>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|region| !region.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn format_optional_unix(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "never".to_string())
 }
 
 async fn render_spy_view(

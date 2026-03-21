@@ -3,6 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 pub mod app;
+pub mod author_env;
 pub mod control;
 mod audio;
 pub mod input_guard;

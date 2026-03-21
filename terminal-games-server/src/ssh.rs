@@ -405,6 +405,7 @@ impl SshServer {
             );
             let mut admin_control = session_registration.control_rx;
             let mut admin_input_rx = session_registration.admin_input_rx;
+            let status_bar_state_rx = session_registration.status_bar_state_rx;
             let mut spy_resize_rx = resize_rx.clone();
             let session_guard = metrics.start_session(
                 Transport::Ssh,
@@ -444,6 +445,7 @@ impl SshServer {
                 log_backend: Arc::new(NoopLogBackend),
                 active_shortname_tracker: Some(active_shortname_tracker),
                 idle_fuel_receiver: Some(idle_fuel_rx),
+                status_bar_state_receiver: status_bar_state_rx,
             });
             let close_reason = loop {
                 tokio::select! {

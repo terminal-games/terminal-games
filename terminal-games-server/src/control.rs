@@ -14,7 +14,7 @@ use axum::{
     Router,
     body::Bytes,
     extract::{
-        DefaultBodyLimit, Path, Query, State,
+        DefaultBodyLimit, Multipart, Path, Query, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
@@ -26,16 +26,25 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sysinfo::System;
 use terminal_games::{
+    author_env::{
+        AuthorEnvVar as RuntimeAuthorEnvVar, decrypt_author_env_blob, encrypt_author_env_blob,
+        validate_author_env_name, validate_author_envs,
+    },
     app::AppServer,
     control::{
-        AuthorSelfResponse, AuthorSummary, AuthorTokenClaims, BanIpRequest, CacheInvalidateRequest,
+        AuthorEnvDeleteRequest, AuthorEnvListResponse, AuthorEnvSetRequest, AuthorSelfResponse,
+        AuthorSummary, AuthorTokenClaims, BanEntry, BanIpAddRequest, BanIpRemoveRequest,
+        BroadcastLevel, BroadcastRequest, CacheInvalidateRequest,
         CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest, DeleteShortnameRequest,
         DeleteShortnameResponse, KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus,
-        SpyControlMessage, UploadGameResponse,
+        RotateAuthorTokenRequest, RotateAuthorTokenResponse, SpyControlMessage,
+        StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest,
+        UploadGameResponse,
     },
     manifest::{GameManifest, extract_manifest_from_wasm, validate_shortname},
     mesh::Mesh,
 };
+use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
     admission::{AdmissionController, BanRule},
@@ -105,7 +114,7 @@ impl ControlPlane {
         }
     }
 
-    async fn require_author(&self, headers: &HeaderMap) -> Result<AuthorRecord, Response> {
+    async fn require_author(&self, headers: &HeaderMap) -> Result<AuthorAuth, Response> {
         let Some(token) = bearer_token(headers) else {
             return Err((StatusCode::UNAUTHORIZED, "missing bearer token").into_response());
         };
@@ -120,7 +129,7 @@ impl ControlPlane {
         if sha256_hex(&claims.secret) != record.token_hash {
             return Err((StatusCode::UNAUTHORIZED, "invalid author token").into_response());
         }
-        Ok(record)
+        Ok(AuthorAuth { record, claims })
     }
 
     async fn discover(&self) -> anyhow::Result<RegionDiscoveryResponse> {
@@ -159,15 +168,28 @@ pub fn router(control: ControlPlane) -> Router {
         .route("/admin/discover", get(admin_discover))
         .route("/admin/regions", get(admin_regions))
         .route("/admin/sessions", get(admin_sessions))
-        .route("/admin/ban-ip", post(admin_ban_ip))
+        .route("/admin/ban-ip/add", post(admin_ban_ip_add))
+        .route("/admin/ban-ip/list", get(admin_ban_ip_list))
+        .route("/admin/ban-ip/remove", post(admin_ban_ip_remove))
         .route("/admin/apply-ban", post(admin_apply_ban))
+        .route("/admin/apply-ban-remove", post(admin_apply_ban_remove))
         .route("/admin/session/kick", post(admin_session_kick))
         .route("/admin/session/spy/{local_session_id}", get(admin_session_spy))
+        .route("/admin/ticker/list", get(admin_ticker_list))
+        .route("/admin/ticker/add", post(admin_ticker_add))
+        .route("/admin/ticker/remove", post(admin_ticker_remove))
+        .route("/admin/broadcast", post(admin_broadcast))
+        .route("/admin/status-bar/refresh", post(admin_status_bar_refresh))
         .route("/admin/author/create", post(admin_author_create))
         .route("/admin/author/list", get(admin_author_list))
+        .route("/admin/author/rotate-token", post(admin_author_rotate_token))
         .route("/admin/author/delete", post(admin_author_delete))
         .route("/admin/cache/invalidate", post(admin_cache_invalidate))
         .route("/author/self", get(author_self))
+        .route("/author/env/list", get(author_env_list))
+        .route("/author/env/set", post(author_env_set))
+        .route("/author/env/delete", post(author_env_delete))
+        .route("/author/rotate-token", post(author_rotate_token))
         .route(
             "/author/upload",
             post(author_upload).layer(DefaultBodyLimit::max(AUTHOR_UPLOAD_MAX_BYTES)),
@@ -217,6 +239,12 @@ struct AuthorRecord {
     token_hash: String,
 }
 
+#[derive(Debug, Clone)]
+struct AuthorAuth {
+    record: AuthorRecord,
+    claims: AuthorTokenClaims,
+}
+
 pub async fn admin_discover(
     State(control): State<ControlPlane>,
     headers: HeaderMap,
@@ -252,10 +280,65 @@ pub async fn admin_sessions(
     Json(sessions).into_response()
 }
 
-pub async fn admin_ban_ip(
+pub async fn admin_ban_ip_add(
     State(control): State<ControlPlane>,
     headers: HeaderMap,
-    Json(request): Json<BanIpRequest>,
+    Json(request): Json<BanIpAddRequest>,
+) -> Response {
+    if let Err(response) = control.require_admin(&headers) {
+        return response;
+    }
+    let rule = match BanRule::parse(request.ip.clone()) {
+        Ok(rule) => rule,
+        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+    };
+    let expires_at = match parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref()) {
+        Ok(expires_at) => expires_at,
+        Err(error) => return bad_request(error),
+    };
+    let result = async {
+        control
+            .app_server
+            .db
+            .execute(
+                "INSERT INTO ip_bans (ip, reason, expires_at, inserted_at)
+                 VALUES (?1, ?2, ?3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+                 ON CONFLICT(ip) DO UPDATE SET
+                     reason = excluded.reason,
+                     expires_at = excluded.expires_at,
+                     inserted_at = excluded.inserted_at",
+                libsql::params!(request.ip, request.reason.clone(), expires_at),
+            )
+            .await?;
+            control
+                .admission_controller
+            .apply_ban_updates(vec![(rule, Some(request.reason), expires_at)]);
+        anyhow::Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn admin_ban_ip_list(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = control.require_admin(&headers) {
+        return response;
+    }
+    match load_ban_entries(&control.app_server.db).await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn admin_ban_ip_remove(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+    Json(request): Json<BanIpRemoveRequest>,
 ) -> Response {
     if let Err(response) = control.require_admin(&headers) {
         return response;
@@ -269,18 +352,13 @@ pub async fn admin_ban_ip(
             .app_server
             .db
             .execute(
-                "INSERT INTO ip_bans (ip, reason, expires_at, inserted_at)
-                 VALUES (?1, ?2, NULL, CAST(unixepoch('subsec') * 1000 AS INTEGER))
-                 ON CONFLICT(ip) DO UPDATE SET
-                     reason = excluded.reason,
-                     expires_at = excluded.expires_at,
-                     inserted_at = excluded.inserted_at",
-                libsql::params!(request.ip, request.reason.clone()),
+                "DELETE FROM ip_bans WHERE ip = ?1",
+                libsql::params!(request.ip),
             )
             .await?;
         control
             .admission_controller
-            .apply_ban_updates(vec![(rule, Some(request.reason), None)]);
+            .apply_ban_updates(vec![(rule, None, Some(0))]);
         anyhow::Ok(())
     }
     .await;
@@ -293,7 +371,30 @@ pub async fn admin_ban_ip(
 pub async fn admin_apply_ban(
     State(control): State<ControlPlane>,
     headers: HeaderMap,
-    Json(request): Json<BanIpRequest>,
+    Json(request): Json<BanIpAddRequest>,
+) -> Response {
+    if let Err(response) = control.require_admin(&headers) {
+        return response;
+    }
+    let expires_at = match parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref()) {
+        Ok(expires_at) => expires_at,
+        Err(error) => return bad_request(error),
+    };
+    match BanRule::parse(request.ip) {
+        Ok(rule) => {
+            control
+                .admission_controller
+                .apply_ban_updates(vec![(rule, Some(request.reason), expires_at)]);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
+    }
+}
+
+pub async fn admin_apply_ban_remove(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+    Json(request): Json<BanIpRemoveRequest>,
 ) -> Response {
     if let Err(response) = control.require_admin(&headers) {
         return response;
@@ -302,7 +403,7 @@ pub async fn admin_apply_ban(
         Ok(rule) => {
             control
                 .admission_controller
-                .apply_ban_updates(vec![(rule, Some(request.reason), None)]);
+                .apply_ban_updates(vec![(rule, None, Some(0))]);
             StatusCode::NO_CONTENT.into_response()
         }
         Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
@@ -321,6 +422,150 @@ pub async fn admin_session_kick(
         StatusCode::NO_CONTENT.into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+pub async fn admin_ticker_list(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = control.require_admin(&headers) {
+        return response;
+    }
+    match load_ticker_entries(&control.app_server.db).await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn admin_ticker_add(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+    Json(request): Json<TickerAddRequest>,
+) -> Response {
+    if let Err(response) = control.require_admin(&headers) {
+        return response;
+    }
+    let content = request.content.trim();
+    if content.is_empty() {
+        return bad_request("ticker content cannot be empty");
+    }
+    if content.len() > 120 {
+        return bad_request("ticker content exceeds 120 bytes");
+    }
+    let expires_at =
+        match parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref()) {
+            Ok(expires_at) => expires_at,
+            Err(error) => return bad_request(error),
+        };
+    let result = async {
+        control
+            .app_server
+            .db
+            .execute(
+                "INSERT INTO status_tickers (content, expires_at) VALUES (?1, ?2)",
+                libsql::params!(content, expires_at),
+            )
+            .await?;
+        let state = load_status_bar_state(&control.app_server.db, &control.region_id).await?;
+        control.session_registry.set_status_bar_state(state);
+        anyhow::Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn admin_ticker_remove(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+    Json(request): Json<TickerRemoveRequest>,
+) -> Response {
+    if let Err(response) = control.require_admin(&headers) {
+        return response;
+    }
+    let result = async {
+        control
+            .app_server
+            .db
+            .execute(
+                "DELETE FROM status_tickers WHERE id = ?1",
+                libsql::params!(request.ticker_id),
+            )
+            .await?;
+        let state = load_status_bar_state(&control.app_server.db, &control.region_id).await?;
+        control.session_registry.set_status_bar_state(state);
+        anyhow::Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn admin_broadcast(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+    Json(request): Json<BroadcastRequest>,
+) -> Response {
+    if let Err(response) = control.require_admin(&headers) {
+        return response;
+    }
+    if request.message.trim().is_empty() {
+        return bad_request("broadcast message cannot be empty");
+    }
+    if request.message.len() > 240 {
+        return bad_request("broadcast message exceeds 240 bytes");
+    }
+    let expires_at = match parse_duration_string(&request.duration)
+        .and_then(|duration| expiry_from_duration(duration))
+    {
+        Ok(expires_at) => expires_at,
+        Err(error) => return bad_request(error),
+    };
+    let regions_csv = normalize_regions_csv(&request.regions);
+    let result = async {
+        control
+            .app_server
+            .db
+            .execute(
+                "INSERT INTO status_broadcasts (level, regions, message, expires_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                libsql::params!(
+                    broadcast_level_sql(request.level),
+                    regions_csv,
+                    request.message,
+                    expires_at
+                ),
+            )
+            .await?;
+        let state = load_status_bar_state(&control.app_server.db, &control.region_id).await?;
+        control.session_registry.set_status_bar_state(state);
+        anyhow::Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn admin_status_bar_refresh(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = control.require_admin(&headers) {
+        return response;
+    }
+    match load_status_bar_state(&control.app_server.db, &control.region_id).await {
+        Ok(state) => {
+            control.session_registry.set_status_bar_state(state);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => internal_error(error),
     }
 }
 
@@ -377,6 +622,42 @@ pub async fn admin_author_list(
     }
 }
 
+pub async fn admin_author_rotate_token(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+    Json(request): Json<RotateAuthorTokenRequest>,
+) -> Response {
+    if let Err(response) = control.require_admin(&headers) {
+        return response;
+    }
+    let result = async {
+        let Some(author) = load_author_by_id(&control.app_server.db, request.author_id).await? else {
+            return Ok::<_, anyhow::Error>(None);
+        };
+        let secret = random_token_secret();
+        let token_hash = sha256_hex(&secret);
+        control
+            .app_server
+            .db
+            .execute(
+                "UPDATE authors SET token_hash = ?2 WHERE id = ?1",
+                libsql::params!(request.author_id, token_hash),
+            )
+            .await?;
+        let token = AuthorTokenClaims::new(request.base_url, author.shortname.clone(), secret).encode()?;
+        Ok(Some(RotateAuthorTokenResponse {
+            author: author.into(),
+            token,
+        }))
+    }
+    .await;
+    match result {
+        Ok(Some(response)) => Json(response).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
 pub async fn admin_author_delete(
     State(control): State<ControlPlane>,
     headers: HeaderMap,
@@ -418,7 +699,129 @@ pub async fn author_self(
         Ok(author) => author,
         Err(response) => return response,
     };
-    match load_author_self(&control.app_server.db, &author, &control.region_id).await {
+    match load_author_self(&control.app_server.db, &author.record, &control.region_id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn author_env_list(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+) -> Response {
+    let author = match control.require_author(&headers).await {
+        Ok(author) => author,
+        Err(response) => return response,
+    };
+    match load_author_envs(&control.app_server.db, &author.record.shortname).await {
+        Ok(envs) => Json(AuthorEnvListResponse {
+            shortname: author.record.shortname,
+            envs,
+        })
+        .into_response(),
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn author_env_set(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+    Json(request): Json<AuthorEnvSetRequest>,
+) -> Response {
+    let author = match control.require_author(&headers).await {
+        Ok(author) => author,
+        Err(response) => return response,
+    };
+    if let Err(error) = validate_control_envs(&request.envs) {
+        return bad_request(error);
+    }
+    match upsert_author_envs(&control.app_server.db, &author.record.shortname, &request.envs, request.replace).await {
+        Ok((game_id, version)) => {
+            control
+                .app_server
+                .apply_uploaded_version(game_id, version)
+                .await;
+            control
+                .mesh
+                .propagate_game_version_update(terminal_games::mesh::GameVersionUpdateMessage {
+                    shortname: author.record.shortname.clone(),
+                    game_id,
+                    version,
+                })
+                .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn author_env_delete(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+    Json(request): Json<AuthorEnvDeleteRequest>,
+) -> Response {
+    let author = match control.require_author(&headers).await {
+        Ok(author) => author,
+        Err(response) => return response,
+    };
+    if let Err(error) = validate_author_env_name(&request.name) {
+        return bad_request(error);
+    }
+    match delete_author_env(&control.app_server.db, &author.record.shortname, &request.name).await {
+        Ok((game_id, version)) => {
+            control
+                .app_server
+                .apply_uploaded_version(game_id, version)
+                .await;
+            control
+                .mesh
+                .propagate_game_version_update(terminal_games::mesh::GameVersionUpdateMessage {
+                    shortname: author.record.shortname.clone(),
+                    game_id,
+                    version,
+                })
+                .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => internal_error(error),
+    }
+}
+
+pub async fn author_rotate_token(
+    State(control): State<ControlPlane>,
+    headers: HeaderMap,
+) -> Response {
+    let author = match control.require_author(&headers).await {
+        Ok(author) => author,
+        Err(response) => return response,
+    };
+    let result = async {
+        let secret = random_token_secret();
+        let token_hash = sha256_hex(&secret);
+        control
+            .app_server
+            .db
+            .execute(
+                "UPDATE authors SET token_hash = ?2 WHERE id = ?1",
+                libsql::params!(author.record.id, token_hash),
+            )
+            .await?;
+        let token = AuthorTokenClaims::new(
+            author.claims.url,
+            author.record.shortname.clone(),
+            secret,
+        )
+        .encode()?;
+        Ok::<_, anyhow::Error>(RotateAuthorTokenResponse {
+            author: load_author_by_shortname(&control.app_server.db, &author.record.shortname)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("author missing after rotate"))?
+                .into(),
+            token,
+        })
+    }
+    .await;
+    match result {
         Ok(response) => Json(response).into_response(),
         Err(error) => internal_error(error),
     }
@@ -427,11 +830,45 @@ pub async fn author_self(
 pub async fn author_upload(
     State(control): State<ControlPlane>,
     headers: HeaderMap,
-    body: Bytes,
+    mut multipart: Multipart,
 ) -> Response {
     let author = match control.require_author(&headers).await {
         Ok(author) => author,
         Err(response) => return response,
+    };
+    let mut maybe_wasm = None;
+    let mut envs = None;
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let Some(name) = field.name().map(str::to_string) else {
+                    continue;
+                };
+                match name.as_str() {
+                    "wasm" => match field.bytes().await {
+                        Ok(bytes) => maybe_wasm = Some(bytes),
+                        Err(error) => return bad_request(error),
+                    },
+                    "envs" => match field.text().await {
+                        Ok(text) => {
+                            let parsed = serde_json::from_str::<Vec<terminal_games::control::AuthorEnvVar>>(&text)
+                                .map_err(|error| anyhow::anyhow!("invalid env json: {error}"));
+                            match parsed {
+                                Ok(parsed) => envs = Some(parsed),
+                                Err(error) => return bad_request(error),
+                            }
+                        }
+                        Err(error) => return bad_request(error),
+                    },
+                    _ => {}
+                }
+            }
+            Ok(None) => break,
+            Err(error) => return bad_request(error),
+        }
+    }
+    let Some(body) = maybe_wasm else {
+        return bad_request("missing wasm upload");
     };
     if body.len() > AUTHOR_UPLOAD_MAX_BYTES {
         return (
@@ -454,13 +891,22 @@ pub async fn author_upload(
         Ok(manifest) => manifest,
         Err(error) => return bad_request(error),
     };
-    if manifest.shortname != author.shortname {
+    if manifest.shortname != author.record.shortname {
         return bad_request(format!(
             "manifest shortname '{}' does not match author shortname '{}'",
-            manifest.shortname, author.shortname
+            manifest.shortname, author.record.shortname
         ));
     }
-    match upload_version(&control.app_server.db, &author.shortname, &manifest, &body).await {
+    let envs = match envs {
+        Some(envs) => {
+            if let Err(error) = validate_control_envs(&envs) {
+                return bad_request(error);
+            }
+            Some(envs)
+        }
+        None => None,
+    };
+    match upload_version(&control.app_server.db, &author.record.shortname, &manifest, &body, envs.as_deref()).await {
         Ok(response) => {
             control
                 .app_server
@@ -489,10 +935,10 @@ pub async fn author_delete(
         Ok(author) => author,
         Err(response) => return response,
     };
-    if request.shortname != author.shortname {
+    if request.shortname != author.record.shortname {
         return (StatusCode::FORBIDDEN, "shortname mismatch").into_response();
     }
-    match delete_author_and_game(&control.app_server.db, author.id).await {
+    match delete_author_and_game(&control.app_server.db, author.record.id).await {
         Ok(Some(shortname)) => {
             control.app_server.invalidate_shortname_cache(&shortname).await;
             Json(DeleteShortnameResponse { shortname }).into_response()
@@ -753,6 +1199,68 @@ async fn load_author_by_shortname(
     }))
 }
 
+async fn load_author_by_id(
+    db: &libsql::Connection,
+    author_id: u64,
+) -> anyhow::Result<Option<CreateAuthorSummaryRow>> {
+    let mut rows = db
+        .query(
+            "SELECT id, shortname FROM authors WHERE id = ?1 LIMIT 1",
+            libsql::params!(author_id),
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(CreateAuthorSummaryRow {
+        author_id: row.get::<u64>(0)?,
+        shortname: row.get::<String>(1)?,
+    }))
+}
+
+async fn load_game_env_blob(
+    db: &libsql::Connection,
+    shortname: &str,
+) -> anyhow::Result<Option<(u64, Vec<u8>, Vec<u8>)>> {
+    let mut rows = db
+        .query(
+            "SELECT id, env_salt, env_blob FROM games WHERE shortname = ?1 LIMIT 1",
+            libsql::params!(shortname),
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        row.get::<u64>(0)?,
+        row.get::<Vec<u8>>(1)?,
+        row.get::<Vec<u8>>(2)?,
+    )))
+}
+
+fn control_envs_to_runtime(
+    envs: &[terminal_games::control::AuthorEnvVar],
+) -> Vec<RuntimeAuthorEnvVar> {
+    envs.iter()
+        .cloned()
+        .map(|env| RuntimeAuthorEnvVar {
+            name: env.name,
+            value: env.value,
+        })
+        .collect()
+}
+
+fn runtime_envs_to_control(
+    envs: Vec<RuntimeAuthorEnvVar>,
+) -> Vec<terminal_games::control::AuthorEnvVar> {
+    envs.into_iter()
+        .map(|env| terminal_games::control::AuthorEnvVar {
+            name: env.name,
+            value: env.value,
+        })
+        .collect()
+}
+
 struct CreateAuthorSummaryRow {
     author_id: u64,
     shortname: String,
@@ -865,9 +1373,15 @@ async fn upload_version(
     shortname: &str,
     manifest: &GameManifest,
     wasm: &[u8],
+    envs: Option<&[terminal_games::control::AuthorEnvVar]>,
 ) -> anyhow::Result<UploadGameResponse> {
     let details_json = serde_json::to_string(&manifest.details)?;
     let tx = db.transaction().await?;
+    let env_blob = match envs {
+        Some(envs) => Some(encrypt_author_env_blob(&control_envs_to_runtime(envs))?),
+        None => None,
+    };
+    let empty_env_blob = encrypt_author_env_blob(&[])?;
     let mut game_rows = tx
         .query(
             "SELECT id, current_version FROM games WHERE shortname = ?1 LIMIT 1",
@@ -877,19 +1391,48 @@ async fn upload_version(
     let (game_id, next_version) = if let Some(game_row) = game_rows.next().await? {
         let game_id = game_row.get::<u64>(0)?;
         let next_version = game_row.get::<u64>(1)? + 1;
-        tx.execute(
-            "UPDATE games
-             SET wasm = ?2, details = json(?3), current_version = ?4
-             WHERE id = ?1",
-            libsql::params!(game_id, wasm.to_vec(), details_json.as_str(), next_version),
-        )
-        .await?;
+        if let Some(env_blob) = &env_blob {
+            tx.execute(
+                "UPDATE games
+                 SET wasm = ?2, details = json(?3), current_version = ?4, env_salt = ?5, env_blob = ?6
+                 WHERE id = ?1",
+                libsql::params!(
+                    game_id,
+                    wasm.to_vec(),
+                    details_json.as_str(),
+                    next_version,
+                    env_blob.salt.clone(),
+                    env_blob.ciphertext.clone()
+                ),
+            )
+            .await?;
+        } else {
+            tx.execute(
+                "UPDATE games
+                 SET wasm = ?2, details = json(?3), current_version = ?4
+                 WHERE id = ?1",
+                libsql::params!(game_id, wasm.to_vec(), details_json.as_str(), next_version),
+            )
+            .await?;
+        }
         (game_id, next_version)
     } else {
         tx.execute(
-            "INSERT INTO games (shortname, wasm, details, current_version)
-             VALUES (?1, ?2, json(?3), 1)",
-            libsql::params!(shortname, wasm.to_vec(), details_json.as_str()),
+            "INSERT INTO games (shortname, wasm, details, current_version, env_salt, env_blob)
+             VALUES (?1, ?2, json(?3), 1, ?4, ?5)",
+            libsql::params!(
+                shortname,
+                wasm.to_vec(),
+                details_json.as_str(),
+                env_blob
+                    .as_ref()
+                    .map(|blob| blob.salt.clone())
+                    .unwrap_or_else(|| empty_env_blob.salt.clone()),
+                env_blob
+                    .as_ref()
+                    .map(|blob| blob.ciphertext.clone())
+                    .unwrap_or_else(|| empty_env_blob.ciphertext.clone())
+            ),
         )
         .await?;
         let mut id_rows = tx.query("SELECT last_insert_rowid()", ()).await?;
@@ -909,6 +1452,184 @@ async fn upload_version(
     })
 }
 
+async fn load_ban_entries(db: &libsql::Connection) -> anyhow::Result<Vec<BanEntry>> {
+    let mut rows = db
+        .query(
+            "SELECT ip, COALESCE(reason, ''), expires_at, inserted_at
+             FROM ip_bans
+             ORDER BY inserted_at DESC, ip ASC",
+            (),
+        )
+        .await?;
+    let now = current_unix_seconds();
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let expires_at = row.get::<Option<i64>>(2)?;
+        if !is_ban_active(expires_at, now) {
+            continue;
+        }
+        entries.push(BanEntry {
+            ip: row.get::<String>(0)?,
+            reason: row.get::<String>(1)?.trim().to_string(),
+            expires_at,
+            inserted_at: row.get::<i64>(3)?,
+        });
+    }
+    Ok(entries)
+}
+
+async fn load_ticker_entries(db: &libsql::Connection) -> anyhow::Result<Vec<TickerEntry>> {
+    let mut rows = db
+        .query(
+            "SELECT id, content, expires_at, created_at
+             FROM status_tickers
+             ORDER BY created_at ASC, id ASC",
+            (),
+        )
+        .await?;
+    let now = current_unix_seconds();
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let expires_at = row.get::<Option<i64>>(2)?;
+        if expires_at.is_some_and(|expires_at| expires_at <= now) {
+            continue;
+        }
+        entries.push(TickerEntry {
+            ticker_id: row.get::<u64>(0)?,
+            content: row.get::<String>(1)?,
+            expires_at,
+            created_at: row.get::<i64>(3)?,
+        });
+    }
+    Ok(entries)
+}
+
+pub async fn load_status_bar_state(
+    db: &libsql::Connection,
+    region_id: &str,
+) -> anyhow::Result<StatusBarState> {
+    let tickers = load_ticker_entries(db).await?;
+    let mut rows = db
+        .query(
+            "SELECT id, level, regions, message, expires_at, created_at
+             FROM status_broadcasts
+             ORDER BY created_at ASC, id ASC",
+            (),
+        )
+        .await?;
+    let now = current_unix_seconds();
+    let mut broadcasts = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let expires_at = row.get::<i64>(4)?;
+        if expires_at <= now {
+            continue;
+        }
+        let regions = parse_regions_csv(&row.get::<String>(2)?);
+        if !regions.is_empty() && !regions.iter().any(|region| region == region_id) {
+            continue;
+        }
+        broadcasts.push(StatusBroadcast {
+            broadcast_id: row.get::<u64>(0)?,
+            level: parse_broadcast_level(&row.get::<String>(1)?)?,
+            regions,
+            message: row.get::<String>(3)?,
+            expires_at,
+            created_at: row.get::<i64>(5)?,
+        });
+    }
+    Ok(StatusBarState { tickers, broadcasts })
+}
+
+async fn load_author_envs(
+    db: &libsql::Connection,
+    shortname: &str,
+) -> anyhow::Result<Vec<terminal_games::control::AuthorEnvVar>> {
+    let (_, env_salt, env_blob) = load_game_env_blob(db, shortname)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("upload a game before managing env vars"))?;
+    Ok(runtime_envs_to_control(decrypt_author_env_blob(
+        &env_salt,
+        &env_blob,
+    )?))
+}
+
+async fn upsert_author_envs(
+    db: &libsql::Connection,
+    shortname: &str,
+    envs: &[terminal_games::control::AuthorEnvVar],
+    replace: bool,
+) -> anyhow::Result<(u64, u64)> {
+    let (game_id, env_salt, env_blob) = load_game_env_blob(db, shortname)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("upload a game before managing env vars"))?;
+    let mut current = if replace {
+        Vec::new()
+    } else {
+        decrypt_author_env_blob(&env_salt, &env_blob)?
+    };
+    for env in control_envs_to_runtime(envs) {
+        if let Some(existing) = current.iter_mut().find(|existing| existing.name == env.name) {
+            existing.value = env.value;
+        } else {
+            current.push(env);
+        }
+    }
+    let encrypted = encrypt_author_env_blob(&current)?;
+    let tx = db.transaction().await?;
+    tx.execute(
+        "UPDATE games
+         SET env_salt = ?2,
+             env_blob = ?3,
+             current_version = current_version + 1
+         WHERE id = ?1",
+        libsql::params!(game_id, encrypted.salt, encrypted.ciphertext),
+    )
+    .await?;
+    let mut rows = tx
+        .query("SELECT current_version FROM games WHERE id = ?1", libsql::params!(game_id))
+        .await?;
+    let version = rows
+        .next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("game row missing after env update"))?
+        .get::<u64>(0)?;
+    tx.commit().await?;
+    Ok((game_id, version))
+}
+
+async fn delete_author_env(
+    db: &libsql::Connection,
+    shortname: &str,
+    name: &str,
+) -> anyhow::Result<(u64, u64)> {
+    let Some((game_id, env_salt, env_blob)) = load_game_env_blob(db, shortname).await? else {
+        anyhow::bail!("upload a game before managing env vars");
+    };
+    let mut current = decrypt_author_env_blob(&env_salt, &env_blob)?;
+    current.retain(|env| env.name != name);
+    let encrypted = encrypt_author_env_blob(&current)?;
+    let tx = db.transaction().await?;
+    tx.execute(
+        "UPDATE games
+         SET env_salt = ?2,
+             env_blob = ?3,
+             current_version = current_version + 1
+         WHERE id = ?1",
+        libsql::params!(game_id, encrypted.salt, encrypted.ciphertext),
+    )
+    .await?;
+    let mut rows = tx
+        .query("SELECT current_version FROM games WHERE id = ?1", libsql::params!(game_id))
+        .await?;
+    let version = rows
+        .next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("game row missing after env delete"))?
+        .get::<u64>(0)?;
+    tx.commit().await?;
+    Ok((game_id, version))
+}
+
 fn random_token_secret() -> String {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -919,6 +1640,105 @@ fn sha256_hex(secret: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+fn validate_control_envs(envs: &[terminal_games::control::AuthorEnvVar]) -> anyhow::Result<()> {
+    let runtime_envs = envs
+        .iter()
+        .cloned()
+        .map(|env| RuntimeAuthorEnvVar {
+            name: env.name,
+            value: env.value,
+        })
+        .collect::<Vec<_>>();
+    validate_author_envs(&runtime_envs)
+}
+
+fn parse_optional_expiry(
+    duration: Option<&str>,
+    expires_at: Option<&str>,
+) -> anyhow::Result<Option<i64>> {
+    match (duration, expires_at) {
+        (Some(_), Some(_)) => anyhow::bail!("pass either duration or expires-at, not both"),
+        (Some(duration), None) => Ok(Some(expiry_from_duration(parse_duration_string(duration)?)?)),
+        (None, Some(expires_at)) => Ok(Some(parse_utc_timestamp(expires_at)?)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn expiry_from_duration(duration: TimeDuration) -> anyhow::Result<i64> {
+    Ok((OffsetDateTime::now_utc() + duration).unix_timestamp())
+}
+
+fn parse_duration_string(raw: &str) -> anyhow::Result<TimeDuration> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    anyhow::ensure!(!trimmed.is_empty(), "duration cannot be empty");
+    let compact = trimmed.replace(' ', "");
+    let split_at = compact
+        .find(|ch: char| !ch.is_ascii_digit())
+        .ok_or_else(|| anyhow::anyhow!("duration must include a unit like 1h or 1 week"))?;
+    let amount = compact[..split_at]
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("invalid duration amount"))?;
+    anyhow::ensure!(amount > 0, "duration must be positive");
+    let unit = &compact[split_at..];
+    let seconds = match unit {
+        "s" | "sec" | "secs" | "second" | "seconds" => amount,
+        "m" | "min" | "mins" | "minute" | "minutes" => amount * 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => amount * 60 * 60,
+        "d" | "day" | "days" => amount * 60 * 60 * 24,
+        "w" | "wk" | "wks" | "week" | "weeks" => amount * 60 * 60 * 24 * 7,
+        _ => anyhow::bail!("unsupported duration unit '{unit}'"),
+    };
+    Ok(TimeDuration::seconds(seconds))
+}
+
+fn parse_utc_timestamp(raw: &str) -> anyhow::Result<i64> {
+    Ok(OffsetDateTime::parse(raw.trim(), &Rfc3339)?.unix_timestamp())
+}
+
+fn parse_broadcast_level(raw: &str) -> anyhow::Result<BroadcastLevel> {
+    match raw {
+        "info" => Ok(BroadcastLevel::Info),
+        "warning" => Ok(BroadcastLevel::Warning),
+        "error" => Ok(BroadcastLevel::Error),
+        other => anyhow::bail!("invalid broadcast level '{other}'"),
+    }
+}
+
+fn broadcast_level_sql(level: BroadcastLevel) -> &'static str {
+    match level {
+        BroadcastLevel::Info => "info",
+        BroadcastLevel::Warning => "warning",
+        BroadcastLevel::Error => "error",
+    }
+}
+
+fn normalize_regions_csv(regions: &[String]) -> String {
+    let mut regions = regions
+        .iter()
+        .map(|region| region.trim().to_string())
+        .filter(|region| !region.is_empty())
+        .collect::<Vec<_>>();
+    regions.sort();
+    regions.dedup();
+    regions.join(",")
+}
+
+fn parse_regions_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|region| !region.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn current_unix_seconds() -> i64 {
+    OffsetDateTime::now_utc().unix_timestamp()
+}
+
+fn is_ban_active(expires_at: Option<i64>, now: i64) -> bool {
+    expires_at.is_none_or(|expires_at| expires_at > now)
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {

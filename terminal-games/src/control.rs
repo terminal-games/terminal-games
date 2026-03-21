@@ -93,6 +93,27 @@ pub struct BanIpRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanIpAddRequest {
+    pub ip: String,
+    pub reason: String,
+    pub duration: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanIpRemoveRequest {
+    pub ip: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanEntry {
+    pub ip: String,
+    pub reason: String,
+    pub expires_at: Option<i64>,
+    pub inserted_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KickSessionRequest {
     pub local_session_id: u64,
 }
@@ -123,6 +144,18 @@ pub struct DeleteAuthorRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotateAuthorTokenRequest {
+    pub author_id: u64,
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotateAuthorTokenResponse {
+    pub author: AuthorSummary,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteShortnameRequest {
     pub shortname: String,
 }
@@ -139,6 +172,30 @@ pub struct UploadGameResponse {
     pub game_id: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthorEnvVar {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorEnvListResponse {
+    pub shortname: String,
+    pub envs: Vec<AuthorEnvVar>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorEnvSetRequest {
+    pub envs: Vec<AuthorEnvVar>,
+    #[serde(default)]
+    pub replace: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorEnvDeleteRequest {
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthorSelfResponse {
     pub author_id: u64,
@@ -151,6 +208,62 @@ pub struct AuthorSelfResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheInvalidateRequest {
     pub shortname: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BroadcastLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TickerAddRequest {
+    pub content: String,
+    pub duration: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TickerRemoveRequest {
+    pub ticker_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TickerEntry {
+    pub ticker_id: u64,
+    pub content: String,
+    pub expires_at: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BroadcastRequest {
+    pub level: BroadcastLevel,
+    #[serde(default)]
+    pub regions: Vec<String>,
+    pub message: String,
+    pub duration: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusBroadcast {
+    pub broadcast_id: u64,
+    pub level: BroadcastLevel,
+    pub message: String,
+    pub expires_at: i64,
+    pub created_at: i64,
+    #[serde(default)]
+    pub regions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StatusBarState {
+    #[serde(default)]
+    pub tickers: Vec<TickerEntry>,
+    #[serde(default)]
+    pub broadcasts: Vec<StatusBroadcast>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

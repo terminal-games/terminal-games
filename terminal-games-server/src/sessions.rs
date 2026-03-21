@@ -12,7 +12,7 @@ use std::{
 use bytes::Bytes;
 use terminal_games::{
     app::{ActiveShortnameTracker, SessionEndReason},
-    control::SessionSummary,
+    control::{SessionSummary, StatusBarState},
 };
 use tokio::sync::{broadcast, mpsc, watch};
 
@@ -70,6 +70,7 @@ pub struct SessionRegistration {
     pub tracker: Arc<dyn ActiveShortnameTracker>,
     pub control_rx: watch::Receiver<SessionAdminControl>,
     pub admin_input_rx: mpsc::Receiver<Bytes>,
+    pub status_bar_state_rx: watch::Receiver<StatusBarState>,
 }
 
 #[derive(Clone)]
@@ -123,14 +124,21 @@ impl ActiveShortnameTracker for Tracker {
 pub struct SessionRegistry {
     region_id: String,
     sessions: Mutex<HashMap<u64, Arc<RuntimeSession>>>,
+    status_bar_state_tx: watch::Sender<StatusBarState>,
 }
 
 impl SessionRegistry {
     pub fn new(region_id: String) -> Arc<Self> {
+        let (status_bar_state_tx, _) = watch::channel(StatusBarState::default());
         Arc::new(Self {
             region_id,
             sessions: Mutex::new(HashMap::new()),
+            status_bar_state_tx,
         })
+    }
+
+    pub fn region_id(&self) -> &str {
+        &self.region_id
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -177,7 +185,12 @@ impl SessionRegistry {
             tracker: Arc::new(Tracker { session }) as Arc<dyn ActiveShortnameTracker>,
             control_rx,
             admin_input_rx: input_rx,
+            status_bar_state_rx: self.status_bar_state_tx.subscribe(),
         }
+    }
+
+    pub fn set_status_bar_state(&self, state: StatusBarState) {
+        let _ = self.status_bar_state_tx.send(state);
     }
 
     pub fn remove(&self, local_session_id: u64) {

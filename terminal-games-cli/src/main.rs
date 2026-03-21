@@ -31,6 +31,8 @@ use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, laye
 
 use terminal_games::{
     app::{AppInstantiationParams, AppServer},
+    author_env::encrypt_author_env_blob,
+    control::StatusBarState,
     input_guard::{InputGuard, InputGuardError},
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
     mesh::{LocalDiscovery, Mesh},
@@ -321,12 +323,13 @@ async fn upsert_game(
     details: &str,
 ) -> Result<()> {
     let wasm = fs::read(path).with_context(|| format!("Failed to read wasm for {shortname}"))?;
+    let empty_env = encrypt_author_env_blob(&[])?;
     conn.execute(
-        "INSERT INTO games (shortname, wasm, details, current_version)
-         VALUES (?1, ?2, json(?3), 1)
+        "INSERT INTO games (shortname, wasm, details, current_version, env_salt, env_blob)
+         VALUES (?1, ?2, json(?3), 1, ?4, ?5)
          ON CONFLICT(shortname) DO UPDATE
          SET wasm = excluded.wasm, details = excluded.details, current_version = games.current_version + 1",
-        libsql::params!(shortname, wasm, details),
+        libsql::params!(shortname, wasm, details, empty_env.salt, empty_env.ciphertext),
     )
     .await
     .with_context(|| format!("Failed to upsert game {shortname}"))?;
@@ -583,6 +586,7 @@ async fn async_main() -> Result<()> {
     }
     let (first_cols, first_rows) = *resize_rx.borrow();
     let terminal_parser = input_guard.take_terminal_parser(first_rows, first_cols);
+    let (_, status_bar_state_rx) = tokio::sync::watch::channel(StatusBarState::default());
 
     let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
         args: None,
@@ -604,6 +608,7 @@ async fn async_main() -> Result<()> {
         log_backend: guest_log_backend,
         active_shortname_tracker: None,
         idle_fuel_receiver,
+        status_bar_state_receiver: status_bar_state_rx,
     });
     let mut pending_input: Option<
         Pin<Box<dyn Future<Output = Result<(), InputGuardError>> + Send>>,

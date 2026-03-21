@@ -21,6 +21,7 @@ use anyhow::{Context, Result};
 use crate::admission::{AdmissionConfig, BanRule, StoredBan};
 use terminal_games::{
     app::AppServer,
+    author_env::encrypt_author_env_blob,
     manifest::extract_manifest_from_wasm,
     mesh::{EnvDiscovery, Mesh},
 };
@@ -39,6 +40,7 @@ async fn ensure_builtin_menu(conn: &libsql::Connection) -> Result<()> {
     };
     let manifest = manifest.sanitized()?;
     let details_json = serde_json::to_string(&manifest.details)?;
+    let empty_env = encrypt_author_env_blob(&[])?;
 
     let tx = conn.transaction().await?;
     let mut rows = tx
@@ -64,9 +66,15 @@ async fn ensure_builtin_menu(conn: &libsql::Connection) -> Result<()> {
         }
     } else {
         tx.execute(
-            "INSERT INTO games (shortname, wasm, details, current_version)
-             VALUES (?1, ?2, json(?3), 1)",
-            libsql::params!(manifest.shortname.as_str(), MENU_WASM.to_vec(), details_json.as_str()),
+            "INSERT INTO games (shortname, wasm, details, current_version, env_salt, env_blob)
+             VALUES (?1, ?2, json(?3), 1, ?4, ?5)",
+            libsql::params!(
+                manifest.shortname.as_str(),
+                MENU_WASM.to_vec(),
+                details_json.as_str(),
+                empty_env.salt,
+                empty_env.ciphertext
+            ),
         )
         .await?;
     }
@@ -298,6 +306,9 @@ async fn main() -> Result<()> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| mesh.region().to_string());
     let session_registry = sessions::SessionRegistry::new(region_id);
+    let initial_status_bar_state =
+        control::load_status_bar_state(&conn, &session_registry.region_id()).await?;
+    session_registry.set_status_bar_state(initial_status_bar_state);
     let control_plane = control::ControlPlane::new(
         app_server.clone(),
         admission_controller.clone(),

@@ -26,7 +26,9 @@ use wasmtime::InstanceAllocationStrategy;
 use wasmtime_wasi::I32Exit;
 
 use crate::{
+    author_env::decrypt_author_env_blob,
     audio::{CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
+    control::StatusBarState,
     log_backend::{GuestLogBackend, LogLevel, parse_guest_log_object},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
@@ -181,6 +183,7 @@ pub struct AppInstantiationParams {
     pub log_backend: Arc<dyn GuestLogBackend>,
     pub active_shortname_tracker: Option<Arc<dyn ActiveShortnameTracker>>,
     pub idle_fuel_receiver: Option<watch::Receiver<i32>>,
+    pub status_bar_state_receiver: watch::Receiver<StatusBarState>,
 }
 
 impl AppServer {
@@ -300,7 +303,7 @@ impl AppServer {
 
         tokio::task::spawn(async move {
             let AppInstantiationParams {
-                mut input_receiver,
+                input_receiver: mut raw_input_receiver,
                 mut replay_request_receiver,
                 output_sender,
                 audio_sender,
@@ -319,6 +322,7 @@ impl AppServer {
                 log_backend,
                 active_shortname_tracker,
                 idle_fuel_receiver,
+                status_bar_state_receiver,
             } = params;
             let startup_shortname = first_app_shortname.clone();
 
@@ -332,6 +336,8 @@ impl AppServer {
 
             let (app_output_sender, mut app_output_receiver) =
                 tokio::sync::mpsc::channel::<Vec<u8>>(1);
+            let (app_input_sender, mut app_input_receiver) =
+                tokio::sync::mpsc::channel::<Bytes>(64);
             let has_next_app_shortname = Arc::new(AtomicBool::new(false));
             let (notification_tx, notification_rx) =
                 tokio::sync::mpsc::channel::<StatusNotification>(1);
@@ -410,6 +416,7 @@ impl AppServer {
                 network_info.clone(),
                 terminal_profile,
                 notification_rx,
+                status_bar_state_receiver,
             );
             let mut escape_buffer = EscapeSequenceBuffer::new();
             let mut status_bar_interval = tokio::time::interval(Duration::from_secs(1));
@@ -436,7 +443,7 @@ impl AppServer {
                     menu_username: menu_username.clone(),
                     limits: AppLimiter::default(),
                     next_app: None,
-                    input_receiver,
+                    input_receiver: app_input_receiver,
                     has_next_app: has_next_app_shortname.clone(),
                     graceful_shutdown_token: graceful_shutdown_token.clone(),
                     network_info: network_info.clone(),
@@ -520,6 +527,27 @@ impl AppServer {
                                     if output_sender.send(output).await.is_err() {
                                         break 'block None;
                                     }
+                                }
+                            }
+
+                            input = raw_input_receiver.recv() => {
+                                let Some(input) = input else {
+                                    break 'block None;
+                                };
+                                if status_bar.handle_terminal_input(input.as_ref()) {
+                                    let mut output = Vec::new();
+                                    status_bar.maybe_render_into(terminal.screen(), &mut output, true);
+                                    if !output.is_empty() {
+                                        let output = Arc::new(output);
+                                        replay_buffer.push_output(output.clone());
+                                        if output_sender.send(output).await.is_err() {
+                                            break 'block None;
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if app_input_sender.send(input).await.is_err() {
+                                    break 'block None;
                                 }
                             }
 
@@ -778,7 +806,7 @@ impl AppServer {
                 menu_completed_rx = state.menu_completed_rx;
                 menu_request_tx = state.menu_request_tx;
                 graceful_shutdown_token = state.graceful_shutdown_token;
-                input_receiver = state.input_receiver;
+                app_input_receiver = state.input_receiver;
                 terminal_snapshot = state.terminal_snapshot;
                 maybe_mixer = state.audio;
                 ctx = state.ctx;
@@ -832,7 +860,10 @@ impl AppServer {
         let mut app_rows = ctx
             .db
             .query(
-                "SELECT id, wasm, current_version FROM games WHERE shortname = ?1 AND current_version > 0 LIMIT 1",
+                "SELECT id, wasm, current_version, env_salt, env_blob
+                 FROM games
+                 WHERE shortname = ?1 AND current_version > 0
+                 LIMIT 1",
                 [shortname.as_str()],
             )
             .await?;
@@ -843,6 +874,8 @@ impl AppServer {
         let game_id = app_row.get::<u64>(0)?;
         let wasm_bytes = app_row.get::<Vec<u8>>(1)?;
         let version = app_row.get::<u64>(2)?;
+        let env_salt = app_row.get::<Vec<u8>>(3)?;
+        let env_blob = app_row.get::<Vec<u8>>(4)?;
         let app_id = AppId { game_id, version };
         let latest_version = track_game_version(&ctx.latest_versions, game_id, version).await;
         update_atomic_max(&latest_version, version);
@@ -850,13 +883,9 @@ impl AppServer {
         let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(app_id).await;
 
         let mut envs = vec![];
-        let mut rows = ctx
-            .db
-            .query("SELECT name, value FROM envs WHERE game_id = ?1", [game_id])
-            .await?;
-        while let Some(row) = rows.next().await? {
-            let name = row.get(0)?;
-            let value = row.get(1)?;
+        for env in decrypt_author_env_blob(&env_salt, &env_blob)? {
+            let name = env.name;
+            let value = env.value;
             envs.push((name, value));
         }
         envs.push(("REMOTE_SSHID".to_string(), ctx.remote_sshid.clone()));

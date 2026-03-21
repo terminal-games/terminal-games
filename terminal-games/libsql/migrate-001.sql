@@ -12,15 +12,9 @@ CREATE TABLE IF NOT EXISTS games (
     wasm BLOB NOT NULL,
     details JSON NOT NULL CHECK(json_valid(details)),
     current_version INTEGER NOT NULL DEFAULT(0),
+    env_salt BLOB NOT NULL,
+    env_blob BLOB NOT NULL,
     duration_seconds REAL NOT NULL DEFAULT(0)
-);
-
-CREATE TABLE IF NOT EXISTS envs (
-    game_id INTEGER NOT NULL,
-    name TEXT NOT NULL,
-    value TEXT NOT NULL,
-    PRIMARY KEY(game_id, name),
-    FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS authors (
@@ -71,3 +65,19 @@ CREATE TABLE IF NOT EXISTS ip_bans (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ip_bans_inserted_at ON ip_bans(inserted_at);
+
+CREATE TABLE IF NOT EXISTS status_tickers (
+    id INTEGER PRIMARY KEY,
+    content TEXT NOT NULL,
+    expires_at INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE IF NOT EXISTS status_broadcasts (
+    id INTEGER PRIMARY KEY,
+    level TEXT NOT NULL,
+    regions TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
