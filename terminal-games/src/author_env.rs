@@ -2,17 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::sync::OnceLock;
-
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use tracing::warn;
 
 pub const AUTHOR_ENV_KEY_ENV: &str = "AUTHOR_ENV_SECRET_KEY";
-const AUTHOR_ENV_DEV_FALLBACK_KEY: &str = "terminal-games-dev-author-env-key";
 pub const MAX_AUTHOR_ENVS: usize = 64;
 pub const MAX_AUTHOR_ENV_NAME_BYTES: usize = 64;
 pub const MAX_AUTHOR_ENV_VALUE_BYTES: usize = 8 * 1024;
@@ -93,7 +89,10 @@ pub fn validate_author_env_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn encrypt_author_env_blob(envs: &[AuthorEnvVar]) -> anyhow::Result<EncryptedAuthorEnvBlob> {
+pub fn encrypt_author_env_blob(
+    secret_key: &str,
+    envs: &[AuthorEnvVar],
+) -> anyhow::Result<EncryptedAuthorEnvBlob> {
     validate_author_envs(envs)?;
     let encoded = serde_json::to_vec(envs)?;
     anyhow::ensure!(
@@ -109,7 +108,7 @@ pub fn encrypt_author_env_blob(envs: &[AuthorEnvVar]) -> anyhow::Result<Encrypte
 
     let mut salt = [0u8; AUTHOR_ENV_SALT_BYTES];
     OsRng.fill_bytes(&mut salt);
-    let (cipher, nonce) = cipher_and_nonce_from_salt(&salt)?;
+    let (cipher, nonce) = cipher_and_nonce_from_salt(secret_key, &salt)?;
     let ciphertext = cipher
         .encrypt(&nonce, plaintext.as_slice())
         .map_err(|_| anyhow::anyhow!("failed to encrypt env blob"))?;
@@ -125,6 +124,7 @@ pub fn encrypt_author_env_blob(envs: &[AuthorEnvVar]) -> anyhow::Result<Encrypte
 }
 
 pub fn decrypt_author_env_blob(
+    secret_key: &str,
     salt: &[u8],
     ciphertext: &[u8],
 ) -> anyhow::Result<Vec<AuthorEnvVar>> {
@@ -138,7 +138,7 @@ pub fn decrypt_author_env_blob(
         "invalid env blob length {}",
         ciphertext.len()
     );
-    let (cipher, nonce) = cipher_and_nonce_from_salt(salt)?;
+    let (cipher, nonce) = cipher_and_nonce_from_salt(secret_key, salt)?;
     let plaintext = cipher
         .decrypt(&nonce, ciphertext)
         .map_err(|_| anyhow::anyhow!("failed to decrypt env blob"))?;
@@ -164,8 +164,11 @@ pub fn decrypt_author_env_blob(
     Ok(envs)
 }
 
-fn cipher_and_nonce_from_salt(salt: &[u8]) -> anyhow::Result<(XChaCha20Poly1305, XNonce)> {
-    let hk = Hkdf::<Sha256>::new(Some(salt), author_env_secret_key().as_bytes());
+fn cipher_and_nonce_from_salt(
+    secret_key: &str,
+    salt: &[u8],
+) -> anyhow::Result<(XChaCha20Poly1305, XNonce)> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), secret_key.as_bytes());
     let mut key = [0u8; 32];
     hk.expand(AUTHOR_ENV_KEY_INFO, &mut key)
         .map_err(|_| anyhow::anyhow!("failed to derive author env encryption key"))?;
@@ -176,15 +179,4 @@ fn cipher_and_nonce_from_salt(salt: &[u8]) -> anyhow::Result<(XChaCha20Poly1305,
         XChaCha20Poly1305::new(&key.into()),
         *XNonce::from_slice(&nonce),
     ))
-}
-
-fn author_env_secret_key() -> &'static str {
-    static KEY: OnceLock<String> = OnceLock::new();
-    KEY.get_or_init(|| match std::env::var(AUTHOR_ENV_KEY_ENV) {
-        Ok(value) if !value.trim().is_empty() => value,
-        _ => {
-            warn!("{AUTHOR_ENV_KEY_ENV} is not set; using the built-in development fallback key");
-            AUTHOR_ENV_DEV_FALLBACK_KEY.to_string()
-        }
-    })
 }

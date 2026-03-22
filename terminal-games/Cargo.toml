@@ -33,6 +33,7 @@ strip-ansi-escapes = "0.2"
 tarpc = { version = "0.37", features = ["serde", "serde-transport", "serde-transport-bincode", "tokio1"] }
 terminal-games-manifest = { path = "../terminal-games-manifest" }
 terminput = "0.5"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12",] }
 tokio-util = { version = "0.7", features = ["rt"] }

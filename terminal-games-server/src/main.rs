@@ -17,15 +17,18 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use rustls::crypto::aws_lc_rs;
 use tracing_subscriber::{Layer, filter::LevelFilter, layer::SubscriberExt};
 
 use crate::admission::{AdmissionConfig, BanRule, StoredBan};
 use terminal_games::{
     app::AppServer,
-    author_env::encrypt_author_env_blob,
+    author_env::{AUTHOR_ENV_KEY_ENV, encrypt_author_env_blob},
     manifest::{extract_manifest_from_wasm, sanitize_manifest},
     mesh::{EnvDiscovery, Mesh},
 };
+
+const AUTHOR_ENV_DEV_FALLBACK_KEY: &str = "terminal-games-dev-author-env-key";
 
 // Avoid musl's default allocator due to lackluster performance
 // https://nickb.dev/blog/default-musl-allocator-considered-harmful-to-performance
@@ -33,7 +36,7 @@ use terminal_games::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-async fn ensure_builtin_menu(conn: &libsql::Connection) -> Result<()> {
+async fn ensure_builtin_menu(conn: &libsql::Connection, author_env_secret_key: &str) -> Result<()> {
     static MENU_WASM: &[u8] = include_bytes!("../../cmd/menu/menu.wasm");
 
     let Some(manifest) = extract_manifest_from_wasm(MENU_WASM)? else {
@@ -41,7 +44,7 @@ async fn ensure_builtin_menu(conn: &libsql::Connection) -> Result<()> {
     };
     let manifest = sanitize_manifest(&manifest)?;
     let details_json = serde_json::to_string(&manifest.details)?;
-    let empty_env = encrypt_author_env_blob(&[])?;
+    let empty_env = encrypt_author_env_blob(author_env_secret_key, &[])?;
 
     let tx = conn.transaction().await?;
     let mut rows = tx
@@ -200,6 +203,7 @@ fn spawn_ip_ban_sync_task(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = aws_lc_rs::default_provider().install_default();
     let filter = tracing_subscriber::filter::Targets::new()
         .with_target("terminal_games", LevelFilter::INFO)
         .with_target("terminal_games_server", LevelFilter::INFO)
@@ -238,14 +242,19 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to commit migration transaction")?;
 
-    ensure_builtin_menu(&conn).await?;
+    let author_env_secret_key = load_author_env_secret_key();
+    ensure_builtin_menu(&conn, &author_env_secret_key).await?;
     tracing::info!("Ensured builtin menu is installed");
 
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
     mesh.start_discovery().await?;
     mesh.serve().await?;
 
-    let app_server = Arc::new(AppServer::new(mesh.clone(), conn.clone())?);
+    let app_server = Arc::new(AppServer::new(
+        mesh.clone(),
+        conn.clone(),
+        author_env_secret_key,
+    )?);
     {
         let app_server = app_server.clone();
         let mut updates = mesh.subscribe_game_version_updates();
@@ -360,6 +369,18 @@ async fn main() -> Result<()> {
     mesh.graceful_shutdown().await;
 
     Ok(())
+}
+
+fn load_author_env_secret_key() -> String {
+    match std::env::var(AUTHOR_ENV_KEY_ENV) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            tracing::warn!(
+                "{AUTHOR_ENV_KEY_ENV} is not set; using the built-in development fallback key"
+            );
+            AUTHOR_ENV_DEV_FALLBACK_KEY.to_string()
+        }
+    }
 }
 
 fn parse_ssh_captcha_threshold(raw: Result<String, std::env::VarError>) -> Result<Option<f64>> {

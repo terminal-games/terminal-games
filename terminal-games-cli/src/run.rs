@@ -30,18 +30,20 @@ use terminal_games::{
     control::StatusBarState,
     input_guard::{InputGuard, InputGuardError},
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
+    mesh::GameVersionUpdateMessage,
     mesh::{LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
     terminal_profile::TerminalProfile,
 };
 
 use crate::audio;
+use crate::config::load_or_create_author_env_secret_key;
 
 #[derive(Args)]
 pub(crate) struct RunArgs {
     /// Path to the wasm file to run
     #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
-    wasm_file: Option<String>,
+    pub(crate) wasm_file: Option<String>,
 
     /// Additional games in shortname=path format
     #[arg(short, long = "game", value_name = "SHORTNAME=PATH")]
@@ -83,7 +85,7 @@ pub(crate) struct RunArgs {
     #[arg(long = "platform-log-level", default_value = "warn")]
     platform_log_level: LogLevelFilter,
 
-    /// Username for CLI auth (default: $USER)
+    /// Username for CLI auth [default: $USER]
     #[arg(long)]
     username: Option<String>,
 }
@@ -293,21 +295,109 @@ fn compute_jittered_latency(latency_ms: u64, jitter_ms: u64) -> Duration {
 
 async fn upsert_game(
     conn: &libsql::Connection,
+    author_env_secret_key: &str,
     shortname: &str,
     path: &str,
     details: &str,
-) -> Result<()> {
+) -> Result<Option<GameVersionUpdateMessage>> {
     let wasm = fs::read(path).with_context(|| format!("Failed to read wasm for {shortname}"))?;
-    let empty_env = encrypt_author_env_blob(&[])?;
-    conn.execute(
-        "INSERT INTO games (shortname, wasm, details, current_version, env_salt, env_blob)
-         VALUES (?1, ?2, json(?3), 1, ?4, ?5)
-         ON CONFLICT(shortname) DO UPDATE
-         SET wasm = excluded.wasm, details = excluded.details, current_version = games.current_version + 1",
-        libsql::params!(shortname, wasm, details, empty_env.salt, empty_env.ciphertext),
-    )
-    .await
-    .with_context(|| format!("Failed to upsert game {shortname}"))?;
+    let empty_env = encrypt_author_env_blob(author_env_secret_key, &[])?;
+    let tx = conn.transaction().await?;
+    let mut rows = tx
+        .query(
+            "SELECT id, wasm, current_version FROM games WHERE shortname = ?1 LIMIT 1",
+            libsql::params!(shortname),
+        )
+        .await
+        .with_context(|| format!("Failed to query existing game {shortname}"))?;
+    let update = if let Some(row) = rows.next().await? {
+        let game_id = row.get::<u64>(0)?;
+        let existing_wasm = row.get::<Vec<u8>>(1)?;
+        let current_version = row.get::<u64>(2)?;
+        if existing_wasm == wasm {
+            tx.execute(
+                "UPDATE games
+                 SET details = json(?2),
+                     env_salt = ?3,
+                     env_blob = ?4
+                 WHERE id = ?1",
+                libsql::params!(game_id, details, empty_env.salt, empty_env.ciphertext),
+            )
+            .await
+            .with_context(|| format!("Failed to refresh game metadata {shortname}"))?;
+            None
+        } else {
+            let next_version = current_version + 1;
+            tx.execute(
+                "UPDATE games
+                 SET wasm = ?2,
+                     details = json(?3),
+                     env_salt = ?4,
+                     env_blob = ?5,
+                     current_version = ?6
+                 WHERE id = ?1",
+                libsql::params!(
+                    game_id,
+                    wasm,
+                    details,
+                    empty_env.salt,
+                    empty_env.ciphertext,
+                    next_version
+                ),
+            )
+            .await
+            .with_context(|| format!("Failed to update game {shortname}"))?;
+            Some(GameVersionUpdateMessage {
+                shortname: shortname.to_string(),
+                game_id,
+                version: next_version,
+            })
+        }
+    } else {
+        tx.execute(
+            "INSERT INTO games (shortname, wasm, details, current_version, env_salt, env_blob)
+             VALUES (?1, ?2, json(?3), 1, ?4, ?5)",
+            libsql::params!(
+                shortname,
+                wasm,
+                details,
+                empty_env.salt,
+                empty_env.ciphertext
+            ),
+        )
+        .await
+        .with_context(|| format!("Failed to insert game {shortname}"))?;
+        let mut rows = tx
+            .query(
+                "SELECT id FROM games WHERE shortname = ?1 LIMIT 1",
+                libsql::params!(shortname),
+            )
+            .await?;
+        let game_id = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("game row missing after insert for {shortname}"))?
+            .get::<u64>(0)?;
+        Some(GameVersionUpdateMessage {
+            shortname: shortname.to_string(),
+            game_id,
+            version: 1,
+        })
+    };
+    tx.commit().await?;
+    Ok(update)
+}
+
+async fn sync_local_game_versions(conn: &libsql::Connection, app_server: &AppServer) -> Result<()> {
+    let mut rows = conn
+        .query("SELECT id, current_version FROM games", ())
+        .await
+        .context("Failed to query local game versions")?;
+    while let Some(row) = rows.next().await? {
+        let game_id = row.get::<u64>(0)?;
+        let version = row.get::<u64>(1)?;
+        app_server.apply_uploaded_version(game_id, version).await;
+    }
     Ok(())
 }
 
@@ -316,6 +406,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         .wasm_file
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing wasm file"))?;
+    let author_env_secret_key = load_or_create_author_env_secret_key()?;
 
     let (log_writer, _flush_guard) = BufferedLogWriter::new();
     let platform_filter: LevelFilter = args.platform_log_level.into();
@@ -340,7 +431,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
 
     let data_dir = dirs::data_dir()
         .expect("Failed to determine data directory")
-        .join("terminal-games");
+        .join("terminal-games-cli");
     std::fs::create_dir_all(&data_dir)?;
     let db_path = data_dir.join("terminal-games.db");
 
@@ -380,13 +471,18 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         )
     };
 
-    upsert_game(
+    let mut local_game_updates = Vec::new();
+    if let Some(update) = upsert_game(
         &conn,
+        &author_env_secret_key,
         first_app_shortname.as_str(),
         wasm_path.as_str(),
         default_details(first_app_shortname.as_str()).as_str(),
     )
-    .await?;
+    .await?
+    {
+        local_game_updates.push(update);
+    }
 
     for game in &args.games {
         if let Some((shortname, path)) = game.split_once('=') {
@@ -395,13 +491,17 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                 .context("Failed to resolve game path")?
                 .display()
                 .to_string();
-            upsert_game(
+            if let Some(update) = upsert_game(
                 &conn,
+                &author_env_secret_key,
                 shortname,
                 path.as_str(),
                 default_details(shortname).as_str(),
             )
-            .await?;
+            .await?
+            {
+                local_game_updates.push(update);
+            }
         }
     }
 
@@ -472,7 +572,51 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         .expect("Failed to register with local discovery");
     mesh.start_discovery().await?;
 
-    let app_server = Arc::new(AppServer::new(mesh.clone(), conn)?);
+    let app_server = Arc::new(AppServer::new(
+        mesh.clone(),
+        conn,
+        author_env_secret_key.clone(),
+    )?);
+    {
+        let app_server = app_server.clone();
+        let mut updates = mesh.subscribe_game_version_updates();
+        tokio::spawn(async move {
+            loop {
+                match updates.recv().await {
+                    Ok(update) => {
+                        app_server
+                            .apply_uploaded_version(update.game_id, update.version)
+                            .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "lagged mesh game version updates");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+    {
+        let app_server = app_server.clone();
+        let conn = app_server.db.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(error) = sync_local_game_versions(&conn, &app_server).await {
+                    tracing::warn!(error = ?error, "failed to sync local game versions");
+                }
+            }
+        });
+    }
+    for update in local_game_updates {
+        app_server
+            .apply_uploaded_version(update.game_id, update.version)
+            .await;
+        mesh.propagate_game_version_update(update).await;
+    }
+    sync_local_game_versions(&app_server.db, &app_server).await?;
 
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;
@@ -545,7 +689,8 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     }
     let (first_cols, first_rows) = *resize_rx.borrow();
     let terminal_parser = input_guard.take_terminal_parser(first_rows, first_cols);
-    let (_, status_bar_state_rx) = tokio::sync::watch::channel(StatusBarState::default());
+    let (_status_bar_state_tx, status_bar_state_rx) =
+        tokio::sync::watch::channel(StatusBarState::default());
 
     let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
         args: None,
@@ -621,6 +766,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         }
     });
 
+    let mut app_error = None;
     loop {
         tokio::select! {
             biased;
@@ -630,9 +776,13 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                     Ok(Ok(exit_code)) => {
                         tracing::trace!(?exit_code, "App exited");
                     }
-                    Ok(Err(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::error!(error = %error, "App exited with error");
+                        app_error = Some(anyhow::Error::new(error));
+                    }
                     Err(error) => {
                         tracing::error!(?error, "App exit channel dropped");
+                        app_error = Some(anyhow::anyhow!("app exit channel dropped"));
                     }
                 }
                 break;
@@ -707,6 +857,10 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
 
     let _ = local_discovery.unregister().await;
     mesh.graceful_shutdown().await;
+
+    if let Some(error) = app_error {
+        return Err(error);
+    }
 
     Ok(())
 }

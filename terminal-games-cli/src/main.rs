@@ -10,12 +10,14 @@ mod control_client;
 mod run;
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
 use clap_complete::CompleteEnv;
+use rustls::crypto::aws_lc_rs;
 
 #[derive(Parser)]
 #[command(
     about = "Terminal Games CLI",
+    arg_required_else_help = true,
     subcommand_negates_reqs = true,
     args_conflicts_with_subcommands = true
 )]
@@ -36,6 +38,7 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    let _ = aws_lc_rs::default_provider().install_default();
     CompleteEnv::with_factory(Cli::command).complete();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -50,6 +53,11 @@ async fn async_main() -> Result<()> {
             Command::Admin(cli) => admin::run(cli).await,
             Command::Author(cli) => author::run(cli).await,
         };
+    }
+    if cli.run.wasm_file.is_none() {
+        Cli::command()
+            .error(ErrorKind::MissingRequiredArgument, "<WASM_FILE>")
+            .exit();
     }
     run::run(cli.run).await
 }

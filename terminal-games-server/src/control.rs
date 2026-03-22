@@ -46,12 +46,13 @@ use terminal_games::{
         RegionDiscoveryResponse, RegionRuntimeStatus, RotateAuthorTokenRequest,
         RotateAuthorTokenResponse, RpcError, SessionSummary, SpyControlMessage, StatusBarState,
         StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest, TickerReorderRequest,
-        UploadGameRequest, UploadGameResponse,
+        UploadGameRequest, UploadGameResponse, expiry_from_duration, parse_duration_string,
+        parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
     mesh::Mesh,
 };
-use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
+use time::OffsetDateTime;
 
 use crate::{
     admission::{AdmissionController, BanRule},
@@ -118,7 +119,7 @@ impl ControlPlane {
         let Some(token) = bearer_token(headers) else {
             return Err((StatusCode::UNAUTHORIZED, "missing bearer token").into_response());
         };
-        if secure_secret_eq(token, expected) {
+        if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
             Ok(())
         } else {
             Err((StatusCode::UNAUTHORIZED, "invalid bearer token").into_response())
@@ -137,7 +138,10 @@ impl ControlPlane {
         else {
             return Err((StatusCode::UNAUTHORIZED, "unknown author").into_response());
         };
-        if !secure_secret_eq(&sha256_hex(&claims.secret), &record.token_hash) {
+        if !constant_time_eq(
+            sha256_hex(&claims.secret).as_bytes(),
+            record.token_hash.as_bytes(),
+        ) {
             return Err((StatusCode::UNAUTHORIZED, "invalid author token").into_response());
         }
         Ok(AuthorAuth { record, claims })
@@ -530,7 +534,7 @@ impl AdminControlRpc for AdminRpcServer {
         self.control.admission_controller.apply_ban_updates(vec![(
             rule,
             Some(request.reason),
-            None,
+            request.expires_at,
         )]);
         Ok(())
     }
@@ -850,7 +854,11 @@ impl AuthorControlRpc for AuthorRpcServer {
             load_game_env_blob(&self.control.app_server.db, &self.author.record.shortname)
                 .await?
                 .ok_or_else(|| RpcError::from("upload a game before managing env vars"))?;
-        let envs = decrypt_author_env_blob(&env_salt, &env_blob)?;
+        let envs = decrypt_author_env_blob(
+            self.control.app_server.author_env_secret_key(),
+            &env_salt,
+            &env_blob,
+        )?;
         Ok(AuthorEnvListResponse {
             shortname: self.author.record.shortname,
             envs,
@@ -870,7 +878,11 @@ impl AuthorControlRpc for AuthorRpcServer {
         let mut current = if request.replace {
             Vec::new()
         } else {
-            decrypt_author_env_blob(&env_salt, &env_blob)?
+            decrypt_author_env_blob(
+                self.control.app_server.author_env_secret_key(),
+                &env_salt,
+                &env_blob,
+            )?
         };
         for env in request.envs.iter().cloned() {
             if let Some(existing) = current
@@ -882,7 +894,8 @@ impl AuthorControlRpc for AuthorRpcServer {
                 current.push(env);
             }
         }
-        let encrypted = encrypt_author_env_blob(&current)?;
+        let encrypted =
+            encrypt_author_env_blob(self.control.app_server.author_env_secret_key(), &current)?;
         let tx = self.control.app_server.db.transaction().await?;
         tx.execute(
             "UPDATE games
@@ -922,9 +935,14 @@ impl AuthorControlRpc for AuthorRpcServer {
         else {
             return Err("upload a game before managing env vars".into());
         };
-        let mut current = decrypt_author_env_blob(&env_salt, &env_blob)?;
+        let mut current = decrypt_author_env_blob(
+            self.control.app_server.author_env_secret_key(),
+            &env_salt,
+            &env_blob,
+        )?;
         current.retain(|env| env.name != request.name);
-        let encrypted = encrypt_author_env_blob(&current)?;
+        let encrypted =
+            encrypt_author_env_blob(self.control.app_server.author_env_secret_key(), &current)?;
         let tx = self.control.app_server.db.transaction().await?;
         tx.execute(
             "UPDATE games
@@ -994,10 +1012,14 @@ impl AuthorControlRpc for AuthorRpcServer {
         let details_json = serde_json::to_string(&manifest.details)?;
         let tx = self.control.app_server.db.transaction().await?;
         let env_blob = match request.envs.as_deref() {
-            Some(envs) => Some(encrypt_author_env_blob(envs)?),
+            Some(envs) => Some(encrypt_author_env_blob(
+                self.control.app_server.author_env_secret_key(),
+                envs,
+            )?),
             None => None,
         };
-        let empty_env_blob = encrypt_author_env_blob(&[])?;
+        let empty_env_blob =
+            encrypt_author_env_blob(self.control.app_server.author_env_secret_key(), &[])?;
         let mut game_rows = tx
             .query(
                 "SELECT id, current_version FROM games WHERE shortname = ?1 LIMIT 1",
@@ -1424,10 +1446,6 @@ fn sha256_hex(secret: &str) -> String {
     hex::encode(sha256_bytes(secret))
 }
 
-fn secure_secret_eq(left: &str, right: &str) -> bool {
-    constant_time_eq(&sha256_bytes(left), &sha256_bytes(right))
-}
-
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -1437,51 +1455,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= left ^ right;
     }
     diff == 0
-}
-
-fn parse_optional_expiry(
-    duration: Option<&str>,
-    expires_at: Option<&str>,
-) -> anyhow::Result<Option<i64>> {
-    match (duration, expires_at) {
-        (Some(_), Some(_)) => anyhow::bail!("pass either duration or expires-at, not both"),
-        (Some(duration), None) => Ok(Some(expiry_from_duration(parse_duration_string(
-            duration,
-        )?)?)),
-        (None, Some(expires_at)) => Ok(Some(parse_utc_timestamp(expires_at)?)),
-        (None, None) => Ok(None),
-    }
-}
-
-fn expiry_from_duration(duration: TimeDuration) -> anyhow::Result<i64> {
-    Ok((OffsetDateTime::now_utc() + duration).unix_timestamp())
-}
-
-fn parse_duration_string(raw: &str) -> anyhow::Result<TimeDuration> {
-    let trimmed = raw.trim().to_ascii_lowercase();
-    anyhow::ensure!(!trimmed.is_empty(), "duration cannot be empty");
-    let compact = trimmed.replace(' ', "");
-    let split_at = compact
-        .find(|ch: char| !ch.is_ascii_digit())
-        .ok_or_else(|| anyhow::anyhow!("duration must include a unit like 1h or 1 week"))?;
-    let amount = compact[..split_at]
-        .parse::<i64>()
-        .map_err(|_| anyhow::anyhow!("invalid duration amount"))?;
-    anyhow::ensure!(amount > 0, "duration must be positive");
-    let unit = &compact[split_at..];
-    let seconds = match unit {
-        "s" | "sec" | "secs" | "second" | "seconds" => amount,
-        "m" | "min" | "mins" | "minute" | "minutes" => amount * 60,
-        "h" | "hr" | "hrs" | "hour" | "hours" => amount * 60 * 60,
-        "d" | "day" | "days" => amount * 60 * 60 * 24,
-        "w" | "wk" | "wks" | "week" | "weeks" => amount * 60 * 60 * 24 * 7,
-        _ => anyhow::bail!("unsupported duration unit '{unit}'"),
-    };
-    Ok(TimeDuration::seconds(seconds))
-}
-
-fn parse_utc_timestamp(raw: &str) -> anyhow::Result<i64> {
-    Ok(OffsetDateTime::parse(raw.trim(), &Rfc3339)?.unix_timestamp())
 }
 
 fn parse_broadcast_level(raw: &str) -> anyhow::Result<BroadcastLevel> {

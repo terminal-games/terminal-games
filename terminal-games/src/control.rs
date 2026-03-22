@@ -5,6 +5,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use tarpc::context;
+use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub use crate::author_env::AuthorEnvVar;
 
@@ -110,6 +111,50 @@ impl AuthorTokenClaims {
     }
 }
 
+pub fn parse_optional_expiry(
+    duration: Option<&str>,
+    expires_at: Option<&str>,
+) -> anyhow::Result<Option<i64>> {
+    match (duration, expires_at) {
+        (Some(_), Some(_)) => anyhow::bail!("pass either duration or expires-at, not both"),
+        (Some(duration), None) => Ok(Some(expiry_from_duration(parse_duration_string(
+            duration,
+        )?)?)),
+        (None, Some(expires_at)) => Ok(Some(parse_utc_timestamp(expires_at)?)),
+        (None, None) => Ok(None),
+    }
+}
+
+pub fn expiry_from_duration(duration: TimeDuration) -> anyhow::Result<i64> {
+    Ok((OffsetDateTime::now_utc() + duration).unix_timestamp())
+}
+
+pub fn parse_duration_string(raw: &str) -> anyhow::Result<TimeDuration> {
+    let trimmed = raw.trim().to_ascii_lowercase();
+    anyhow::ensure!(!trimmed.is_empty(), "duration cannot be empty");
+    let compact = trimmed.replace(' ', "");
+    let split_at = compact
+        .find(|ch: char| !ch.is_ascii_digit())
+        .ok_or_else(|| anyhow::anyhow!("duration must include a unit like 1h or 1 week"))?;
+    let amount = compact[..split_at]
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("invalid duration amount"))?;
+    anyhow::ensure!(amount > 0, "duration must be positive");
+    let seconds = match &compact[split_at..] {
+        "s" | "sec" | "secs" | "second" | "seconds" => amount,
+        "m" | "min" | "mins" | "minute" | "minutes" => amount * 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => amount * 60 * 60,
+        "d" | "day" | "days" => amount * 60 * 60 * 24,
+        "w" | "wk" | "wks" | "week" | "weeks" => amount * 60 * 60 * 24 * 7,
+        unit => anyhow::bail!("unsupported duration unit '{unit}'"),
+    };
+    Ok(TimeDuration::seconds(seconds))
+}
+
+pub fn parse_utc_timestamp(raw: &str) -> anyhow::Result<i64> {
+    Ok(OffsetDateTime::parse(raw.trim(), &Rfc3339)?.unix_timestamp())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegionDiscoveryResponse {
     pub current_region: String,
@@ -144,6 +189,7 @@ pub struct SessionSummary {
 pub struct BanIpRequest {
     pub ip: String,
     pub reason: String,
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

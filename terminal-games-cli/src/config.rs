@@ -4,12 +4,14 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
-    io::{self, Read},
+    fmt::Write as _,
+    fs::{self, OpenOptions},
+    io::{self, Read, Write},
     path::PathBuf,
 };
 
 use anyhow::{Context, Result};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use terminal_games::control::{AuthorTokenClaims, RegionDiscoveryResponse};
 
@@ -29,12 +31,15 @@ struct AdminProfilesFile {
 pub struct CliConfig {
     #[serde(rename = "default-profile", default = "default_profile_name")]
     pub default_profile: String,
+    #[serde(rename = "author-env-secret-key", default)]
+    pub author_env_secret_key: Option<String>,
 }
 
 impl Default for CliConfig {
     fn default() -> Self {
         Self {
             default_profile: default_profile_name(),
+            author_env_secret_key: None,
         }
     }
 }
@@ -63,6 +68,21 @@ pub fn load_cli_config() -> Result<CliConfig> {
 
 pub fn save_cli_config(config: &CliConfig) -> Result<()> {
     write_toml(cli_config_path(), config)
+}
+
+pub fn load_or_create_author_env_secret_key() -> Result<String> {
+    let mut config = load_cli_config()?;
+    if let Some(secret_key) = config
+        .author_env_secret_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(secret_key.to_string());
+    }
+    let secret_key = generate_secret_key();
+    config.author_env_secret_key = Some(secret_key.clone());
+    save_cli_config(&config)?;
+    Ok(secret_key)
 }
 
 pub fn resolve_admin_profile(profile_override: Option<&str>) -> Result<(String, AdminProfile)> {
@@ -344,7 +364,7 @@ fn default_profile_name() -> String {
     "default".to_string()
 }
 
-fn codex_config_dir() -> Result<PathBuf> {
+fn config_dir() -> Result<PathBuf> {
     let base = dirs::config_dir().ok_or_else(|| anyhow::anyhow!("config dir not found"))?;
     let path = base.join("terminal-games-cli");
     fs::create_dir_all(&path)?;
@@ -352,15 +372,15 @@ fn codex_config_dir() -> Result<PathBuf> {
 }
 
 fn cli_config_path() -> Result<PathBuf> {
-    Ok(codex_config_dir()?.join("config.toml"))
+    Ok(config_dir()?.join("config.toml"))
 }
 
 fn admin_profiles_path() -> Result<PathBuf> {
-    Ok(codex_config_dir()?.join("admin.toml"))
+    Ok(config_dir()?.join("admin.toml"))
 }
 
 fn author_tokens_path() -> Result<PathBuf> {
-    Ok(codex_config_dir()?.join("author.toml"))
+    Ok(config_dir()?.join("author.toml"))
 }
 
 fn author_token_key(profile: &str, claims: &AuthorTokenClaims) -> String {
@@ -386,14 +406,40 @@ where
 {
     let path = path?;
     let contents = toml::to_string_pretty(value)?;
-    fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::metadata(&path)?;
-        let mut perms = metadata.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&path, perms)?;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
     }
     Ok(())
+}
+
+fn generate_secret_key() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
 }

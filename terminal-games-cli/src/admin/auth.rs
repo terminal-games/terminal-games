@@ -52,6 +52,7 @@ pub(super) async fn run(args: AdminAuthArgs, profile_override: Option<String>) -
     {
         save_cli_config(&CliConfig {
             default_profile: profile_name.clone(),
+            author_env_secret_key: current_config.author_env_secret_key.clone(),
         })?;
     }
 

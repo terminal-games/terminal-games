@@ -158,6 +158,7 @@ pub struct AppServer {
     engine: wasmtime::Engine,
     pub db: libsql::Connection,
     mesh: Mesh,
+    author_env_secret_key: Arc<str>,
     module_cache: Arc<tokio::sync::RwLock<HashMap<AppId, wasmtime::Module>>>,
     latest_versions: Arc<tokio::sync::RwLock<HashMap<u64, Arc<AtomicU64>>>>,
 }
@@ -186,7 +187,11 @@ pub struct AppInstantiationParams {
 }
 
 impl AppServer {
-    pub fn new(mesh: Mesh, db: libsql::Connection) -> anyhow::Result<Self> {
+    pub fn new(
+        mesh: Mesh,
+        db: libsql::Connection,
+        author_env_secret_key: impl Into<Arc<str>>,
+    ) -> anyhow::Result<Self> {
         let mut config = wasmtime::Config::new();
         let cache_config = wasmtime::CacheConfig::new();
         config.cache(Some(wasmtime::Cache::new(cache_config)?));
@@ -232,10 +237,15 @@ impl AppServer {
             linker: Arc::new(linker),
             mesh,
             db,
+            author_env_secret_key: author_env_secret_key.into(),
             engine,
             module_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             latest_versions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         })
+    }
+
+    pub fn author_env_secret_key(&self) -> &str {
+        &self.author_env_secret_key
     }
 
     pub async fn invalidate_shortname_cache(&self, shortname: &str) {
@@ -299,6 +309,7 @@ impl AppServer {
         let linker = self.linker.clone();
         let module_cache = self.module_cache.clone();
         let latest_versions = self.latest_versions.clone();
+        let author_env_secret_key = self.author_env_secret_key.clone();
 
         tokio::task::spawn(async move {
             let AppInstantiationParams {
@@ -370,6 +381,7 @@ impl AppServer {
                 db: db.clone(),
                 linker,
                 mesh,
+                author_env_secret_key,
                 module_cache,
                 latest_versions,
                 app_output_sender,
@@ -756,7 +768,7 @@ impl AppServer {
                                             tracing::info!(%url, "Uploaded replay");
                                             StatusNotification::info(
                                                 format!(
-                                                    " \x1b[3mReplay saved: \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ",
+                                                    " \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ",
                                                     url, url
                                                 ),
                                                 Duration::from_secs(REPLAY_RESULT_NOTIFICATION_SECS),
@@ -903,7 +915,9 @@ impl AppServer {
         let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(app_id).await;
 
         let mut envs = vec![];
-        for env in decrypt_author_env_blob(&env_salt, &env_blob)? {
+        for env in
+            decrypt_author_env_blob(ctx.author_env_secret_key.as_ref(), &env_salt, &env_blob)?
+        {
             let name = env.name;
             let value = env.value;
             envs.push((name, value));
@@ -2264,6 +2278,7 @@ pub struct PreloadedAppState {
 pub struct AppContext {
     db: libsql::Connection,
     mesh: Mesh,
+    author_env_secret_key: Arc<str>,
     remote_sshid: String,
     audio_enabled: bool,
     term: Option<String>,

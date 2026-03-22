@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{collections::VecDeque, time::Instant};
+use std::{collections::VecDeque, io::Read, thread, time::Instant};
 
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
@@ -14,7 +14,7 @@ use terminput::{
     Event as TerminputEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
     MouseEvent, MouseEventKind, ScrollDirection,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use unicode_width::UnicodeWidthStr;
@@ -56,8 +56,21 @@ pub(super) async fn session_spy(args: AdminSessionSpyArgs, profile: Option<Strin
     )?;
 
     let result = async {
-        let mut stdin = tokio::io::stdin();
-        let mut stdin_buf = [0u8; 4096];
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdin.lock().read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read_len) => {
+                        if stdin_tx.blocking_send(buf[..read_len].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         let mut vt: Option<avt::Vt> = None;
         let mut mouse_modes = std::collections::BTreeSet::new();
         let mut local_mouse_capture = false;
@@ -158,14 +171,10 @@ pub(super) async fn session_spy(args: AdminSessionSpyArgs, profile: Option<Strin
                         }
                     }
                 }
-                read_len = stdin.read(&mut stdin_buf) => {
-                    let read_len = read_len?;
-                    if read_len == 0 {
-                        break;
-                    }
-                    let data = &stdin_buf[..read_len];
+                data = stdin_rx.recv() => {
+                    let Some(data) = data else { break };
                     let Some(forwarded) = apply_spy_local_shortcuts(
-                        data,
+                        &data,
                         &mut status_bar,
                         vt.as_ref(),
                         local_size,
@@ -519,16 +528,30 @@ async fn apply_spy_local_shortcuts(
     input_overlay: &SpyInputOverlay,
     stdout: &mut tokio::io::Stdout,
 ) -> Result<Option<Vec<u8>>> {
-    let mut forwarded = Vec::with_capacity(data.len());
+    let mut forwarded = data.to_vec();
     let mut toggled = false;
-    for &byte in data {
-        match byte {
-            0x03 => return Ok(None),
-            0x14 => {
+    if let Ok(Some(TerminputEvent::Key(key))) = TerminputEvent::parse_from(data)
+        && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        && key.modifiers.contains(KeyModifiers::CTRL)
+    {
+        match key.code {
+            KeyCode::Char('c') | KeyCode::Char('C') => return Ok(None),
+            KeyCode::Char('t') | KeyCode::Char('T') => {
                 status_bar.toggle_input_overlay();
                 toggled = true;
+                forwarded.clear();
             }
-            _ => forwarded.push(byte),
+            _ => {}
+        }
+    } else {
+        match data {
+            [0x03] => return Ok(None),
+            [0x14] => {
+                status_bar.toggle_input_overlay();
+                toggled = true;
+                forwarded.clear();
+            }
+            _ => {}
         }
     }
     if toggled && let Some(vt) = vt {
