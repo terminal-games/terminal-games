@@ -577,21 +577,26 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         conn,
         author_env_secret_key.clone(),
     )?);
+    let graceful_shutdown_token = CancellationToken::new();
     {
         let app_server = app_server.clone();
         let mut updates = mesh.subscribe_game_version_updates();
+        let graceful_shutdown_token = graceful_shutdown_token.clone();
         tokio::spawn(async move {
             loop {
-                match updates.recv().await {
-                    Ok(update) => {
-                        app_server
-                            .apply_uploaded_version(update.game_id, update.version)
-                            .await;
+                tokio::select! {
+                    _ = graceful_shutdown_token.cancelled() => break,
+                    result = updates.recv() => match result {
+                        Ok(update) => {
+                            app_server
+                                .apply_uploaded_version(update.game_id, update.version)
+                                .await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "lagged mesh game version updates");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "lagged mesh game version updates");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -599,13 +604,18 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     {
         let app_server = app_server.clone();
         let conn = app_server.db.clone();
+        let graceful_shutdown_token = graceful_shutdown_token.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
-                if let Err(error) = sync_local_game_versions(&conn, &app_server).await {
-                    tracing::warn!(error = ?error, "failed to sync local game versions");
+                tokio::select! {
+                    _ = graceful_shutdown_token.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(error) = sync_local_game_versions(&conn, &app_server).await {
+                            tracing::warn!(error = ?error, "failed to sync local game versions");
+                        }
+                    }
                 }
             }
         });
@@ -630,7 +640,6 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(crossterm::terminal::size()?);
 
-    let graceful_shutdown_token = CancellationToken::new();
     let (mut input_guard, input_rx, idle_fuel_rx) =
         InputGuard::new(graceful_shutdown_token.clone(), replay_request_tx.clone());
     let mut input_tick = args.idle_timeout.then(InputGuard::tick_interval);

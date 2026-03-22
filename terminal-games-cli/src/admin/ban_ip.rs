@@ -37,20 +37,15 @@ async fn add(args: AdminBanIpAddArgs, profile: Option<String>) -> Result<()> {
         .ban_ip_add(terminal_games::control::rpc_context(), request.clone())
         .await?
         .map_err(anyhow::Error::msg)?;
-    let fanout_api = api.clone();
     let region_count = api
-        .fanout(|base_url, _| {
-            let request = terminal_games::control::BanIpRequest {
+        .fanout(|rpc| {
+            let apply_request = terminal_games::control::BanIpRequest {
                 ip: request.ip.clone(),
                 reason: request.reason.clone(),
                 expires_at,
             };
-            let fanout_api = fanout_api.clone();
             async move {
-                fanout_api
-                    .rpc_at(&base_url)
-                    .await?
-                    .apply_ban(terminal_games::control::rpc_context(), request)
+                rpc.apply_ban(terminal_games::control::rpc_context(), apply_request)
                     .await?
                     .map_err(anyhow::Error::msg)
             }
@@ -94,16 +89,11 @@ async fn remove(args: AdminBanIpRemoveArgs, profile: Option<String>) -> Result<(
         .ban_ip_remove(terminal_games::control::rpc_context(), request.clone())
         .await?
         .map_err(anyhow::Error::msg)?;
-    let fanout_api = api.clone();
     let region_count = api
-        .fanout(|base_url, _| {
-            let request = request.clone();
-            let fanout_api = fanout_api.clone();
+        .fanout(|rpc| {
+            let apply_request = request.clone();
             async move {
-                fanout_api
-                    .rpc_at(&base_url)
-                    .await?
-                    .apply_ban_remove(terminal_games::control::rpc_context(), request)
+                rpc.apply_ban_remove(terminal_games::control::rpc_context(), apply_request)
                     .await?
                     .map_err(anyhow::Error::msg)
             }

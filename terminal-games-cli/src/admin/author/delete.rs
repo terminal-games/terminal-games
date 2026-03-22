@@ -36,15 +36,10 @@ pub(super) async fn run(args: AdminAuthorDeleteArgs, profile: Option<String>) ->
     let invalidate_body = CacheInvalidateRequest {
         shortname: deleted.shortname,
     };
-    let fanout_api = api.clone();
-    api.fanout(|base_url, _| {
+    api.fanout(|rpc| {
         let invalidate_body = invalidate_body.clone();
-        let fanout_api = fanout_api.clone();
         async move {
-            fanout_api
-                .rpc_at(&base_url)
-                .await?
-                .cache_invalidate(terminal_games::control::rpc_context(), invalidate_body)
+            rpc.cache_invalidate(terminal_games::control::rpc_context(), invalidate_body)
                 .await?
                 .map_err(anyhow::Error::msg)
         }

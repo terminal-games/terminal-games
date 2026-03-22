@@ -266,48 +266,25 @@ impl StatusBar {
     }
 
     fn render_ticker_content(&mut self, p: &palette::Palette) -> Option<RenderedTicker> {
-        let active_ticker_count = self.active_tickers().len();
-        if active_ticker_count == 0 {
+        let now = unix_now();
+        let ticker_count = self.active_ticker_count_at(now);
+        if ticker_count == 0 {
             self.selected_ticker = None;
             return None;
         }
-        self.sync_selected_ticker(active_ticker_count);
-        let tickers = self.active_tickers();
-        let ticker_index = self.selected_ticker.unwrap_or_else(|| {
-            ((std::time::Instant::now() - self.session_start_time).as_secs() / 10) as usize
-                % tickers.len()
-        });
-        if tickers.len() == 1 {
-            return Some(RenderedTicker {
-                text: style(
-                    format!(" {} ", tickers[0].content),
-                    Some(p.text),
-                    Some(p.surface_bright),
-                    false,
-                ),
-                click_cols: Vec::new(),
-            });
-        }
-        let content_width = tickers[ticker_index].content.width();
-        let dots_start = 1 + content_width + 1;
-        Some(RenderedTicker {
-            text: style(
-                format!(
-                    " {} {}{}{} ",
-                    tickers[ticker_index].content,
-                    style_inline_fg("•".repeat(ticker_index), p.text_subtle),
-                    style_inline_fg("•", p.text),
-                    style_inline_fg(
-                        "•".repeat(tickers.len().saturating_sub(ticker_index + 1)),
-                        p.text_subtle
-                    ),
-                ),
-                Some(p.text),
-                Some(p.surface_bright),
-                false,
-            ),
-            click_cols: (0..tickers.len()).map(|idx| dots_start + idx).collect(),
-        })
+        let selected_ticker = self.normalized_selected_ticker(ticker_count);
+        let ticker_index =
+            selected_ticker.unwrap_or_else(|| self.rotating_ticker_index(ticker_count));
+        let rendered = {
+            let tickers = self.active_tickers_at(now);
+            if ticker_count == 1 {
+                render_single_ticker(tickers[0], p)
+            } else {
+                render_multi_ticker(&tickers, ticker_index, p)
+            }
+        };
+        self.selected_ticker = selected_ticker;
+        Some(rendered)
     }
 
     fn show_notification(&mut self, notification: StatusNotification) {
@@ -386,8 +363,7 @@ impl StatusBar {
         true
     }
 
-    fn active_tickers(&self) -> Vec<&TickerEntry> {
-        let now = unix_now();
+    fn active_tickers_at(&self, now: i64) -> Vec<&TickerEntry> {
         self.shared_state
             .tickers
             .iter()
@@ -395,18 +371,77 @@ impl StatusBar {
             .collect()
     }
 
+    fn active_ticker_count_at(&self, now: i64) -> usize {
+        self.shared_state
+            .tickers
+            .iter()
+            .filter(|ticker| ticker.expires_at.is_none_or(|expires_at| expires_at > now))
+            .count()
+    }
+
+    fn normalized_selected_ticker(&self, ticker_count: usize) -> Option<usize> {
+        if ticker_count <= 1 {
+            return None;
+        }
+        self.selected_ticker.filter(|&selected| selected < ticker_count)
+    }
+
+    fn rotating_ticker_index(&self, ticker_count: usize) -> usize {
+        ((std::time::Instant::now() - self.session_start_time).as_secs() / 10) as usize
+            % ticker_count
+    }
+
     pub async fn wait_for_shared_state_change(&mut self) -> Result<(), watch::error::RecvError> {
         self.shared_state_rx.changed().await?;
         self.shared_state = self.shared_state_rx.borrow_and_update().clone();
-        self.sync_selected_ticker(self.active_tickers().len());
+        self.sync_selected_ticker(self.active_ticker_count_at(unix_now()));
         Ok(())
     }
 
     fn sync_shared_state_if_needed(&mut self) {
         if self.shared_state_rx.has_changed().unwrap_or(false) {
             self.shared_state = self.shared_state_rx.borrow_and_update().clone();
-            self.sync_selected_ticker(self.active_tickers().len());
+            self.sync_selected_ticker(self.active_ticker_count_at(unix_now()));
         }
+    }
+}
+
+fn render_single_ticker(ticker: &TickerEntry, p: &palette::Palette) -> RenderedTicker {
+    RenderedTicker {
+        text: style(
+            format!(" {} ", ticker.content),
+            Some(p.text),
+            Some(p.surface_bright),
+            false,
+        ),
+        click_cols: Vec::new(),
+    }
+}
+
+fn render_multi_ticker(
+    tickers: &[&TickerEntry],
+    ticker_index: usize,
+    p: &palette::Palette,
+) -> RenderedTicker {
+    let content_width = tickers[ticker_index].content.width();
+    let dots_start = 1 + content_width + 1;
+    RenderedTicker {
+        text: style(
+            format!(
+                " {} {}{}{} ",
+                tickers[ticker_index].content,
+                style_inline_fg("•".repeat(ticker_index), p.text_subtle),
+                style_inline_fg("•", p.text),
+                style_inline_fg(
+                    "•".repeat(tickers.len().saturating_sub(ticker_index + 1)),
+                    p.text_subtle
+                ),
+            ),
+            Some(p.text),
+            Some(p.surface_bright),
+            false,
+        ),
+        click_cols: (0..tickers.len()).map(|idx| dots_start + idx).collect(),
     }
 }
 

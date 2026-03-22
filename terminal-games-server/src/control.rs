@@ -456,7 +456,6 @@ impl AdminControlRpc for AdminRpcServer {
         _: context::Context,
         request: BanIpAddRequest,
     ) -> Result<(), RpcError> {
-        let rule = BanRule::parse(request.ip.clone())?;
         let expires_at =
             parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref())?;
         self.control
@@ -472,11 +471,6 @@ impl AdminControlRpc for AdminRpcServer {
                 libsql::params!(request.ip, request.reason.clone(), expires_at),
             )
             .await?;
-        self.control.admission_controller.apply_ban_updates(vec![(
-            rule,
-            Some(request.reason),
-            expires_at,
-        )]);
         Ok(())
     }
 
@@ -514,7 +508,6 @@ impl AdminControlRpc for AdminRpcServer {
         _: context::Context,
         request: BanIpRemoveRequest,
     ) -> Result<(), RpcError> {
-        let rule = BanRule::parse(request.ip.clone())?;
         self.control
             .app_server
             .db
@@ -523,9 +516,6 @@ impl AdminControlRpc for AdminRpcServer {
                 libsql::params!(request.ip),
             )
             .await?;
-        self.control
-            .admission_controller
-            .apply_ban_updates(vec![(rule, None, Some(0))]);
         Ok(())
     }
 

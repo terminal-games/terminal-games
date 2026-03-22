@@ -229,14 +229,17 @@ impl AdminClient {
 
     pub async fn fanout<F, Fut>(&self, mut call: F) -> Result<usize>
     where
-        F: FnMut(String, String) -> Fut,
+        F: FnMut(AdminControlRpcClient) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
         let (_, region_urls) = self.discover().await?;
-        let futures = region_urls
+        let connect_futures = region_urls
             .values()
-            .cloned()
-            .map(|base_url| call(base_url, self.token.clone()));
+            .map(|base_url| connect_admin_rpc(base_url, &self.token));
+        let mut futures = Vec::new();
+        for result in join_all(connect_futures).await {
+            futures.push(call(result?));
+        }
         for result in join_all(futures).await {
             result?;
         }

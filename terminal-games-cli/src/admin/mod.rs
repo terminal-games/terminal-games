@@ -326,14 +326,9 @@ pub(super) fn load_api(profile_override: Option<&str>) -> Result<AdminClient> {
 }
 
 pub(super) async fn refresh_status_bar_state(api: &AdminClient) -> Result<()> {
-    let fanout_api = api.clone();
-    api.fanout(|base_url, _| {
-        let fanout_api = fanout_api.clone();
+    api.fanout(|rpc| {
         async move {
-            fanout_api
-                .rpc_at(&base_url)
-                .await?
-                .status_bar_refresh(terminal_games::control::rpc_context())
+            rpc.status_bar_refresh(terminal_games::control::rpc_context())
                 .await?
                 .map_err(anyhow::Error::msg)
         }
