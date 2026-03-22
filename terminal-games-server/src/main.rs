@@ -17,12 +17,13 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use tracing_subscriber::{Layer, filter::LevelFilter, layer::SubscriberExt};
 
 use crate::admission::{AdmissionConfig, BanRule, StoredBan};
 use terminal_games::{
     app::AppServer,
     author_env::encrypt_author_env_blob,
-    manifest::extract_manifest_from_wasm,
+    manifest::{extract_manifest_from_wasm, sanitize_manifest},
     mesh::{EnvDiscovery, Mesh},
 };
 
@@ -38,7 +39,7 @@ async fn ensure_builtin_menu(conn: &libsql::Connection) -> Result<()> {
     let Some(manifest) = extract_manifest_from_wasm(MENU_WASM)? else {
         anyhow::bail!("embedded menu.wasm is missing terminal-games manifest");
     };
-    let manifest = manifest.sanitized()?;
+    let manifest = sanitize_manifest(&manifest)?;
     let details_json = serde_json::to_string(&manifest.details)?;
     let empty_env = encrypt_author_env_blob(&[])?;
 
@@ -60,7 +61,12 @@ async fn ensure_builtin_menu(conn: &libsql::Connection) -> Result<()> {
                 "UPDATE games
                  SET wasm = ?2, details = json(?3), current_version = ?4
                  WHERE id = ?1",
-                libsql::params!(game_id, MENU_WASM.to_vec(), details_json.as_str(), next_version),
+                libsql::params!(
+                    game_id,
+                    MENU_WASM.to_vec(),
+                    details_json.as_str(),
+                    next_version
+                ),
             )
             .await?;
         }
@@ -194,9 +200,16 @@ fn spawn_ip_ban_sync_task(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let subscriber = tracing_subscriber::fmt()
-        // .with_max_level(tracing::Level::TRACE)
-        .finish();
+    let filter = tracing_subscriber::filter::Targets::new()
+        .with_target("terminal_games", LevelFilter::INFO)
+        .with_target("terminal_games_server", LevelFilter::INFO)
+        .with_target("tarpc", LevelFilter::WARN)
+        .with_default(LevelFilter::WARN);
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_filter(filter),
+    );
     tracing::subscriber::set_global_default(subscriber)?;
 
     let db = if let Ok(libsql_url) = std::env::var("LIBSQL_URL") {

@@ -219,12 +219,11 @@ impl Mixer {
             return true;
         }
         match self.audio_tx.try_send(chunk) {
-            Ok(()) => true,
             Err(tokio::sync::mpsc::error::TrySendError::Full(chunk)) => {
                 self.packet_writer.inner_mut().output_buffer = chunk;
                 false
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => true,
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => true,
         }
     }
 }

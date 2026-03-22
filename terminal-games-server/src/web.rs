@@ -471,6 +471,7 @@ async fn handle_socket(
     let mut admin_control = session_registration.control_rx;
     let mut admin_input_rx = session_registration.admin_input_rx;
     let status_bar_state_rx = session_registration.status_bar_state_rx;
+    let _session_cleanup_guard = session_registration.cleanup_guard;
     let session_guard =
         server
             .metrics
@@ -655,8 +656,9 @@ async fn handle_socket(
     };
 
     cancellation_token.cancel();
-    server.session_registry.finish(local_session_id, close_reason);
-    server.session_registry.remove(local_session_id);
+    server
+        .session_registry
+        .finish(local_session_id, close_reason);
     if close_reason.should_notify_web_client() {
         let _ = send_session_closed_and_close(&mut sender, close_reason).await;
     }

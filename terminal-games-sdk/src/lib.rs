@@ -6,13 +6,13 @@ pub mod ansi_backend;
 pub mod app;
 pub mod audio;
 pub mod log;
-pub mod manifest;
 pub mod peer;
 pub mod terminal;
 
 #[cfg(feature = "network")]
 pub mod network;
 
+pub use terminal_games_manifest as manifest;
 pub use terminput;
 
 mod internal {

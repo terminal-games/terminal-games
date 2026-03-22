@@ -31,6 +31,7 @@ sha2 = "0.10"
 smallvec = "1"
 strip-ansi-escapes = "0.2"
 tarpc = { version = "0.37", features = ["serde", "serde-transport", "serde-transport-bincode", "tokio1"] }
+terminal-games-manifest = { path = "../terminal-games-manifest" }
 terminput = "0.5"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12",] }

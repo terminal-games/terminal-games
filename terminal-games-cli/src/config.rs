@@ -188,7 +188,10 @@ pub fn parse_author_ref(value: &str) -> Result<(String, String)> {
     let profile = profile.trim();
     let shortname = shortname.trim();
     anyhow::ensure!(!profile.is_empty(), "author target profile cannot be empty");
-    anyhow::ensure!(!shortname.is_empty(), "author target shortname cannot be empty");
+    anyhow::ensure!(
+        !shortname.is_empty(),
+        "author target shortname cannot be empty"
+    );
     Ok((profile.to_string(), shortname.to_string()))
 }
 
@@ -212,8 +215,8 @@ pub fn normalize_base_url(input: &str) -> Result<String> {
     } else {
         format!("https://{trimmed}")
     };
-    let mut url = reqwest::Url::parse(&with_scheme)
-        .with_context(|| format!("invalid url '{trimmed}'"))?;
+    let mut url =
+        reqwest::Url::parse(&with_scheme).with_context(|| format!("invalid url '{trimmed}'"))?;
     url.set_path("");
     url.set_query(None);
     url.set_fragment(None);
@@ -242,7 +245,9 @@ pub fn derive_region_urls(
     for region in &discovery.regions {
         let region_host = if region == &discovery.current_region && host == base_host {
             base_host.clone()
-        } else if region == &discovery.current_region && host != base_host && host.starts_with(region)
+        } else if region == &discovery.current_region
+            && host != base_host
+            && host.starts_with(region)
         {
             host.to_string()
         } else {
@@ -268,7 +273,10 @@ pub fn read_secret_stdin() -> Result<String> {
 }
 
 pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
-    let mut widths = headers.iter().map(|header| header.len()).collect::<Vec<_>>();
+    let mut widths = headers
+        .iter()
+        .map(|header| header.len())
+        .collect::<Vec<_>>();
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
             if index >= widths.len() {
@@ -367,10 +375,9 @@ where
     if !path.exists() {
         return Ok(T::default());
     }
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(toml::from_str(&contents)
-        .with_context(|| format!("failed to parse {}", path.display()))?)
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn write_toml<T>(path: Result<PathBuf>, value: &T) -> Result<()>

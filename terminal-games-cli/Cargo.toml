@@ -30,6 +30,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smallvec = "1"
 terminal-games = { path = "../terminal-games" }
+tarpc = { version = "0.37", features = ["serde", "serde-transport", "serde-transport-bincode", "tokio1"] }
 terminput = "0.5"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
@@ -38,6 +39,7 @@ toml = "0.8"
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+unicode-width = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pulseaudio = "0.3"

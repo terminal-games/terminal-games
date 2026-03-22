@@ -4,9 +4,63 @@
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+use tarpc::context;
+
+pub use crate::author_env::AuthorEnvVar;
 
 const AUTHOR_TOKEN_PREFIX: &str = "tga1.";
 const AUTHOR_TOKEN_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcError {
+    pub message: String,
+}
+
+impl RpcError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RpcError {}
+
+impl From<anyhow::Error> for RpcError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<libsql::Error> for RpcError {
+    fn from(error: libsql::Error) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for RpcError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<String> for RpcError {
+    fn from(message: String) -> Self {
+        Self { message }
+    }
+}
+
+impl From<&str> for RpcError {
+    fn from(message: &str) -> Self {
+        Self::new(message)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthorTokenClaims {
@@ -172,10 +226,10 @@ pub struct UploadGameResponse {
     pub game_id: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorEnvVar {
-    pub name: String,
-    pub value: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadGameRequest {
+    pub wasm: Vec<u8>,
+    pub envs: Option<Vec<AuthorEnvVar>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,10 +285,16 @@ pub struct TickerRemoveRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TickerReorderRequest {
+    pub ticker_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TickerEntry {
     pub ticker_id: u64,
     pub content: String,
     pub expires_at: Option<i64>,
+    pub sort_order: i64,
     pub created_at: i64,
 }
 
@@ -269,9 +329,68 @@ pub struct StatusBarState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SpyControlMessage {
-    Init { cols: u16, rows: u16, dump: String },
-    Resize { cols: u16, rows: u16 },
-    Metadata { username: String },
-    Input { data: Vec<u8> },
-    Closed { reason_slug: String, message: String },
+    Init {
+        cols: u16,
+        rows: u16,
+        dump: String,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    Metadata {
+        username: String,
+    },
+    Input {
+        data: Vec<u8>,
+    },
+    Closed {
+        reason_slug: String,
+        message: String,
+    },
+}
+
+#[tarpc::service]
+pub trait AdminControlRpc {
+    async fn discover() -> Result<RegionDiscoveryResponse, RpcError>;
+    async fn local_region_status() -> Result<RegionRuntimeStatus, RpcError>;
+    async fn sessions() -> Result<Vec<SessionSummary>, RpcError>;
+    async fn ban_ip_add(request: BanIpAddRequest) -> Result<(), RpcError>;
+    async fn ban_ip_list() -> Result<Vec<BanEntry>, RpcError>;
+    async fn ban_ip_remove(request: BanIpRemoveRequest) -> Result<(), RpcError>;
+    async fn apply_ban(request: BanIpRequest) -> Result<(), RpcError>;
+    async fn apply_ban_remove(request: BanIpRemoveRequest) -> Result<(), RpcError>;
+    async fn session_kick(request: KickSessionRequest) -> Result<(), RpcError>;
+    async fn ticker_list() -> Result<Vec<TickerEntry>, RpcError>;
+    async fn ticker_add(request: TickerAddRequest) -> Result<(), RpcError>;
+    async fn ticker_remove(request: TickerRemoveRequest) -> Result<(), RpcError>;
+    async fn ticker_reorder(request: TickerReorderRequest) -> Result<(), RpcError>;
+    async fn broadcast(request: BroadcastRequest) -> Result<(), RpcError>;
+    async fn status_bar_refresh() -> Result<(), RpcError>;
+    async fn author_create(request: CreateAuthorRequest) -> Result<CreateAuthorResponse, RpcError>;
+    async fn author_list() -> Result<Vec<AuthorSummary>, RpcError>;
+    async fn author_rotate_token(
+        request: RotateAuthorTokenRequest,
+    ) -> Result<RotateAuthorTokenResponse, RpcError>;
+    async fn author_delete(
+        request: DeleteAuthorRequest,
+    ) -> Result<Option<DeleteShortnameResponse>, RpcError>;
+    async fn cache_invalidate(request: CacheInvalidateRequest) -> Result<(), RpcError>;
+}
+
+#[tarpc::service]
+pub trait AuthorControlRpc {
+    async fn self_info() -> Result<AuthorSelfResponse, RpcError>;
+    async fn env_list() -> Result<AuthorEnvListResponse, RpcError>;
+    async fn env_set(request: AuthorEnvSetRequest) -> Result<(), RpcError>;
+    async fn env_delete(request: AuthorEnvDeleteRequest) -> Result<(), RpcError>;
+    async fn rotate_token() -> Result<RotateAuthorTokenResponse, RpcError>;
+    async fn upload(request: UploadGameRequest) -> Result<UploadGameResponse, RpcError>;
+    async fn delete_shortname(
+        request: DeleteShortnameRequest,
+    ) -> Result<Option<DeleteShortnameResponse>, RpcError>;
+}
+
+pub fn rpc_context() -> context::Context {
+    context::current()
 }

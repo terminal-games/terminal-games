@@ -195,8 +195,7 @@ fn has_user_input(data: &[u8]) -> bool {
     }
     match Event::parse_from(data) {
         Ok(Some(Event::Key(_) | Event::Mouse(_))) => true,
-        Ok(Some(_)) => false,
-        Ok(None) | Err(_) => false,
+        Ok(Some(_)) | Ok(None) | Err(_) => false,
     }
 }
 

@@ -5,8 +5,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, watch};
 use terminput::{Event, MouseButton, MouseEventKind};
+use tokio::sync::{mpsc, watch};
 use unicode_width::UnicodeWidthStr;
 
 use crate::control::{BroadcastLevel, StatusBarState, TickerEntry};
@@ -66,7 +66,6 @@ impl StatusNotification {
 pub struct StatusBar {
     pub shortname: String,
     username: String,
-    tickers: Vec<String>,
     session_start_time: std::time::Instant,
     prev_size: (u16, u16),
     prev_status_bar_content: Vec<u8>,
@@ -124,7 +123,6 @@ impl StatusBar {
         Self {
             shortname,
             username: username.to_string(),
-            tickers: Vec::new(),
             session_start_time: std::time::Instant::now(),
             prev_size: (0, 0),
             prev_status_bar_content: Vec::new(),
@@ -140,12 +138,7 @@ impl StatusBar {
         }
     }
 
-    fn content(
-        &mut self,
-        screen: &headless_terminal::Screen,
-        width: u16,
-        row: u16,
-    ) -> Vec<u8> {
+    fn content(&mut self, screen: &headless_terminal::Screen, width: u16, row: u16) -> Vec<u8> {
         let p = palette::palette(self.terminal_profile(screen));
         let active_tab = style(
             format!(" {} ", self.shortname),
@@ -265,26 +258,21 @@ impl StatusBar {
                 Some(p.surface_bright),
                 false,
             ),
-            BroadcastLevel::Warning => style(
-                content.as_str(),
-                Some(p.on_primary),
-                Some(p.warning),
-                true,
-            ),
-            BroadcastLevel::Error => style(
-                content.as_str(),
-                Some(p.text),
-                Some(p.danger),
-                true,
-            ),
+            BroadcastLevel::Warning => {
+                style(content.as_str(), Some(p.on_primary), Some(p.warning), true)
+            }
+            BroadcastLevel::Error => style(content.as_str(), Some(p.text), Some(p.danger), true),
         })
     }
 
-    fn render_ticker_content(&self, p: &palette::Palette) -> Option<RenderedTicker> {
-        let tickers = self.active_tickers();
-        if tickers.is_empty() {
+    fn render_ticker_content(&mut self, p: &palette::Palette) -> Option<RenderedTicker> {
+        let active_ticker_count = self.active_tickers().len();
+        if active_ticker_count == 0 {
+            self.selected_ticker = None;
             return None;
         }
+        self.sync_selected_ticker(active_ticker_count);
+        let tickers = self.active_tickers();
         let ticker_index = self.selected_ticker.unwrap_or_else(|| {
             ((std::time::Instant::now() - self.session_start_time).as_secs() / 10) as usize
                 % tickers.len()
@@ -334,6 +322,16 @@ impl StatusBar {
         self.username = username.to_string();
     }
 
+    fn sync_selected_ticker(&mut self, ticker_count: usize) {
+        if ticker_count <= 1
+            || self
+                .selected_ticker
+                .is_some_and(|selected| selected >= ticker_count)
+        {
+            self.selected_ticker = None;
+        }
+    }
+
     pub fn handle_terminal_input(&mut self, data: &[u8]) -> bool {
         let Ok(Some(Event::Mouse(mouse))) = Event::parse_from(data) else {
             return false;
@@ -341,7 +339,7 @@ impl StatusBar {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return false;
         }
-        if self.ticker_click_row != Some(mouse.row as u16) {
+        if self.ticker_click_row != Some(mouse.row) {
             return false;
         }
         let Some(index) = self
@@ -363,29 +361,10 @@ impl StatusBar {
     ) -> bool {
         let (height, width) = screen.size();
 
-        if self.shared_state_rx.has_changed().unwrap_or(false) {
-            self.shared_state = self.shared_state_rx.borrow_and_update().clone();
-            self.tickers = self
-                .shared_state
-                .tickers
-                .iter()
-                .map(|ticker| ticker.content.clone())
-                .collect();
-            let ticker_count = self.active_tickers().len();
-            if ticker_count <= 1
-                || self
-                    .selected_ticker
-                    .is_some_and(|selected| selected >= ticker_count)
-            {
-                self.selected_ticker = None;
-            }
-        }
+        self.sync_shared_state_if_needed();
 
-        match self.notification_rx.try_recv() {
-            Ok(notification) => {
-                self.show_notification(notification);
-            }
-            Err(_) => {}
+        if let Ok(notification) = self.notification_rx.try_recv() {
+            self.show_notification(notification);
         }
 
         let content = self.content(screen, width, height);
@@ -414,6 +393,20 @@ impl StatusBar {
             .iter()
             .filter(|ticker| ticker.expires_at.is_none_or(|expires_at| expires_at > now))
             .collect()
+    }
+
+    pub async fn wait_for_shared_state_change(&mut self) -> Result<(), watch::error::RecvError> {
+        self.shared_state_rx.changed().await?;
+        self.shared_state = self.shared_state_rx.borrow_and_update().clone();
+        self.sync_selected_ticker(self.active_tickers().len());
+        Ok(())
+    }
+
+    fn sync_shared_state_if_needed(&mut self) {
+        if self.shared_state_rx.has_changed().unwrap_or(false) {
+            self.shared_state = self.shared_state_rx.borrow_and_update().clone();
+            self.sync_selected_ticker(self.active_tickers().len());
+        }
     }
 }
 

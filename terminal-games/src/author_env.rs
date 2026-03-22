@@ -102,8 +102,7 @@ pub fn encrypt_author_env_blob(envs: &[AuthorEnvVar]) -> anyhow::Result<Encrypte
     );
 
     let mut plaintext = vec![0u8; AUTHOR_ENV_PLAINTEXT_BYTES];
-    plaintext[..AUTHOR_ENV_LENGTH_BYTES]
-        .copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+    plaintext[..AUTHOR_ENV_LENGTH_BYTES].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
     plaintext[AUTHOR_ENV_LENGTH_BYTES..AUTHOR_ENV_LENGTH_BYTES + encoded.len()]
         .copy_from_slice(&encoded);
     OsRng.fill_bytes(&mut plaintext[AUTHOR_ENV_LENGTH_BYTES + encoded.len()..]);
@@ -125,7 +124,10 @@ pub fn encrypt_author_env_blob(envs: &[AuthorEnvVar]) -> anyhow::Result<Encrypte
     })
 }
 
-pub fn decrypt_author_env_blob(salt: &[u8], ciphertext: &[u8]) -> anyhow::Result<Vec<AuthorEnvVar>> {
+pub fn decrypt_author_env_blob(
+    salt: &[u8],
+    ciphertext: &[u8],
+) -> anyhow::Result<Vec<AuthorEnvVar>> {
     anyhow::ensure!(
         salt.len() == AUTHOR_ENV_SALT_BYTES,
         "invalid env salt length {}",
@@ -181,9 +183,7 @@ fn author_env_secret_key() -> &'static str {
     KEY.get_or_init(|| match std::env::var(AUTHOR_ENV_KEY_ENV) {
         Ok(value) if !value.trim().is_empty() => value,
         _ => {
-            warn!(
-                "{AUTHOR_ENV_KEY_ENV} is not set; using the built-in development fallback key"
-            );
+            warn!("{AUTHOR_ENV_KEY_ENV} is not set; using the built-in development fallback key");
             AUTHOR_ENV_DEV_FALLBACK_KEY.to_string()
         }
     })

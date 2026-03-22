@@ -4,9 +4,9 @@
 
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 1;
 const MAX_SHORTNAME_LEN: usize = 32;
 const MAX_AUTHOR_LEN: usize = 256;
 const MAX_VERSION_LEN: usize = 128;
@@ -14,7 +14,7 @@ const MAX_LOCALIZED_VALUE_LEN: usize = 16 * 1024;
 const MAX_SCREENSHOT_CONTENT_LEN: usize = 128 * 1024;
 const MAX_SCREENSHOTS_PER_LOCALE: usize = 8;
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GameManifest {
     pub terminal_games_manifest_version: u32,
     pub shortname: String,
@@ -22,7 +22,7 @@ pub struct GameManifest {
     pub details: GameDetails,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GameDetails {
     #[serde(default)]
     pub author: String,
@@ -38,7 +38,7 @@ pub struct GameDetails {
     pub screenshots: BTreeMap<String, Vec<Screenshot>>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Screenshot {
     #[serde(default)]
     pub content: String,
@@ -93,7 +93,7 @@ pub fn parse_and_validate_manifest_json(bytes: &[u8]) -> Result<GameManifest, St
     Ok(manifest)
 }
 
-fn validate_shortname(shortname: &str) -> Result<(), String> {
+pub fn validate_shortname(shortname: &str) -> Result<(), String> {
     if shortname.is_empty() || shortname.len() > MAX_SHORTNAME_LEN {
         return Err(format!(
             "shortname must be between 1 and {} characters",

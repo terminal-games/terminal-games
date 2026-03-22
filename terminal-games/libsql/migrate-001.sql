@@ -68,10 +68,14 @@ CREATE INDEX IF NOT EXISTS idx_ip_bans_inserted_at ON ip_bans(inserted_at);
 
 CREATE TABLE IF NOT EXISTS status_tickers (
     id INTEGER PRIMARY KEY,
+    sort_order INTEGER NOT NULL,
     content TEXT NOT NULL,
     expires_at INTEGER,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
+
+CREATE INDEX IF NOT EXISTS idx_status_tickers_sort_order
+ON status_tickers(sort_order, id);
 
 CREATE TABLE IF NOT EXISTS status_broadcasts (
     id INTEGER PRIMARY KEY,

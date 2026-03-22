@@ -406,6 +406,7 @@ impl SshServer {
             let mut admin_control = session_registration.control_rx;
             let mut admin_input_rx = session_registration.admin_input_rx;
             let status_bar_state_rx = session_registration.status_bar_state_rx;
+            let _session_cleanup_guard = session_registration.cleanup_guard;
             let mut spy_resize_rx = resize_rx.clone();
             let session_guard = metrics.start_session(
                 Transport::Ssh,
@@ -556,7 +557,6 @@ impl SshServer {
                 }
             };
             session_registry.finish(local_session_id, close_reason);
-            session_registry.remove(local_session_id);
             close_terminal_session(
                 &session_handle,
                 channel_id,
@@ -604,7 +604,9 @@ async fn close_terminal_session(
         out.extend_from_slice(b"\r\n");
         let _ = session_handle.data(channel_id, out.into()).await;
     }
-    let _ = session_handle.exit_status_request(channel_id, exit_status).await;
+    let _ = session_handle
+        .exit_status_request(channel_id, exit_status)
+        .await;
     let _ = session_handle.eof(channel_id).await;
     tokio::time::sleep(Duration::from_millis(40)).await;
     let _ = session_handle.close(channel_id).await;

@@ -71,6 +71,7 @@ pub struct SessionRegistration {
     pub control_rx: watch::Receiver<SessionAdminControl>,
     pub admin_input_rx: mpsc::Receiver<Bytes>,
     pub status_bar_state_rx: watch::Receiver<StatusBarState>,
+    pub cleanup_guard: SessionCleanupGuard,
 }
 
 #[derive(Clone)]
@@ -95,6 +96,17 @@ struct RuntimeSession {
 
 struct Tracker {
     session: Arc<RuntimeSession>,
+}
+
+pub struct SessionCleanupGuard {
+    registry: Arc<SessionRegistry>,
+    local_session_id: u64,
+}
+
+impl Drop for SessionCleanupGuard {
+    fn drop(&mut self) {
+        self.registry.remove(self.local_session_id);
+    }
 }
 
 impl ActiveShortnameTracker for Tracker {
@@ -178,7 +190,9 @@ impl SessionRegistry {
                 guard.insert(local_session_id, session.clone());
             }
             Err(poisoned) => {
-                poisoned.into_inner().insert(local_session_id, session.clone());
+                poisoned
+                    .into_inner()
+                    .insert(local_session_id, session.clone());
             }
         }
         SessionRegistration {
@@ -186,11 +200,15 @@ impl SessionRegistry {
             control_rx,
             admin_input_rx: input_rx,
             status_bar_state_rx: self.status_bar_state_tx.subscribe(),
+            cleanup_guard: SessionCleanupGuard {
+                registry: self.clone(),
+                local_session_id,
+            },
         }
     }
 
     pub fn set_status_bar_state(&self, state: StatusBarState) {
-        let _ = self.status_bar_state_tx.send(state);
+        self.status_bar_state_tx.send_replace(state);
     }
 
     pub fn remove(&self, local_session_id: u64) {
@@ -273,7 +291,9 @@ impl SessionRegistry {
         let Some(session) = self.lookup(local_session_id) else {
             return;
         };
-        let _ = session.output_tx.send(SpyEvent::Input { data: data.to_vec() });
+        let _ = session.output_tx.send(SpyEvent::Input {
+            data: data.to_vec(),
+        });
     }
 
     pub fn record_resize(&self, local_session_id: u64, cols: u16, rows: u16) {

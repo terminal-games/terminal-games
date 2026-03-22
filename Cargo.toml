@@ -5,6 +5,7 @@ members = [
     "examples/rust-simple",
     "headless-terminal",
     "terminal-games-cli",
+    "terminal-games-manifest",
     "terminal-games-sdk",
     "terminal-games-server",
     "terminal-games",

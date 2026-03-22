@@ -4,44 +4,51 @@
 
 use std::{
     collections::VecDeque,
+    error::Error as StdError,
+    io,
+    pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context as TaskContext, Poll},
     time::{Duration, Instant},
 };
 
-use base64::Engine as _;
 use axum::{
-    Json,
     Router,
-    body::Bytes,
     extract::{
-        DefaultBodyLimit, Multipart, Path, Query, State,
+        FromRequestParts, Path, Query, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION, request::Parts},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
 };
+use base64::Engine as _;
+use bytes::BytesMut;
+use futures::{Sink, Stream, StreamExt};
 use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sysinfo::System;
+use tarpc::server::Channel;
+use tarpc::{context, server};
 use terminal_games::{
-    author_env::{
-        AuthorEnvVar as RuntimeAuthorEnvVar, decrypt_author_env_blob, encrypt_author_env_blob,
-        validate_author_env_name, validate_author_envs,
-    },
     app::AppServer,
-    control::{
-        AuthorEnvDeleteRequest, AuthorEnvListResponse, AuthorEnvSetRequest, AuthorSelfResponse,
-        AuthorSummary, AuthorTokenClaims, BanEntry, BanIpAddRequest, BanIpRemoveRequest,
-        BroadcastLevel, BroadcastRequest, CacheInvalidateRequest,
-        CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest, DeleteShortnameRequest,
-        DeleteShortnameResponse, KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus,
-        RotateAuthorTokenRequest, RotateAuthorTokenResponse, SpyControlMessage,
-        StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest,
-        UploadGameResponse,
+    author_env::{
+        decrypt_author_env_blob, encrypt_author_env_blob, validate_author_env_name,
+        validate_author_envs,
     },
-    manifest::{GameManifest, extract_manifest_from_wasm, validate_shortname},
+    control::{
+        AdminControlRpc, AuthorControlRpc, AuthorEnvDeleteRequest, AuthorEnvListResponse,
+        AuthorEnvSetRequest, AuthorSelfResponse, AuthorSummary, AuthorTokenClaims, BanEntry,
+        BanIpAddRequest, BanIpRemoveRequest, BanIpRequest, BroadcastLevel, BroadcastRequest,
+        CacheInvalidateRequest, CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest,
+        DeleteShortnameRequest, DeleteShortnameResponse, KickSessionRequest,
+        RegionDiscoveryResponse, RegionRuntimeStatus, RotateAuthorTokenRequest,
+        RotateAuthorTokenResponse, RpcError, SessionSummary, SpyControlMessage, StatusBarState,
+        StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest, TickerReorderRequest,
+        UploadGameRequest, UploadGameResponse,
+    },
+    manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
     mesh::Mesh,
 };
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -50,9 +57,13 @@ use crate::{
     admission::{AdmissionController, BanRule},
     sessions::SessionRegistry,
 };
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_tungstenite::tungstenite::{Error as WsError, error::ProtocolError};
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 const BANDWIDTH_WINDOW: Duration = Duration::from_secs(5);
 const AUTHOR_UPLOAD_MAX_BYTES: usize = 50 * 1024 * 1024;
+const CONTROL_RPC_MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -107,7 +118,7 @@ impl ControlPlane {
         let Some(token) = bearer_token(headers) else {
             return Err((StatusCode::UNAUTHORIZED, "missing bearer token").into_response());
         };
-        if token == expected {
+        if secure_secret_eq(token, expected) {
             Ok(())
         } else {
             Err((StatusCode::UNAUTHORIZED, "invalid bearer token").into_response())
@@ -126,7 +137,7 @@ impl ControlPlane {
         else {
             return Err((StatusCode::UNAUTHORIZED, "unknown author").into_response());
         };
-        if sha256_hex(&claims.secret) != record.token_hash {
+        if !secure_secret_eq(&sha256_hex(&claims.secret), &record.token_hash) {
             return Err((StatusCode::UNAUTHORIZED, "invalid author token").into_response());
         }
         Ok(AuthorAuth { record, claims })
@@ -147,6 +158,51 @@ impl ControlPlane {
         })
     }
 
+    async fn publish_game_version_update(&self, shortname: &str, game_id: u64, version: u64) {
+        self.app_server
+            .apply_uploaded_version(game_id, version)
+            .await;
+        self.mesh
+            .propagate_game_version_update(terminal_games::mesh::GameVersionUpdateMessage {
+                shortname: shortname.to_string(),
+                game_id,
+                version,
+            })
+            .await;
+    }
+
+    async fn rotate_author_token(
+        &self,
+        author_id: u64,
+        shortname: &str,
+        base_url: String,
+    ) -> anyhow::Result<RotateAuthorTokenResponse> {
+        let secret = random_token_secret();
+        let token_hash = sha256_hex(&secret);
+        self.app_server
+            .db
+            .execute(
+                "UPDATE authors SET token_hash = ?2 WHERE id = ?1",
+                libsql::params!(author_id, token_hash),
+            )
+            .await?;
+        Ok(RotateAuthorTokenResponse {
+            author: AuthorSummary {
+                author_id,
+                author_name: String::new(),
+                shortname: shortname.to_string(),
+                playtime_seconds: 0.0,
+            },
+            token: AuthorTokenClaims::new(base_url, shortname.to_string(), secret).encode()?,
+        })
+    }
+
+    pub async fn refresh_status_bar_state(&self) -> anyhow::Result<()> {
+        let state = load_status_bar_state(&self.app_server.db, &self.region_id).await?;
+        self.session_registry.set_status_bar_state(state);
+        Ok(())
+    }
+
     fn local_region_status(&self) -> RegionRuntimeStatus {
         let mut system = System::new();
         system.refresh_memory();
@@ -156,7 +212,9 @@ impl ControlPlane {
             current_sessions: self.session_registry.count(),
             max_capacity: self.max_capacity,
             cpu_usage_percent: system.global_cpu_usage(),
-            memory_used_bytes: system.total_memory().saturating_sub(system.available_memory()),
+            memory_used_bytes: system
+                .total_memory()
+                .saturating_sub(system.available_memory()),
             memory_total_bytes: system.total_memory(),
             bandwidth_bytes_per_second: self.bandwidth.bytes_per_second(),
         }
@@ -165,37 +223,116 @@ impl ControlPlane {
 
 pub fn router(control: ControlPlane) -> Router {
     Router::new()
-        .route("/admin/discover", get(admin_discover))
-        .route("/admin/regions", get(admin_regions))
-        .route("/admin/sessions", get(admin_sessions))
-        .route("/admin/ban-ip/add", post(admin_ban_ip_add))
-        .route("/admin/ban-ip/list", get(admin_ban_ip_list))
-        .route("/admin/ban-ip/remove", post(admin_ban_ip_remove))
-        .route("/admin/apply-ban", post(admin_apply_ban))
-        .route("/admin/apply-ban-remove", post(admin_apply_ban_remove))
-        .route("/admin/session/kick", post(admin_session_kick))
-        .route("/admin/session/spy/{local_session_id}", get(admin_session_spy))
-        .route("/admin/ticker/list", get(admin_ticker_list))
-        .route("/admin/ticker/add", post(admin_ticker_add))
-        .route("/admin/ticker/remove", post(admin_ticker_remove))
-        .route("/admin/broadcast", post(admin_broadcast))
-        .route("/admin/status-bar/refresh", post(admin_status_bar_refresh))
-        .route("/admin/author/create", post(admin_author_create))
-        .route("/admin/author/list", get(admin_author_list))
-        .route("/admin/author/rotate-token", post(admin_author_rotate_token))
-        .route("/admin/author/delete", post(admin_author_delete))
-        .route("/admin/cache/invalidate", post(admin_cache_invalidate))
-        .route("/author/self", get(author_self))
-        .route("/author/env/list", get(author_env_list))
-        .route("/author/env/set", post(author_env_set))
-        .route("/author/env/delete", post(author_env_delete))
-        .route("/author/rotate-token", post(author_rotate_token))
+        .route("/admin/rpc", get(admin_rpc))
         .route(
-            "/author/upload",
-            post(author_upload).layer(DefaultBodyLimit::max(AUTHOR_UPLOAD_MAX_BYTES)),
+            "/admin/session/spy/{local_session_id}",
+            get(admin_session_spy),
         )
-        .route("/author/delete", post(author_delete))
+        .route("/author/rpc", get(author_rpc))
         .with_state(control)
+}
+
+struct ServerWsTransport {
+    socket: WebSocket,
+    read_buf: BytesMut,
+}
+
+impl ServerWsTransport {
+    fn new(socket: WebSocket) -> Self {
+        Self {
+            socket,
+            read_buf: BytesMut::new(),
+        }
+    }
+}
+
+impl AsyncRead for ServerWsTransport {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            if !self.read_buf.is_empty() {
+                let len = self.read_buf.len().min(buf.remaining());
+                buf.put_slice(&self.read_buf.split_to(len));
+                return Poll::Ready(Ok(()));
+            }
+            let Some(message) = futures::ready!(Pin::new(&mut self.socket).poll_next(cx)) else {
+                return Poll::Ready(Ok(()));
+            };
+            match message {
+                Ok(Message::Binary(data)) => self.read_buf = BytesMut::from(&data[..]),
+                Ok(Message::Text(text)) => {
+                    self.read_buf = BytesMut::from(text.as_str().as_bytes());
+                }
+                Ok(Message::Close(_)) => return Poll::Ready(Ok(())),
+                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+                Err(error) if websocket_disconnect_is_eof(&error) => {
+                    return Poll::Ready(Ok(()));
+                }
+                Err(error) => return Poll::Ready(Err(io::Error::other(error))),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for ServerWsTransport {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        futures::ready!(Pin::new(&mut self.socket).poll_ready(cx)).map_err(io::Error::other)?;
+        Pin::new(&mut self.socket)
+            .start_send(Message::Binary(BytesMut::from(buf).freeze()))
+            .map_err(io::Error::other)?;
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket)
+            .poll_flush(cx)
+            .map_err(io::Error::other)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.socket)
+            .poll_close(cx)
+            .map_err(io::Error::other)
+    }
+}
+
+fn websocket_disconnect_is_eof(error: &axum::Error) -> bool {
+    let Some(error) = error
+        .source()
+        .and_then(|source| source.downcast_ref::<WsError>())
+    else {
+        return false;
+    };
+    match error {
+        WsError::ConnectionClosed | WsError::AlreadyClosed => true,
+        WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => true,
+        WsError::Io(error) => matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::NotConnected
+        ),
+        _ => false,
+    }
+}
+
+#[derive(Clone)]
+struct AdminRpcServer {
+    control: ControlPlane,
+}
+
+#[derive(Clone)]
+struct AuthorRpcServer {
+    control: ControlPlane,
+    author: AuthorAuth,
 }
 
 #[derive(Default)]
@@ -232,123 +369,149 @@ impl BandwidthTracker {
     }
 }
 
-#[derive(Debug, Clone)]
-struct AuthorRecord {
-    id: u64,
-    shortname: String,
-    token_hash: String,
-}
-
-#[derive(Debug, Clone)]
-struct AuthorAuth {
-    record: AuthorRecord,
-    claims: AuthorTokenClaims,
-}
-
-pub async fn admin_discover(
+pub async fn admin_rpc(
+    ws: WebSocketUpgrade,
     State(control): State<ControlPlane>,
-    headers: HeaderMap,
+    _: AdminGuard,
 ) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
-    match control.discover().await {
-        Ok(payload) => Json(payload).into_response(),
-        Err(error) => internal_error(error),
-    }
+    ws.max_message_size(CONTROL_RPC_MAX_FRAME_LEN)
+        .max_frame_size(CONTROL_RPC_MAX_FRAME_LEN)
+        .on_upgrade(move |socket| run_admin_rpc_socket(socket, control))
 }
 
-pub async fn admin_regions(
+pub async fn author_rpc(
+    ws: WebSocketUpgrade,
     State(control): State<ControlPlane>,
-    headers: HeaderMap,
+    author: AuthorAuth,
 ) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
-    Json(control.local_region_status()).into_response()
+    ws.max_message_size(CONTROL_RPC_MAX_FRAME_LEN)
+        .max_frame_size(CONTROL_RPC_MAX_FRAME_LEN)
+        .on_upgrade(move |socket| run_author_rpc_socket(socket, control, author))
 }
 
-pub async fn admin_sessions(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
-    let mut sessions = control.session_registry.summaries();
-    sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-    Json(sessions).into_response()
+async fn run_admin_rpc_socket(socket: WebSocket, control: ControlPlane) {
+    let mut codec = LengthDelimitedCodec::new();
+    codec.set_max_frame_length(CONTROL_RPC_MAX_FRAME_LEN);
+    let transport = tarpc::serde_transport::new::<
+        _,
+        tarpc::ClientMessage<terminal_games::control::AdminControlRpcRequest>,
+        tarpc::Response<terminal_games::control::AdminControlRpcResponse>,
+        _,
+    >(
+        Framed::new(ServerWsTransport::new(socket), codec),
+        tarpc::tokio_serde::formats::Bincode::default(),
+    );
+    server::BaseChannel::with_defaults(transport)
+        .execute(AdminRpcServer { control }.serve())
+        .for_each(|response| async move {
+            let _ = response.await;
+        })
+        .await;
 }
 
-pub async fn admin_ban_ip_add(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<BanIpAddRequest>,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
+async fn run_author_rpc_socket(socket: WebSocket, control: ControlPlane, author: AuthorAuth) {
+    let mut codec = LengthDelimitedCodec::new();
+    codec.set_max_frame_length(CONTROL_RPC_MAX_FRAME_LEN);
+    let transport = tarpc::serde_transport::new::<
+        _,
+        tarpc::ClientMessage<terminal_games::control::AuthorControlRpcRequest>,
+        tarpc::Response<terminal_games::control::AuthorControlRpcResponse>,
+        _,
+    >(
+        Framed::new(ServerWsTransport::new(socket), codec),
+        tarpc::tokio_serde::formats::Bincode::default(),
+    );
+    server::BaseChannel::with_defaults(transport)
+        .execute(AuthorRpcServer { control, author }.serve())
+        .for_each(|response| async move {
+            let _ = response.await;
+        })
+        .await;
+}
+
+impl AdminControlRpc for AdminRpcServer {
+    async fn discover(self, _: context::Context) -> Result<RegionDiscoveryResponse, RpcError> {
+        Ok(self.control.discover().await?)
     }
-    let rule = match BanRule::parse(request.ip.clone()) {
-        Ok(rule) => rule,
-        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-    };
-    let expires_at = match parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref()) {
-        Ok(expires_at) => expires_at,
-        Err(error) => return bad_request(error),
-    };
-    let result = async {
-        control
+
+    async fn local_region_status(
+        self,
+        _: context::Context,
+    ) -> Result<RegionRuntimeStatus, RpcError> {
+        Ok(self.control.local_region_status())
+    }
+
+    async fn sessions(self, _: context::Context) -> Result<Vec<SessionSummary>, RpcError> {
+        let mut sessions = self.control.session_registry.summaries();
+        sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        Ok(sessions)
+    }
+
+    async fn ban_ip_add(
+        self,
+        _: context::Context,
+        request: BanIpAddRequest,
+    ) -> Result<(), RpcError> {
+        let rule = BanRule::parse(request.ip.clone())?;
+        let expires_at =
+            parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref())?;
+        self.control
             .app_server
             .db
             .execute(
                 "INSERT INTO ip_bans (ip, reason, expires_at, inserted_at)
-                 VALUES (?1, ?2, ?3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
-                 ON CONFLICT(ip) DO UPDATE SET
-                     reason = excluded.reason,
-                     expires_at = excluded.expires_at,
-                     inserted_at = excluded.inserted_at",
+             VALUES (?1, ?2, ?3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+             ON CONFLICT(ip) DO UPDATE SET
+                 reason = excluded.reason,
+                 expires_at = excluded.expires_at,
+                 inserted_at = excluded.inserted_at",
                 libsql::params!(request.ip, request.reason.clone(), expires_at),
             )
             .await?;
-            control
-                .admission_controller
-            .apply_ban_updates(vec![(rule, Some(request.reason), expires_at)]);
-        anyhow::Ok(())
+        self.control.admission_controller.apply_ban_updates(vec![(
+            rule,
+            Some(request.reason),
+            expires_at,
+        )]);
+        Ok(())
     }
-    .await;
-    match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error),
-    }
-}
 
-pub async fn admin_ban_ip_list(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
+    async fn ban_ip_list(self, _: context::Context) -> Result<Vec<BanEntry>, RpcError> {
+        let mut rows = self
+            .control
+            .app_server
+            .db
+            .query(
+                "SELECT ip, COALESCE(reason, ''), expires_at, inserted_at
+                 FROM ip_bans
+                 ORDER BY inserted_at DESC, ip ASC",
+                (),
+            )
+            .await?;
+        let now = current_unix_seconds();
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let expires_at = row.get::<Option<i64>>(2)?;
+            if !is_ban_active(expires_at, now) {
+                continue;
+            }
+            entries.push(BanEntry {
+                ip: row.get::<String>(0)?,
+                reason: row.get::<String>(1)?.trim().to_string(),
+                expires_at,
+                inserted_at: row.get::<i64>(3)?,
+            });
+        }
+        Ok(entries)
     }
-    match load_ban_entries(&control.app_server.db).await {
-        Ok(entries) => Json(entries).into_response(),
-        Err(error) => internal_error(error),
-    }
-}
 
-pub async fn admin_ban_ip_remove(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<BanIpRemoveRequest>,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
-    let rule = match BanRule::parse(request.ip.clone()) {
-        Ok(rule) => rule,
-        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-    };
-    let result = async {
-        control
+    async fn ban_ip_remove(
+        self,
+        _: context::Context,
+        request: BanIpRemoveRequest,
+    ) -> Result<(), RpcError> {
+        let rule = BanRule::parse(request.ip.clone())?;
+        self.control
             .app_server
             .db
             .execute(
@@ -356,138 +519,133 @@ pub async fn admin_ban_ip_remove(
                 libsql::params!(request.ip),
             )
             .await?;
-        control
+        self.control
             .admission_controller
             .apply_ban_updates(vec![(rule, None, Some(0))]);
-        anyhow::Ok(())
+        Ok(())
     }
-    .await;
-    match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error),
-    }
-}
 
-pub async fn admin_apply_ban(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<BanIpAddRequest>,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
+    async fn apply_ban(self, _: context::Context, request: BanIpRequest) -> Result<(), RpcError> {
+        let rule = BanRule::parse(request.ip)?;
+        self.control.admission_controller.apply_ban_updates(vec![(
+            rule,
+            Some(request.reason),
+            None,
+        )]);
+        Ok(())
     }
-    let expires_at = match parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref()) {
-        Ok(expires_at) => expires_at,
-        Err(error) => return bad_request(error),
-    };
-    match BanRule::parse(request.ip) {
-        Ok(rule) => {
-            control
-                .admission_controller
-                .apply_ban_updates(vec![(rule, Some(request.reason), expires_at)]);
-            StatusCode::NO_CONTENT.into_response()
+
+    async fn apply_ban_remove(
+        self,
+        _: context::Context,
+        request: BanIpRemoveRequest,
+    ) -> Result<(), RpcError> {
+        let rule = BanRule::parse(request.ip)?;
+        self.control
+            .admission_controller
+            .apply_ban_updates(vec![(rule, None, Some(0))]);
+        Ok(())
+    }
+
+    async fn session_kick(
+        self,
+        _: context::Context,
+        request: KickSessionRequest,
+    ) -> Result<(), RpcError> {
+        if self.control.session_registry.kick(request.local_session_id) {
+            Ok(())
+        } else {
+            Err("session not found".into())
         }
-        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
     }
-}
 
-pub async fn admin_apply_ban_remove(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<BanIpRemoveRequest>,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
+    async fn ticker_list(self, _: context::Context) -> Result<Vec<TickerEntry>, RpcError> {
+        Ok(load_ticker_entries(&self.control.app_server.db).await?)
     }
-    match BanRule::parse(request.ip) {
-        Ok(rule) => {
-            control
-                .admission_controller
-                .apply_ban_updates(vec![(rule, None, Some(0))]);
-            StatusCode::NO_CONTENT.into_response()
+
+    async fn ticker_add(
+        self,
+        _: context::Context,
+        request: TickerAddRequest,
+    ) -> Result<(), RpcError> {
+        let content = request.content.trim();
+        if content.is_empty() {
+            return Err("ticker content cannot be empty".into());
         }
-        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
-    }
-}
-
-pub async fn admin_session_kick(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<KickSessionRequest>,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
-    if control.session_registry.kick(request.local_session_id) {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        StatusCode::NOT_FOUND.into_response()
-    }
-}
-
-pub async fn admin_ticker_list(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
-    match load_ticker_entries(&control.app_server.db).await {
-        Ok(entries) => Json(entries).into_response(),
-        Err(error) => internal_error(error),
-    }
-}
-
-pub async fn admin_ticker_add(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<TickerAddRequest>,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
-    let content = request.content.trim();
-    if content.is_empty() {
-        return bad_request("ticker content cannot be empty");
-    }
-    if content.len() > 120 {
-        return bad_request("ticker content exceeds 120 bytes");
-    }
-    let expires_at =
-        match parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref()) {
-            Ok(expires_at) => expires_at,
-            Err(error) => return bad_request(error),
-        };
-    let result = async {
-        control
+        if content.len() > 120 {
+            return Err("ticker content exceeds 120 bytes".into());
+        }
+        let expires_at =
+            parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref())?;
+        let mut rows = self
+            .control
+            .app_server
+            .db
+            .query(
+                "SELECT COALESCE(MAX(sort_order), 0) FROM status_tickers",
+                (),
+            )
+            .await?;
+        let next_order = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)?,
+            None => 0,
+        } + 1;
+        self.control
             .app_server
             .db
             .execute(
-                "INSERT INTO status_tickers (content, expires_at) VALUES (?1, ?2)",
-                libsql::params!(content, expires_at),
+                "INSERT INTO status_tickers (sort_order, content, expires_at) VALUES (?1, ?2, ?3)",
+                libsql::params!(next_order, content, expires_at),
             )
             .await?;
-        let state = load_status_bar_state(&control.app_server.db, &control.region_id).await?;
-        control.session_registry.set_status_bar_state(state);
-        anyhow::Ok(())
+        self.control.refresh_status_bar_state().await?;
+        Ok(())
     }
-    .await;
-    match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error),
-    }
-}
 
-pub async fn admin_ticker_remove(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<TickerRemoveRequest>,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
+    async fn ticker_reorder(
+        self,
+        _: context::Context,
+        request: TickerReorderRequest,
+    ) -> Result<(), RpcError> {
+        let tx = self.control.app_server.db.transaction().await?;
+        let mut rows = tx
+            .query(
+                "SELECT id FROM status_tickers ORDER BY sort_order ASC, id ASC",
+                (),
+            )
+            .await?;
+        let mut existing_ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            existing_ids.push(row.get::<u64>(0)?);
+        }
+        if existing_ids.is_empty() {
+            return Err("no tickers exist to reorder".into());
+        }
+        let mut expected_ids = existing_ids.clone();
+        expected_ids.sort_unstable();
+        let mut provided_ids = request.ticker_ids.clone();
+        provided_ids.sort_unstable();
+        if provided_ids != expected_ids {
+            return Err("ticker reorder must provide each ticker id exactly once".into());
+        }
+        for (index, id) in request.ticker_ids.iter().copied().enumerate() {
+            tx.execute(
+                "UPDATE status_tickers SET sort_order = ?2 WHERE id = ?1",
+                libsql::params!(id, (index as i64) + 1),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        self.control.refresh_status_bar_state().await?;
+        Ok(())
     }
-    let result = async {
-        control
+
+    async fn ticker_remove(
+        self,
+        _: context::Context,
+        request: TickerRemoveRequest,
+    ) -> Result<(), RpcError> {
+        self.control
             .app_server
             .db
             .execute(
@@ -495,45 +653,29 @@ pub async fn admin_ticker_remove(
                 libsql::params!(request.ticker_id),
             )
             .await?;
-        let state = load_status_bar_state(&control.app_server.db, &control.region_id).await?;
-        control.session_registry.set_status_bar_state(state);
-        anyhow::Ok(())
+        self.control.refresh_status_bar_state().await?;
+        Ok(())
     }
-    .await;
-    match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error),
-    }
-}
 
-pub async fn admin_broadcast(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<BroadcastRequest>,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
-    if request.message.trim().is_empty() {
-        return bad_request("broadcast message cannot be empty");
-    }
-    if request.message.len() > 240 {
-        return bad_request("broadcast message exceeds 240 bytes");
-    }
-    let expires_at = match parse_duration_string(&request.duration)
-        .and_then(|duration| expiry_from_duration(duration))
-    {
-        Ok(expires_at) => expires_at,
-        Err(error) => return bad_request(error),
-    };
-    let regions_csv = normalize_regions_csv(&request.regions);
-    let result = async {
-        control
+    async fn broadcast(
+        self,
+        _: context::Context,
+        request: BroadcastRequest,
+    ) -> Result<(), RpcError> {
+        if request.message.trim().is_empty() {
+            return Err("broadcast message cannot be empty".into());
+        }
+        if request.message.len() > 240 {
+            return Err("broadcast message exceeds 240 bytes".into());
+        }
+        let expires_at = parse_duration_string(&request.duration).and_then(expiry_from_duration)?;
+        let regions_csv = normalize_regions_csv(&request.regions);
+        self.control
             .app_server
             .db
             .execute(
                 "INSERT INTO status_broadcasts (level, regions, message, expires_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+             VALUES (?1, ?2, ?3, ?4)",
                 libsql::params!(
                     broadcast_level_sql(request.level),
                     regions_csv,
@@ -542,409 +684,456 @@ pub async fn admin_broadcast(
                 ),
             )
             .await?;
-        let state = load_status_bar_state(&control.app_server.db, &control.region_id).await?;
-        control.session_registry.set_status_bar_state(state);
-        anyhow::Ok(())
+        self.control.refresh_status_bar_state().await?;
+        Ok(())
     }
-    .await;
-    match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => internal_error(error),
-    }
-}
 
-pub async fn admin_status_bar_refresh(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
+    async fn status_bar_refresh(self, _: context::Context) -> Result<(), RpcError> {
+        self.control.refresh_status_bar_state().await?;
+        Ok(())
     }
-    match load_status_bar_state(&control.app_server.db, &control.region_id).await {
-        Ok(state) => {
-            control.session_registry.set_status_bar_state(state);
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(error) => internal_error(error),
-    }
-}
 
-pub async fn admin_author_create(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<CreateAuthorRequest>,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
-    if let Err(error) = validate_shortname(&request.shortname) {
-        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
-    }
-    let result = async {
+    async fn author_create(
+        self,
+        _: context::Context,
+        request: CreateAuthorRequest,
+    ) -> Result<CreateAuthorResponse, RpcError> {
+        validate_shortname(&request.shortname)?;
         let secret = random_token_secret();
         let token_hash = sha256_hex(&secret);
-        control
+        self.control
             .app_server
             .db
             .execute(
                 "INSERT INTO authors (shortname, token_hash)
-                 VALUES (?1, ?2)",
+             VALUES (?1, ?2)",
                 libsql::params!(request.shortname.clone(), token_hash),
             )
             .await?;
-        let author = load_author_by_shortname(&control.app_server.db, &request.shortname)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("author row missing after insert"))?;
-        let token = AuthorTokenClaims::new(request.base_url, author.shortname.clone(), secret)
-            .encode()?;
-        Ok::<_, anyhow::Error>(CreateAuthorResponse {
-            author: author.into(),
-            token,
-        })
-    }
-    .await;
-    match result {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => internal_error(error),
-    }
-}
-
-pub async fn admin_author_list(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
-    match load_all_authors(&control.app_server.db).await {
-        Ok(authors) => Json(authors).into_response(),
-        Err(error) => internal_error(error),
-    }
-}
-
-pub async fn admin_author_rotate_token(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<RotateAuthorTokenRequest>,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
-    let result = async {
-        let Some(author) = load_author_by_id(&control.app_server.db, request.author_id).await? else {
-            return Ok::<_, anyhow::Error>(None);
-        };
-        let secret = random_token_secret();
-        let token_hash = sha256_hex(&secret);
-        control
+        let mut rows = self
+            .control
             .app_server
             .db
-            .execute(
-                "UPDATE authors SET token_hash = ?2 WHERE id = ?1",
-                libsql::params!(request.author_id, token_hash),
+            .query(
+                "SELECT id, shortname FROM authors WHERE shortname = ?1 LIMIT 1",
+                libsql::params!(request.shortname),
             )
             .await?;
-        let token = AuthorTokenClaims::new(request.base_url, author.shortname.clone(), secret).encode()?;
-        Ok(Some(RotateAuthorTokenResponse {
-            author: author.into(),
-            token,
-        }))
+        let Some(row) = rows.next().await? else {
+            return Err("author row missing after insert".into());
+        };
+        let shortname = row.get::<String>(1)?;
+        let author = AuthorSummary {
+            author_id: row.get::<u64>(0)?,
+            author_name: String::new(),
+            shortname: shortname.clone(),
+            playtime_seconds: 0.0,
+        };
+        Ok(CreateAuthorResponse {
+            author,
+            token: AuthorTokenClaims::new(request.base_url, shortname, secret).encode()?,
+        })
     }
-    .await;
-    match result {
-        Ok(Some(response)) => Json(response).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => internal_error(error),
-    }
-}
 
-pub async fn admin_author_delete(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<DeleteAuthorRequest>,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
-    match delete_author_and_game(&control.app_server.db, request.author_id).await {
-        Ok(Some(shortname)) => {
-            control.app_server.invalidate_shortname_cache(&shortname).await;
-            Json(DeleteShortnameResponse { shortname }).into_response()
+    async fn author_list(self, _: context::Context) -> Result<Vec<AuthorSummary>, RpcError> {
+        let mut rows = self
+            .control
+            .app_server
+            .db
+            .query(
+                "SELECT a.id,
+                        COALESCE(json_extract(g.details, '$.author'), ''),
+                        a.shortname,
+                        COALESCE(g.duration_seconds, 0.0)
+                 FROM authors a
+                 LEFT JOIN games g ON g.shortname = a.shortname
+                 ORDER BY a.id ASC",
+                (),
+            )
+            .await?;
+        let mut authors = Vec::new();
+        while let Some(row) = rows.next().await? {
+            authors.push(AuthorSummary {
+                author_id: row.get::<u64>(0)?,
+                author_name: row.get::<String>(1)?,
+                shortname: row.get::<String>(2)?,
+                playtime_seconds: row.get::<f64>(3)?,
+            });
         }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => internal_error(error),
+        Ok(authors)
+    }
+
+    async fn author_rotate_token(
+        self,
+        _: context::Context,
+        request: RotateAuthorTokenRequest,
+    ) -> Result<RotateAuthorTokenResponse, RpcError> {
+        let mut rows = self
+            .control
+            .app_server
+            .db
+            .query(
+                "SELECT id, shortname FROM authors WHERE id = ?1 LIMIT 1",
+                libsql::params!(request.author_id),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Err("author not found".into());
+        };
+        let author_id = row.get::<u64>(0)?;
+        let shortname = row.get::<String>(1)?;
+        Ok(self
+            .control
+            .rotate_author_token(author_id, &shortname, request.base_url)
+            .await?)
+    }
+
+    async fn author_delete(
+        self,
+        _: context::Context,
+        request: DeleteAuthorRequest,
+    ) -> Result<Option<DeleteShortnameResponse>, RpcError> {
+        let shortname =
+            delete_author_and_game(&self.control.app_server.db, request.author_id).await?;
+        if let Some(shortname) = shortname {
+            self.control
+                .app_server
+                .invalidate_shortname_cache(&shortname)
+                .await;
+            Ok(Some(DeleteShortnameResponse { shortname }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn cache_invalidate(
+        self,
+        _: context::Context,
+        request: CacheInvalidateRequest,
+    ) -> Result<(), RpcError> {
+        self.control
+            .app_server
+            .invalidate_shortname_cache(&request.shortname)
+            .await;
+        Ok(())
     }
 }
 
-pub async fn admin_cache_invalidate(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<CacheInvalidateRequest>,
-) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
+impl AuthorControlRpc for AuthorRpcServer {
+    async fn self_info(self, _: context::Context) -> Result<AuthorSelfResponse, RpcError> {
+        let mut rows = self
+            .control
+            .app_server
+            .db
+            .query(
+                "SELECT COALESCE(json_extract(details, '$.author'), ''),
+                        COALESCE(duration_seconds, 0.0)
+                 FROM games WHERE shortname = ?1 LIMIT 1",
+                libsql::params!(self.author.record.shortname.as_str()),
+            )
+            .await?;
+        let (author_name, playtime_seconds) = match rows.next().await? {
+            Some(row) => (row.get::<String>(0).unwrap_or_default(), row.get::<f64>(1)?),
+            None => (String::new(), 0.0),
+        };
+        Ok(AuthorSelfResponse {
+            author_id: self.author.record.id,
+            author_name,
+            shortname: self.author.record.shortname.clone(),
+            server: self.control.region_id.clone(),
+            playtime_seconds,
+        })
     }
-    control
-        .app_server
-        .invalidate_shortname_cache(&request.shortname)
-        .await;
-    StatusCode::NO_CONTENT.into_response()
-}
 
-pub async fn author_self(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-) -> Response {
-    let author = match control.require_author(&headers).await {
-        Ok(author) => author,
-        Err(response) => return response,
-    };
-    match load_author_self(&control.app_server.db, &author.record, &control.region_id).await {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => internal_error(error),
-    }
-}
-
-pub async fn author_env_list(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-) -> Response {
-    let author = match control.require_author(&headers).await {
-        Ok(author) => author,
-        Err(response) => return response,
-    };
-    match load_author_envs(&control.app_server.db, &author.record.shortname).await {
-        Ok(envs) => Json(AuthorEnvListResponse {
-            shortname: author.record.shortname,
+    async fn env_list(self, _: context::Context) -> Result<AuthorEnvListResponse, RpcError> {
+        let (_, env_salt, env_blob) =
+            load_game_env_blob(&self.control.app_server.db, &self.author.record.shortname)
+                .await?
+                .ok_or_else(|| RpcError::from("upload a game before managing env vars"))?;
+        let envs = decrypt_author_env_blob(&env_salt, &env_blob)?;
+        Ok(AuthorEnvListResponse {
+            shortname: self.author.record.shortname,
             envs,
         })
-        .into_response(),
-        Err(error) => internal_error(error),
     }
-}
 
-pub async fn author_env_set(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<AuthorEnvSetRequest>,
-) -> Response {
-    let author = match control.require_author(&headers).await {
-        Ok(author) => author,
-        Err(response) => return response,
-    };
-    if let Err(error) = validate_control_envs(&request.envs) {
-        return bad_request(error);
-    }
-    match upsert_author_envs(&control.app_server.db, &author.record.shortname, &request.envs, request.replace).await {
-        Ok((game_id, version)) => {
-            control
-                .app_server
-                .apply_uploaded_version(game_id, version)
-                .await;
-            control
-                .mesh
-                .propagate_game_version_update(terminal_games::mesh::GameVersionUpdateMessage {
-                    shortname: author.record.shortname.clone(),
-                    game_id,
-                    version,
-                })
-                .await;
-            StatusCode::NO_CONTENT.into_response()
+    async fn env_set(
+        self,
+        _: context::Context,
+        request: AuthorEnvSetRequest,
+    ) -> Result<(), RpcError> {
+        validate_author_envs(&request.envs)?;
+        let (game_id, env_salt, env_blob) =
+            load_game_env_blob(&self.control.app_server.db, &self.author.record.shortname)
+                .await?
+                .ok_or_else(|| RpcError::from("upload a game before managing env vars"))?;
+        let mut current = if request.replace {
+            Vec::new()
+        } else {
+            decrypt_author_env_blob(&env_salt, &env_blob)?
+        };
+        for env in request.envs.iter().cloned() {
+            if let Some(existing) = current
+                .iter_mut()
+                .find(|existing| existing.name == env.name)
+            {
+                existing.value = env.value;
+            } else {
+                current.push(env);
+            }
         }
-        Err(error) => internal_error(error),
-    }
-}
-
-pub async fn author_env_delete(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<AuthorEnvDeleteRequest>,
-) -> Response {
-    let author = match control.require_author(&headers).await {
-        Ok(author) => author,
-        Err(response) => return response,
-    };
-    if let Err(error) = validate_author_env_name(&request.name) {
-        return bad_request(error);
-    }
-    match delete_author_env(&control.app_server.db, &author.record.shortname, &request.name).await {
-        Ok((game_id, version)) => {
-            control
-                .app_server
-                .apply_uploaded_version(game_id, version)
-                .await;
-            control
-                .mesh
-                .propagate_game_version_update(terminal_games::mesh::GameVersionUpdateMessage {
-                    shortname: author.record.shortname.clone(),
-                    game_id,
-                    version,
-                })
-                .await;
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(error) => internal_error(error),
-    }
-}
-
-pub async fn author_rotate_token(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-) -> Response {
-    let author = match control.require_author(&headers).await {
-        Ok(author) => author,
-        Err(response) => return response,
-    };
-    let result = async {
-        let secret = random_token_secret();
-        let token_hash = sha256_hex(&secret);
-        control
-            .app_server
-            .db
-            .execute(
-                "UPDATE authors SET token_hash = ?2 WHERE id = ?1",
-                libsql::params!(author.record.id, token_hash),
+        let encrypted = encrypt_author_env_blob(&current)?;
+        let tx = self.control.app_server.db.transaction().await?;
+        tx.execute(
+            "UPDATE games
+             SET env_salt = ?2,
+                 env_blob = ?3,
+                 current_version = current_version + 1
+             WHERE id = ?1",
+            libsql::params!(game_id, encrypted.salt, encrypted.ciphertext),
+        )
+        .await?;
+        let mut rows = tx
+            .query(
+                "SELECT current_version FROM games WHERE id = ?1",
+                libsql::params!(game_id),
             )
             .await?;
-        let token = AuthorTokenClaims::new(
-            author.claims.url,
-            author.record.shortname.clone(),
-            secret,
-        )
-        .encode()?;
-        Ok::<_, anyhow::Error>(RotateAuthorTokenResponse {
-            author: load_author_by_shortname(&control.app_server.db, &author.record.shortname)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("author missing after rotate"))?
-                .into(),
-            token,
-        })
+        let version = rows
+            .next()
+            .await?
+            .ok_or_else(|| RpcError::from("game row missing after env update"))?
+            .get::<u64>(0)?;
+        tx.commit().await?;
+        self.control
+            .publish_game_version_update(&self.author.record.shortname, game_id, version)
+            .await;
+        Ok(())
     }
-    .await;
-    match result {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => internal_error(error),
-    }
-}
 
-pub async fn author_upload(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    mut multipart: Multipart,
-) -> Response {
-    let author = match control.require_author(&headers).await {
-        Ok(author) => author,
-        Err(response) => return response,
-    };
-    let mut maybe_wasm = None;
-    let mut envs = None;
-    loop {
-        match multipart.next_field().await {
-            Ok(Some(field)) => {
-                let Some(name) = field.name().map(str::to_string) else {
-                    continue;
-                };
-                match name.as_str() {
-                    "wasm" => match field.bytes().await {
-                        Ok(bytes) => maybe_wasm = Some(bytes),
-                        Err(error) => return bad_request(error),
-                    },
-                    "envs" => match field.text().await {
-                        Ok(text) => {
-                            let parsed = serde_json::from_str::<Vec<terminal_games::control::AuthorEnvVar>>(&text)
-                                .map_err(|error| anyhow::anyhow!("invalid env json: {error}"));
-                            match parsed {
-                                Ok(parsed) => envs = Some(parsed),
-                                Err(error) => return bad_request(error),
-                            }
-                        }
-                        Err(error) => return bad_request(error),
-                    },
-                    _ => {}
-                }
-            }
-            Ok(None) => break,
-            Err(error) => return bad_request(error),
-        }
+    async fn env_delete(
+        self,
+        _: context::Context,
+        request: AuthorEnvDeleteRequest,
+    ) -> Result<(), RpcError> {
+        validate_author_env_name(&request.name)?;
+        let Some((game_id, env_salt, env_blob)) =
+            load_game_env_blob(&self.control.app_server.db, &self.author.record.shortname).await?
+        else {
+            return Err("upload a game before managing env vars".into());
+        };
+        let mut current = decrypt_author_env_blob(&env_salt, &env_blob)?;
+        current.retain(|env| env.name != request.name);
+        let encrypted = encrypt_author_env_blob(&current)?;
+        let tx = self.control.app_server.db.transaction().await?;
+        tx.execute(
+            "UPDATE games
+             SET env_salt = ?2,
+                 env_blob = ?3,
+                 current_version = current_version + 1
+             WHERE id = ?1",
+            libsql::params!(game_id, encrypted.salt, encrypted.ciphertext),
+        )
+        .await?;
+        let mut rows = tx
+            .query(
+                "SELECT current_version FROM games WHERE id = ?1",
+                libsql::params!(game_id),
+            )
+            .await?;
+        let version = rows
+            .next()
+            .await?
+            .ok_or_else(|| RpcError::from("game row missing after env delete"))?
+            .get::<u64>(0)?;
+        tx.commit().await?;
+        self.control
+            .publish_game_version_update(&self.author.record.shortname, game_id, version)
+            .await;
+        Ok(())
     }
-    let Some(body) = maybe_wasm else {
-        return bad_request("missing wasm upload");
-    };
-    if body.len() > AUTHOR_UPLOAD_MAX_BYTES {
-        return (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            format!(
+
+    async fn rotate_token(
+        self,
+        _: context::Context,
+    ) -> Result<RotateAuthorTokenResponse, RpcError> {
+        Ok(self
+            .control
+            .rotate_author_token(
+                self.author.record.id,
+                &self.author.record.shortname,
+                self.author.claims.url,
+            )
+            .await?)
+    }
+
+    async fn upload(
+        self,
+        _: context::Context,
+        request: UploadGameRequest,
+    ) -> Result<UploadGameResponse, RpcError> {
+        if request.wasm.len() > AUTHOR_UPLOAD_MAX_BYTES {
+            return Err(RpcError::from(format!(
                 "wasm upload exceeds {} bytes",
                 AUTHOR_UPLOAD_MAX_BYTES
-            ),
-        )
-            .into_response();
-    }
-    let manifest = match extract_manifest_from_wasm(&body)
-        .and_then(|manifest| {
+            )));
+        }
+        let manifest = extract_manifest_from_wasm(&request.wasm).and_then(|manifest| {
             manifest.ok_or_else(|| anyhow::anyhow!("missing embedded terminal-games manifest"))
-        }) {
-        Ok(manifest) => manifest,
-        Err(error) => return bad_request(error),
-    };
-    let manifest = match manifest.sanitized() {
-        Ok(manifest) => manifest,
-        Err(error) => return bad_request(error),
-    };
-    if manifest.shortname != author.record.shortname {
-        return bad_request(format!(
-            "manifest shortname '{}' does not match author shortname '{}'",
-            manifest.shortname, author.record.shortname
-        ));
-    }
-    let envs = match envs {
-        Some(envs) => {
-            if let Err(error) = validate_control_envs(&envs) {
-                return bad_request(error);
+        })?;
+        let manifest = sanitize_manifest(&manifest)?;
+        if manifest.shortname != self.author.record.shortname {
+            return Err(RpcError::from(format!(
+                "manifest shortname '{}' does not match author shortname '{}'",
+                manifest.shortname, self.author.record.shortname
+            )));
+        }
+        if let Some(envs) = &request.envs {
+            validate_author_envs(envs)?;
+        }
+        let details_json = serde_json::to_string(&manifest.details)?;
+        let tx = self.control.app_server.db.transaction().await?;
+        let env_blob = match request.envs.as_deref() {
+            Some(envs) => Some(encrypt_author_env_blob(envs)?),
+            None => None,
+        };
+        let empty_env_blob = encrypt_author_env_blob(&[])?;
+        let mut game_rows = tx
+            .query(
+                "SELECT id, current_version FROM games WHERE shortname = ?1 LIMIT 1",
+                libsql::params!(self.author.record.shortname.as_str()),
+            )
+            .await?;
+        let (game_id, next_version) = if let Some(game_row) = game_rows.next().await? {
+            let game_id = game_row.get::<u64>(0)?;
+            let next_version = game_row.get::<u64>(1)? + 1;
+            if let Some(env_blob) = &env_blob {
+                tx.execute(
+                        "UPDATE games
+                         SET wasm = ?2, details = json(?3), current_version = ?4, env_salt = ?5, env_blob = ?6
+                         WHERE id = ?1",
+                        libsql::params!(
+                            game_id,
+                            request.wasm.clone(),
+                            details_json.as_str(),
+                            next_version,
+                            env_blob.salt.clone(),
+                            env_blob.ciphertext.clone()
+                        ),
+                    )
+                    .await
+                    ?;
+            } else {
+                tx.execute(
+                    "UPDATE games
+                         SET wasm = ?2, details = json(?3), current_version = ?4
+                         WHERE id = ?1",
+                    libsql::params!(
+                        game_id,
+                        request.wasm.clone(),
+                        details_json.as_str(),
+                        next_version
+                    ),
+                )
+                .await?;
             }
-            Some(envs)
+            (game_id, next_version)
+        } else {
+            tx.execute(
+                "INSERT INTO games (shortname, wasm, details, current_version, env_salt, env_blob)
+                     VALUES (?1, ?2, json(?3), 1, ?4, ?5)",
+                libsql::params!(
+                    self.author.record.shortname.as_str(),
+                    request.wasm.clone(),
+                    details_json.as_str(),
+                    env_blob
+                        .as_ref()
+                        .map(|blob| blob.salt.clone())
+                        .unwrap_or_else(|| empty_env_blob.salt.clone()),
+                    env_blob
+                        .as_ref()
+                        .map(|blob| blob.ciphertext.clone())
+                        .unwrap_or_else(|| empty_env_blob.ciphertext.clone())
+                ),
+            )
+            .await?;
+            let mut id_rows = tx.query("SELECT last_insert_rowid()", ()).await?;
+            let game_id = id_rows
+                .next()
+                .await?
+                .ok_or_else(|| RpcError::from("missing last_insert_rowid"))?
+                .get::<u64>(0)?;
+            (game_id, 1)
+        };
+        tx.commit().await?;
+        let response = UploadGameResponse {
+            shortname: self.author.record.shortname.clone(),
+            version: next_version,
+            game_id,
+        };
+        self.control
+            .publish_game_version_update(&response.shortname, response.game_id, response.version)
+            .await;
+        Ok(response)
+    }
+
+    async fn delete_shortname(
+        self,
+        _: context::Context,
+        request: DeleteShortnameRequest,
+    ) -> Result<Option<DeleteShortnameResponse>, RpcError> {
+        if request.shortname != self.author.record.shortname {
+            return Err("shortname mismatch".into());
         }
-        None => None,
-    };
-    match upload_version(&control.app_server.db, &author.record.shortname, &manifest, &body, envs.as_deref()).await {
-        Ok(response) => {
-            control
+        let shortname =
+            delete_author_and_game(&self.control.app_server.db, self.author.record.id).await?;
+        if let Some(shortname) = shortname {
+            self.control
                 .app_server
-                .apply_uploaded_version(response.game_id, response.version)
+                .invalidate_shortname_cache(&shortname)
                 .await;
-            control
-                .mesh
-                .propagate_game_version_update(terminal_games::mesh::GameVersionUpdateMessage {
-                    shortname: response.shortname.clone(),
-                    game_id: response.game_id,
-                    version: response.version,
-                })
-                .await;
-            Json(response).into_response()
+            Ok(Some(DeleteShortnameResponse { shortname }))
+        } else {
+            Ok(None)
         }
-        Err(error) => internal_error(error),
     }
 }
 
-pub async fn author_delete(
-    State(control): State<ControlPlane>,
-    headers: HeaderMap,
-    Json(request): Json<DeleteShortnameRequest>,
-) -> Response {
-    let author = match control.require_author(&headers).await {
-        Ok(author) => author,
-        Err(response) => return response,
-    };
-    if request.shortname != author.record.shortname {
-        return (StatusCode::FORBIDDEN, "shortname mismatch").into_response();
+#[derive(Debug, Clone)]
+struct AuthorRecord {
+    id: u64,
+    shortname: String,
+    token_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AuthorAuth {
+    record: AuthorRecord,
+    claims: AuthorTokenClaims,
+}
+
+pub(crate) struct AdminGuard;
+
+impl FromRequestParts<ControlPlane> for AdminGuard {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &ControlPlane,
+    ) -> Result<Self, Self::Rejection> {
+        state.require_admin(&parts.headers)?;
+        Ok(Self)
     }
-    match delete_author_and_game(&control.app_server.db, author.record.id).await {
-        Ok(Some(shortname)) => {
-            control.app_server.invalidate_shortname_cache(&shortname).await;
-            Json(DeleteShortnameResponse { shortname }).into_response()
-        }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(error) => internal_error(error),
+}
+
+impl FromRequestParts<ControlPlane> for AuthorAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &ControlPlane,
+    ) -> Result<Self, Self::Rejection> {
+        state.require_author(&parts.headers).await
     }
 }
 
@@ -961,11 +1150,8 @@ pub async fn admin_session_spy(
     Path(local_session_id): Path<u64>,
     Query(query): Query<SpyQuery>,
     State(control): State<ControlPlane>,
-    headers: HeaderMap,
+    _: AdminGuard,
 ) -> Response {
-    if let Err(response) = control.require_admin(&headers) {
-        return response;
-    }
     let Some(spy) = control.session_registry.spy(local_session_id, query.rw) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -986,88 +1172,7 @@ async fn run_spy_socket(
     let Ok(init) = init else {
         return;
     };
-    if socket
-        .send(Message::Text(init.into()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
-    if rw {
-        loop {
-            tokio::select! {
-                message = spy.event_rx.recv() => {
-                    let Ok(message) = message else {
-                        let _ = close_spy_socket(&mut socket, "spy stream ended").await;
-                        break;
-                    };
-                    match message {
-                        crate::sessions::SpyEvent::Output(data) => {
-                            if socket.send(Message::Binary(data.into())).await.is_err() {
-                                break;
-                            }
-                        }
-                        crate::sessions::SpyEvent::Resize { cols, rows } => {
-                            let Ok(payload) =
-                                serde_json::to_string(&SpyControlMessage::Resize { cols, rows })
-                            else {
-                                break;
-                            };
-                            if socket.send(Message::Text(payload.into())).await.is_err() {
-                                break;
-                            }
-                        }
-                        crate::sessions::SpyEvent::Metadata { username } => {
-                            let Ok(payload) =
-                                serde_json::to_string(&SpyControlMessage::Metadata { username })
-                            else {
-                                break;
-                            };
-                            if socket.send(Message::Text(payload.into())).await.is_err() {
-                                break;
-                            }
-                        }
-                        crate::sessions::SpyEvent::Input { data } => {
-                            if !show_input {
-                                continue;
-                            }
-                            let Ok(payload) =
-                                serde_json::to_string(&SpyControlMessage::Input { data })
-                            else {
-                                break;
-                            };
-                            if socket.send(Message::Text(payload.into())).await.is_err() {
-                                break;
-                            }
-                        }
-                        crate::sessions::SpyEvent::Closed { reason } => {
-                            let _ = send_spy_closed(&mut socket, reason).await;
-                            break;
-                        }
-                    }
-                }
-                incoming = socket.recv() => {
-                    let Some(incoming) = incoming else {
-                        break;
-                    };
-                    let Ok(message) = incoming else {
-                        break;
-                    };
-                    match message {
-                        Message::Binary(data) => {
-                            if let Some(input_tx) = &spy.input_tx {
-                                if input_tx.send(Bytes::from(data)).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                        Message::Close(_) => break,
-                        _ => {}
-                    }
-                }
-            }
-        }
+    if socket.send(Message::Text(init.into())).await.is_err() {
         return;
     }
 
@@ -1130,8 +1235,16 @@ async fn run_spy_socket(
                 let Ok(message) = incoming else {
                     break;
                 };
-                if matches!(message, Message::Close(_)) {
-                    break;
+                match message {
+                    Message::Binary(data) if rw => {
+                        if let Some(input_tx) = &spy.input_tx
+                            && input_tx.send(data).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
                 }
             }
         }
@@ -1180,44 +1293,6 @@ async fn load_author_record_by_shortname(
     }))
 }
 
-async fn load_author_by_shortname(
-    db: &libsql::Connection,
-    shortname: &str,
-) -> anyhow::Result<Option<CreateAuthorSummaryRow>> {
-    let mut rows = db
-        .query(
-            "SELECT id, shortname FROM authors WHERE shortname = ?1 LIMIT 1",
-            libsql::params!(shortname),
-        )
-        .await?;
-    let Some(row) = rows.next().await? else {
-        return Ok(None);
-    };
-    Ok(Some(CreateAuthorSummaryRow {
-        author_id: row.get::<u64>(0)?,
-        shortname: row.get::<String>(1)?,
-    }))
-}
-
-async fn load_author_by_id(
-    db: &libsql::Connection,
-    author_id: u64,
-) -> anyhow::Result<Option<CreateAuthorSummaryRow>> {
-    let mut rows = db
-        .query(
-            "SELECT id, shortname FROM authors WHERE id = ?1 LIMIT 1",
-            libsql::params!(author_id),
-        )
-        .await?;
-    let Some(row) = rows.next().await? else {
-        return Ok(None);
-    };
-    Ok(Some(CreateAuthorSummaryRow {
-        author_id: row.get::<u64>(0)?,
-        shortname: row.get::<String>(1)?,
-    }))
-}
-
 async fn load_game_env_blob(
     db: &libsql::Connection,
     shortname: &str,
@@ -1238,110 +1313,6 @@ async fn load_game_env_blob(
     )))
 }
 
-fn control_envs_to_runtime(
-    envs: &[terminal_games::control::AuthorEnvVar],
-) -> Vec<RuntimeAuthorEnvVar> {
-    envs.iter()
-        .cloned()
-        .map(|env| RuntimeAuthorEnvVar {
-            name: env.name,
-            value: env.value,
-        })
-        .collect()
-}
-
-fn runtime_envs_to_control(
-    envs: Vec<RuntimeAuthorEnvVar>,
-) -> Vec<terminal_games::control::AuthorEnvVar> {
-    envs.into_iter()
-        .map(|env| terminal_games::control::AuthorEnvVar {
-            name: env.name,
-            value: env.value,
-        })
-        .collect()
-}
-
-struct CreateAuthorSummaryRow {
-    author_id: u64,
-    shortname: String,
-}
-
-impl From<CreateAuthorSummaryRow> for AuthorSummary {
-    fn from(value: CreateAuthorSummaryRow) -> Self {
-        Self {
-            author_id: value.author_id,
-            author_name: String::new(),
-            shortname: value.shortname,
-            playtime_seconds: 0.0,
-        }
-    }
-}
-
-async fn load_all_authors(db: &libsql::Connection) -> anyhow::Result<Vec<AuthorSummary>> {
-    let mut rows = db
-        .query(
-            "SELECT a.id,
-                    COALESCE(json_extract(g.details, '$.author'), ''),
-                    a.shortname,
-                    COALESCE(g.duration_seconds, 0)
-             FROM authors a
-             LEFT JOIN games g ON g.shortname = a.shortname
-             ORDER BY a.id ASC",
-            (),
-        )
-        .await?;
-    let mut authors = Vec::new();
-    while let Some(row) = rows.next().await? {
-        authors.push(AuthorSummary {
-            author_id: row.get::<u64>(0)?,
-            author_name: row.get::<String>(1)?,
-            shortname: row.get::<String>(2)?,
-            playtime_seconds: decode_sql_f64(&row, 3)?,
-        });
-    }
-    Ok(authors)
-}
-
-async fn load_author_self(
-    db: &libsql::Connection,
-    author: &AuthorRecord,
-    region_id: &str,
-) -> anyhow::Result<AuthorSelfResponse> {
-    let mut rows = db
-        .query(
-            "SELECT COALESCE(json_extract(details, '$.author'), ''),
-                    COALESCE(duration_seconds, 0)
-             FROM games WHERE shortname = ?1 LIMIT 1",
-            libsql::params!(author.shortname.as_str()),
-        )
-        .await?;
-    let (author_name, playtime_seconds) = match rows.next().await? {
-        Some(row) => (
-            row.get::<String>(0).unwrap_or_default(),
-            decode_sql_f64(&row, 1)?,
-        ),
-        None => (String::new(), 0.0),
-    };
-    Ok(AuthorSelfResponse {
-        author_id: author.id,
-        author_name,
-        shortname: author.shortname.clone(),
-        server: region_id.to_string(),
-        playtime_seconds,
-    })
-}
-
-fn decode_sql_f64(row: &libsql::Row, idx: i32) -> anyhow::Result<f64> {
-    match row.get_value(idx)? {
-        libsql::Value::Real(value) => Ok(value),
-        libsql::Value::Integer(value) => Ok(value as f64),
-        libsql::Value::Null => Ok(0.0),
-        other => Err(anyhow::anyhow!(
-            "expected numeric SQL value at column {idx}, got {other:?}"
-        )),
-    }
-}
-
 async fn delete_author_and_game(
     db: &libsql::Connection,
     author_id: u64,
@@ -1357,8 +1328,11 @@ async fn delete_author_and_game(
         return Ok(None);
     };
     let shortname = row.get::<String>(0)?;
-    tx.execute("DELETE FROM authors WHERE id = ?1", libsql::params!(author_id))
-        .await?;
+    tx.execute(
+        "DELETE FROM authors WHERE id = ?1",
+        libsql::params!(author_id),
+    )
+    .await?;
     tx.execute(
         "DELETE FROM games WHERE shortname = ?1",
         libsql::params!(shortname.as_str()),
@@ -1368,122 +1342,12 @@ async fn delete_author_and_game(
     Ok(Some(shortname))
 }
 
-async fn upload_version(
-    db: &libsql::Connection,
-    shortname: &str,
-    manifest: &GameManifest,
-    wasm: &[u8],
-    envs: Option<&[terminal_games::control::AuthorEnvVar]>,
-) -> anyhow::Result<UploadGameResponse> {
-    let details_json = serde_json::to_string(&manifest.details)?;
-    let tx = db.transaction().await?;
-    let env_blob = match envs {
-        Some(envs) => Some(encrypt_author_env_blob(&control_envs_to_runtime(envs))?),
-        None => None,
-    };
-    let empty_env_blob = encrypt_author_env_blob(&[])?;
-    let mut game_rows = tx
-        .query(
-            "SELECT id, current_version FROM games WHERE shortname = ?1 LIMIT 1",
-            libsql::params!(shortname),
-        )
-        .await?;
-    let (game_id, next_version) = if let Some(game_row) = game_rows.next().await? {
-        let game_id = game_row.get::<u64>(0)?;
-        let next_version = game_row.get::<u64>(1)? + 1;
-        if let Some(env_blob) = &env_blob {
-            tx.execute(
-                "UPDATE games
-                 SET wasm = ?2, details = json(?3), current_version = ?4, env_salt = ?5, env_blob = ?6
-                 WHERE id = ?1",
-                libsql::params!(
-                    game_id,
-                    wasm.to_vec(),
-                    details_json.as_str(),
-                    next_version,
-                    env_blob.salt.clone(),
-                    env_blob.ciphertext.clone()
-                ),
-            )
-            .await?;
-        } else {
-            tx.execute(
-                "UPDATE games
-                 SET wasm = ?2, details = json(?3), current_version = ?4
-                 WHERE id = ?1",
-                libsql::params!(game_id, wasm.to_vec(), details_json.as_str(), next_version),
-            )
-            .await?;
-        }
-        (game_id, next_version)
-    } else {
-        tx.execute(
-            "INSERT INTO games (shortname, wasm, details, current_version, env_salt, env_blob)
-             VALUES (?1, ?2, json(?3), 1, ?4, ?5)",
-            libsql::params!(
-                shortname,
-                wasm.to_vec(),
-                details_json.as_str(),
-                env_blob
-                    .as_ref()
-                    .map(|blob| blob.salt.clone())
-                    .unwrap_or_else(|| empty_env_blob.salt.clone()),
-                env_blob
-                    .as_ref()
-                    .map(|blob| blob.ciphertext.clone())
-                    .unwrap_or_else(|| empty_env_blob.ciphertext.clone())
-            ),
-        )
-        .await?;
-        let mut id_rows = tx.query("SELECT last_insert_rowid()", ()).await?;
-        let game_id = id_rows
-            .next()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("missing last_insert_rowid"))?
-            .get::<u64>(0)?;
-        (game_id, 1)
-    };
-    tx.commit().await?;
-
-    Ok(UploadGameResponse {
-        shortname: shortname.to_string(),
-        version: next_version,
-        game_id,
-    })
-}
-
-async fn load_ban_entries(db: &libsql::Connection) -> anyhow::Result<Vec<BanEntry>> {
-    let mut rows = db
-        .query(
-            "SELECT ip, COALESCE(reason, ''), expires_at, inserted_at
-             FROM ip_bans
-             ORDER BY inserted_at DESC, ip ASC",
-            (),
-        )
-        .await?;
-    let now = current_unix_seconds();
-    let mut entries = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let expires_at = row.get::<Option<i64>>(2)?;
-        if !is_ban_active(expires_at, now) {
-            continue;
-        }
-        entries.push(BanEntry {
-            ip: row.get::<String>(0)?,
-            reason: row.get::<String>(1)?.trim().to_string(),
-            expires_at,
-            inserted_at: row.get::<i64>(3)?,
-        });
-    }
-    Ok(entries)
-}
-
 async fn load_ticker_entries(db: &libsql::Connection) -> anyhow::Result<Vec<TickerEntry>> {
     let mut rows = db
         .query(
-            "SELECT id, content, expires_at, created_at
+            "SELECT id, content, expires_at, sort_order, created_at
              FROM status_tickers
-             ORDER BY created_at ASC, id ASC",
+             ORDER BY sort_order ASC, id ASC",
             (),
         )
         .await?;
@@ -1498,7 +1362,8 @@ async fn load_ticker_entries(db: &libsql::Connection) -> anyhow::Result<Vec<Tick
             ticker_id: row.get::<u64>(0)?,
             content: row.get::<String>(1)?,
             expires_at,
-            created_at: row.get::<i64>(3)?,
+            sort_order: row.get::<i64>(3)?,
+            created_at: row.get::<i64>(4)?,
         });
     }
     Ok(entries)
@@ -1537,97 +1402,10 @@ pub async fn load_status_bar_state(
             created_at: row.get::<i64>(5)?,
         });
     }
-    Ok(StatusBarState { tickers, broadcasts })
-}
-
-async fn load_author_envs(
-    db: &libsql::Connection,
-    shortname: &str,
-) -> anyhow::Result<Vec<terminal_games::control::AuthorEnvVar>> {
-    let (_, env_salt, env_blob) = load_game_env_blob(db, shortname)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("upload a game before managing env vars"))?;
-    Ok(runtime_envs_to_control(decrypt_author_env_blob(
-        &env_salt,
-        &env_blob,
-    )?))
-}
-
-async fn upsert_author_envs(
-    db: &libsql::Connection,
-    shortname: &str,
-    envs: &[terminal_games::control::AuthorEnvVar],
-    replace: bool,
-) -> anyhow::Result<(u64, u64)> {
-    let (game_id, env_salt, env_blob) = load_game_env_blob(db, shortname)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("upload a game before managing env vars"))?;
-    let mut current = if replace {
-        Vec::new()
-    } else {
-        decrypt_author_env_blob(&env_salt, &env_blob)?
-    };
-    for env in control_envs_to_runtime(envs) {
-        if let Some(existing) = current.iter_mut().find(|existing| existing.name == env.name) {
-            existing.value = env.value;
-        } else {
-            current.push(env);
-        }
-    }
-    let encrypted = encrypt_author_env_blob(&current)?;
-    let tx = db.transaction().await?;
-    tx.execute(
-        "UPDATE games
-         SET env_salt = ?2,
-             env_blob = ?3,
-             current_version = current_version + 1
-         WHERE id = ?1",
-        libsql::params!(game_id, encrypted.salt, encrypted.ciphertext),
-    )
-    .await?;
-    let mut rows = tx
-        .query("SELECT current_version FROM games WHERE id = ?1", libsql::params!(game_id))
-        .await?;
-    let version = rows
-        .next()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("game row missing after env update"))?
-        .get::<u64>(0)?;
-    tx.commit().await?;
-    Ok((game_id, version))
-}
-
-async fn delete_author_env(
-    db: &libsql::Connection,
-    shortname: &str,
-    name: &str,
-) -> anyhow::Result<(u64, u64)> {
-    let Some((game_id, env_salt, env_blob)) = load_game_env_blob(db, shortname).await? else {
-        anyhow::bail!("upload a game before managing env vars");
-    };
-    let mut current = decrypt_author_env_blob(&env_salt, &env_blob)?;
-    current.retain(|env| env.name != name);
-    let encrypted = encrypt_author_env_blob(&current)?;
-    let tx = db.transaction().await?;
-    tx.execute(
-        "UPDATE games
-         SET env_salt = ?2,
-             env_blob = ?3,
-             current_version = current_version + 1
-         WHERE id = ?1",
-        libsql::params!(game_id, encrypted.salt, encrypted.ciphertext),
-    )
-    .await?;
-    let mut rows = tx
-        .query("SELECT current_version FROM games WHERE id = ?1", libsql::params!(game_id))
-        .await?;
-    let version = rows
-        .next()
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("game row missing after env delete"))?
-        .get::<u64>(0)?;
-    tx.commit().await?;
-    Ok((game_id, version))
+    Ok(StatusBarState {
+        tickers,
+        broadcasts,
+    })
 }
 
 fn random_token_secret() -> String {
@@ -1636,22 +1414,29 @@ fn random_token_secret() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn sha256_hex(secret: &str) -> String {
+fn sha256_bytes(secret: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
-    hex::encode(hasher.finalize())
+    hasher.finalize().into()
 }
 
-fn validate_control_envs(envs: &[terminal_games::control::AuthorEnvVar]) -> anyhow::Result<()> {
-    let runtime_envs = envs
-        .iter()
-        .cloned()
-        .map(|env| RuntimeAuthorEnvVar {
-            name: env.name,
-            value: env.value,
-        })
-        .collect::<Vec<_>>();
-    validate_author_envs(&runtime_envs)
+fn sha256_hex(secret: &str) -> String {
+    hex::encode(sha256_bytes(secret))
+}
+
+fn secure_secret_eq(left: &str, right: &str) -> bool {
+    constant_time_eq(&sha256_bytes(left), &sha256_bytes(right))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&left, &right) in left.iter().zip(right.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
 }
 
 fn parse_optional_expiry(
@@ -1660,7 +1445,9 @@ fn parse_optional_expiry(
 ) -> anyhow::Result<Option<i64>> {
     match (duration, expires_at) {
         (Some(_), Some(_)) => anyhow::bail!("pass either duration or expires-at, not both"),
-        (Some(duration), None) => Ok(Some(expiry_from_duration(parse_duration_string(duration)?)?)),
+        (Some(duration), None) => Ok(Some(expiry_from_duration(parse_duration_string(
+            duration,
+        )?)?)),
         (None, Some(expires_at)) => Ok(Some(parse_utc_timestamp(expires_at)?)),
         (None, None) => Ok(None),
     }
@@ -1748,10 +1535,6 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|value| !value.is_empty())
-}
-
-fn bad_request(error: impl std::fmt::Display) -> Response {
-    (StatusCode::BAD_REQUEST, error.to_string()).into_response()
 }
 
 fn internal_error(error: impl std::fmt::Display) -> Response {

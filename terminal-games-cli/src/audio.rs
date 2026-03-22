@@ -200,10 +200,9 @@ fn run_audio_player(receiver: mpsc::Receiver<Vec<u8>>) -> anyhow::Result<()> {
 
     let prebuffer_samples = SAMPLE_RATE as usize * CHANNELS / 50;
     let mut started = false;
-    let samples_ref = samples.clone();
 
     decode_ogg_opus(receiver, |new_samples| {
-        let mut buf = match samples_ref.lock() {
+        let mut buf = match samples.lock() {
             Ok(buf) => buf,
             Err(poisoned) => poisoned.into_inner(),
         };

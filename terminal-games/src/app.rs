@@ -12,7 +12,6 @@ use std::{
     },
     task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
-    u64,
 };
 
 use bytes::Bytes;
@@ -26,8 +25,8 @@ use wasmtime::InstanceAllocationStrategy;
 use wasmtime_wasi::I32Exit;
 
 use crate::{
-    author_env::decrypt_author_env_blob,
     audio::{CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
+    author_env::decrypt_author_env_blob,
     control::StatusBarState,
     log_backend::{GuestLogBackend, LogLevel, parse_guest_log_object},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
@@ -521,12 +520,8 @@ impl AppServer {
                                 }
                                 terminal_snapshot.sync_from_screen(screen);
 
-                                if !output.is_empty() {
-                                    let output = Arc::new(output);
-                                    replay_buffer.push_output(output.clone());
-                                    if output_sender.send(output).await.is_err() {
-                                        break 'block None;
-                                    }
+                                if !emit_output(output, &mut replay_buffer, &output_sender).await {
+                                    break 'block None;
                                 }
                             }
 
@@ -535,14 +530,16 @@ impl AppServer {
                                     break 'block None;
                                 };
                                 if status_bar.handle_terminal_input(input.as_ref()) {
-                                    let mut output = Vec::new();
-                                    status_bar.maybe_render_into(terminal.screen(), &mut output, true);
-                                    if !output.is_empty() {
-                                        let output = Arc::new(output);
-                                        replay_buffer.push_output(output.clone());
-                                        if output_sender.send(output).await.is_err() {
-                                            break 'block None;
-                                        }
+                                    if !render_status_bar_output(
+                                        terminal.screen(),
+                                        &mut status_bar,
+                                        true,
+                                        &mut replay_buffer,
+                                        &output_sender,
+                                    )
+                                    .await
+                                    {
+                                        break 'block None;
                                     }
                                     continue;
                                 }
@@ -558,29 +555,50 @@ impl AppServer {
                                 let (width, height) = *window_size_receiver.borrow();
                                 replay_buffer.push_resize(width, height);
 
-                                let mut output = Vec::new();
                                 let screen = terminal.screen_mut();
                                 screen.set_size(height, width);
-                                status_bar.maybe_render_into(screen, &mut output, true);
-                                terminal_snapshot.sync_from_screen(screen);
-                                if !output.is_empty() {
-                                    let output = Arc::new(output);
-                                    replay_buffer.push_output(output.clone());
-                                    if output_sender.send(output).await.is_err() {
-                                        break 'block None;
-                                    }
+                                if !render_status_bar_output(
+                                    screen,
+                                    &mut status_bar,
+                                    true,
+                                    &mut replay_buffer,
+                                    &output_sender,
+                                )
+                                .await
+                                {
+                                    break 'block None;
                                 }
+                                terminal_snapshot.sync_from_screen(screen);
                             }
 
                             _ = status_bar_interval.tick() => {
-                                let mut output = Vec::new();
-                                status_bar.maybe_render_into(terminal.screen(), &mut output, false);
-                                if !output.is_empty() {
-                                    let output = Arc::new(output);
-                                    replay_buffer.push_output(output.clone());
-                                    if output_sender.send(output).await.is_err() {
-                                        break 'block None;
-                                    }
+                                if !render_status_bar_output(
+                                    terminal.screen(),
+                                    &mut status_bar,
+                                    false,
+                                    &mut replay_buffer,
+                                    &output_sender,
+                                )
+                                .await
+                                {
+                                    break 'block None;
+                                }
+                            }
+
+                            result = status_bar.wait_for_shared_state_change() => {
+                                if result.is_err() {
+                                    break 'block None;
+                                }
+                                if !render_status_bar_output(
+                                    terminal.screen(),
+                                    &mut status_bar,
+                                    false,
+                                    &mut replay_buffer,
+                                    &output_sender,
+                                )
+                                .await
+                                {
+                                    break 'block None;
                                 }
                             }
 
@@ -629,14 +647,16 @@ impl AppServer {
                                     if let Some(replays) = update.replays {
                                         menu_session.replays = replays;
                                     }
-                                    let mut output = Vec::new();
-                                    status_bar.maybe_render_into(terminal.screen(), &mut output, true);
-                                    if !output.is_empty() {
-                                        let output = Arc::new(output);
-                                        replay_buffer.push_output(output.clone());
-                                        if output_sender.send(output).await.is_err() {
-                                            break 'block None;
-                                        }
+                                    if !render_status_bar_output(
+                                        terminal.screen(),
+                                        &mut status_bar,
+                                        true,
+                                        &mut replay_buffer,
+                                        &output_sender,
+                                    )
+                                    .await
+                                    {
+                                        break 'block None;
                                     }
                                 }
                             }
@@ -908,19 +928,17 @@ impl AppServer {
         if let Some(user_id) = ctx.user_id {
             envs.push(("USER_ID".to_string(), user_id.to_string()));
         }
-        if let Some(user_id) = ctx.user_id {
-            if let Ok(mut rows) = ctx
+        if let Some(user_id) = ctx.user_id
+            && let Ok(mut rows) = ctx
                 .db
                 .query(
                     "SELECT locale FROM users WHERE id = ?1 LIMIT 1",
                     libsql::params!(user_id),
                 )
                 .await
-            {
-                if let Ok(Some(row)) = rows.next().await {
-                    locale = row.get::<String>(0).unwrap_or(locale);
-                }
-            }
+            && let Ok(Some(row)) = rows.next().await
+        {
+            locale = row.get::<String>(0).unwrap_or(locale);
         }
         envs.push(("LOCALE".to_string(), locale.clone()));
 
@@ -1959,11 +1977,10 @@ impl AppServer {
                         libsql::params!(replay.game_id),
                     )
                     .await
+                    && let Ok(Some(row)) = rows.next().await
                 {
-                    if let Ok(Some(row)) = rows.next().await {
-                        shortname = row.get::<String>(0).unwrap_or_default();
-                        details = row.get::<String>(1).unwrap_or_default();
-                    }
+                    shortname = row.get::<String>(0).unwrap_or_default();
+                    details = row.get::<String>(1).unwrap_or_default();
                 }
                 replays.push(ReplayOut {
                     created_at: replay.created_at,
@@ -2014,15 +2031,9 @@ impl AppServer {
         Ok(if is_cancelled { 1 } else { 0 })
     }
 
-    fn new_version_available_poll(
-        caller: wasmtime::Caller<'_, AppState>,
-    ) -> wasmtime::Result<i32> {
+    fn new_version_available_poll(caller: wasmtime::Caller<'_, AppState>) -> wasmtime::Result<i32> {
         let current_version = caller.data().app.app_id.version;
-        let latest = caller
-            .data()
-            .app
-            .latest_version
-            .load(Ordering::Acquire);
+        let latest = caller.data().app.latest_version.load(Ordering::Acquire);
         let has_update = latest != 0 && latest != current_version;
         Ok(if has_update { 1 } else { 0 })
     }
@@ -2213,6 +2224,31 @@ fn update_atomic_max(value: &AtomicU64, next: u64) -> bool {
         }
     }
     false
+}
+
+async fn emit_output(
+    output: Vec<u8>,
+    replay_buffer: &mut ReplayBuffer,
+    output_sender: &tokio::sync::mpsc::Sender<Arc<Vec<u8>>>,
+) -> bool {
+    if output.is_empty() {
+        return true;
+    }
+    let output = Arc::new(output);
+    replay_buffer.push_output(output.clone());
+    output_sender.send(output).await.is_ok()
+}
+
+async fn render_status_bar_output(
+    screen: &headless_terminal::Screen,
+    status_bar: &mut StatusBar,
+    force: bool,
+    replay_buffer: &mut ReplayBuffer,
+    output_sender: &tokio::sync::mpsc::Sender<Arc<Vec<u8>>>,
+) -> bool {
+    let mut output = Vec::new();
+    status_bar.maybe_render_into(screen, &mut output, force);
+    emit_output(output, replay_buffer, output_sender).await
 }
 
 pub struct PreloadedAppState {
@@ -2577,38 +2613,21 @@ struct MenuRequestJob {
     kind: MenuRequestKind,
 }
 
+#[derive(Default)]
 struct MenuUpdate {
     username: Option<String>,
     locale: Option<String>,
     replays: Option<Vec<SessionReplay>>,
 }
 
-impl Default for MenuUpdate {
-    fn default() -> Self {
-        Self {
-            username: None,
-            locale: None,
-            replays: None,
-        }
-    }
-}
-
 pub struct Connection {
     stream: Stream,
 }
 
+#[derive(Default)]
 struct AppLimiter {
     memory_total: usize,
     table_total: usize,
-}
-
-impl Default for AppLimiter {
-    fn default() -> Self {
-        AppLimiter {
-            memory_total: 0,
-            table_total: 0,
-        }
-    }
 }
 
 impl wasmtime::ResourceLimiter for AppLimiter {

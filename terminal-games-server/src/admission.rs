@@ -860,10 +860,13 @@ fn matching_ban_for_ip(
             reason: entry.reason.clone(),
         };
         let specificity = entry.matcher.prefix_len();
-        if best_match.as_ref().is_none_or(|(current, current_specificity)| {
-            specificity > *current_specificity
-                || (specificity == *current_specificity && candidate.rule < current.rule)
-        }) {
+        if best_match
+            .as_ref()
+            .is_none_or(|(current, current_specificity)| {
+                specificity > *current_specificity
+                    || (specificity == *current_specificity && candidate.rule < current.rule)
+            })
+        {
             best_match = Some((candidate, specificity));
         }
     }
