@@ -34,23 +34,22 @@ use tarpc::{context, server};
 use terminal_games::{
     app::AppServer,
     author_env::{
-        decrypt_author_env_blob, encrypt_author_env_blob, validate_author_env_name,
-        validate_author_envs,
+        EncryptedAuthorEnvBlob, decrypt_author_env_blob, encrypt_author_env_blob,
+        validate_author_env_name, validate_author_envs,
     },
     control::{
         AdminControlRpc, AuthorControlRpc, AuthorEnvDeleteRequest, AuthorEnvListResponse,
         AuthorEnvSetRequest, AuthorSelfResponse, AuthorSummary, AuthorTokenClaims, BanEntry,
         BanIpAddRequest, BanIpRemoveRequest, BanIpRequest, BroadcastLevel, BroadcastRequest,
         CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest, DeleteShortnameRequest,
-        DeleteShortnameResponse, KickSessionRequest,
-        RegionDiscoveryResponse, RegionRuntimeStatus, RotateAuthorTokenRequest,
-        RotateAuthorTokenResponse, RpcError, SessionSummary, SpyControlMessage, StatusBarState,
-        StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest, TickerReorderRequest,
-        UploadGameRequest, UploadGameResponse, expiry_from_duration, parse_duration_string,
-        parse_optional_expiry,
+        DeleteShortnameResponse, KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus,
+        RotateAuthorTokenRequest, RotateAuthorTokenResponse, RpcError, SessionSummary,
+        SpyControlMessage, StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry,
+        TickerRemoveRequest, TickerReorderRequest, UploadGameRequest, UploadGameResponse,
+        expiry_from_duration, parse_duration_string, parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
-    mesh::{GameRuntimeUpdateMessage, Mesh},
+    mesh::{BuildId, ContentHash, GameRuntimeUpdateMessage, Mesh, hash_author_envs, hash_bytes},
 };
 use time::OffsetDateTime;
 
@@ -790,7 +789,6 @@ impl AdminControlRpc for AdminRpcServer {
             Ok(None)
         }
     }
-
 }
 
 impl AuthorControlRpc for AuthorRpcServer {
@@ -845,14 +843,16 @@ impl AuthorControlRpc for AuthorRpcServer {
             load_game_env_blob(&self.control.app_server.db, &self.author.record.shortname)
                 .await?
                 .ok_or_else(|| RpcError::from("upload a game before managing env vars"))?;
+        let existing = decrypt_author_env_blob(
+            self.control.app_server.author_env_secret_key(),
+            &env_salt,
+            &env_blob,
+        )?;
+        let previous_env_hash = hash_author_envs(&existing);
         let mut current = if request.replace {
             Vec::new()
         } else {
-            decrypt_author_env_blob(
-                self.control.app_server.author_env_secret_key(),
-                &env_salt,
-                &env_blob,
-            )?
+            existing
         };
         for env in request.envs.iter().cloned() {
             if let Some(existing) = current
@@ -866,31 +866,18 @@ impl AuthorControlRpc for AuthorRpcServer {
         }
         let encrypted =
             encrypt_author_env_blob(self.control.app_server.author_env_secret_key(), &current)?;
-        let tx = self.control.app_server.db.transaction().await?;
-        tx.execute(
-            "UPDATE games
-             SET env_salt = ?2,
-                 env_blob = ?3,
-                 current_version = current_version + 1
-             WHERE id = ?1",
-            libsql::params!(game_id, encrypted.salt, encrypted.ciphertext),
+        let env_hash = hash_author_envs(&current);
+        if let Some(updated_at_ns) = store_game_envs(
+            &self.control.app_server.db,
+            game_id,
+            previous_env_hash,
+            env_hash,
+            encrypted,
         )
-        .await?;
-        let mut rows = tx
-            .query(
-                "SELECT current_version FROM games WHERE id = ?1",
-                libsql::params!(game_id),
-            )
-            .await?;
-        let version = rows
-            .next()
-            .await?
-            .ok_or_else(|| RpcError::from("game row missing after env update"))?
-            .get::<u64>(0)?;
-        tx.commit().await?;
-        self.control
-            .publish_game_runtime_update(GameRuntimeUpdateMessage::published(game_id, version))
-            .await;
+        .await?
+        {
+            publish_game_build_update(&self.control, game_id, updated_at_ns).await?;
+        }
         Ok(())
     }
 
@@ -910,34 +897,22 @@ impl AuthorControlRpc for AuthorRpcServer {
             &env_salt,
             &env_blob,
         )?;
+        let previous_env_hash = hash_author_envs(&current);
         current.retain(|env| env.name != request.name);
         let encrypted =
             encrypt_author_env_blob(self.control.app_server.author_env_secret_key(), &current)?;
-        let tx = self.control.app_server.db.transaction().await?;
-        tx.execute(
-            "UPDATE games
-             SET env_salt = ?2,
-                 env_blob = ?3,
-                 current_version = current_version + 1
-             WHERE id = ?1",
-            libsql::params!(game_id, encrypted.salt, encrypted.ciphertext),
+        let env_hash = hash_author_envs(&current);
+        if let Some(updated_at_ns) = store_game_envs(
+            &self.control.app_server.db,
+            game_id,
+            previous_env_hash,
+            env_hash,
+            encrypted,
         )
-        .await?;
-        let mut rows = tx
-            .query(
-                "SELECT current_version FROM games WHERE id = ?1",
-                libsql::params!(game_id),
-            )
-            .await?;
-        let version = rows
-            .next()
-            .await?
-            .ok_or_else(|| RpcError::from("game row missing after env delete"))?
-            .get::<u64>(0)?;
-        tx.commit().await?;
-        self.control
-            .publish_game_runtime_update(GameRuntimeUpdateMessage::published(game_id, version))
-            .await;
+        .await?
+        {
+            publish_game_build_update(&self.control, game_id, updated_at_ns).await?;
+        }
         Ok(())
     }
 
@@ -981,71 +956,102 @@ impl AuthorControlRpc for AuthorRpcServer {
         }
         let details_json = serde_json::to_string(&manifest.details)?;
         let tx = self.control.app_server.db.transaction().await?;
+        let wasm_hash = hash_bytes(&request.wasm);
         let env_blob = match request.envs.as_deref() {
-            Some(envs) => Some(encrypt_author_env_blob(
-                self.control.app_server.author_env_secret_key(),
-                envs,
-            )?),
+            Some(envs) => Some((
+                encrypt_author_env_blob(self.control.app_server.author_env_secret_key(), envs)?,
+                hash_author_envs(envs),
+            )),
             None => None,
         };
         let empty_env_blob =
             encrypt_author_env_blob(self.control.app_server.author_env_secret_key(), &[])?;
+        let empty_env_hash = hash_author_envs(&[]);
         let mut game_rows = tx
             .query(
-                "SELECT id, current_version FROM games WHERE shortname = ?1 LIMIT 1",
+                "SELECT id, env_salt, env_blob, env_hash, wasm_hash, build_updated_at FROM games WHERE shortname = ?1 LIMIT 1",
                 libsql::params!(self.author.record.shortname.as_str()),
             )
             .await?;
-        let (game_id, next_version) = if let Some(game_row) = game_rows.next().await? {
+        let (game_id, build_id, updated_at_ns, publish_update) = if let Some(game_row) =
+            game_rows.next().await?
+        {
             let game_id = game_row.get::<u64>(0)?;
-            let next_version = game_row.get::<u64>(1)? + 1;
-            if let Some(env_blob) = &env_blob {
-                tx.execute(
-                        "UPDATE games
-                         SET wasm = ?2, details = json(?3), current_version = ?4, env_salt = ?5, env_blob = ?6
-                         WHERE id = ?1",
-                        libsql::params!(
-                            game_id,
-                            request.wasm.clone(),
-                            details_json.as_str(),
-                            next_version,
-                            env_blob.salt.clone(),
-                            env_blob.ciphertext.clone()
-                        ),
-                    )
-                    .await
-                    ?;
+            let env_salt = game_row.get::<Vec<u8>>(1)?;
+            let env_ciphertext = game_row.get::<Vec<u8>>(2)?;
+            let existing_build_id = BuildId::from_hash_slices(
+                &game_row.get::<Vec<u8>>(4)?,
+                &game_row.get::<Vec<u8>>(3)?,
+            )?;
+            let env_hash = match &env_blob {
+                Some((_, env_hash)) => *env_hash,
+                None => existing_build_id.env_hash,
+            };
+            let existing_updated_at_ns = game_row.get::<i64>(5)?;
+            let build_id = BuildId {
+                wasm_hash,
+                env_hash,
+            };
+            let build_changed = build_id != existing_build_id;
+            let updated_at_ns = if build_changed {
+                current_unix_nanos()
             } else {
-                tx.execute(
-                    "UPDATE games
-                         SET wasm = ?2, details = json(?3), current_version = ?4
-                         WHERE id = ?1",
-                    libsql::params!(
-                        game_id,
-                        request.wasm.clone(),
-                        details_json.as_str(),
-                        next_version
-                    ),
-                )
-                .await?;
-            }
-            (game_id, next_version)
-        } else {
+                existing_updated_at_ns
+            };
+            let (stored_env_salt, stored_env_blob) = match &env_blob {
+                Some((blob, _)) => (blob.salt.clone(), blob.ciphertext.clone()),
+                None => (env_salt, env_ciphertext),
+            };
             tx.execute(
-                "INSERT INTO games (shortname, wasm, details, current_version, env_salt, env_blob)
-                     VALUES (?1, ?2, json(?3), 1, ?4, ?5)",
+                "UPDATE games
+                 SET wasm = ?2,
+                     details = json(?3),
+                     wasm_hash = ?4,
+                     env_hash = ?5,
+                     env_salt = ?6,
+                     env_blob = ?7,
+                     build_updated_at = ?8
+                 WHERE id = ?1",
+                libsql::params!(
+                    game_id,
+                    request.wasm.clone(),
+                    details_json.as_str(),
+                    build_id.wasm_hash.to_vec(),
+                    build_id.env_hash.to_vec(),
+                    stored_env_salt,
+                    stored_env_blob,
+                    updated_at_ns
+                ),
+            )
+            .await?;
+            (game_id, build_id, updated_at_ns, build_changed)
+        } else {
+            let build_id = BuildId {
+                wasm_hash,
+                env_hash: env_blob
+                    .as_ref()
+                    .map(|(_, env_hash)| *env_hash)
+                    .unwrap_or(empty_env_hash),
+            };
+            let updated_at_ns = current_unix_nanos();
+            tx.execute(
+                "INSERT INTO games (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
+                     VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)",
                 libsql::params!(
                     self.author.record.shortname.as_str(),
                     request.wasm.clone(),
                     details_json.as_str(),
+                    build_id.wasm_hash.to_vec(),
+                    build_id.env_hash.to_vec(),
                     env_blob
                         .as_ref()
-                        .map(|blob| blob.salt.clone())
+                        .map(|(blob, _)| blob.salt.clone())
                         .unwrap_or_else(|| empty_env_blob.salt.clone()),
                     env_blob
                         .as_ref()
-                        .map(|blob| blob.ciphertext.clone())
-                        .unwrap_or_else(|| empty_env_blob.ciphertext.clone())
+                        .map(|(blob, _)| blob.ciphertext.clone())
+                        .unwrap_or_else(|| empty_env_blob.ciphertext.clone()),
+                    updated_at_ns
                 ),
             )
             .await?;
@@ -1055,20 +1061,23 @@ impl AuthorControlRpc for AuthorRpcServer {
                 .await?
                 .ok_or_else(|| RpcError::from("missing last_insert_rowid"))?
                 .get::<u64>(0)?;
-            (game_id, 1)
+            (game_id, build_id, updated_at_ns, true)
         };
         tx.commit().await?;
         let response = UploadGameResponse {
             shortname: self.author.record.shortname.clone(),
-            version: next_version,
+            build_id: build_id.id_string(),
             game_id,
         };
-        self.control
-            .publish_game_runtime_update(GameRuntimeUpdateMessage::published(
-                response.game_id,
-                response.version,
-            ))
-            .await;
+        if publish_update {
+            self.control
+                .publish_game_runtime_update(GameRuntimeUpdateMessage::published(
+                    response.game_id,
+                    build_id,
+                    updated_at_ns,
+                ))
+                .await;
+        }
         Ok(response)
     }
 
@@ -1307,6 +1316,67 @@ async fn load_game_env_blob(
     )))
 }
 
+async fn store_game_envs(
+    db: &libsql::Connection,
+    game_id: u64,
+    previous_env_hash: ContentHash,
+    env_hash: ContentHash,
+    encrypted: EncryptedAuthorEnvBlob,
+) -> anyhow::Result<Option<i64>> {
+    if env_hash == previous_env_hash {
+        return Ok(None);
+    }
+    let updated_at_ns = current_unix_nanos();
+    let tx = db.transaction().await?;
+    tx.execute(
+        "UPDATE games
+         SET env_salt = ?2,
+             env_blob = ?3,
+             env_hash = ?4,
+             build_updated_at = ?5
+         WHERE id = ?1",
+        libsql::params!(
+            game_id,
+            encrypted.salt,
+            encrypted.ciphertext,
+            env_hash.to_vec(),
+            updated_at_ns
+        ),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(updated_at_ns))
+}
+
+async fn publish_game_build_update(
+    control: &ControlPlane,
+    game_id: u64,
+    updated_at_ns: i64,
+) -> anyhow::Result<()> {
+    control
+        .publish_game_runtime_update(GameRuntimeUpdateMessage::published(
+            game_id,
+            load_game_build_id(&control.app_server.db, game_id).await?,
+            updated_at_ns,
+        ))
+        .await;
+    Ok(())
+}
+
+async fn load_game_build_id(db: &libsql::Connection, game_id: u64) -> anyhow::Result<BuildId> {
+    let mut rows = db
+        .query(
+            "SELECT wasm_hash, env_hash FROM games WHERE id = ?1 LIMIT 1",
+            libsql::params!(game_id),
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("game row missing after build update"))?;
+    BuildId::from_hash_slices(&row.get::<Vec<u8>>(0)?, &row.get::<Vec<u8>>(1)?)
+}
+
 async fn delete_author_and_game(
     db: &libsql::Connection,
     author_id: u64,
@@ -1314,7 +1384,7 @@ async fn delete_author_and_game(
     let tx = db.transaction().await?;
     let mut rows = tx
         .query(
-            "SELECT authors.shortname, games.id, games.current_version
+            "SELECT authors.shortname, games.id, games.wasm_hash, games.env_hash
              FROM authors
              LEFT JOIN games ON games.shortname = authors.shortname
              WHERE authors.id = ?1
@@ -1327,7 +1397,15 @@ async fn delete_author_and_game(
     };
     let shortname = row.get::<String>(0)?;
     let game_id = row.get::<Option<u64>>(1)?;
-    let deleted_version = row.get::<Option<u64>>(2)?;
+    let deleted_build_id = match (
+        row.get::<Option<Vec<u8>>>(2)?,
+        row.get::<Option<Vec<u8>>>(3)?,
+    ) {
+        (Some(wasm_hash), Some(env_hash)) => {
+            Some(BuildId::from_hash_slices(&wasm_hash, &env_hash)?)
+        }
+        _ => None,
+    };
     tx.execute(
         "DELETE FROM authors WHERE id = ?1",
         libsql::params!(author_id),
@@ -1339,10 +1417,13 @@ async fn delete_author_and_game(
     )
     .await?;
     tx.commit().await?;
-    let update = match (game_id, deleted_version) {
-        (Some(game_id), Some(deleted_version)) => {
-            Some(GameRuntimeUpdateMessage::deleted(game_id, deleted_version))
-        }
+    let deleted_at_ns = current_unix_nanos();
+    let update = match (game_id, deleted_build_id) {
+        (Some(game_id), Some(build_id)) => Some(GameRuntimeUpdateMessage::deleted(
+            game_id,
+            build_id,
+            deleted_at_ns,
+        )),
         _ => None,
     };
     Ok(Some((update, shortname)))
@@ -1479,6 +1560,10 @@ fn parse_regions_csv(raw: &str) -> Vec<String> {
 
 fn current_unix_seconds() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp()
+}
+
+fn current_unix_nanos() -> i64 {
+    OffsetDateTime::now_utc().unix_timestamp_nanos() as i64
 }
 
 fn is_ban_active(expires_at: Option<i64>, now: i64) -> bool {

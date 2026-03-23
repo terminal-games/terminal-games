@@ -25,7 +25,7 @@ use terminal_games::{
     app::AppServer,
     author_env::{AUTHOR_ENV_KEY_ENV, encrypt_author_env_blob},
     manifest::{extract_manifest_from_wasm, sanitize_manifest},
-    mesh::{EnvDiscovery, GameRuntimeUpdateMessage, Mesh},
+    mesh::{BuildId, EnvDiscovery, GameRuntimeUpdateMessage, Mesh},
 };
 
 const AUTHOR_ENV_DEV_FALLBACK_KEY: &str = "terminal-games-dev-author-env-key";
@@ -45,44 +45,57 @@ async fn ensure_builtin_menu(conn: &libsql::Connection, author_env_secret_key: &
     let manifest = sanitize_manifest(&manifest)?;
     let details_json = serde_json::to_string(&manifest.details)?;
     let empty_env = encrypt_author_env_blob(author_env_secret_key, &[])?;
+    let build_id = BuildId::from_wasm_and_envs(MENU_WASM, &[]);
 
     let tx = conn.transaction().await?;
     let mut rows = tx
         .query(
-            "SELECT id, wasm, details, current_version FROM games WHERE shortname = ?1 LIMIT 1",
+            "SELECT id, wasm_hash, env_hash, details FROM games WHERE shortname = ?1 LIMIT 1",
             libsql::params!(manifest.shortname.as_str()),
         )
         .await?;
     if let Some(row) = rows.next().await? {
         let game_id = row.get::<u64>(0)?;
-        let current_wasm = row.get::<Vec<u8>>(1)?;
-        let current_details = row.get::<String>(2)?;
-        let current_version = row.get::<u64>(3)?;
-        if current_wasm != MENU_WASM || current_details != details_json {
-            let next_version = current_version + 1;
+        let current_build_id =
+            BuildId::from_hash_slices(&row.get::<Vec<u8>>(1)?, &row.get::<Vec<u8>>(2)?)?;
+        let current_details = row.get::<String>(3)?;
+        if current_build_id != build_id || current_details != details_json {
             tx.execute(
                 "UPDATE games
-                 SET wasm = ?2, details = json(?3), current_version = ?4
+                 SET wasm = ?2,
+                     details = json(?3),
+                     wasm_hash = ?4,
+                     env_hash = ?5,
+                     env_salt = ?6,
+                     env_blob = ?7,
+                     build_updated_at = ?8
                  WHERE id = ?1",
                 libsql::params!(
                     game_id,
                     MENU_WASM.to_vec(),
                     details_json.as_str(),
-                    next_version
+                    build_id.wasm_hash.to_vec(),
+                    build_id.env_hash.to_vec(),
+                    empty_env.salt.clone(),
+                    empty_env.ciphertext.clone(),
+                    current_unix_nanos(),
                 ),
             )
             .await?;
         }
     } else {
         tx.execute(
-            "INSERT INTO games (shortname, wasm, details, current_version, env_salt, env_blob)
-             VALUES (?1, ?2, json(?3), 1, ?4, ?5)",
+            "INSERT INTO games (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
+             VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)",
             libsql::params!(
                 manifest.shortname.as_str(),
                 MENU_WASM.to_vec(),
                 details_json.as_str(),
+                build_id.wasm_hash.to_vec(),
+                build_id.env_hash.to_vec(),
                 empty_env.salt,
-                empty_env.ciphertext
+                empty_env.ciphertext,
+                current_unix_nanos()
             ),
         )
         .await?;
@@ -91,28 +104,32 @@ async fn ensure_builtin_menu(conn: &libsql::Connection, author_env_secret_key: &
     Ok(())
 }
 
-async fn load_game_runtime_snapshot(
+async fn load_game_build_snapshot(
     conn: &libsql::Connection,
 ) -> Result<Vec<GameRuntimeUpdateMessage>> {
     let mut updates = Vec::new();
     let mut game_rows = conn
-        .query("SELECT id, current_version FROM games", ())
+        .query(
+            "SELECT id, wasm_hash, env_hash, build_updated_at FROM games",
+            (),
+        )
         .await?;
     while let Some(row) = game_rows.next().await? {
         updates.push(GameRuntimeUpdateMessage::published(
             row.get::<u64>(0)?,
-            row.get::<u64>(1)?,
+            BuildId::from_hash_slices(&row.get::<Vec<u8>>(1)?, &row.get::<Vec<u8>>(2)?)?,
+            row.get::<i64>(3)?,
         ));
     }
     Ok(updates)
 }
 
-async fn sync_game_runtime_snapshot(
+async fn sync_game_build_snapshot(
     conn: &libsql::Connection,
     app_server: &AppServer,
     mesh: &Mesh,
 ) -> Result<()> {
-    let snapshot = load_game_runtime_snapshot(conn).await?;
+    let snapshot = load_game_build_snapshot(conn).await?;
     app_server.game_registry().sync_snapshot(snapshot.clone());
     mesh.replace_game_runtime_snapshot(snapshot).await;
     Ok(())
@@ -282,7 +299,7 @@ async fn main() -> Result<()> {
         conn.clone(),
         author_env_secret_key,
     )?);
-    sync_game_runtime_snapshot(&conn, &app_server, &mesh).await?;
+    sync_game_build_snapshot(&conn, &app_server, &mesh).await?;
     {
         let app_server = app_server.clone();
         let conn = conn.clone();
@@ -297,7 +314,7 @@ async fn main() -> Result<()> {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "lagged mesh game runtime updates");
                         if let Err(error) =
-                            sync_game_runtime_snapshot(&conn, &app_server, &mesh).await
+                            sync_game_build_snapshot(&conn, &app_server, &mesh).await
                         {
                             tracing::warn!(
                                 error = ?error,
@@ -464,4 +481,11 @@ fn current_unix_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn current_unix_nanos() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64
 }

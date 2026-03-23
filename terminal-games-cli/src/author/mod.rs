@@ -9,7 +9,10 @@ mod list;
 mod rotate_token;
 mod upload;
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -58,7 +61,7 @@ pub(super) struct AuthorUploadArgs {
     #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
     path_to_wasm_file: PathBuf,
     /// Set env vars atomically during upload. Repeat as needed.
-    #[arg(short = 'e', value_name = "NAME=VALUE")]
+    #[arg(short = 'e', long = "env", value_name = "NAME=VALUE")]
     env: Vec<String>,
     /// Load env vars from a dotenv-style file and replace the full set atomically.
     #[arg(long = "env-file", add = ArgValueCompleter::new(PathCompleter::file()))]
@@ -200,9 +203,9 @@ fn current_author_ref_from_args() -> Option<String> {
     }
 }
 
-pub(super) fn load_upload_envs(
+pub(crate) fn load_upload_envs(
     inline: &[String],
-    env_file: Option<&PathBuf>,
+    env_file: Option<&Path>,
 ) -> Result<Option<Vec<AuthorEnvVar>>> {
     if inline.is_empty() && env_file.is_none() {
         return Ok(None);

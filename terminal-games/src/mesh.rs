@@ -17,6 +17,7 @@ use base64::Engine as _;
 use futures::StreamExt;
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tarpc::server::Channel;
 use tarpc::{client, context, server};
 use tokio::{
@@ -31,7 +32,67 @@ use tokio_util::{
     task::TaskTracker,
 };
 
-use crate::rate_limiting::get_tcp_rtt_from_fd;
+use crate::{author_env::AuthorEnvVar, rate_limiting::get_tcp_rtt_from_fd};
+
+pub type ContentHash = [u8; 32];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BuildId {
+    pub wasm_hash: ContentHash,
+    pub env_hash: ContentHash,
+}
+
+impl BuildId {
+    pub fn from_wasm_and_envs(wasm: &[u8], envs: &[AuthorEnvVar]) -> Self {
+        Self {
+            wasm_hash: hash_bytes(wasm),
+            env_hash: hash_author_envs(envs),
+        }
+    }
+
+    pub fn from_hash_slices(wasm_hash: &[u8], env_hash: &[u8]) -> anyhow::Result<Self> {
+        Ok(Self {
+            wasm_hash: content_hash_from_slice(wasm_hash)?,
+            env_hash: content_hash_from_slice(env_hash)?,
+        })
+    }
+
+    pub fn id_string(self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.wasm_hash);
+        hasher.update(self.env_hash);
+        hex::encode(hasher.finalize())
+    }
+}
+
+pub fn hash_bytes(data: &[u8]) -> ContentHash {
+    Sha256::digest(data).into()
+}
+
+pub fn hash_author_envs(envs: &[AuthorEnvVar]) -> ContentHash {
+    let mut pairs = envs
+        .iter()
+        .map(|env| (env.name.as_str(), env.value.as_str()))
+        .collect::<Vec<_>>();
+    pairs.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    for (name, value) in pairs {
+        let name_bytes = name.as_bytes();
+        let value_bytes = value.as_bytes();
+        hasher.update((name_bytes.len() as u64).to_le_bytes());
+        hasher.update(name_bytes);
+        hasher.update((value_bytes.len() as u64).to_le_bytes());
+        hasher.update(value_bytes);
+    }
+    hasher.finalize().into()
+}
+
+pub fn content_hash_from_slice(bytes: &[u8]) -> anyhow::Result<ContentHash> {
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid hash length {}", bytes.len()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Message {
@@ -72,30 +133,33 @@ pub enum GameRuntimeUpdateKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GameRuntimeUpdateMessage {
     pub game_id: u64,
-    pub version: u64,
+    pub build_id: BuildId,
+    pub updated_at_ns: i64,
     pub kind: GameRuntimeUpdateKind,
 }
 
 impl GameRuntimeUpdateMessage {
-    pub fn published(game_id: u64, version: u64) -> Self {
+    pub fn published(game_id: u64, build_id: BuildId, updated_at_ns: i64) -> Self {
         Self {
             game_id,
-            version,
+            build_id,
+            updated_at_ns,
             kind: GameRuntimeUpdateKind::Published,
         }
     }
 
-    pub fn deleted(game_id: u64, version: u64) -> Self {
+    pub fn deleted(game_id: u64, build_id: BuildId, updated_at_ns: i64) -> Self {
         Self {
             game_id,
-            version,
+            build_id,
+            updated_at_ns,
             kind: GameRuntimeUpdateKind::Deleted,
         }
     }
 
     fn supersedes(&self, other: &Self) -> bool {
-        self.version > other.version
-            || (self.version == other.version
+        self.updated_at_ns > other.updated_at_ns
+            || (self.updated_at_ns == other.updated_at_ns
                 && self.kind == GameRuntimeUpdateKind::Deleted
                 && other.kind == GameRuntimeUpdateKind::Published)
     }
@@ -181,12 +245,18 @@ pub struct PeerMessage {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct AppId {
     pub game_id: u64,
-    pub version: u64,
+    pub build_id: BuildId,
 }
 
 impl Display for AppId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.game_id, self.version)
+        write!(
+            f,
+            "{}:{}:{}",
+            self.game_id,
+            hex::encode(self.build_id.wasm_hash),
+            hex::encode(self.build_id.env_hash)
+        )
     }
 }
 
@@ -1169,7 +1239,10 @@ impl MeshInner {
     }
 
     async fn replace_game_runtime_snapshot(&self, updates: Vec<GameRuntimeUpdateMessage>) {
-        let snapshot_ids = updates.iter().map(|update| update.game_id).collect::<HashSet<_>>();
+        let snapshot_ids = updates
+            .iter()
+            .map(|update| update.game_id)
+            .collect::<HashSet<_>>();
         let mut latest = self.latest_game_runtime_updates.lock().await;
         latest.retain(|game_id, update| {
             snapshot_ids.contains(game_id) || update.kind == GameRuntimeUpdateKind::Deleted

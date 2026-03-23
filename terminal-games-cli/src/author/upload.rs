@@ -30,7 +30,7 @@ pub(super) async fn run(args: AuthorUploadArgs) -> Result<()> {
     );
 
     let client = AuthorClient::from_claims(claims)?;
-    let envs = load_upload_envs(&args.env, args.env_file.as_ref())?;
+    let envs = load_upload_envs(&args.env, args.env_file.as_deref())?;
     let response: UploadGameResponse = client
         .rpc()
         .await?
@@ -41,8 +41,8 @@ pub(super) async fn run(args: AuthorUploadArgs) -> Result<()> {
         .await?
         .map_err(anyhow::Error::msg)?;
     println!(
-        "Uploaded '{}' version {} (game id {})",
-        response.shortname, response.version, response.game_id,
+        "Uploaded '{}' build {} (game id {})",
+        response.shortname, response.build_id, response.game_id,
     );
     Ok(())
 }

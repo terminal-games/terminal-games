@@ -5,14 +5,14 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
-use sha2::{Digest, Sha256};
-
-use crate::mesh::{GameRuntimeUpdateKind, GameRuntimeUpdateMessage};
+use crate::mesh::{
+    BuildId, ContentHash, GameRuntimeUpdateKind, GameRuntimeUpdateMessage, hash_bytes,
+};
 
 #[derive(Clone, Default)]
 pub struct GameRuntimeRegistry {
@@ -22,57 +22,51 @@ pub struct GameRuntimeRegistry {
 #[derive(Default)]
 struct RegistryState {
     games: HashMap<u64, GameRuntime>,
+    modules: HashMap<ContentHash, wasmtime::Module>,
 }
 
 struct GameRuntime {
-    latest_version: Arc<AtomicU64>,
-    module: Option<CachedModule>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct WasmModuleKey([u8; 32]);
-
-struct CachedModule {
-    key: WasmModuleKey,
-    module: wasmtime::Module,
+    build_id: BuildId,
+    subscribers: Vec<Weak<AtomicBool>>,
+    latest_updated_at_ns: i64,
 }
 
 impl GameRuntimeRegistry {
-    pub fn subscribe(&self, game_id: u64, current_version: u64) -> Arc<AtomicU64> {
+    pub fn subscribe(
+        &self,
+        game_id: u64,
+        build_id: BuildId,
+        updated_at_ns: i64,
+    ) -> Arc<AtomicBool> {
         let mut state = self.inner.lock().expect("game registry poisoned");
         let game = state
             .games
             .entry(game_id)
-            .or_insert_with(|| GameRuntime::new(current_version));
-        game.publish_version(current_version);
-        game.latest_version.clone()
+            .or_insert_with(|| GameRuntime::new(build_id, updated_at_ns));
+        let update_available = Arc::new(AtomicBool::new(game.build_id != build_id));
+        game.subscribe(&update_available);
+        game.publish(build_id, updated_at_ns);
+        update_available
     }
 
     pub fn load_or_compile_module(
         &self,
-        game_id: u64,
         wasm_bytes: &[u8],
         engine: &wasmtime::Engine,
     ) -> anyhow::Result<wasmtime::Module> {
-        let module_key = WasmModuleKey::from_wasm(wasm_bytes);
+        let module_key = hash_bytes(wasm_bytes);
 
         {
-            let mut state = self.inner.lock().expect("game registry poisoned");
-            let game = state.games.entry(game_id).or_insert_with(|| GameRuntime::new(0));
-            if let Some(module) = game.cached_module(module_key) {
-                return Ok(module);
+            let state = self.inner.lock().expect("game registry poisoned");
+            if let Some(module) = state.modules.get(&module_key) {
+                return Ok(module.clone());
             }
         }
 
         let module = wasmtime::Module::from_binary(engine, wasm_bytes)?;
 
         let mut state = self.inner.lock().expect("game registry poisoned");
-        let game = state.games.entry(game_id).or_insert_with(|| GameRuntime::new(0));
-        if let Some(cached) = game.cached_module(module_key) {
-            return Ok(cached);
-        }
-        game.module = Some(CachedModule::new(module_key, module.clone()));
-        Ok(module)
+        Ok(state.modules.entry(module_key).or_insert(module).clone())
     }
 
     pub fn apply_update(&self, update: GameRuntimeUpdateMessage) -> bool {
@@ -82,17 +76,22 @@ impl GameRuntimeRegistry {
                 let game = state
                     .games
                     .entry(update.game_id)
-                    .or_insert_with(|| GameRuntime::new(update.version));
-                game.publish_version(update.version)
+                    .or_insert_with(|| GameRuntime::new(update.build_id, update.updated_at_ns));
+                game.publish(update.build_id, update.updated_at_ns)
             }
             GameRuntimeUpdateKind::Deleted => state.games.remove(&update.game_id).is_some(),
         }
     }
 
     pub fn sync_snapshot(&self, snapshot: Vec<GameRuntimeUpdateMessage>) {
-        let snapshot_ids = snapshot.iter().map(|update| update.game_id).collect::<HashSet<_>>();
+        let snapshot_ids = snapshot
+            .iter()
+            .map(|update| update.game_id)
+            .collect::<HashSet<_>>();
         let mut state = self.inner.lock().expect("game registry poisoned");
-        state.games.retain(|game_id, _| snapshot_ids.contains(game_id));
+        state
+            .games
+            .retain(|game_id, _| snapshot_ids.contains(game_id));
         for update in snapshot {
             if update.kind == GameRuntimeUpdateKind::Deleted {
                 state.games.remove(&update.game_id);
@@ -101,65 +100,41 @@ impl GameRuntimeRegistry {
             let game = state
                 .games
                 .entry(update.game_id)
-                .or_insert_with(|| GameRuntime::new(update.version));
-            game.publish_version(update.version);
+                .or_insert_with(|| GameRuntime::new(update.build_id, update.updated_at_ns));
+            game.publish(update.build_id, update.updated_at_ns);
         }
-    }
-
-    #[cfg(test)]
-    fn module_cache_len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("game registry poisoned")
-            .games
-            .values()
-            .filter(|game| game.module.is_some())
-            .count()
-    }
-
-    #[cfg(test)]
-    fn has_game_state(&self, game_id: u64) -> bool {
-        self.inner
-            .lock()
-            .expect("game registry poisoned")
-            .games
-            .contains_key(&game_id)
     }
 }
 
 impl GameRuntime {
-    fn new(initial_version: u64) -> Self {
+    fn new(build_id: BuildId, latest_updated_at_ns: i64) -> Self {
         Self {
-            latest_version: Arc::new(AtomicU64::new(initial_version)),
-            module: None,
+            build_id,
+            subscribers: Vec::new(),
+            latest_updated_at_ns,
         }
     }
 
-    fn publish_version(&self, version: u64) -> bool {
-        let current = self.latest_version.load(Ordering::Acquire);
-        if version <= current {
+    fn subscribe(&mut self, update_available: &Arc<AtomicBool>) {
+        self.subscribers.push(Arc::downgrade(update_available));
+    }
+
+    fn publish(&mut self, build_id: BuildId, updated_at_ns: i64) -> bool {
+        if updated_at_ns < self.latest_updated_at_ns {
             return false;
         }
-        self.latest_version.store(version, Ordering::Release);
-        true
-    }
-
-    fn cached_module(&self, module_key: WasmModuleKey) -> Option<wasmtime::Module> {
-        self.module
-            .as_ref()
-            .filter(|cached| cached.key == module_key)
-            .map(|cached| cached.module.clone())
-    }
-}
-
-impl WasmModuleKey {
-    fn from_wasm(wasm_bytes: &[u8]) -> Self {
-        Self(Sha256::digest(wasm_bytes).into())
-    }
-}
-
-impl CachedModule {
-    fn new(key: WasmModuleKey, module: wasmtime::Module) -> Self {
-        Self { key, module }
+        self.latest_updated_at_ns = updated_at_ns;
+        let changed = self.build_id != build_id;
+        self.build_id = build_id;
+        if changed {
+            self.subscribers.retain(|subscriber| {
+                let Some(subscriber) = subscriber.upgrade() else {
+                    return false;
+                };
+                subscriber.store(true, Ordering::Relaxed);
+                true
+            });
+        }
+        changed
     }
 }

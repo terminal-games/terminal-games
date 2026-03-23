@@ -6,7 +6,7 @@ use std::{
     fs,
     future::Future,
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -26,17 +26,18 @@ use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, laye
 
 use terminal_games::{
     app::{AppInstantiationParams, AppServer},
-    author_env::encrypt_author_env_blob,
-    control::StatusBarState,
+    author_env::{encrypt_author_env_blob, validate_author_envs},
+    control::{AuthorEnvVar, StatusBarState},
     input_guard::{InputGuard, InputGuardError},
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
     mesh::GameRuntimeUpdateMessage,
-    mesh::{LocalDiscovery, Mesh},
+    mesh::{BuildId, LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
     terminal_profile::TerminalProfile,
 };
 
 use crate::audio;
+use crate::author::load_upload_envs;
 use crate::config::load_or_create_author_env_secret_key;
 
 #[derive(Args)]
@@ -48,6 +49,14 @@ pub(crate) struct RunArgs {
     /// Additional games in shortname=path format
     #[arg(short, long = "game", value_name = "SHORTNAME=PATH")]
     games: Vec<String>,
+
+    /// Set env vars for the primary wasm app. Repeat as needed.
+    #[arg(short = 'e', long = "env", value_name = "NAME=VALUE")]
+    env: Vec<String>,
+
+    /// Load env vars for the primary wasm app from a dotenv-style file.
+    #[arg(long = "env-file", add = ArgValueCompleter::new(PathCompleter::file()))]
+    env_file: Option<PathBuf>,
 
     /// Enable flate2 compression on output
     #[arg(short = 'C', long)]
@@ -299,66 +308,91 @@ async fn upsert_game(
     shortname: &str,
     path: &str,
     details: &str,
+    envs: &[AuthorEnvVar],
 ) -> Result<Option<GameRuntimeUpdateMessage>> {
     let wasm = fs::read(path).with_context(|| format!("Failed to read wasm for {shortname}"))?;
-    let empty_env = encrypt_author_env_blob(author_env_secret_key, &[])?;
+    let build_id = BuildId::from_wasm_and_envs(&wasm, envs);
+    let encrypted_env = encrypt_author_env_blob(author_env_secret_key, envs)?;
     let tx = conn.transaction().await?;
     let mut rows = tx
         .query(
-            "SELECT id, wasm, current_version FROM games WHERE shortname = ?1 LIMIT 1",
+            "SELECT id, wasm_hash, env_hash FROM games WHERE shortname = ?1 LIMIT 1",
             libsql::params!(shortname),
         )
         .await
         .with_context(|| format!("Failed to query existing game {shortname}"))?;
     let update = if let Some(row) = rows.next().await? {
         let game_id = row.get::<u64>(0)?;
-        let existing_wasm = row.get::<Vec<u8>>(1)?;
-        let current_version = row.get::<u64>(2)?;
-        if existing_wasm == wasm {
+        let existing_build_id =
+            BuildId::from_hash_slices(&row.get::<Vec<u8>>(1)?, &row.get::<Vec<u8>>(2)?)?;
+        if existing_build_id == build_id {
             tx.execute(
                 "UPDATE games
                  SET details = json(?2),
-                     env_salt = ?3,
-                     env_blob = ?4
+                     wasm = ?3,
+                     wasm_hash = ?4,
+                     env_hash = ?5,
+                     env_salt = ?6,
+                     env_blob = ?7
                  WHERE id = ?1",
-                libsql::params!(game_id, details, empty_env.salt, empty_env.ciphertext),
+                libsql::params!(
+                    game_id,
+                    details,
+                    wasm,
+                    build_id.wasm_hash.to_vec(),
+                    build_id.env_hash.to_vec(),
+                    encrypted_env.salt,
+                    encrypted_env.ciphertext
+                ),
             )
             .await
             .with_context(|| format!("Failed to refresh game metadata {shortname}"))?;
             None
         } else {
-            let next_version = current_version + 1;
+            let updated_at_ns = current_unix_nanos();
             tx.execute(
                 "UPDATE games
                  SET wasm = ?2,
                      details = json(?3),
-                     env_salt = ?4,
-                     env_blob = ?5,
-                     current_version = ?6
+                     wasm_hash = ?4,
+                     env_hash = ?5,
+                     env_salt = ?6,
+                     env_blob = ?7,
+                     build_updated_at = ?8
                  WHERE id = ?1",
                 libsql::params!(
                     game_id,
                     wasm,
                     details,
-                    empty_env.salt,
-                    empty_env.ciphertext,
-                    next_version
+                    build_id.wasm_hash.to_vec(),
+                    build_id.env_hash.to_vec(),
+                    encrypted_env.salt,
+                    encrypted_env.ciphertext,
+                    updated_at_ns
                 ),
             )
             .await
             .with_context(|| format!("Failed to update game {shortname}"))?;
-            Some(GameRuntimeUpdateMessage::published(game_id, next_version))
+            Some(GameRuntimeUpdateMessage::published(
+                game_id,
+                build_id,
+                updated_at_ns,
+            ))
         }
     } else {
+        let updated_at_ns = current_unix_nanos();
         tx.execute(
-            "INSERT INTO games (shortname, wasm, details, current_version, env_salt, env_blob)
-             VALUES (?1, ?2, json(?3), 1, ?4, ?5)",
+            "INSERT INTO games (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
+             VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)",
             libsql::params!(
                 shortname,
                 wasm,
                 details,
-                empty_env.salt,
-                empty_env.ciphertext
+                build_id.wasm_hash.to_vec(),
+                build_id.env_hash.to_vec(),
+                encrypted_env.salt,
+                encrypted_env.ciphertext,
+                updated_at_ns
             ),
         )
         .await
@@ -369,36 +403,51 @@ async fn upsert_game(
             .await?
             .ok_or_else(|| anyhow::anyhow!("missing last_insert_rowid"))?
             .get::<u64>(0)?;
-        Some(GameRuntimeUpdateMessage::published(game_id, 1))
+        Some(GameRuntimeUpdateMessage::published(
+            game_id,
+            build_id,
+            updated_at_ns,
+        ))
     };
     tx.commit().await?;
     Ok(update)
 }
 
-async fn load_local_game_runtime_snapshot(
+async fn load_local_game_build_snapshot(
     conn: &libsql::Connection,
 ) -> Result<Vec<GameRuntimeUpdateMessage>> {
     let mut updates = Vec::new();
     let mut game_rows = conn
-        .query("SELECT id, current_version FROM games", ())
+        .query(
+            "SELECT id, wasm_hash, env_hash, build_updated_at FROM games",
+            (),
+        )
         .await
-        .context("Failed to query local game versions")?;
+        .context("Failed to query local game builds")?;
     while let Some(row) = game_rows.next().await? {
         updates.push(GameRuntimeUpdateMessage::published(
             row.get::<u64>(0)?,
-            row.get::<u64>(1)?,
+            BuildId::from_hash_slices(&row.get::<Vec<u8>>(1)?, &row.get::<Vec<u8>>(2)?)?,
+            row.get::<i64>(3)?,
         ));
     }
 
     Ok(updates)
 }
 
-async fn sync_local_game_runtime_snapshot(
+fn current_unix_nanos() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64
+}
+
+async fn sync_local_game_build_snapshot(
     conn: &libsql::Connection,
     app_server: &AppServer,
     mesh: &Mesh,
 ) -> Result<()> {
-    let snapshot = load_local_game_runtime_snapshot(conn).await?;
+    let snapshot = load_local_game_build_snapshot(conn).await?;
     app_server.game_registry().sync_snapshot(snapshot.clone());
     mesh.replace_game_runtime_snapshot(snapshot).await;
     Ok(())
@@ -410,6 +459,8 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing wasm file"))?;
     let author_env_secret_key = load_or_create_author_env_secret_key()?;
+    let primary_envs = load_upload_envs(&args.env, args.env_file.as_deref())?.unwrap_or_default();
+    validate_author_envs(&primary_envs)?;
 
     let (log_writer, _flush_guard) = BufferedLogWriter::new();
     let platform_filter: LevelFilter = args.platform_log_level.into();
@@ -481,6 +532,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         first_app_shortname.as_str(),
         wasm_path.as_str(),
         default_details(first_app_shortname.as_str()).as_str(),
+        &primary_envs,
     )
     .await?
     {
@@ -500,6 +552,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                 shortname,
                 path.as_str(),
                 default_details(shortname).as_str(),
+                &[],
             )
             .await?
             {
@@ -597,7 +650,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             tracing::warn!(skipped, "lagged mesh game runtime updates");
                             if let Err(error) =
-                                sync_local_game_runtime_snapshot(&app_server.db, &app_server, &mesh).await
+                                sync_local_game_build_snapshot(&app_server.db, &app_server, &mesh).await
                             {
                                 tracing::warn!(
                                     error = ?error,
@@ -615,7 +668,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         let _ = app_server.game_registry().apply_update(update);
         mesh.propagate_game_runtime_update(update).await;
     }
-    sync_local_game_runtime_snapshot(&app_server.db, &app_server, &mesh).await?;
+    sync_local_game_build_snapshot(&app_server.db, &app_server, &mesh).await?;
 
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;

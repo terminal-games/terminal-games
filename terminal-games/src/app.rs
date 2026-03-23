@@ -30,7 +30,7 @@ use crate::{
     control::StatusBarState,
     game_registry::GameRuntimeRegistry,
     log_backend::{GuestLogBackend, LogLevel, parse_guest_log_object},
-    mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
+    mesh::{AppId, BuildId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
     replay::ReplayBuffer,
     status_bar::{StatusBar, StatusNotification},
@@ -841,9 +841,9 @@ impl AppServer {
         let mut app_rows = ctx
             .db
             .query(
-                "SELECT id, wasm, current_version, env_salt, env_blob
+                "SELECT id, wasm, wasm_hash, env_hash, env_salt, env_blob, build_updated_at
                  FROM games
-                 WHERE shortname = ?1 AND current_version > 0
+                 WHERE shortname = ?1
                  LIMIT 1",
                 [shortname.as_str()],
             )
@@ -854,22 +854,22 @@ impl AppServer {
             .ok_or_else(|| UnknownGameShortnameError(shortname.clone()))?;
         let game_id = app_row.get::<u64>(0)?;
         let wasm_bytes = app_row.get::<Vec<u8>>(1)?;
-        let version = app_row.get::<u64>(2)?;
-        let env_salt = app_row.get::<Vec<u8>>(3)?;
-        let env_blob = app_row.get::<Vec<u8>>(4)?;
-        let app_id = AppId { game_id, version };
-        let latest_version = ctx.game_registry.subscribe(game_id, version);
+        let build_id =
+            BuildId::from_hash_slices(&app_row.get::<Vec<u8>>(2)?, &app_row.get::<Vec<u8>>(3)?)?;
+        let env_salt = app_row.get::<Vec<u8>>(4)?;
+        let env_blob = app_row.get::<Vec<u8>>(5)?;
+        let build_updated_at = app_row.get::<i64>(6)?;
+        let mut envs: Vec<(String, String)> =
+            decrypt_author_env_blob(ctx.author_env_secret_key.as_ref(), &env_salt, &env_blob)?
+                .into_iter()
+                .map(|env| (env.name, env.value))
+                .collect();
+        let app_id = AppId { game_id, build_id };
+        let update_available = ctx
+            .game_registry
+            .subscribe(game_id, build_id, build_updated_at);
 
         let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(app_id).await;
-
-        let mut envs = vec![];
-        for env in
-            decrypt_author_env_blob(ctx.author_env_secret_key.as_ref(), &env_salt, &env_blob)?
-        {
-            let name = env.name;
-            let value = env.value;
-            envs.push((name, value));
-        }
         envs.push(("REMOTE_SSHID".to_string(), ctx.remote_sshid.clone()));
         let username = menu_username.to_string();
         let mut locale = ctx.locale.clone();
@@ -879,7 +879,7 @@ impl AppServer {
         envs.push(("USERNAME".to_string(), username));
         envs.push(("PEER_ID".to_string(), peer_id.to_bytes().encode_hex()));
         envs.push(("APP_SHORTNAME".to_string(), shortname.to_string()));
-        envs.push(("APP_VERSION_ID".to_string(), version.to_string()));
+        envs.push(("APP_VERSION_ID".to_string(), build_id.id_string()));
         envs.push((
             "AUDIO_ENABLED".to_string(),
             if ctx.audio_enabled { "1" } else { "0" }.to_string(),
@@ -913,7 +913,7 @@ impl AppServer {
 
         let module = ctx
             .game_registry
-            .load_or_compile_module(game_id, &wasm_bytes, ctx.linker.engine())?;
+            .load_or_compile_module(&wasm_bytes, ctx.linker.engine())?;
         let instance_pre = ctx.linker.instantiate_pre(&module)?;
 
         Ok((
@@ -922,7 +922,7 @@ impl AppServer {
                 peer_rx,
                 peer_tx,
                 app_id,
-                latest_version,
+                update_available,
                 shortname,
             },
             instance_pre,
@@ -1978,9 +1978,7 @@ impl AppServer {
     }
 
     fn new_version_available_poll(caller: wasmtime::Caller<'_, AppState>) -> wasmtime::Result<i32> {
-        let current_version = caller.data().app.app_id.version;
-        let latest = caller.data().app.latest_version.load(Ordering::Acquire);
-        let has_update = latest != 0 && latest != current_version;
+        let has_update = caller.data().app.update_available.load(Ordering::Relaxed);
         Ok(if has_update { 1 } else { 0 })
     }
 
@@ -2179,7 +2177,7 @@ pub struct PreloadedAppState {
     peer_rx: tokio::sync::mpsc::Receiver<PeerMessageApp>,
     peer_tx: tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>,
     app_id: AppId,
-    latest_version: Arc<AtomicU64>,
+    update_available: Arc<AtomicBool>,
     shortname: String,
 }
 

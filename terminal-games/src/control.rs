@@ -268,7 +268,7 @@ pub struct DeleteShortnameResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadGameResponse {
     pub shortname: String,
-    pub version: u64,
+    pub build_id: String,
     pub game_id: u64,
 }
 

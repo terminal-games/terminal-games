@@ -11,9 +11,11 @@ CREATE TABLE IF NOT EXISTS games (
     shortname TEXT NOT NULL UNIQUE,
     wasm BLOB NOT NULL,
     details JSON NOT NULL CHECK(json_valid(details)),
-    current_version INTEGER NOT NULL DEFAULT(0),
+    wasm_hash BLOB NOT NULL,
+    env_hash BLOB NOT NULL,
     env_salt BLOB NOT NULL,
     env_blob BLOB NOT NULL,
+    build_updated_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000000 AS INTEGER)),
     duration_seconds REAL NOT NULL DEFAULT(0)
 );
 

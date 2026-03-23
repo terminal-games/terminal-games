@@ -21,8 +21,7 @@ pub(super) async fn run(args: AdminAuthorDeleteArgs, profile: Option<String>) ->
         return Ok(());
     }
     let api = load_api(profile.as_deref())?;
-    api
-        .rpc()
+    api.rpc()
         .await?
         .author_delete(
             terminal_games::control::rpc_context(),
