@@ -10,7 +10,9 @@ mod control_client;
 mod run;
 
 use anyhow::Result;
-use clap::{Arg, ArgAction, Command as ClapCommand, CommandFactory, Parser, Subcommand, error::ErrorKind};
+use clap::{
+    Arg, ArgAction, Command as ClapCommand, CommandFactory, Parser, Subcommand, error::ErrorKind,
+};
 use clap_complete::CompleteEnv;
 use rustls::crypto::aws_lc_rs;
 
@@ -108,7 +110,10 @@ fn should_skip_arg(arg: &Arg, depth: usize) -> bool {
 }
 
 fn format_command_line(prefix: &str, command: &ClapCommand) -> (String, String) {
-    let depth = prefix.split_whitespace().filter(|part| !part.is_empty()).count();
+    let depth = prefix
+        .split_whitespace()
+        .filter(|part| !part.is_empty())
+        .count();
     let usage = command
         .get_arguments()
         .filter(|arg| !should_skip_arg(arg, depth))

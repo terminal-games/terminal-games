@@ -25,7 +25,7 @@ use terminal_games::{
     app::AppServer,
     author_env::{AUTHOR_ENV_KEY_ENV, encrypt_author_env_blob},
     manifest::{extract_manifest_from_wasm, sanitize_manifest},
-    mesh::{EnvDiscovery, Mesh},
+    mesh::{EnvDiscovery, GameRuntimeUpdateMessage, Mesh},
 };
 
 const AUTHOR_ENV_DEV_FALLBACK_KEY: &str = "terminal-games-dev-author-env-key";
@@ -88,6 +88,33 @@ async fn ensure_builtin_menu(conn: &libsql::Connection, author_env_secret_key: &
         .await?;
     }
     tx.commit().await?;
+    Ok(())
+}
+
+async fn load_game_runtime_snapshot(
+    conn: &libsql::Connection,
+) -> Result<Vec<GameRuntimeUpdateMessage>> {
+    let mut updates = Vec::new();
+    let mut game_rows = conn
+        .query("SELECT id, current_version FROM games", ())
+        .await?;
+    while let Some(row) = game_rows.next().await? {
+        updates.push(GameRuntimeUpdateMessage::published(
+            row.get::<u64>(0)?,
+            row.get::<u64>(1)?,
+        ));
+    }
+    Ok(updates)
+}
+
+async fn sync_game_runtime_snapshot(
+    conn: &libsql::Connection,
+    app_server: &AppServer,
+    mesh: &Mesh,
+) -> Result<()> {
+    let snapshot = load_game_runtime_snapshot(conn).await?;
+    app_server.game_registry().sync_snapshot(snapshot.clone());
+    mesh.replace_game_runtime_snapshot(snapshot).await;
     Ok(())
 }
 
@@ -255,19 +282,28 @@ async fn main() -> Result<()> {
         conn.clone(),
         author_env_secret_key,
     )?);
+    sync_game_runtime_snapshot(&conn, &app_server, &mesh).await?;
     {
         let app_server = app_server.clone();
-        let mut updates = mesh.subscribe_game_version_updates();
+        let conn = conn.clone();
+        let mesh = mesh.clone();
+        let mut updates = mesh.subscribe_game_runtime_updates();
         tokio::spawn(async move {
             loop {
                 match updates.recv().await {
                     Ok(update) => {
-                        app_server
-                            .apply_uploaded_version(update.game_id, update.version)
-                            .await;
+                        let _ = app_server.game_registry().apply_update(update);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "lagged mesh game version updates");
+                        tracing::warn!(skipped, "lagged mesh game runtime updates");
+                        if let Err(error) =
+                            sync_game_runtime_snapshot(&conn, &app_server, &mesh).await
+                        {
+                            tracing::warn!(
+                                error = ?error,
+                                "failed to resync game runtime snapshot after lag"
+                            );
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }

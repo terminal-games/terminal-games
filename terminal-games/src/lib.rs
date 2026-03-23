@@ -6,6 +6,7 @@ pub mod app;
 mod audio;
 pub mod author_env;
 pub mod control;
+pub mod game_registry;
 pub mod input_guard;
 pub mod log_backend;
 pub mod manifest;

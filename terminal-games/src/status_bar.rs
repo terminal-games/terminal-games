@@ -383,7 +383,8 @@ impl StatusBar {
         if ticker_count <= 1 {
             return None;
         }
-        self.selected_ticker.filter(|&selected| selected < ticker_count)
+        self.selected_ticker
+            .filter(|&selected| selected < ticker_count)
     }
 
     fn rotating_ticker_index(&self, ticker_count: usize) -> usize {

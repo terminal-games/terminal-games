@@ -41,8 +41,8 @@ use terminal_games::{
         AdminControlRpc, AuthorControlRpc, AuthorEnvDeleteRequest, AuthorEnvListResponse,
         AuthorEnvSetRequest, AuthorSelfResponse, AuthorSummary, AuthorTokenClaims, BanEntry,
         BanIpAddRequest, BanIpRemoveRequest, BanIpRequest, BroadcastLevel, BroadcastRequest,
-        CacheInvalidateRequest, CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest,
-        DeleteShortnameRequest, DeleteShortnameResponse, KickSessionRequest,
+        CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest, DeleteShortnameRequest,
+        DeleteShortnameResponse, KickSessionRequest,
         RegionDiscoveryResponse, RegionRuntimeStatus, RotateAuthorTokenRequest,
         RotateAuthorTokenResponse, RpcError, SessionSummary, SpyControlMessage, StatusBarState,
         StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest, TickerReorderRequest,
@@ -50,7 +50,7 @@ use terminal_games::{
         parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
-    mesh::Mesh,
+    mesh::{GameRuntimeUpdateMessage, Mesh},
 };
 use time::OffsetDateTime;
 
@@ -162,17 +162,9 @@ impl ControlPlane {
         })
     }
 
-    async fn publish_game_version_update(&self, shortname: &str, game_id: u64, version: u64) {
-        self.app_server
-            .apply_uploaded_version(game_id, version)
-            .await;
-        self.mesh
-            .propagate_game_version_update(terminal_games::mesh::GameVersionUpdateMessage {
-                shortname: shortname.to_string(),
-                game_id,
-                version,
-            })
-            .await;
+    async fn publish_game_runtime_update(&self, update: GameRuntimeUpdateMessage) {
+        let _ = self.app_server.game_registry().apply_update(update);
+        self.mesh.propagate_game_runtime_update(update).await;
     }
 
     async fn rotate_author_token(
@@ -787,30 +779,18 @@ impl AdminControlRpc for AdminRpcServer {
         _: context::Context,
         request: DeleteAuthorRequest,
     ) -> Result<Option<DeleteShortnameResponse>, RpcError> {
-        let shortname =
+        let deleted =
             delete_author_and_game(&self.control.app_server.db, request.author_id).await?;
-        if let Some(shortname) = shortname {
-            self.control
-                .app_server
-                .invalidate_shortname_cache(&shortname)
-                .await;
+        if let Some((update, shortname)) = deleted {
+            if let Some(update) = update {
+                self.control.publish_game_runtime_update(update).await;
+            }
             Ok(Some(DeleteShortnameResponse { shortname }))
         } else {
             Ok(None)
         }
     }
 
-    async fn cache_invalidate(
-        self,
-        _: context::Context,
-        request: CacheInvalidateRequest,
-    ) -> Result<(), RpcError> {
-        self.control
-            .app_server
-            .invalidate_shortname_cache(&request.shortname)
-            .await;
-        Ok(())
-    }
 }
 
 impl AuthorControlRpc for AuthorRpcServer {
@@ -909,7 +889,7 @@ impl AuthorControlRpc for AuthorRpcServer {
             .get::<u64>(0)?;
         tx.commit().await?;
         self.control
-            .publish_game_version_update(&self.author.record.shortname, game_id, version)
+            .publish_game_runtime_update(GameRuntimeUpdateMessage::published(game_id, version))
             .await;
         Ok(())
     }
@@ -956,7 +936,7 @@ impl AuthorControlRpc for AuthorRpcServer {
             .get::<u64>(0)?;
         tx.commit().await?;
         self.control
-            .publish_game_version_update(&self.author.record.shortname, game_id, version)
+            .publish_game_runtime_update(GameRuntimeUpdateMessage::published(game_id, version))
             .await;
         Ok(())
     }
@@ -1084,7 +1064,10 @@ impl AuthorControlRpc for AuthorRpcServer {
             game_id,
         };
         self.control
-            .publish_game_version_update(&response.shortname, response.game_id, response.version)
+            .publish_game_runtime_update(GameRuntimeUpdateMessage::published(
+                response.game_id,
+                response.version,
+            ))
             .await;
         Ok(response)
     }
@@ -1097,13 +1080,12 @@ impl AuthorControlRpc for AuthorRpcServer {
         if request.shortname != self.author.record.shortname {
             return Err("shortname mismatch".into());
         }
-        let shortname =
+        let deleted =
             delete_author_and_game(&self.control.app_server.db, self.author.record.id).await?;
-        if let Some(shortname) = shortname {
-            self.control
-                .app_server
-                .invalidate_shortname_cache(&shortname)
-                .await;
+        if let Some((update, shortname)) = deleted {
+            if let Some(update) = update {
+                self.control.publish_game_runtime_update(update).await;
+            }
             Ok(Some(DeleteShortnameResponse { shortname }))
         } else {
             Ok(None)
@@ -1328,11 +1310,15 @@ async fn load_game_env_blob(
 async fn delete_author_and_game(
     db: &libsql::Connection,
     author_id: u64,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<(Option<GameRuntimeUpdateMessage>, String)>> {
     let tx = db.transaction().await?;
     let mut rows = tx
         .query(
-            "SELECT shortname FROM authors WHERE id = ?1 LIMIT 1",
+            "SELECT authors.shortname, games.id, games.current_version
+             FROM authors
+             LEFT JOIN games ON games.shortname = authors.shortname
+             WHERE authors.id = ?1
+             LIMIT 1",
             libsql::params!(author_id),
         )
         .await?;
@@ -1340,6 +1326,8 @@ async fn delete_author_and_game(
         return Ok(None);
     };
     let shortname = row.get::<String>(0)?;
+    let game_id = row.get::<Option<u64>>(1)?;
+    let deleted_version = row.get::<Option<u64>>(2)?;
     tx.execute(
         "DELETE FROM authors WHERE id = ?1",
         libsql::params!(author_id),
@@ -1351,7 +1339,13 @@ async fn delete_author_and_game(
     )
     .await?;
     tx.commit().await?;
-    Ok(Some(shortname))
+    let update = match (game_id, deleted_version) {
+        (Some(game_id), Some(deleted_version)) => {
+            Some(GameRuntimeUpdateMessage::deleted(game_id, deleted_version))
+        }
+        _ => None,
+    };
+    Ok(Some((update, shortname)))
 }
 
 async fn load_ticker_entries(db: &libsql::Connection) -> anyhow::Result<Vec<TickerEntry>> {

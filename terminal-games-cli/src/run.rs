@@ -30,7 +30,7 @@ use terminal_games::{
     control::StatusBarState,
     input_guard::{InputGuard, InputGuardError},
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
-    mesh::GameVersionUpdateMessage,
+    mesh::GameRuntimeUpdateMessage,
     mesh::{LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
     terminal_profile::TerminalProfile,
@@ -299,7 +299,7 @@ async fn upsert_game(
     shortname: &str,
     path: &str,
     details: &str,
-) -> Result<Option<GameVersionUpdateMessage>> {
+) -> Result<Option<GameRuntimeUpdateMessage>> {
     let wasm = fs::read(path).with_context(|| format!("Failed to read wasm for {shortname}"))?;
     let empty_env = encrypt_author_env_blob(author_env_secret_key, &[])?;
     let tx = conn.transaction().await?;
@@ -347,11 +347,7 @@ async fn upsert_game(
             )
             .await
             .with_context(|| format!("Failed to update game {shortname}"))?;
-            Some(GameVersionUpdateMessage {
-                shortname: shortname.to_string(),
-                game_id,
-                version: next_version,
-            })
+            Some(GameRuntimeUpdateMessage::published(game_id, next_version))
         }
     } else {
         tx.execute(
@@ -367,37 +363,44 @@ async fn upsert_game(
         )
         .await
         .with_context(|| format!("Failed to insert game {shortname}"))?;
-        let mut rows = tx
-            .query(
-                "SELECT id FROM games WHERE shortname = ?1 LIMIT 1",
-                libsql::params!(shortname),
-            )
-            .await?;
-        let game_id = rows
+        let mut id_rows = tx.query("SELECT last_insert_rowid()", ()).await?;
+        let game_id = id_rows
             .next()
             .await?
-            .ok_or_else(|| anyhow::anyhow!("game row missing after insert for {shortname}"))?
+            .ok_or_else(|| anyhow::anyhow!("missing last_insert_rowid"))?
             .get::<u64>(0)?;
-        Some(GameVersionUpdateMessage {
-            shortname: shortname.to_string(),
-            game_id,
-            version: 1,
-        })
+        Some(GameRuntimeUpdateMessage::published(game_id, 1))
     };
     tx.commit().await?;
     Ok(update)
 }
 
-async fn sync_local_game_versions(conn: &libsql::Connection, app_server: &AppServer) -> Result<()> {
-    let mut rows = conn
+async fn load_local_game_runtime_snapshot(
+    conn: &libsql::Connection,
+) -> Result<Vec<GameRuntimeUpdateMessage>> {
+    let mut updates = Vec::new();
+    let mut game_rows = conn
         .query("SELECT id, current_version FROM games", ())
         .await
         .context("Failed to query local game versions")?;
-    while let Some(row) = rows.next().await? {
-        let game_id = row.get::<u64>(0)?;
-        let version = row.get::<u64>(1)?;
-        app_server.apply_uploaded_version(game_id, version).await;
+    while let Some(row) = game_rows.next().await? {
+        updates.push(GameRuntimeUpdateMessage::published(
+            row.get::<u64>(0)?,
+            row.get::<u64>(1)?,
+        ));
     }
+
+    Ok(updates)
+}
+
+async fn sync_local_game_runtime_snapshot(
+    conn: &libsql::Connection,
+    app_server: &AppServer,
+    mesh: &Mesh,
+) -> Result<()> {
+    let snapshot = load_local_game_runtime_snapshot(conn).await?;
+    app_server.game_registry().sync_snapshot(snapshot.clone());
+    mesh.replace_game_runtime_snapshot(snapshot).await;
     Ok(())
 }
 
@@ -580,7 +583,8 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     let graceful_shutdown_token = CancellationToken::new();
     {
         let app_server = app_server.clone();
-        let mut updates = mesh.subscribe_game_version_updates();
+        let mesh = mesh.clone();
+        let mut updates = mesh.subscribe_game_runtime_updates();
         let graceful_shutdown_token = graceful_shutdown_token.clone();
         tokio::spawn(async move {
             loop {
@@ -588,12 +592,18 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                     _ = graceful_shutdown_token.cancelled() => break,
                     result = updates.recv() => match result {
                         Ok(update) => {
-                            app_server
-                                .apply_uploaded_version(update.game_id, update.version)
-                                .await;
+                            let _ = app_server.game_registry().apply_update(update);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(skipped, "lagged mesh game version updates");
+                            tracing::warn!(skipped, "lagged mesh game runtime updates");
+                            if let Err(error) =
+                                sync_local_game_runtime_snapshot(&app_server.db, &app_server, &mesh).await
+                            {
+                                tracing::warn!(
+                                    error = ?error,
+                                    "failed to resync local game runtime snapshot after lag"
+                                );
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -601,32 +611,11 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
             }
         });
     }
-    {
-        let app_server = app_server.clone();
-        let conn = app_server.db.clone();
-        let graceful_shutdown_token = graceful_shutdown_token.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = graceful_shutdown_token.cancelled() => break,
-                    _ = interval.tick() => {
-                        if let Err(error) = sync_local_game_versions(&conn, &app_server).await {
-                            tracing::warn!(error = ?error, "failed to sync local game versions");
-                        }
-                    }
-                }
-            }
-        });
-    }
     for update in local_game_updates {
-        app_server
-            .apply_uploaded_version(update.game_id, update.version)
-            .await;
-        mesh.propagate_game_version_update(update).await;
+        let _ = app_server.game_registry().apply_update(update);
+        mesh.propagate_game_runtime_update(update).await;
     }
-    sync_local_game_versions(&app_server.db, &app_server).await?;
+    sync_local_game_runtime_snapshot(&app_server.db, &app_server, &mesh).await?;
 
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;

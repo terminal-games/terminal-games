@@ -28,6 +28,7 @@ use crate::{
     audio::{CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
     author_env::decrypt_author_env_blob,
     control::StatusBarState,
+    game_registry::GameRuntimeRegistry,
     log_backend::{GuestLogBackend, LogLevel, parse_guest_log_object},
     mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
@@ -46,7 +47,6 @@ const REPLAY_RATE_LIMIT_SECS: u64 = 10;
 const IDLE_TIMEOUT_WARNING_SECS: i32 = 10;
 const REPLAY_UPLOAD_NOTIFICATION_SECS: u64 = 30;
 const REPLAY_RESULT_NOTIFICATION_SECS: u64 = 15;
-
 // Dial error codes
 const DIAL_ERR_ADDRESS_TOO_LONG: i32 = -1;
 const DIAL_ERR_TOO_MANY_CONNECTIONS: i32 = -2;
@@ -159,8 +159,7 @@ pub struct AppServer {
     pub db: libsql::Connection,
     mesh: Mesh,
     author_env_secret_key: Arc<str>,
-    module_cache: Arc<tokio::sync::RwLock<HashMap<AppId, wasmtime::Module>>>,
-    latest_versions: Arc<tokio::sync::RwLock<HashMap<u64, Arc<AtomicU64>>>>,
+    game_registry: GameRuntimeRegistry,
 }
 
 pub struct AppInstantiationParams {
@@ -239,8 +238,7 @@ impl AppServer {
             db,
             author_env_secret_key: author_env_secret_key.into(),
             engine,
-            module_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            latest_versions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            game_registry: GameRuntimeRegistry::default(),
         })
     }
 
@@ -248,52 +246,8 @@ impl AppServer {
         &self.author_env_secret_key
     }
 
-    pub async fn invalidate_shortname_cache(&self, shortname: &str) {
-        let mut game_rows = match self
-            .db
-            .query(
-                "SELECT id FROM games WHERE shortname = ?1 LIMIT 1",
-                libsql::params!(shortname),
-            )
-            .await
-        {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(shortname, error = ?error, "failed to query cache invalidation game id");
-                return;
-            }
-        };
-        let game_id = match game_rows.next().await {
-            Ok(Some(row)) => match row.get::<u64>(0) {
-                Ok(id) => id,
-                Err(error) => {
-                    tracing::warn!(shortname, error = ?error, "failed to decode game id");
-                    return;
-                }
-            },
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!(shortname, error = ?error, "failed reading game id row");
-                return;
-            }
-        };
-        let mut cache = self.module_cache.write().await;
-        cache.retain(|app_id, _| app_id.game_id != game_id);
-    }
-
-    pub async fn apply_uploaded_version(&self, game_id: u64, version: u64) {
-        let should_invalidate = {
-            let latest = self.track_game_version(game_id, version).await;
-            update_atomic_max(&latest, version)
-        };
-        if should_invalidate {
-            let mut cache = self.module_cache.write().await;
-            cache.retain(|app_id, _| app_id.game_id != game_id);
-        }
-    }
-
-    async fn track_game_version(&self, game_id: u64, version: u64) -> Arc<AtomicU64> {
-        track_game_version(&self.latest_versions, game_id, version).await
+    pub fn game_registry(&self) -> &GameRuntimeRegistry {
+        &self.game_registry
     }
 
     /// Run an app with IO defined in [`params`] in the background
@@ -307,8 +261,7 @@ impl AppServer {
         let db = self.db.clone();
         let engine = self.engine.clone();
         let linker = self.linker.clone();
-        let module_cache = self.module_cache.clone();
-        let latest_versions = self.latest_versions.clone();
+        let game_registry = self.game_registry.clone();
         let author_env_secret_key = self.author_env_secret_key.clone();
 
         tokio::task::spawn(async move {
@@ -382,8 +335,7 @@ impl AppServer {
                 linker,
                 mesh,
                 author_env_secret_key,
-                module_cache,
-                latest_versions,
+                game_registry,
                 app_output_sender,
                 remote_sshid,
                 term,
@@ -738,50 +690,47 @@ impl AppServer {
                                     " \x1b[3mUploading replay... ",
                                     Duration::from_secs(REPLAY_UPLOAD_NOTIFICATION_SECS),
                                 ));
-                                let (initial_app_id, asciicast) = match replay_buffer.serialize_asciicast() {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "Failed to serialize replay");
-                                        let _ = notification_tx.try_send(StatusNotification::error(
-                                            " Failed to serialize replay. ",
-                                            Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
-                                        ));
-                                        continue;
-                                    }
-                                };
-                                let db = db.clone();
-                                let menu_session = menu_session.clone();
-                                let username = menu_username.clone();
-                                let (tx, rx) = tokio::sync::oneshot::channel();
-                                tokio::spawn(async move {
-                                    let (notif, session_update) = save_replay(
-                                        &db,
-                                        menu_session,
-                                        user_id,
-                                        initial_app_id,
-                                        &username,
-                                        &asciicast,
-                                    )
-                                    .await;
-                                    let notif = match notif {
-                                        Ok(url) => {
-                                            tracing::info!(%url, "Uploaded replay");
-                                            StatusNotification::info(
-                                                format!(
-                                                    " \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ",
-                                                    url, url
-                                                ),
-                                                Duration::from_secs(REPLAY_RESULT_NOTIFICATION_SECS),
-                                            )
-                                        }
-                                        Err(e) => StatusNotification::error(
-                                            format!(" {} ", e),
-                                            Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
-                                        ),
-                                    };
-                                    let _ = tx.send((notif, session_update));
-                                });
-                                pending_replay_upload = Some(rx);
+                                if let Ok((initial_app_id, asciicast)) = replay_buffer.serialize_asciicast() {
+                                    let db = db.clone();
+                                    let menu_session = menu_session.clone();
+                                    let username = menu_username.clone();
+                                    let (tx, rx) = tokio::sync::oneshot::channel();
+                                    tokio::spawn(async move {
+                                        let (notif, session_update) = save_replay(
+                                            &db,
+                                            menu_session,
+                                            user_id,
+                                            initial_app_id,
+                                            &username,
+                                            &asciicast,
+                                        )
+                                        .await;
+                                        let notif = match notif {
+                                            Ok(url) => {
+                                                tracing::info!(%url, "Uploaded replay");
+                                                StatusNotification::info(
+                                                    format!(
+                                                        " \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ",
+                                                        url, url
+                                                    ),
+                                                    Duration::from_secs(REPLAY_RESULT_NOTIFICATION_SECS),
+                                                )
+                                            }
+                                            Err(e) => StatusNotification::error(
+                                                format!(" {} ", e),
+                                                Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
+                                            ),
+                                        };
+                                        let _ = tx.send((notif, session_update));
+                                    });
+                                    pending_replay_upload = Some(rx);
+                                } else {
+                                    tracing::error!("Failed to serialize replay");
+                                    let _ = notification_tx.try_send(StatusNotification::error(
+                                        " Failed to serialize replay. ",
+                                        Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
+                                    ));
+                                }
                             }
 
                             _ = graceful_shutdown_token.cancelled(), if graceful_shutdown_timeout.is_none() => {
@@ -909,8 +858,7 @@ impl AppServer {
         let env_salt = app_row.get::<Vec<u8>>(3)?;
         let env_blob = app_row.get::<Vec<u8>>(4)?;
         let app_id = AppId { game_id, version };
-        let latest_version = track_game_version(&ctx.latest_versions, game_id, version).await;
-        update_atomic_max(&latest_version, version);
+        let latest_version = ctx.game_registry.subscribe(game_id, version);
 
         let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(app_id).await;
 
@@ -963,7 +911,9 @@ impl AppServer {
             .envs(&envs)
             .build_p1();
 
-        let module = Self::load_or_compile_module(ctx, app_id, &wasm_bytes).await?;
+        let module = ctx
+            .game_registry
+            .load_or_compile_module(game_id, &wasm_bytes, ctx.linker.engine())?;
         let instance_pre = ctx.linker.instantiate_pre(&module)?;
 
         Ok((
@@ -977,24 +927,6 @@ impl AppServer {
             },
             instance_pre,
         ))
-    }
-
-    async fn load_or_compile_module(
-        ctx: &AppContext,
-        app_id: AppId,
-        wasm_bytes: &[u8],
-    ) -> anyhow::Result<wasmtime::Module> {
-        {
-            let cache = ctx.module_cache.read().await;
-            if let Some(module) = cache.get(&app_id) {
-                return Ok(module.clone());
-            }
-        }
-
-        let module = wasmtime::Module::from_binary(ctx.linker.engine(), wasm_bytes)?;
-        let mut cache = ctx.module_cache.write().await;
-        let entry = cache.entry(app_id).or_insert(module);
-        Ok(entry.clone())
     }
 
     fn host_dial(
@@ -2217,29 +2149,6 @@ impl AppServer {
     }
 }
 
-async fn track_game_version(
-    latest_versions: &tokio::sync::RwLock<HashMap<u64, Arc<AtomicU64>>>,
-    game_id: u64,
-    version: u64,
-) -> Arc<AtomicU64> {
-    let mut guard = latest_versions.write().await;
-    guard
-        .entry(game_id)
-        .or_insert_with(|| Arc::new(AtomicU64::new(version)))
-        .clone()
-}
-
-fn update_atomic_max(value: &AtomicU64, next: u64) -> bool {
-    let mut current = value.load(Ordering::Acquire);
-    while next > current {
-        match value.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return true,
-            Err(observed) => current = observed,
-        }
-    }
-    false
-}
-
 async fn emit_output(
     output: Vec<u8>,
     replay_buffer: &mut ReplayBuffer,
@@ -2283,8 +2192,7 @@ pub struct AppContext {
     audio_enabled: bool,
     term: Option<String>,
     linker: Arc<wasmtime::Linker<AppState>>,
-    module_cache: Arc<tokio::sync::RwLock<HashMap<AppId, wasmtime::Module>>>,
-    latest_versions: Arc<tokio::sync::RwLock<HashMap<u64, Arc<AtomicU64>>>>,
+    game_registry: GameRuntimeRegistry,
     app_output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     user_id: Option<u64>,
     locale: String,

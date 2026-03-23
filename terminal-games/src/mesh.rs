@@ -39,7 +39,7 @@ enum Message {
     PeerListSync(PeerListSyncMessage),
     PeerAdded(PeerChangeMessage),
     PeerRemoved(PeerChangeMessage),
-    GameVersionUpdated(GameVersionUpdateMessage),
+    GameRuntimeUpdated(GameRuntimeUpdateMessage),
 }
 
 #[tarpc::service]
@@ -48,7 +48,7 @@ trait MeshRpc {
     async fn peer_list_sync(msg: PeerListSyncMessage);
     async fn peer_added(msg: PeerChangeMessage);
     async fn peer_removed(msg: PeerChangeMessage);
-    async fn game_version_updated(msg: GameVersionUpdateMessage);
+    async fn game_runtime_updated(msg: GameRuntimeUpdateMessage);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,11 +63,42 @@ struct PeerChangeMessage {
     app_id: AppId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GameVersionUpdateMessage {
-    pub shortname: String,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GameRuntimeUpdateKind {
+    Published,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GameRuntimeUpdateMessage {
     pub game_id: u64,
     pub version: u64,
+    pub kind: GameRuntimeUpdateKind,
+}
+
+impl GameRuntimeUpdateMessage {
+    pub fn published(game_id: u64, version: u64) -> Self {
+        Self {
+            game_id,
+            version,
+            kind: GameRuntimeUpdateKind::Published,
+        }
+    }
+
+    pub fn deleted(game_id: u64, version: u64) -> Self {
+        Self {
+            game_id,
+            version,
+            kind: GameRuntimeUpdateKind::Deleted,
+        }
+    }
+
+    fn supersedes(&self, other: &Self) -> bool {
+        self.version > other.version
+            || (self.version == other.version
+                && self.kind == GameRuntimeUpdateKind::Deleted
+                && other.kind == GameRuntimeUpdateKind::Published)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -423,11 +454,12 @@ struct MeshInner {
     regions: Mutex<HashMap<RegionId, RegionState>>,
     peers: Mutex<HashMap<AppId, HashMap<PeerId, tokio::sync::mpsc::Sender<PeerMessageApp>>>>,
     global_peers: Mutex<HashMap<AppId, HashSet<PeerId>>>,
+    latest_game_runtime_updates: Mutex<HashMap<u64, GameRuntimeUpdateMessage>>,
     discovery: Arc<dyn Discovery>,
     cancel: CancellationToken,
     tasks: TaskTracker,
     heal_now: Notify,
-    game_version_updates: broadcast::Sender<GameVersionUpdateMessage>,
+    game_runtime_updates: broadcast::Sender<GameRuntimeUpdateMessage>,
 }
 
 #[derive(Clone)]
@@ -448,11 +480,12 @@ impl Mesh {
     pub fn with_region(discovery: Arc<dyn Discovery>, region: RegionId) -> Self {
         Self {
             inner: Arc::new(MeshInner {
-                game_version_updates: broadcast::channel(64).0,
+                game_runtime_updates: broadcast::channel(64).0,
                 region,
                 regions: Default::default(),
                 peers: Default::default(),
                 global_peers: Default::default(),
+                latest_game_runtime_updates: Default::default(),
                 discovery,
                 cancel: CancellationToken::new(),
                 tasks: TaskTracker::new(),
@@ -638,13 +671,20 @@ impl Mesh {
         tracing::debug!("Mesh graceful shutdown complete");
     }
 
-    pub fn subscribe_game_version_updates(&self) -> broadcast::Receiver<GameVersionUpdateMessage> {
-        self.inner.game_version_updates.subscribe()
+    pub fn subscribe_game_runtime_updates(&self) -> broadcast::Receiver<GameRuntimeUpdateMessage> {
+        self.inner.game_runtime_updates.subscribe()
     }
 
-    pub async fn propagate_game_version_update(&self, update: GameVersionUpdateMessage) {
+    pub async fn replace_game_runtime_snapshot(&self, updates: Vec<GameRuntimeUpdateMessage>) {
+        self.inner.replace_game_runtime_snapshot(updates).await;
+    }
+
+    pub async fn propagate_game_runtime_update(&self, update: GameRuntimeUpdateMessage) {
+        if !self.inner.remember_game_runtime_update(update).await {
+            return;
+        }
         self.inner
-            .broadcast(Message::GameVersionUpdated(update))
+            .broadcast(Message::GameRuntimeUpdated(update))
             .await;
     }
 }
@@ -906,6 +946,13 @@ impl MeshInner {
                 .iter()
                 .map(|(app_id, peer_map)| (*app_id, peer_map.keys().copied().collect()))
                 .collect();
+            let local_game_runtime_updates = self
+                .latest_game_runtime_updates
+                .lock()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
             rpc_client
                 .peer_list_sync(
                     context::current(),
@@ -916,6 +963,14 @@ impl MeshInner {
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to send initial peer list sync: {}", e))?;
+            for update in local_game_runtime_updates {
+                rpc_client
+                    .game_runtime_updated(context::current(), update)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to send initial game runtime sync: {}", e)
+                    })?;
+            }
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
             let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
@@ -931,7 +986,7 @@ impl MeshInner {
                                 Message::PeerListSync(msg) => rpc_client.peer_list_sync(context::current(), msg).await,
                                 Message::PeerAdded(msg) => rpc_client.peer_added(context::current(), msg).await,
                                 Message::PeerRemoved(msg) => rpc_client.peer_removed(context::current(), msg).await,
-                                Message::GameVersionUpdated(msg) => rpc_client.game_version_updated(context::current(), msg).await,
+                                Message::GameRuntimeUpdated(msg) => rpc_client.game_runtime_updated(context::current(), msg).await,
                             };
                             if let Err(error) = send_result {
                                 tracing::warn!(region=%their_region, ?error, "RPC send failed");
@@ -1107,8 +1162,32 @@ impl MeshInner {
         }
     }
 
-    async fn handle_game_version_updated(&self, msg: GameVersionUpdateMessage) {
-        let _ = self.game_version_updates.send(msg);
+    async fn handle_game_runtime_updated(&self, msg: GameRuntimeUpdateMessage) {
+        if self.remember_game_runtime_update(msg).await {
+            let _ = self.game_runtime_updates.send(msg);
+        }
+    }
+
+    async fn replace_game_runtime_snapshot(&self, updates: Vec<GameRuntimeUpdateMessage>) {
+        let snapshot_ids = updates.iter().map(|update| update.game_id).collect::<HashSet<_>>();
+        let mut latest = self.latest_game_runtime_updates.lock().await;
+        latest.retain(|game_id, update| {
+            snapshot_ids.contains(game_id) || update.kind == GameRuntimeUpdateKind::Deleted
+        });
+        for update in updates {
+            latest.insert(update.game_id, update);
+        }
+    }
+
+    async fn remember_game_runtime_update(&self, update: GameRuntimeUpdateMessage) -> bool {
+        let mut latest = self.latest_game_runtime_updates.lock().await;
+        match latest.get(&update.game_id) {
+            Some(existing) if !update.supersedes(existing) => false,
+            _ => {
+                latest.insert(update.game_id, update);
+                true
+            }
+        }
     }
 }
 
@@ -1399,7 +1478,7 @@ impl MeshRpc for MeshRpcServer {
         self.inner.handle_peer_removed(msg).await;
     }
 
-    async fn game_version_updated(self, _: context::Context, msg: GameVersionUpdateMessage) {
-        self.inner.handle_game_version_updated(msg).await;
+    async fn game_runtime_updated(self, _: context::Context, msg: GameRuntimeUpdateMessage) {
+        self.inner.handle_game_runtime_updated(msg).await;
     }
 }

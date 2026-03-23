@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use dialoguer::Confirm;
-use terminal_games::control::{CacheInvalidateRequest, DeleteAuthorRequest};
+use terminal_games::control::DeleteAuthorRequest;
 
 use super::super::{AdminAuthorDeleteArgs, load_api};
 
@@ -21,7 +21,7 @@ pub(super) async fn run(args: AdminAuthorDeleteArgs, profile: Option<String>) ->
         return Ok(());
     }
     let api = load_api(profile.as_deref())?;
-    let deleted = api
+    api
         .rpc()
         .await?
         .author_delete(
@@ -33,18 +33,6 @@ pub(super) async fn run(args: AdminAuthorDeleteArgs, profile: Option<String>) ->
         .await?
         .map_err(anyhow::Error::msg)?
         .ok_or_else(|| anyhow::anyhow!("unknown author {}", args.author_id))?;
-    let invalidate_body = CacheInvalidateRequest {
-        shortname: deleted.shortname,
-    };
-    api.fanout(|rpc| {
-        let invalidate_body = invalidate_body.clone();
-        async move {
-            rpc.cache_invalidate(terminal_games::control::rpc_context(), invalidate_body)
-                .await?
-                .map_err(anyhow::Error::msg)
-        }
-    })
-    .await?;
     println!("Deleted author {}", args.author_id);
     Ok(())
 }

@@ -103,23 +103,30 @@ pub fn validate_shortname(shortname: &str) -> anyhow::Result<()> {
 }
 
 fn sanitize_wrapped_text(input: &str) -> String {
-    trim_trailing_empty_lines(&sanitize_ansi_text(input))
+    trim_trailing_empty_lines(&sanitize_ansi_text(input, true))
 }
 
 fn sanitize_screenshot(input: &str) -> String {
-    let mut vt = avt::Vt::new(SCREENSHOT_COLS, SCREENSHOT_ROWS);
-    vt.feed_str(&normalize_screenshot_lines(&sanitize_ansi_text(input)));
-    vt.dump()
+    let text = sanitize_ansi_text(input, true);
+    let mut rows = text
+        .split('\n')
+        .take(SCREENSHOT_ROWS)
+        .map(|line| crop_ansi_line(line, SCREENSHOT_COLS))
+        .collect::<Vec<_>>();
+    while rows.len() < SCREENSHOT_ROWS {
+        rows.push(" ".repeat(SCREENSHOT_COLS));
+    }
+    rows.join("\n")
 }
 
-fn sanitize_ansi_text(input: &str) -> String {
+fn sanitize_ansi_text(input: &str, allow_osc8: bool) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
             b'\x1b' => {
-                let (consumed, preserved) = parse_escape_sequence(&bytes[i..]);
+                let (consumed, preserved) = parse_escape_sequence(&bytes[i..], allow_osc8);
                 if preserved {
                     out.push_str(std::str::from_utf8(&bytes[i..i + consumed]).unwrap_or_default());
                 }
@@ -153,13 +160,13 @@ fn sanitize_ansi_text(input: &str) -> String {
     out
 }
 
-fn parse_escape_sequence(bytes: &[u8]) -> (usize, bool) {
+fn parse_escape_sequence(bytes: &[u8], allow_osc8: bool) -> (usize, bool) {
     if bytes.len() < 2 {
         return (bytes.len(), false);
     }
     match bytes[1] {
         b'[' => parse_csi_sequence(bytes),
-        b']' => parse_terminated_escape(bytes, b'\x07'),
+        b']' => parse_osc_sequence(bytes, allow_osc8),
         b'P' | b'X' | b'^' | b'_' => parse_st_terminated_escape(bytes),
         b'@'..=b'~' => (2, false),
         _ => (1, false),
@@ -183,14 +190,14 @@ fn parse_csi_sequence(bytes: &[u8]) -> (usize, bool) {
     (bytes.len(), false)
 }
 
-fn parse_terminated_escape(bytes: &[u8], terminator: u8) -> (usize, bool) {
+fn parse_osc_sequence(bytes: &[u8], allow_osc8: bool) -> (usize, bool) {
     let mut end = 2usize;
     while end < bytes.len() {
-        if bytes[end] == terminator {
-            return (end + 1, false);
+        if bytes[end] == b'\x07' {
+            return (end + 1, allow_osc8 && is_preserved_osc8(&bytes[..end + 1]));
         }
         if bytes[end] == b'\x1b' && bytes.get(end + 1) == Some(&b'\\') {
-            return (end + 2, false);
+            return (end + 2, allow_osc8 && is_preserved_osc8(&bytes[..end + 2]));
         }
         end += 1;
     }
@@ -212,6 +219,10 @@ fn is_safe_text_char(ch: char) -> bool {
     !ch.is_control() && UnicodeWidthChar::width(ch).is_some()
 }
 
+fn is_preserved_osc8(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x1b]8;;")
+}
+
 fn trim_trailing_empty_lines(text: &str) -> String {
     let lines = text.lines().collect::<Vec<_>>();
     let mut end = lines.len();
@@ -221,14 +232,38 @@ fn trim_trailing_empty_lines(text: &str) -> String {
     lines[..end].join("\n")
 }
 
-fn normalize_screenshot_lines(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + text.matches('\n').count());
-    for ch in text.chars() {
-        if ch == '\n' {
-            out.push('\r');
+fn crop_ansi_line(line: &str, max_width: usize) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len() + max_width);
+    let mut i = 0usize;
+    let mut width = 0usize;
+    while i < bytes.len() && width < max_width {
+        match bytes[i] {
+            b'\x1b' => {
+                let (consumed, preserved) = parse_escape_sequence(&bytes[i..], true);
+                if preserved {
+                    out.push_str(std::str::from_utf8(&bytes[i..i + consumed]).unwrap_or_default());
+                }
+                i += consumed.max(1);
+            }
+            _ => {
+                let tail = &line[i..];
+                let ch = tail.chars().next().unwrap_or_default();
+                let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if width + ch_width > max_width {
+                    break;
+                }
+                out.push(ch);
+                width += ch_width;
+                i += ch.len_utf8().max(1);
+            }
         }
-        out.push(ch);
     }
+    if width < max_width {
+        out.push_str(&" ".repeat(max_width - width));
+    }
+    out.push_str("\x1b]8;;\x1b\\");
+    out.push_str("\x1b[0m");
     out
 }
 
@@ -241,8 +276,8 @@ mod tests {
         let text = "hello\x1b[31m red\x1b[0m\x1b]8;;https://example.com\x1b\\bad\x1b[2J\nthere";
         let sanitized = sanitize_wrapped_text(text);
         assert!(sanitized.contains("\x1b[31m red\x1b[0m"));
+        assert!(sanitized.contains("\x1b]8;;https://example.com\x1b\\"));
         assert!(sanitized.contains("bad"));
-        assert!(!sanitized.contains("\x1b]8"));
         assert!(!sanitized.contains("\x1b[2J"));
     }
 
@@ -262,5 +297,18 @@ mod tests {
         let lines = stripped.split('\n').collect::<Vec<_>>();
         assert!(lines[0].starts_with("abc"));
         assert!(lines[1].starts_with("xyz"));
+    }
+
+    #[test]
+    fn screenshots_are_confined_to_24_rows() {
+        let screenshot = sanitize_screenshot(&"x\n".repeat(100));
+        let stripped = strip_ansi_escapes::strip_str(&screenshot);
+        assert_eq!(stripped.split('\n').count(), 24);
+    }
+
+    #[test]
+    fn screenshots_close_osc8_at_line_end() {
+        let screenshot = sanitize_screenshot("\x1b]8;;https://example.com\x1b\\hello");
+        assert!(screenshot.contains("\x1b]8;;\x1b\\\x1b[0m"));
     }
 }

@@ -305,11 +305,6 @@ pub struct AuthorSelfResponse {
     pub playtime_seconds: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheInvalidateRequest {
-    pub shortname: String,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BroadcastLevel {
@@ -421,7 +416,6 @@ pub trait AdminControlRpc {
     async fn author_delete(
         request: DeleteAuthorRequest,
     ) -> Result<Option<DeleteShortnameResponse>, RpcError>;
-    async fn cache_invalidate(request: CacheInvalidateRequest) -> Result<(), RpcError>;
 }
 
 #[tarpc::service]
