@@ -49,15 +49,16 @@ use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
 use terminal_games::app::{AppInstantiationParams, AppServer, SessionControl, SessionEndReason};
-use terminal_games::input_guard::{InputGuard, InputGuardError};
+use terminal_games::input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker};
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
 use terminal_games::terminal_profile::TerminalProfile;
 
 use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
 use crate::control::ControlPlane;
+use crate::idle::IdleMonitor;
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
-use crate::sessions::{FanoutTracker, SessionAdminControl, SessionRegistry};
+use crate::sessions::SessionRegistry;
 
 const DEFAULT_WEB_POW_DIFFICULTY: u8 = 18;
 const MAX_WEB_POW_DIFFICULTY: u8 = 32;
@@ -417,13 +418,10 @@ async fn handle_socket(
     let remote_sshid = sanitize_user_agent(&user_agent);
     let username = "web".to_string();
 
-    let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(initial_size);
     let cancellation_token = CancellationToken::new();
     let token = cancellation_token.clone();
-    let (mut input_guard, input_rx, idle_fuel_rx) =
-        InputGuard::new(cancellation_token.clone(), replay_request_tx.clone());
-    let mut input_tick = InputGuard::tick_interval();
+    let background_tracker = TerminalBackgroundTracker::default();
 
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
@@ -465,35 +463,44 @@ async fn handle_socket(
         connect_info.remote_addr.ip(),
         Transport::Web,
         first_app_shortname.clone(),
-        initial_size.0,
-        initial_size.1,
+        resize_rx.clone(),
     );
-    let mut admin_control = session_registration.control_rx;
-    let mut admin_input_rx = session_registration.admin_input_rx;
-    let status_bar_state_rx = session_registration.status_bar_state_rx;
+    let mut session_control = session_registration.control_rx;
+    let mut idle_rx = session_registration.idle_rx;
+    let app_input_sender = session_registration.app_input_sender.clone();
+    let app_input_receiver = session_registration.app_input_receiver;
+    let spy_snapshot_requests = session_registration.spy_snapshot_requests;
+    let session_ui = session_registration.session_ui;
+    let session_identity = session_registration.identity.clone();
     let _session_cleanup_guard = session_registration.cleanup_guard;
-    let session_guard =
-        server
-            .metrics
-            .start_session(Transport::Web, AuthKind::Anonymous, true, None);
-    let active_shortname_tracker = FanoutTracker::new(vec![
-        session_guard.active_shortname_tracker(),
-        session_registration.tracker,
-    ]);
-    let mut admitted_session = admission_ticket.start_session(session_guard);
+    let idle_notifications = session_ui.notification_sender();
+    let mut idle_monitor = IdleMonitor::new(idle_notifications);
+    idle_monitor.set_paused(idle_rx.borrow().paused);
+    let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
+    let input_forwarder = InputForwarder::new_with_sender(
+        cancellation_token.clone(),
+        app_input_sender.clone(),
+        replay_request_tx,
+    );
+    let session_metrics = server
+        .metrics
+        .start_session(session_identity.app(), Transport::Web, AuthKind::Anonymous, true, None);
+    let mut admitted_session = admission_ticket.start_session(session_metrics.clone());
     let mut cluster_control = admitted_session.subscribe_control();
-    let terminal_parser = input_guard.take_terminal_parser(initial_size.1, initial_size.0);
+    let mut app_metrics_rx = session_identity.app_receiver();
+    let terminal_parser = background_tracker.into_terminal_parser(initial_size.1, initial_size.0);
 
     let mut exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
-        first_app_shortname,
         args,
-        input_receiver: input_rx,
+        input_receiver: app_input_receiver,
         replay_request_receiver: replay_request_rx,
+        spy_snapshot_requests,
         output_sender: output_tx,
         audio_sender: Some(audio_tx),
         remote_sshid,
         term: Some("xterm-256color".to_string()),
-        username: username.clone(),
+        session_identity,
+        session_ui,
         window_size_receiver: resize_rx,
         graceful_shutdown_token: token,
         network_info: connect_info.network_info,
@@ -502,13 +509,8 @@ async fn handle_socket(
         user_id: None,
         locale,
         log_backend: Arc::new(NoopLogBackend),
-        active_shortname_tracker: Some(active_shortname_tracker),
-        idle_fuel_receiver: Some(idle_fuel_rx),
-        status_bar_state_receiver: status_bar_state_rx,
     });
-    let mut pending_input: Option<
-        Pin<Box<dyn Future<Output = Result<(), InputGuardError>> + Send>>,
-    > = None;
+    let mut pending_input: Option<Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>> = None;
     let close_reason = loop {
         tokio::select! {
             biased;
@@ -525,10 +527,41 @@ async fn handle_socket(
                         tracing::error!(?error, "App exit channel dropped");
                     }
                 }
-                if input_guard.is_idle_timed_out() {
-                    break SessionEndReason::IdleTimeout;
-                }
                 break SessionEndReason::NormalExit;
+            }
+
+            changed = session_control.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                let SessionControl::Close(reason) = *session_control.borrow() else {
+                    continue;
+                };
+                cancellation_token.cancel();
+                break reason;
+            }
+
+            result = async {
+                pending_input.as_mut().expect("guarded by select").await
+            }, if pending_input.is_some() => {
+                if result.is_err() {
+                    break SessionEndReason::ConnectionLost;
+                }
+                pending_input = None;
+            }
+
+            changed = ban_changes.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                if server
+                    .admission_controller
+                    .is_ip_banned(connect_info.remote_addr.ip())
+                {
+                    server
+                        .session_registry
+                        .request_close(local_session_id, SessionEndReason::BannedIp);
+                }
             }
 
             changed = cluster_control.changed() => {
@@ -538,40 +571,41 @@ async fn handle_socket(
                 let SessionControl::Close(reason) = *cluster_control.borrow() else {
                     continue;
                 };
-                cancellation_token.cancel();
-                break reason;
+                server.session_registry.request_close(local_session_id, reason);
             }
 
-            changed = ban_changes.changed() => {
-                if changed.is_err() || !server.admission_controller.is_ip_banned(connect_info.remote_addr.ip()) {
-                    continue;
-                }
-                cancellation_token.cancel();
-                break SessionEndReason::BannedIp;
-            }
-
-            changed = admin_control.changed() => {
+            changed = app_metrics_rx.changed() => {
                 if changed.is_err() {
                     continue;
                 }
-                let SessionAdminControl::Kick = *admin_control.borrow() else {
-                    continue;
-                };
-                cancellation_token.cancel();
-                break SessionEndReason::KickedByAdmin;
+                let app = app_metrics_rx.borrow_and_update().clone();
+                session_metrics.set_active_app(&app);
             }
 
-            result = async {
-                pending_input.as_mut().expect("guarded by select").await
-            }, if pending_input.is_some() => {
-                if result.is_err() {
-                    break SessionEndReason::NormalExit;
+            _ = idle_monitor.wait_for_tick() => {
+                if let Some(reason) = idle_monitor.on_tick() {
+                    server
+                        .session_registry
+                        .set_idle_fuel(local_session_id, idle_monitor.idle_state().fuel_seconds);
+                    server
+                        .session_registry
+                        .request_close(local_session_id, reason);
+                } else {
+                    server
+                        .session_registry
+                        .set_idle_fuel(local_session_id, idle_monitor.idle_state().fuel_seconds);
                 }
-                pending_input = None;
             }
 
-            _ = input_tick.tick() => {
-                input_guard.tick();
+            changed = idle_rx.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                let idle_state = *idle_rx.borrow_and_update();
+                idle_monitor.set_paused(idle_state.paused);
+                server
+                    .session_registry
+                    .set_idle_fuel(local_session_id, idle_monitor.idle_state().fuel_seconds);
             }
 
             data = output_rx.recv() => {
@@ -588,7 +622,7 @@ async fn handle_socket(
                     }
                 }
                 msg.push(0x00);
-                server.metrics.record_bytes(Direction::Out, Transport::Web, msg.len());
+                session_metrics.record_bytes(Direction::Out, msg.len());
                 server.control.record_bytes(msg.len());
                 if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
                     cancellation_token.cancel();
@@ -602,20 +636,12 @@ async fn handle_socket(
                 };
                 admitted_session.record_output(data.len());
                 data.push(0x01);
-                server.metrics.record_bytes(Direction::Out, Transport::Web, data.len());
+                session_metrics.record_bytes(Direction::Out, data.len());
                 server.control.record_bytes(data.len());
                 if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
                     cancellation_token.cancel();
                     break SessionEndReason::ConnectionLost;
                 }
-            }
-
-            data = admin_input_rx.recv(), if pending_input.is_none() => {
-                let Some(data) = data else {
-                    continue;
-                };
-                admitted_session.record_input(&data);
-                pending_input = Some(Box::pin(input_guard.prepare_input(data).send()));
             }
 
             msg = receiver.next(), if pending_input.is_none() => {
@@ -625,18 +651,18 @@ async fn handle_socket(
                 };
                 match msg {
                     Ok(Message::Binary(data)) => {
-                        server.metrics.record_bytes(Direction::In, Transport::Web, data.len());
+                        idle_monitor.observe_input(&data);
+                        session_metrics.record_bytes(Direction::In, data.len());
                         server.control.record_bytes(data.len());
                         admitted_session.record_input(&data);
                         server.session_registry.record_input(local_session_id, &data);
-                        pending_input = Some(Box::pin(input_guard.prepare_input(data).send()));
+                        pending_input = Some(Box::pin(input_forwarder.prepare_input(data).send()));
                     }
                     Ok(Message::Text(text)) => {
                         let text_str = text.to_string();
                         if let Some(rest) = text_str.strip_prefix("resize:") {
                             if let Some((w, h)) = parse_resize(rest) {
                                 let _ = resize_tx.send((w, h));
-                                server.session_registry.record_resize(local_session_id, w, h);
                             }
                         } else if let Some(ts) = text_str.strip_prefix("ping:") {
                             if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
@@ -656,6 +682,7 @@ async fn handle_socket(
     };
 
     cancellation_token.cancel();
+    session_metrics.finish(close_reason);
     server
         .session_registry
         .finish(local_session_id, close_reason);

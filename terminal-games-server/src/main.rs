@@ -5,6 +5,7 @@
 mod admission;
 mod cluster_detection;
 mod control;
+mod idle;
 mod metrics;
 mod sessions;
 mod ssh;
@@ -380,6 +381,11 @@ async fn main() -> Result<()> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| mesh.region().to_string());
+    let admin_shared_secret = std::env::var("ADMIN_SHARED_SECRET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(Arc::<str>::from);
     let session_registry = sessions::SessionRegistry::new(region_id);
     let initial_status_bar_state =
         control::load_status_bar_state(&conn, &session_registry.region_id()).await?;
@@ -390,6 +396,8 @@ async fn main() -> Result<()> {
         session_registry.clone(),
         mesh.clone(),
         max_active_apps,
+        admin_shared_secret,
+        session_registry.region_id().to_string(),
     );
 
     tokio::select! {

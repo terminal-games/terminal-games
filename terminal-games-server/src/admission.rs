@@ -5,7 +5,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ipnet::IpNet;
@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, watch};
 use crate::cluster_detection::{
     self, ClusterEvaluation, ClusterEvaluationJob, HistoricalSignature, NetworkPrefix,
 };
-use crate::metrics::{ServerMetrics, SessionGuard, Transport};
+use crate::metrics::{ServerMetrics, SessionHandle, Transport};
 use terminal_games::app::{SessionControl, SessionEndReason};
 
 pub(crate) const INPUT_WINDOW_MS: u64 = 8 * 60_000;
@@ -153,7 +153,7 @@ pub struct AdmissionTicket {
     control_rx: watch::Receiver<SessionControl>,
     pending_output_bytes: usize,
     pending_output_started_at_ms: Option<u64>,
-    session_guard: Option<SessionGuard>,
+    session_guard: Option<SessionHandle>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -277,7 +277,7 @@ impl AdmissionController {
             }),
         };
         let active_bans = {
-            let guard = lock(&controller.inner.banned_ips);
+            let guard = controller.inner.banned_ips.lock().unwrap();
             guard.len()
         };
         controller
@@ -293,7 +293,7 @@ impl AdmissionController {
         let matched_ban = self.matching_ip_ban(client_ip);
 
         {
-            let mut state = lock(&self.inner.state);
+            let mut state = self.inner.state.lock().unwrap();
             if let Some(ban) = matched_ban {
                 tracing::warn!(
                     client_ip = %client_ip,
@@ -349,7 +349,7 @@ impl AdmissionController {
         let Some(threshold) = self.inner.config.ssh_captcha_threshold else {
             return false;
         };
-        let state = lock(&self.inner.state);
+        let state = self.inner.state.lock().unwrap();
         cluster_detection::compute_pressure(state.running.len(), self.inner.config.max_running)
             >= threshold
     }
@@ -359,7 +359,7 @@ impl AdmissionController {
     }
 
     pub fn matching_ip_ban(&self, client_ip: IpAddr) -> Option<MatchedBan> {
-        let mut banned_ips = lock(&self.inner.banned_ips);
+        let mut banned_ips = self.inner.banned_ips.lock().unwrap();
         matching_ban_for_ip(&mut banned_ips, client_ip)
     }
 
@@ -378,7 +378,7 @@ impl AdmissionController {
         let mut activated = 0usize;
         let active_ban_count;
         {
-            let mut current = lock(&self.inner.banned_ips);
+            let mut current = self.inner.banned_ips.lock().unwrap();
             for (rule, reason, expires_at) in updates {
                 let was_active = current
                     .get(&rule.key)
@@ -429,7 +429,7 @@ impl AdmissionController {
             return summary;
         }
         let _ = self.inner.ban_changes.send(());
-        let mut state = lock(&self.inner.state);
+        let mut state = self.inner.state.lock().unwrap();
         let mut idx = 0usize;
         let mut removed_any = false;
         let mut evicted_from_queue = 0usize;
@@ -494,7 +494,7 @@ impl AdmissionTicket {
         self.rx.clone()
     }
 
-    pub fn start_session(mut self, session_guard: SessionGuard) -> Self {
+    pub fn start_session(mut self, session_guard: SessionHandle) -> Self {
         let now_ms = monotonic_millis();
         let (control_tx, control_rx) = watch::channel(SessionControl::Active);
         let _ = self
@@ -583,7 +583,7 @@ impl Drop for AdmissionTicket {
                 .cluster_tx
                 .send(ClusterEvent::SessionEnded(self.id));
         }
-        let mut state = lock(&self.controller.state);
+        let mut state = self.controller.state.lock().unwrap();
         match *self.rx.borrow() {
             AdmissionState::Allowed => {
                 if let Some(idx) = state.running.iter().position(|(id, _)| *id == self.id) {
@@ -890,11 +890,4 @@ fn monotonic_millis() -> u64 {
         .elapsed()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
 }

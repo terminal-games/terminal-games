@@ -379,16 +379,33 @@ pub enum SpyControlMessage {
         cols: u16,
         rows: u16,
     },
+    App {
+        app_id: Option<String>,
+        shortname: String,
+    },
     Metadata {
         username: String,
     },
     Input {
         data: Vec<u8>,
     },
+    Idle {
+        fuel_seconds: i32,
+        paused: bool,
+    },
     Closed {
         reason_slug: String,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SpyClientMessage {
+    SetIdlePaused {
+        paused: bool,
+    },
+    Kick,
 }
 
 #[tarpc::service]

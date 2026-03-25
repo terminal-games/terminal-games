@@ -13,6 +13,6 @@ pub mod manifest;
 pub mod mesh;
 pub mod palette;
 pub mod rate_limiting;
-mod replay;
+pub mod replay;
 mod status_bar;
 pub mod terminal_profile;

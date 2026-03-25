@@ -7,7 +7,7 @@ use std::{collections::VecDeque, io::Read, thread, time::Instant};
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
-use terminal_games::control::{SessionSummary, SpyControlMessage};
+use terminal_games::control::{SessionSummary, SpyClientMessage, SpyControlMessage};
 use terminal_games::palette::{self, Color as PaletteColor};
 use terminal_games::terminal_profile::{TerminalColorMode, TerminalProfile};
 use terminput::{
@@ -121,6 +121,17 @@ pub(super) async fn session_spy(args: AdminSessionSpyArgs, profile: Option<Strin
                                     vt.resize((cols as usize).max(1), (rows as usize).max(1));
                                     render_spy_view(vt, local_size, &status_bar, &input_overlay, &mut stdout).await?;
                                 }
+                                SpyControlMessage::App { app_id, shortname } => {
+                                    status_bar.set_app(app_id, shortname);
+                                    render_spy_view_if_ready(
+                                        vt.as_ref(),
+                                        local_size,
+                                        &status_bar,
+                                        &input_overlay,
+                                        &mut stdout,
+                                    )
+                                    .await?;
+                                }
                                 SpyControlMessage::Metadata { username } => {
                                     status_bar.set_username(username);
                                     render_spy_view_if_ready(
@@ -144,6 +155,17 @@ pub(super) async fn session_spy(args: AdminSessionSpyArgs, profile: Option<Strin
                                         )
                                         .await?;
                                     }
+                                }
+                                SpyControlMessage::Idle { fuel_seconds, paused } => {
+                                    status_bar.set_idle(fuel_seconds, paused);
+                                    render_spy_view_if_ready(
+                                        vt.as_ref(),
+                                        local_size,
+                                        &status_bar,
+                                        &input_overlay,
+                                        &mut stdout,
+                                    )
+                                    .await?;
                                 }
                                 SpyControlMessage::Closed { reason_slug: _, message } => {
                                     exit_message = Some(format!("Spy ended: {message}"));
@@ -173,16 +195,22 @@ pub(super) async fn session_spy(args: AdminSessionSpyArgs, profile: Option<Strin
                 }
                 data = stdin_rx.recv() => {
                     let Some(data) = data else { break };
-                    let Some(forwarded) = apply_spy_local_shortcuts(
+                    let shortcut = apply_spy_local_shortcuts(
                         &data,
                         &mut status_bar,
                         vt.as_ref(),
                         local_size,
                         &input_overlay,
                         &mut stdout,
-                    ).await? else {
+                    ).await?;
+                    let Some(forwarded) = shortcut.forwarded else {
                         break;
                     };
+                    if let Some(message) = shortcut.command {
+                        write
+                            .send(Message::Text(serde_json::to_string(&message)?.into()))
+                            .await?;
+                    }
                     if args.rw && !forwarded.is_empty() {
                         write.send(Message::Binary(forwarded.into())).await?;
                     }
@@ -527,29 +555,60 @@ async fn apply_spy_local_shortcuts(
     local_size: (u16, u16),
     input_overlay: &SpyInputOverlay,
     stdout: &mut tokio::io::Stdout,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<SpyShortcutOutcome> {
     let mut forwarded = data.to_vec();
     let mut toggled = false;
+    let mut command = None;
     if let Ok(Some(TerminputEvent::Key(key))) = TerminputEvent::parse_from(data)
         && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
         && key.modifiers.contains(KeyModifiers::CTRL)
     {
         match key.code {
-            KeyCode::Char('c') | KeyCode::Char('C') => return Ok(None),
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                return Ok(SpyShortcutOutcome {
+                    forwarded: None,
+                    command: None,
+                });
+            }
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 status_bar.toggle_input_overlay();
                 toggled = true;
                 forwarded.clear();
             }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                let paused = status_bar.toggle_idle_paused();
+                toggled = true;
+                forwarded.clear();
+                command = Some(SpyClientMessage::SetIdlePaused { paused });
+            }
+            KeyCode::Char('k') | KeyCode::Char('K') => {
+                forwarded.clear();
+                command = Some(SpyClientMessage::Kick);
+            }
             _ => {}
         }
     } else {
         match data {
-            [0x03] => return Ok(None),
+            [0x03] => {
+                return Ok(SpyShortcutOutcome {
+                    forwarded: None,
+                    command: None,
+                });
+            }
             [0x14] => {
                 status_bar.toggle_input_overlay();
                 toggled = true;
                 forwarded.clear();
+            }
+            [0x10] => {
+                let paused = status_bar.toggle_idle_paused();
+                toggled = true;
+                forwarded.clear();
+                command = Some(SpyClientMessage::SetIdlePaused { paused });
+            }
+            [0x0b] => {
+                forwarded.clear();
+                command = Some(SpyClientMessage::Kick);
             }
             _ => {}
         }
@@ -557,11 +616,21 @@ async fn apply_spy_local_shortcuts(
     if toggled && let Some(vt) = vt {
         render_spy_view(vt, local_size, status_bar, input_overlay, stdout).await?;
     }
-    Ok(Some(forwarded))
+    Ok(SpyShortcutOutcome {
+        forwarded: Some(forwarded),
+        command,
+    })
+}
+
+struct SpyShortcutOutcome {
+    forwarded: Option<Vec<u8>>,
+    command: Option<SpyClientMessage>,
 }
 
 struct SpyStatusBar {
     session: SessionSummary,
+    idle_fuel_seconds: i32,
+    idle_paused: bool,
     read_write: bool,
     show_input_overlay: bool,
     attached_at: std::time::Instant,
@@ -572,6 +641,8 @@ impl SpyStatusBar {
     fn new(session: SessionSummary, read_write: bool, show_input_overlay: bool) -> Self {
         Self {
             session,
+            idle_fuel_seconds: 60,
+            idle_paused: false,
             read_write,
             show_input_overlay,
             attached_at: std::time::Instant::now(),
@@ -605,20 +676,32 @@ impl SpyStatusBar {
         } else {
             "show input"
         };
-        let hint_plain = format!("ctrl+t: {input_hint_value} ctrl+c: exit");
+        let idle_hint_value = if self.idle_paused {
+            "resume idle"
+        } else {
+            "pause idle"
+        };
+        let hint_plain = format!(
+            "ctrl+t: {input_hint_value} ctrl+p: {idle_hint_value} ctrl+k: kick ctrl+c: exit"
+        );
         let hint = StatusField {
             width: visible_width(&hint_plain),
             ansi: format!(
-                "\x1b[{}mctrl+t:\x1b[{}m {} \x1b[{}mctrl+c:\x1b[{}m exit",
+                "\x1b[{}mctrl+t:\x1b[{}m {} \x1b[{}mctrl+p:\x1b[{}m {} \x1b[{}mctrl+k:\x1b[{}m kick \x1b[{}mctrl+c:\x1b[{}m exit",
                 palette::render_color_code(theme.muted, false),
                 palette::render_color_code(theme.text, false),
                 input_hint_value,
                 palette::render_color_code(theme.muted, false),
                 palette::render_color_code(theme.text, false),
+                idle_hint_value,
+                palette::render_color_code(theme.muted, false),
+                palette::render_color_code(theme.text, false),
+                palette::render_color_code(theme.muted, false),
+                palette::render_color_code(theme.text, false),
             ),
         };
         let hint_total_width = hint.width + 1;
-        let reserve_hint = remaining_width > hint_total_width + 24;
+        let reserve_hint = remaining_width > hint_total_width + 20;
         let left_budget = if reserve_hint {
             remaining_width.saturating_sub(hint_total_width)
         } else {
@@ -630,6 +713,22 @@ impl SpyStatusBar {
                 theme.text,
                 "mode",
                 if self.read_write { "rw" } else { "readonly" },
+            ),
+            status_field(
+                theme.muted,
+                theme.text,
+                "app",
+                &self.session.shortname,
+            ),
+            status_field(
+                theme.muted,
+                theme.text,
+                "idle",
+                &if self.idle_paused {
+                    format!("paused {}s", self.idle_fuel_seconds)
+                } else {
+                    format!("{}s", self.idle_fuel_seconds)
+                },
             ),
             status_field(
                 theme.muted,
@@ -706,8 +805,22 @@ impl SpyStatusBar {
         self.session.username = username;
     }
 
+    fn set_app(&mut self, _app_id: Option<String>, shortname: String) {
+        self.session.shortname = shortname;
+    }
+
+    fn set_idle(&mut self, fuel_seconds: i32, paused: bool) {
+        self.idle_fuel_seconds = fuel_seconds;
+        self.idle_paused = paused;
+    }
+
     fn toggle_input_overlay(&mut self) {
         self.show_input_overlay = !self.show_input_overlay;
+    }
+
+    fn toggle_idle_paused(&mut self) -> bool {
+        self.idle_paused = !self.idle_paused;
+        self.idle_paused
     }
 
     fn show_input_overlay(&self) -> bool {

@@ -44,8 +44,9 @@ use terminal_games::{
         CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest, DeleteShortnameRequest,
         DeleteShortnameResponse, KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus,
         RotateAuthorTokenRequest, RotateAuthorTokenResponse, RpcError, SessionSummary,
-        SpyControlMessage, StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry,
-        TickerRemoveRequest, TickerReorderRequest, UploadGameRequest, UploadGameResponse,
+        SpyClientMessage, SpyControlMessage, StatusBarState, StatusBroadcast, TickerAddRequest,
+        TickerEntry, TickerRemoveRequest, TickerReorderRequest, UploadGameRequest,
+        UploadGameResponse,
         expiry_from_duration, parse_duration_string, parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
@@ -84,17 +85,9 @@ impl ControlPlane {
         session_registry: Arc<SessionRegistry>,
         mesh: Mesh,
         max_capacity: usize,
+        admin_shared_secret: Option<Arc<str>>,
+        region_id: String,
     ) -> Self {
-        let admin_shared_secret = std::env::var("ADMIN_SHARED_SECRET")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(Arc::<str>::from);
-        let region_id = std::env::var("REGION_ID")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| mesh.region().to_string());
         Self {
             app_server,
             admission_controller,
@@ -1155,22 +1148,34 @@ pub async fn admin_session_spy(
     State(control): State<ControlPlane>,
     _: AdminGuard,
 ) -> Response {
-    let Some(spy) = control.session_registry.spy(local_session_id, query.rw) else {
+    let Some(spy) = control.session_registry.spy(local_session_id, query.rw).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    ws.on_upgrade(move |socket| run_spy_socket(socket, spy, query.rw, query.show_input))
+    let session_registry = control.session_registry.clone();
+    ws.on_upgrade(move |socket| {
+        run_spy_socket(
+            socket,
+            spy,
+            session_registry,
+            local_session_id,
+            query.rw,
+            query.show_input,
+        )
+    })
 }
 
 async fn run_spy_socket(
     mut socket: WebSocket,
     mut spy: crate::sessions::SpySession,
+    session_registry: Arc<SessionRegistry>,
+    local_session_id: u64,
     rw: bool,
     show_input: bool,
 ) {
     let init = serde_json::to_string(&SpyControlMessage::Init {
-        cols: spy.initial_cols,
-        rows: spy.initial_rows,
-        dump: spy.initial_dump,
+        cols: spy.snapshot.cols,
+        rows: spy.snapshot.rows,
+        dump: spy.snapshot.dump.clone(),
     });
     let Ok(init) = init else {
         return;
@@ -1178,37 +1183,49 @@ async fn run_spy_socket(
     if socket.send(Message::Text(init.into())).await.is_err() {
         return;
     }
+    let initial_app = spy.app_rx.borrow().clone();
+    let Ok(payload) = serde_json::to_string(&SpyControlMessage::App {
+        app_id: initial_app.app_id.map(|app_id| app_id.to_string()),
+        shortname: initial_app.shortname,
+    }) else {
+        return;
+    };
+    if socket.send(Message::Text(payload.into())).await.is_err() {
+        return;
+    }
+    let initial_username = spy.username_rx.borrow().clone();
+    let Ok(payload) = serde_json::to_string(&SpyControlMessage::Metadata {
+        username: initial_username,
+    }) else {
+        return;
+    };
+    if socket.send(Message::Text(payload.into())).await.is_err() {
+        return;
+    }
+    let initial_idle = *spy.idle_rx.borrow();
+    let Ok(payload) = serde_json::to_string(&SpyControlMessage::Idle {
+        fuel_seconds: initial_idle.fuel_seconds,
+        paused: initial_idle.paused,
+    }) else {
+        return;
+    };
+    if socket.send(Message::Text(payload.into())).await.is_err() {
+        return;
+    }
 
     loop {
         tokio::select! {
             message = spy.event_rx.recv() => {
                 let Ok(message) = message else {
-                    let _ = close_spy_socket(&mut socket, "spy stream ended").await;
+                    let _ = socket.send(Message::Close(Some(CloseFrame {
+                        code: 1000,
+                        reason: "spy stream ended".into(),
+                    }))).await;
                     break;
                 };
                 match message {
                     crate::sessions::SpyEvent::Output(data) => {
                         if socket.send(Message::Binary(data.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    crate::sessions::SpyEvent::Resize { cols, rows } => {
-                        let Ok(payload) =
-                            serde_json::to_string(&SpyControlMessage::Resize { cols, rows })
-                        else {
-                            break;
-                        };
-                        if socket.send(Message::Text(payload.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    crate::sessions::SpyEvent::Metadata { username } => {
-                        let Ok(payload) =
-                            serde_json::to_string(&SpyControlMessage::Metadata { username })
-                        else {
-                            break;
-                        };
-                        if socket.send(Message::Text(payload.into())).await.is_err() {
                             break;
                         }
                     }
@@ -1226,9 +1243,77 @@ async fn run_spy_socket(
                         }
                     }
                     crate::sessions::SpyEvent::Closed { reason } => {
-                        let _ = send_spy_closed(&mut socket, reason).await;
+                        let Ok(payload) = serde_json::to_string(&SpyControlMessage::Closed {
+                            reason_slug: reason.slug().to_string(),
+                            message: reason.user_message().to_string(),
+                        }) else {
+                            break;
+                        };
+                        if socket.send(Message::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                        let _ = socket.send(Message::Close(Some(CloseFrame {
+                            code: 1000,
+                            reason: reason.user_message().into(),
+                        }))).await;
                         break;
                     }
+                }
+            }
+            changed = spy.size_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let (cols, rows) = *spy.size_rx.borrow_and_update();
+                let Ok(payload) = serde_json::to_string(&SpyControlMessage::Resize { cols, rows }) else {
+                    break;
+                };
+                if socket.send(Message::Text(payload.into())).await.is_err() {
+                    break;
+                }
+            }
+            changed = spy.username_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let username = spy.username_rx.borrow_and_update().clone();
+                let Ok(payload) = serde_json::to_string(&SpyControlMessage::Metadata {
+                    username,
+                }) else {
+                    break;
+                };
+                if socket.send(Message::Text(payload.into())).await.is_err() {
+                    break;
+                }
+            }
+            changed = spy.app_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let app = spy.app_rx.borrow_and_update().clone();
+                let Ok(payload) = serde_json::to_string(&SpyControlMessage::App {
+                    app_id: app.app_id.map(|app_id| app_id.to_string()),
+                    shortname: app.shortname,
+                }) else {
+                    break;
+                };
+                if socket.send(Message::Text(payload.into())).await.is_err() {
+                    break;
+                }
+            }
+            changed = spy.idle_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let idle = *spy.idle_rx.borrow_and_update();
+                let Ok(payload) = serde_json::to_string(&SpyControlMessage::Idle {
+                    fuel_seconds: idle.fuel_seconds,
+                    paused: idle.paused,
+                }) else {
+                    break;
+                };
+                if socket.send(Message::Text(payload.into())).await.is_err() {
+                    break;
                 }
             }
             incoming = socket.recv() => {
@@ -1246,34 +1331,25 @@ async fn run_spy_socket(
                             break;
                         }
                     }
+                    Message::Text(text) => {
+                        let Ok(message) = serde_json::from_str::<SpyClientMessage>(&text) else {
+                            continue;
+                        };
+                        match message {
+                            SpyClientMessage::SetIdlePaused { paused } => {
+                                session_registry.set_idle_paused(local_session_id, paused);
+                            }
+                            SpyClientMessage::Kick => {
+                                session_registry.kick(local_session_id);
+                            }
+                        }
+                    }
                     Message::Close(_) => break,
                     _ => {}
                 }
             }
         }
     }
-}
-
-async fn send_spy_closed(
-    socket: &mut WebSocket,
-    reason: terminal_games::app::SessionEndReason,
-) -> Result<(), axum::Error> {
-    let payload = serde_json::to_string(&SpyControlMessage::Closed {
-        reason_slug: reason.slug().to_string(),
-        message: reason.user_message().to_string(),
-    })
-    .map_err(axum::Error::new)?;
-    socket.send(Message::Text(payload.into())).await?;
-    close_spy_socket(socket, reason.user_message()).await
-}
-
-async fn close_spy_socket(socket: &mut WebSocket, reason: &str) -> Result<(), axum::Error> {
-    socket
-        .send(Message::Close(Some(CloseFrame {
-            code: 1000,
-            reason: reason.into(),
-        })))
-        .await
 }
 
 async fn load_author_record_by_shortname(

@@ -4,7 +4,6 @@
 
 use std::{
     fs,
-    future::Future,
     io::{Read, Write},
     path::{Path, PathBuf},
     pin::Pin,
@@ -25,10 +24,10 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, layer::SubscriberExt};
 
 use terminal_games::{
-    app::{AppInstantiationParams, AppServer},
+    app::{AppInstantiationParams, AppServer, SessionIdentity, SessionUi},
     author_env::{encrypt_author_env_blob, validate_author_envs},
     control::{AuthorEnvVar, StatusBarState},
-    input_guard::{InputGuard, InputGuardError},
+    input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker},
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
     mesh::GameRuntimeUpdateMessage,
     mesh::{BuildId, LocalDiscovery, Mesh},
@@ -678,15 +677,11 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         crossterm::cursor::Hide
     )?;
 
-    let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(crossterm::terminal::size()?);
-
-    let (mut input_guard, input_rx, idle_fuel_rx) =
-        InputGuard::new(graceful_shutdown_token.clone(), replay_request_tx.clone());
-    let mut input_tick = args.idle_timeout.then(InputGuard::tick_interval);
-    let idle_fuel_receiver = args.idle_timeout.then_some(idle_fuel_rx);
+    let mut background_tracker = TerminalBackgroundTracker::default();
     let (raw_input_tx, mut raw_input_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+    let (_snapshot_tx, snapshot_rx) = tokio::sync::mpsc::channel(1);
     let network_info = Arc::new(NetworkInformation::new_simulated(args.latency));
     let compress = args.compress;
     let bandwidth = args.bandwidth;
@@ -732,41 +727,48 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     let mut terminal_profile = TerminalProfile::from_term(Some(&term), colorterm.as_deref());
     stdout.write_all(b"\x1b]11;?\x07")?;
     stdout.flush()?;
-    if let Some(rgb) = input_guard
+    if let Some(rgb) = background_tracker
         .wait_for_terminal_background(&mut raw_input_rx, Duration::from_millis(500))
-        .await?
+        .await
     {
         terminal_profile = terminal_profile.with_background_rgb(rgb);
     }
     let (first_cols, first_rows) = *resize_rx.borrow();
-    let terminal_parser = input_guard.take_terminal_parser(first_rows, first_cols);
+    let terminal_parser = background_tracker.into_terminal_parser(first_rows, first_cols);
     let (_status_bar_state_tx, status_bar_state_rx) =
         tokio::sync::watch::channel(StatusBarState::default());
+    let session_identity = SessionIdentity::new(username.clone(), first_app_shortname);
+    let session_ui = SessionUi::new(status_bar_state_rx);
+    let (app_input_tx, app_input_rx) = tokio::sync::mpsc::channel::<Bytes>(12);
+    let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
+    let input_forwarder = InputForwarder::new_with_sender(
+        graceful_shutdown_token.clone(),
+        app_input_tx,
+        replay_request_tx,
+    );
 
     let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
         args: None,
-        input_receiver: input_rx,
+        input_receiver: app_input_rx,
         replay_request_receiver: replay_request_rx,
+        spy_snapshot_requests: snapshot_rx,
         output_sender: output_tx,
         audio_sender: audio_player.as_ref().map(|_| audio_tx),
         remote_sshid: "cli".to_string(),
         term: Some(term.clone()),
-        username: username.clone(),
+        session_identity,
+        session_ui,
         window_size_receiver: resize_rx,
         graceful_shutdown_token: graceful_shutdown_token.clone(),
         network_info: network_info.clone(),
         terminal_profile,
         terminal_parser,
-        first_app_shortname,
         user_id,
         locale,
         log_backend: guest_log_backend,
-        active_shortname_tracker: None,
-        idle_fuel_receiver,
-        status_bar_state_receiver: status_bar_state_rx,
     });
     let mut pending_input: Option<
-        Pin<Box<dyn Future<Output = Result<(), InputGuardError>> + Send>>,
+        Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>,
     > = None;
 
     let mut sigwinch =
@@ -839,6 +841,10 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                 break;
             }
 
+            _ = sigint.recv() => {
+                graceful_shutdown_token.cancel();
+            }
+
             result = async {
                 pending_input.as_mut().expect("guarded by select").await
             }, if pending_input.is_some() => {
@@ -848,19 +854,9 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                 pending_input = None;
             }
 
-            _ = sigint.recv() => {
-                graceful_shutdown_token.cancel();
-            }
-
             data = raw_input_rx.recv(), if pending_input.is_none() => {
                 let Some(data) = data else { break };
-                pending_input = Some(Box::pin(input_guard.prepare_input(data).send()));
-            }
-
-            _ = async {
-                input_tick.as_mut().expect("guarded by select").tick().await;
-            }, if input_tick.is_some() => {
-                input_guard.tick();
+                pending_input = Some(Box::pin(input_forwarder.prepare_input(data).send()));
             }
 
             data = audio_rx.recv(), if audio_enabled => {

@@ -3,6 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::os::fd::AsRawFd;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use russh::{Channel, ChannelId, Pty};
 use tokio_util::sync::CancellationToken;
 
 use terminal_games::app::{AppInstantiationParams, AppServer, SessionControl, SessionEndReason};
-use terminal_games::input_guard::InputGuard;
+use terminal_games::input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker};
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::palette;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
@@ -23,8 +24,10 @@ use terminal_games::terminal_profile::TerminalProfile;
 
 use crate::admission::{AdmissionController, AdmissionState, AdmissionTicket};
 use crate::control::ControlPlane;
+use crate::idle::IdleMonitor;
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
-use crate::sessions::{FanoutTracker, SessionAdminControl, SessionRegistry};
+use crate::sessions::SessionRegistry;
+use std::future::Future;
 
 pub struct SshSession {
     raw_input_tx: tokio::sync::mpsc::Sender<Bytes>,
@@ -165,9 +168,7 @@ impl SshServer {
         let cancellation_token = CancellationToken::new();
         let token = cancellation_token.clone();
         let shutdown_token = cancellation_token.clone();
-        let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
-        let (mut input_guard, input_rx, idle_fuel_rx) =
-            InputGuard::new(cancellation_token.clone(), replay_request_tx.clone());
+        let mut background_tracker = TerminalBackgroundTracker::default();
         let (raw_input_tx, mut raw_input_rx) = tokio::sync::mpsc::channel(12);
         let (resize_tx, mut resize_rx) = tokio::sync::watch::channel((0, 0));
         let app_server = self.app_server.clone();
@@ -177,7 +178,6 @@ impl SshServer {
         let control = self.control.clone();
         let client_ip = addr.ip();
         tokio::task::spawn(async move {
-            let mut input_tick = InputGuard::tick_interval();
             let (session_handle, channel_id, remote_sshid) = match ssh_session_receiver.await {
                 Ok(v) => v,
                 Err(err) => {
@@ -311,7 +311,7 @@ impl SshServer {
                     }
                 };
             let mut terminal_profile = TerminalProfile::from_term(term.as_deref(), None);
-            if let Ok(Some(rgb)) = input_guard
+            if let Some(rgb) = background_tracker
                 .wait_for_terminal_background(&mut raw_input_rx, Duration::from_millis(500))
                 .await
             {
@@ -327,7 +327,7 @@ impl SshServer {
                     channel_id,
                     &mut resize_rx,
                     &mut raw_input_rx,
-                    &mut input_guard,
+                    &mut background_tracker,
                     &captcha,
                     terminal_profile,
                 )
@@ -343,7 +343,7 @@ impl SshServer {
                 channel_id,
                 &mut resize_rx,
                 &mut raw_input_rx,
-                &mut input_guard,
+                &mut background_tracker,
                 &admission_ticket,
                 terminal_profile,
             )
@@ -392,7 +392,6 @@ impl SshServer {
                 .data(channel_id, b"\x1b[2J\x1b[H".to_vec().into())
                 .await;
             let local_session_id = admission_ticket.id();
-            let (first_cols, first_rows) = *resize_rx.borrow();
             let session_registration = session_registry.register(
                 local_session_id,
                 user_id,
@@ -400,15 +399,27 @@ impl SshServer {
                 client_ip,
                 Transport::Ssh,
                 first_app_shortname.clone(),
-                first_cols,
-                first_rows,
+                resize_rx.clone(),
             );
-            let mut admin_control = session_registration.control_rx;
-            let mut admin_input_rx = session_registration.admin_input_rx;
-            let status_bar_state_rx = session_registration.status_bar_state_rx;
+            let mut session_control = session_registration.control_rx;
+            let mut idle_rx = session_registration.idle_rx;
+            let app_input_sender = session_registration.app_input_sender.clone();
+            let app_input_receiver = session_registration.app_input_receiver;
+            let spy_snapshot_requests = session_registration.spy_snapshot_requests;
+            let session_ui = session_registration.session_ui;
+            let session_identity = session_registration.identity.clone();
             let _session_cleanup_guard = session_registration.cleanup_guard;
-            let mut spy_resize_rx = resize_rx.clone();
-            let session_guard = metrics.start_session(
+            let idle_notifications = session_ui.notification_sender();
+            let mut idle_monitor = IdleMonitor::new(idle_notifications);
+            idle_monitor.set_paused(idle_rx.borrow().paused);
+            let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
+            let input_forwarder = InputForwarder::new_with_sender(
+                shutdown_token.clone(),
+                app_input_sender.clone(),
+                replay_request_tx,
+            );
+            let session_metrics = metrics.start_session(
+                session_identity.app(),
                 Transport::Ssh,
                 if user_id.is_some() {
                     AuthKind::Authenticated
@@ -418,24 +429,23 @@ impl SshServer {
                 has_audio,
                 user_id,
             );
-            let active_shortname_tracker = FanoutTracker::new(vec![
-                session_guard.active_shortname_tracker(),
-                session_registration.tracker,
-            ]);
-            let mut admitted_session = admission_ticket.start_session(session_guard);
+            let mut admitted_session = admission_ticket.start_session(session_metrics.clone());
             let mut cluster_control = admitted_session.subscribe_control();
-            let terminal_parser = input_guard.take_terminal_parser(first_rows, first_cols);
+            let mut app_metrics_rx = session_identity.app_receiver();
+            let (first_cols, first_rows) = *resize_rx.borrow();
+            let terminal_parser = background_tracker.into_terminal_parser(first_rows, first_cols);
 
             let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
-                first_app_shortname,
                 args,
-                input_receiver: input_rx,
+                input_receiver: app_input_receiver,
                 replay_request_receiver: replay_request_rx,
+                spy_snapshot_requests,
                 output_sender: output_tx,
                 audio_sender: has_audio.then_some(audio_tx),
                 remote_sshid,
                 term,
-                username,
+                session_identity,
+                session_ui,
                 window_size_receiver: resize_rx,
                 graceful_shutdown_token: token,
                 network_info,
@@ -444,10 +454,10 @@ impl SshServer {
                 user_id,
                 locale,
                 log_backend: Arc::new(NoopLogBackend),
-                active_shortname_tracker: Some(active_shortname_tracker),
-                idle_fuel_receiver: Some(idle_fuel_rx),
-                status_bar_state_receiver: status_bar_state_rx,
             });
+            let mut pending_input: Option<
+                Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>,
+            > = None;
             let close_reason = loop {
                 tokio::select! {
                     biased;
@@ -464,10 +474,36 @@ impl SshServer {
                                 tracing::error!(?error, "App exit channel dropped");
                             }
                         }
-                        if input_guard.is_idle_timed_out() {
-                            break SessionEndReason::IdleTimeout;
-                        }
                         break SessionEndReason::NormalExit;
+                    }
+
+                    changed = session_control.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        let SessionControl::Close(reason) = *session_control.borrow() else {
+                            continue;
+                        };
+                        shutdown_token.cancel();
+                        break reason;
+                    }
+
+                    result = async {
+                        pending_input.as_mut().expect("guarded by select").await
+                    }, if pending_input.is_some() => {
+                        if result.is_err() {
+                            break SessionEndReason::ConnectionLost;
+                        }
+                        pending_input = None;
+                    }
+
+                    changed = ban_changes.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        if admission_controller.is_ip_banned(client_ip) {
+                            session_registry.request_close(local_session_id, SessionEndReason::BannedIp);
+                        }
                     }
 
                     changed = cluster_control.changed() => {
@@ -477,57 +513,45 @@ impl SshServer {
                         let SessionControl::Close(reason) = *cluster_control.borrow() else {
                             continue;
                         };
-                        shutdown_token.cancel();
-                        break reason;
+                        session_registry.request_close(local_session_id, reason);
                     }
 
-                    changed = ban_changes.changed() => {
-                        if changed.is_err() || !admission_controller.is_ip_banned(client_ip) {
-                            continue;
-                        }
-                        shutdown_token.cancel();
-                        break SessionEndReason::BannedIp;
-                    }
-
-                    changed = admin_control.changed() => {
+                    changed = app_metrics_rx.changed() => {
                         if changed.is_err() {
                             continue;
                         }
-                        let SessionAdminControl::Kick = *admin_control.borrow() else {
-                            continue;
-                        };
-                        shutdown_token.cancel();
-                        break SessionEndReason::KickedByAdmin;
+                        let app = app_metrics_rx.borrow_and_update().clone();
+                        session_metrics.set_active_app(&app);
                     }
 
-                    data = raw_input_rx.recv() => {
+                    _ = idle_monitor.wait_for_tick() => {
+                        if let Some(reason) = idle_monitor.on_tick() {
+                            session_registry.set_idle_fuel(local_session_id, idle_monitor.idle_state().fuel_seconds);
+                            session_registry.request_close(local_session_id, reason);
+                        } else {
+                            session_registry.set_idle_fuel(local_session_id, idle_monitor.idle_state().fuel_seconds);
+                        }
+                    }
+
+                    changed = idle_rx.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        let idle_state = *idle_rx.borrow_and_update();
+                        idle_monitor.set_paused(idle_state.paused);
+                        session_registry.set_idle_fuel(local_session_id, idle_monitor.idle_state().fuel_seconds);
+                    }
+
+                    data = raw_input_rx.recv(), if pending_input.is_none() => {
                         let Some(data) = data else {
                             break SessionEndReason::ConnectionLost;
                         };
+                        idle_monitor.observe_input(&data);
                         admitted_session.record_input(&data);
+                        session_metrics.record_bytes(Direction::In, data.len());
                         control.record_bytes(data.len());
                         session_registry.record_input(local_session_id, &data);
-                        let _ = input_guard.prepare_input(data).try_send();
-                    }
-
-                    data = admin_input_rx.recv() => {
-                        let Some(data) = data else {
-                            continue;
-                        };
-                        admitted_session.record_input(&data);
-                        let _ = input_guard.prepare_input(data).try_send();
-                    }
-
-                    _ = input_tick.tick() => {
-                        input_guard.tick();
-                    }
-
-                    changed = spy_resize_rx.changed() => {
-                        if changed.is_err() {
-                            continue;
-                        }
-                        let (cols, rows) = *spy_resize_rx.borrow_and_update();
-                        session_registry.record_resize(local_session_id, cols, rows);
+                        pending_input = Some(Box::pin(input_forwarder.prepare_input(data).send()));
                     }
 
                     data = audio_rx.recv(), if has_audio => {
@@ -535,7 +559,7 @@ impl SshServer {
                             break SessionEndReason::NormalExit;
                         };
                         admitted_session.record_output(data.len());
-                        metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
+                        session_metrics.record_bytes(Direction::Out, data.len());
                         control.record_bytes(data.len());
                         if session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, russh::CryptoVec::from_slice(&data)).await.is_err() {
                             break SessionEndReason::ConnectionLost;
@@ -547,7 +571,7 @@ impl SshServer {
                             break SessionEndReason::NormalExit;
                         };
                         admitted_session.record_output(data.len());
-                        metrics.record_bytes(Direction::Out, Transport::Ssh, data.len());
+                        session_metrics.record_bytes(Direction::Out, data.len());
                         control.record_bytes(data.len());
                         session_registry.record_output(local_session_id, &data);
                         if session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await.is_err() {
@@ -556,6 +580,7 @@ impl SshServer {
                     }
                 }
             };
+            session_metrics.finish(close_reason);
             session_registry.finish(local_session_id, close_reason);
             close_terminal_session(
                 &session_handle,
@@ -628,7 +653,7 @@ async fn solve_captcha(
     channel_id: ChannelId,
     resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
     raw_input_rx: &mut tokio::sync::mpsc::Receiver<Bytes>,
-    input_guard: &mut InputGuard,
+    background_tracker: &mut TerminalBackgroundTracker,
     captcha: &str,
     base_terminal_profile: TerminalProfile,
 ) -> bool {
@@ -641,7 +666,7 @@ async fn solve_captcha(
             window,
             captcha,
             &entered,
-            input_guard.terminal_profile(base_terminal_profile),
+            background_tracker.terminal_profile(base_terminal_profile),
         )
         .await
         .is_err()
@@ -656,8 +681,7 @@ async fn solve_captcha(
             }
             data = raw_input_rx.recv() => {
                 let Some(data) = data else { return false; };
-                let pending = input_guard.prepare_input(data.clone());
-                drop(pending);
+                background_tracker.observe(data.as_ref());
                 for byte in data {
                     match byte {
                         0x03 => return false,
@@ -699,7 +723,7 @@ async fn wait_for_admission(
     channel_id: ChannelId,
     resize_rx: &mut tokio::sync::watch::Receiver<(u16, u16)>,
     raw_input_rx: &mut tokio::sync::mpsc::Receiver<Bytes>,
-    input_guard: &mut InputGuard,
+    background_tracker: &mut TerminalBackgroundTracker,
     admission_ticket: &AdmissionTicket,
     base_terminal_profile: TerminalProfile,
 ) -> AdmissionWaitResult {
@@ -720,7 +744,7 @@ async fn wait_for_admission(
             window,
             status,
             frame,
-            input_guard.terminal_profile(base_terminal_profile),
+            background_tracker.terminal_profile(base_terminal_profile),
         )
         .await
         .is_err()
@@ -743,8 +767,7 @@ async fn wait_for_admission(
             }
             data = raw_input_rx.recv() => {
                 let Some(data) = data else { return AdmissionWaitResult::Disconnected; };
-                let pending = input_guard.prepare_input(data.clone());
-                drop(pending);
+                background_tracker.observe(data.as_ref());
                 if data.contains(&0x03) || data.contains(&b'q') {
                     return AdmissionWaitResult::Disconnected;
                 }

@@ -35,6 +35,12 @@ pub struct ReplayBuffer {
     term_type: Option<String>,
 }
 
+pub struct ReplayTerminalSnapshot {
+    pub cols: u16,
+    pub rows: u16,
+    pub dump: String,
+}
+
 #[derive(Serialize)]
 struct AsciicastHeader<'a> {
     version: u32,
@@ -125,6 +131,38 @@ impl ReplayBuffer {
                 }
             }
             self.vt_timestamp = Some(event.timestamp);
+        }
+    }
+
+    pub fn terminal_snapshot(&self) -> ReplayTerminalSnapshot {
+        let (cols, rows) = self.vt.size();
+        let mut vt = avt::Vt::new(cols.max(1), rows.max(1));
+        let dump = self.vt.dump();
+        if !dump.is_empty() {
+            vt.feed_str(&dump);
+        }
+        for event in &self.events {
+            if self
+                .vt_timestamp
+                .is_some_and(|timestamp| event.timestamp <= timestamp)
+            {
+                continue;
+            }
+            match &event.event {
+                ReplayEvent::Output(data) => {
+                    vt.feed_str(&String::from_utf8_lossy(data));
+                }
+                ReplayEvent::Resize { cols, rows } => {
+                    vt.resize((*cols as usize).max(1), (*rows as usize).max(1));
+                }
+                ReplayEvent::AppSwitch { .. } => {}
+            }
+        }
+        let (cols, rows) = vt.size();
+        ReplayTerminalSnapshot {
+            cols: cols as u16,
+            rows: rows as u16,
+            dump: vt.dump(),
         }
     }
 

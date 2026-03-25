@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use terminput::{Event, MouseButton, MouseEventKind};
@@ -13,6 +13,7 @@ use crate::control::{BroadcastLevel, StatusBarState, TickerEntry};
 use crate::palette::{self, Color};
 use crate::rate_limiting::NetworkInfo;
 use crate::terminal_profile::TerminalProfile;
+use crate::app::SessionAppState;
 
 fn terminal_width(str: &str) -> usize {
     strip_ansi_escapes::strip_str(str).width()
@@ -64,8 +65,10 @@ impl StatusNotification {
 }
 
 pub struct StatusBar {
-    pub shortname: String,
+    shortname: String,
+    app_rx: watch::Receiver<SessionAppState>,
     username: String,
+    username_rx: watch::Receiver<String>,
     session_start_time: std::time::Instant,
     prev_size: (u16, u16),
     prev_status_bar_content: Vec<u8>,
@@ -75,14 +78,27 @@ pub struct StatusBar {
     notification_rx: mpsc::Receiver<StatusNotification>,
     shared_state: StatusBarState,
     shared_state_rx: watch::Receiver<StatusBarState>,
-    selected_ticker: Option<usize>,
-    ticker_click_row: Option<u16>,
-    ticker_click_cols: Vec<usize>,
+    input: StatusBarInput,
+    input_rx: watch::Receiver<u64>,
+    tick: tokio::time::Interval,
 }
 
 struct RenderedTicker {
     text: String,
     click_cols: Vec<usize>,
+}
+
+#[derive(Default)]
+struct StatusBarInputState {
+    selected_ticker: Option<usize>,
+    ticker_click_row: Option<u16>,
+    ticker_click_cols: Vec<usize>,
+}
+
+#[derive(Clone)]
+pub struct StatusBarInput {
+    state: Arc<Mutex<StatusBarInputState>>,
+    changed_tx: watch::Sender<u64>,
 }
 
 fn style(text: impl AsRef<str>, fg: Option<Color>, bg: Option<Color>, bold: bool) -> String {
@@ -112,17 +128,24 @@ fn style_inline_fg(text: impl AsRef<str>, fg: Color) -> String {
 
 impl StatusBar {
     pub fn new(
-        shortname: String,
-        username: &str,
+        app_rx: watch::Receiver<SessionAppState>,
+        username_rx: watch::Receiver<String>,
         network_info: Arc<dyn NetworkInfo>,
         terminal_profile: TerminalProfile,
         notification_rx: mpsc::Receiver<StatusNotification>,
         shared_state_rx: watch::Receiver<StatusBarState>,
+        input: StatusBarInput,
     ) -> Self {
         let shared_state = shared_state_rx.borrow().clone();
+        let shortname = app_rx.borrow().shortname.clone();
+        let username = username_rx.borrow().clone();
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         Self {
             shortname,
-            username: username.to_string(),
+            app_rx,
+            username,
+            username_rx,
             session_start_time: std::time::Instant::now(),
             prev_size: (0, 0),
             prev_status_bar_content: Vec::new(),
@@ -132,9 +155,9 @@ impl StatusBar {
             notification_rx,
             shared_state,
             shared_state_rx,
-            selected_ticker: None,
-            ticker_click_row: None,
-            ticker_click_cols: Vec::new(),
+            input_rx: input.subscribe(),
+            input,
+            tick,
         }
     }
 
@@ -183,17 +206,13 @@ impl StatusBar {
             (ssh_callout, Vec::new())
         };
         let right_start = (width as usize).saturating_sub(terminal_width(&right));
-        self.ticker_click_row = (!ticker_click_cols.is_empty()).then_some(row.saturating_sub(1));
-        self.ticker_click_cols = ticker_click_cols
-            .into_iter()
-            .map(|col| right_start + col)
-            .collect();
-        if self
-            .selected_ticker
-            .is_some_and(|selected| selected >= self.ticker_click_cols.len())
-        {
-            self.selected_ticker = None;
-        }
+        self.input.set_ticker_click_targets(
+            (!ticker_click_cols.is_empty()).then_some(row.saturating_sub(1)),
+            ticker_click_cols
+                .into_iter()
+                .map(|col| right_start + col)
+                .collect(),
+        );
 
         let padding = style(
             " ".repeat(
@@ -269,10 +288,11 @@ impl StatusBar {
         let now = unix_now();
         let ticker_count = self.active_ticker_count_at(now);
         if ticker_count == 0 {
-            self.selected_ticker = None;
+            self.input.sync_selected_ticker(ticker_count);
             return None;
         }
-        let selected_ticker = self.normalized_selected_ticker(ticker_count);
+        self.input.sync_selected_ticker(ticker_count);
+        let selected_ticker = self.input.selected_ticker();
         let ticker_index =
             selected_ticker.unwrap_or_else(|| self.rotating_ticker_index(ticker_count));
         let rendered = {
@@ -283,7 +303,6 @@ impl StatusBar {
                 render_multi_ticker(&tickers, ticker_index, p)
             }
         };
-        self.selected_ticker = selected_ticker;
         Some(rendered)
     }
 
@@ -295,41 +314,6 @@ impl StatusBar {
         });
     }
 
-    pub fn set_username(&mut self, username: &str) {
-        self.username = username.to_string();
-    }
-
-    fn sync_selected_ticker(&mut self, ticker_count: usize) {
-        if ticker_count <= 1
-            || self
-                .selected_ticker
-                .is_some_and(|selected| selected >= ticker_count)
-        {
-            self.selected_ticker = None;
-        }
-    }
-
-    pub fn handle_terminal_input(&mut self, data: &[u8]) -> bool {
-        let Ok(Some(Event::Mouse(mouse))) = Event::parse_from(data) else {
-            return false;
-        };
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return false;
-        }
-        if self.ticker_click_row != Some(mouse.row) {
-            return false;
-        }
-        let Some(index) = self
-            .ticker_click_cols
-            .iter()
-            .position(|col| *col == mouse.column as usize)
-        else {
-            return false;
-        };
-        self.selected_ticker = Some(index);
-        true
-    }
-
     pub fn maybe_render_into(
         &mut self,
         screen: &headless_terminal::Screen,
@@ -338,11 +322,7 @@ impl StatusBar {
     ) -> bool {
         let (height, width) = screen.size();
 
-        self.sync_shared_state_if_needed();
-
-        if let Ok(notification) = self.notification_rx.try_recv() {
-            self.show_notification(notification);
-        }
+        self.sync_inputs_if_needed();
 
         let content = self.content(screen, width, height);
         let size_changed = self.prev_size != (height, width);
@@ -379,31 +359,131 @@ impl StatusBar {
             .count()
     }
 
-    fn normalized_selected_ticker(&self, ticker_count: usize) -> Option<usize> {
-        if ticker_count <= 1 {
-            return None;
-        }
-        self.selected_ticker
-            .filter(|&selected| selected < ticker_count)
-    }
-
     fn rotating_ticker_index(&self, ticker_count: usize) -> usize {
         ((std::time::Instant::now() - self.session_start_time).as_secs() / 10) as usize
             % ticker_count
     }
 
-    pub async fn wait_for_shared_state_change(&mut self) -> Result<(), watch::error::RecvError> {
-        self.shared_state_rx.changed().await?;
-        self.shared_state = self.shared_state_rx.borrow_and_update().clone();
-        self.sync_selected_ticker(self.active_ticker_count_at(unix_now()));
-        Ok(())
+    pub async fn drive(&mut self) -> Option<bool> {
+        tokio::select! {
+            _ = self.tick.tick() => Some(false),
+            result = self.shared_state_rx.changed() => {
+                result.ok()?;
+                self.shared_state = self.shared_state_rx.borrow_and_update().clone();
+                Some(false)
+            }
+            result = self.app_rx.changed() => {
+                result.ok()?;
+                self.shortname = self.app_rx.borrow_and_update().shortname.clone();
+                Some(false)
+            }
+            result = self.username_rx.changed() => {
+                result.ok()?;
+                self.username = self.username_rx.borrow_and_update().clone();
+                Some(false)
+            }
+            notification = self.notification_rx.recv() => {
+                self.show_notification(notification?);
+                Some(false)
+            }
+            result = self.input_rx.changed() => {
+                result.ok()?;
+                self.input_rx.borrow_and_update();
+                Some(true)
+            }
+        }
     }
 
-    fn sync_shared_state_if_needed(&mut self) {
+    fn sync_inputs_if_needed(&mut self) {
         if self.shared_state_rx.has_changed().unwrap_or(false) {
             self.shared_state = self.shared_state_rx.borrow_and_update().clone();
-            self.sync_selected_ticker(self.active_ticker_count_at(unix_now()));
         }
+        if self.app_rx.has_changed().unwrap_or(false) {
+            self.shortname = self.app_rx.borrow_and_update().shortname.clone();
+        }
+        if self.username_rx.has_changed().unwrap_or(false) {
+            self.username = self.username_rx.borrow_and_update().clone();
+        }
+        if self.input_rx.has_changed().unwrap_or(false) {
+            self.input_rx.borrow_and_update();
+        }
+        while let Ok(notification) = self.notification_rx.try_recv() {
+            self.show_notification(notification);
+        }
+    }
+}
+
+impl StatusBarInput {
+    pub fn new() -> Self {
+        let (changed_tx, _) = watch::channel(0);
+        Self {
+            state: Arc::new(Mutex::new(StatusBarInputState::default())),
+            changed_tx,
+        }
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changed_tx.subscribe()
+    }
+
+    pub fn handle_terminal_input(&self, data: &[u8]) -> bool {
+        let Ok(Some(Event::Mouse(mouse))) = Event::parse_from(data) else {
+            return false;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+        let selected = {
+            let mut state = self.state.lock().unwrap();
+            if state.ticker_click_row != Some(mouse.row) {
+                return false;
+            }
+            let Some(index) = state
+                .ticker_click_cols
+                .iter()
+                .position(|col| *col == mouse.column as usize)
+            else {
+                return false;
+            };
+            state.selected_ticker = Some(index);
+            true
+        };
+        if selected {
+            self.notify_changed();
+        }
+        selected
+    }
+
+    pub fn set_ticker_click_targets(&self, row: Option<u16>, cols: Vec<usize>) {
+        let mut state = self.state.lock().unwrap();
+        state.ticker_click_row = row;
+        state.ticker_click_cols = cols;
+        if state
+            .selected_ticker
+            .is_some_and(|selected| selected >= state.ticker_click_cols.len())
+        {
+            state.selected_ticker = None;
+        }
+    }
+
+    pub fn sync_selected_ticker(&self, ticker_count: usize) {
+        let mut state = self.state.lock().unwrap();
+        if ticker_count <= 1
+            || state
+                .selected_ticker
+                .is_some_and(|selected| selected >= ticker_count)
+        {
+            state.selected_ticker = None;
+        }
+    }
+
+    pub fn selected_ticker(&self) -> Option<usize> {
+        self.state.lock().unwrap().selected_ticker
+    }
+
+    fn notify_changed(&self) {
+        let next = self.changed_tx.borrow().wrapping_add(1);
+        self.changed_tx.send_replace(next);
     }
 }
 
