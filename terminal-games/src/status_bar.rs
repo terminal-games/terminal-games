@@ -5,6 +5,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::{Bytes, BytesMut};
 use terminput::{Event, MouseButton, MouseEventKind};
 use tokio::sync::{mpsc, watch};
 use unicode_width::UnicodeWidthStr;
@@ -71,7 +72,7 @@ pub struct StatusBar {
     username_rx: watch::Receiver<String>,
     session_start_time: std::time::Instant,
     prev_size: (u16, u16),
-    prev_status_bar_content: Vec<u8>,
+    prev_status_bar_content: Bytes,
     network_info: Arc<dyn NetworkInfo>,
     base_terminal_profile: TerminalProfile,
     notification: Option<ActiveNotification>,
@@ -148,7 +149,7 @@ impl StatusBar {
             username_rx,
             session_start_time: std::time::Instant::now(),
             prev_size: (0, 0),
-            prev_status_bar_content: Vec::new(),
+            prev_status_bar_content: Bytes::new(),
             network_info,
             base_terminal_profile: terminal_profile,
             notification: None,
@@ -161,7 +162,7 @@ impl StatusBar {
         }
     }
 
-    fn content(&mut self, screen: &headless_terminal::Screen, width: u16, row: u16) -> Vec<u8> {
+    fn content(&mut self, screen: &headless_terminal::Screen, width: u16, row: u16) -> Bytes {
         let p = palette::palette(self.terminal_profile(screen));
         let active_tab = style(
             format!(" {} ", self.shortname),
@@ -224,7 +225,7 @@ impl StatusBar {
         );
 
         let content_str = left + &padding + &right;
-        content_str.into_bytes()
+        Bytes::from(content_str.into_bytes())
     }
 
     fn terminal_profile(&self, screen: &headless_terminal::Screen) -> TerminalProfile {
@@ -317,7 +318,7 @@ impl StatusBar {
     pub fn maybe_render_into(
         &mut self,
         screen: &headless_terminal::Screen,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
         force: bool,
     ) -> bool {
         let (height, width) = screen.size();

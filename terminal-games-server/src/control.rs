@@ -1228,7 +1228,7 @@ async fn run_spy_socket(
                 };
                 match message {
                     crate::sessions::SpyEvent::Output(data) => {
-                        if socket.send(Message::Binary(data.into())).await.is_err() {
+                        if socket.send(Message::Binary(data)).await.is_err() {
                             break;
                         }
                     }

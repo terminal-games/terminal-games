@@ -25,8 +25,8 @@ use crate::metrics::Transport;
 
 #[derive(Clone, Debug)]
 pub enum SpyEvent {
-    Output(Vec<u8>),
-    Input { data: Vec<u8> },
+    Output(Bytes),
+    Input { data: Bytes },
     Closed { reason: SessionEndReason },
 }
 
@@ -258,26 +258,24 @@ impl SessionRegistry {
         })
     }
 
-    pub fn record_output(&self, local_session_id: u64, data: &Arc<Vec<u8>>) {
+    pub fn record_output(&self, local_session_id: u64, data: &Bytes) {
         let Some(session) = self.lookup(local_session_id) else {
             return;
         };
         if session.active_spies.load(Ordering::Acquire) == 0 {
             return;
         }
-        let _ = session.spy_tx.send(SpyEvent::Output((**data).clone()));
+        let _ = session.spy_tx.send(SpyEvent::Output(data.clone()));
     }
 
-    pub fn record_input(&self, local_session_id: u64, data: &[u8]) {
+    pub fn record_input(&self, local_session_id: u64, data: &Bytes) {
         let Some(session) = self.lookup(local_session_id) else {
             return;
         };
         if session.active_spies.load(Ordering::Acquire) == 0 {
             return;
         }
-        let _ = session.spy_tx.send(SpyEvent::Input {
-            data: data.to_vec(),
-        });
+        let _ = session.spy_tx.send(SpyEvent::Input { data: data.clone() });
     }
 
     pub async fn spy(&self, local_session_id: u64, read_write: bool) -> Option<SpySession> {

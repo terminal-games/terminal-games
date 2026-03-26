@@ -3,6 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tarpc::context;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -387,7 +388,7 @@ pub enum SpyControlMessage {
         username: String,
     },
     Input {
-        data: Vec<u8>,
+        data: Bytes,
     },
     Idle {
         fuel_seconds: i32,

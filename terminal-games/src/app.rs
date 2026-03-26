@@ -14,7 +14,7 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use headless_terminal::{Color, Parser};
 use hex::ToHex;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -282,7 +282,7 @@ pub struct AppInstantiationParams {
     pub spy_snapshot_requests: tokio::sync::mpsc::Receiver<
         tokio::sync::oneshot::Sender<crate::replay::ReplayTerminalSnapshot>,
     >,
-    pub output_sender: tokio::sync::mpsc::Sender<Arc<Vec<u8>>>,
+    pub output_sender: tokio::sync::mpsc::Sender<Bytes>,
     pub audio_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     pub window_size_receiver: tokio::sync::watch::Receiver<(u16, u16)>,
     pub graceful_shutdown_token: CancellationToken,
@@ -411,7 +411,7 @@ impl AppServer {
             let hard_shutdown_token = CancellationToken::new();
 
             let (app_output_sender, mut app_output_receiver) =
-                tokio::sync::mpsc::channel::<Vec<u8>>(1);
+                tokio::sync::mpsc::channel::<BytesMut>(1);
             let has_next_app_shortname = Arc::new(AtomicBool::new(false));
 
             let audio_enabled = audio_sender.is_some();
@@ -590,7 +590,7 @@ impl AppServer {
                                 terminal_snapshot.sync_from_screen(screen);
 
                                 if !output.is_empty() {
-                                    let output = Arc::new(output);
+                                    let output = output.freeze();
                                     replay_buffer.push_output(output.clone());
                                     if output_sender.send(output).await.is_err() {
                                         break 'block None;
@@ -607,10 +607,10 @@ impl AppServer {
 
                                 let screen = terminal.screen_mut();
                                 screen.set_size(height, width);
-                                let mut output = Vec::new();
+                                let mut output = BytesMut::new();
                                 status_bar.maybe_render_into(screen, &mut output, true);
                                 if !output.is_empty() {
-                                    let output = Arc::new(output);
+                                    let output = output.freeze();
                                     replay_buffer.push_output(output.clone());
                                     if output_sender.send(output).await.is_err() {
                                         break 'block None;
@@ -623,10 +623,10 @@ impl AppServer {
                                 let Some(force) = status_bar_render else {
                                     break 'block None;
                                 };
-                                let mut output = Vec::new();
+                                let mut output = BytesMut::new();
                                 status_bar.maybe_render_into(terminal.screen(), &mut output, force);
                                 if !output.is_empty() {
-                                    let output = Arc::new(output);
+                                    let output = output.freeze();
                                     replay_buffer.push_output(output.clone());
                                     if output_sender.send(output).await.is_err() {
                                         break 'block None;
@@ -646,10 +646,10 @@ impl AppServer {
                                     if let Some(replays) = update.replays {
                                         menu_session.replays = replays;
                                     }
-                                    let mut output = Vec::new();
+                                    let mut output = BytesMut::new();
                                     status_bar.maybe_render_into(terminal.screen(), &mut output, true);
                                     if !output.is_empty() {
-                                        let output = Arc::new(output);
+                                        let output = output.freeze();
                                         replay_buffer.push_output(output.clone());
                                         if output_sender.send(output).await.is_err() {
                                             break 'block None;
@@ -2233,7 +2233,7 @@ pub struct AppContext {
     term: Option<String>,
     linker: Arc<wasmtime::Linker<AppState>>,
     game_registry: GameRuntimeRegistry,
-    app_output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    app_output_sender: tokio::sync::mpsc::Sender<BytesMut>,
     user_id: Option<u64>,
     locale: String,
     log_backend: Arc<dyn GuestLogBackend>,
@@ -2635,13 +2635,13 @@ impl wasmtime::ResourceLimiter for AppLimiter {
 }
 
 struct EscapeSequenceBuffer {
-    buffer: Vec<u8>,
+    buffer: BytesMut,
 }
 
 impl EscapeSequenceBuffer {
     fn new() -> Self {
         Self {
-            buffer: Vec::with_capacity(64),
+            buffer: BytesMut::with_capacity(64),
         }
     }
 
@@ -2728,7 +2728,7 @@ impl EscapeSequenceBuffer {
 
     /// Add data to the buffer and return data that's safe to send
     #[inline]
-    fn push(&mut self, mut data: Vec<u8>) -> Vec<u8> {
+    fn push(&mut self, mut data: BytesMut) -> BytesMut {
         // Fast path: buffer is empty, check if incoming data is complete
         if self.buffer.is_empty() {
             let incomplete_len = Self::incomplete_escape_len(&data);
@@ -2737,27 +2737,24 @@ impl EscapeSequenceBuffer {
             }
             if incomplete_len == data.len() {
                 self.buffer = data;
-                return Vec::new();
+                return BytesMut::new();
             }
             let split_at = data.len() - incomplete_len;
-            self.buffer.extend_from_slice(&data[split_at..]);
-            data.truncate(split_at);
+            self.buffer = data.split_off(split_at);
             return data;
         }
 
         // Slow path: we have buffered data, need to combine
-        self.buffer.append(&mut data);
+        self.buffer.extend_from_slice(&data);
 
         let incomplete_len = Self::incomplete_escape_len(&self.buffer);
         if incomplete_len == 0 {
-            std::mem::take(&mut self.buffer)
+            self.buffer.split()
         } else if incomplete_len < self.buffer.len() {
-            let split_at = self.buffer.len() - incomplete_len;
-            let incomplete = self.buffer.split_off(split_at);
-            let complete = std::mem::replace(&mut self.buffer, incomplete);
-            complete
+            let complete_len = self.buffer.len() - incomplete_len;
+            self.buffer.split_to(complete_len)
         } else {
-            Vec::new()
+            BytesMut::new()
         }
     }
 }
@@ -2779,15 +2776,15 @@ impl wasmtime::CallHookHandler<AppState> for AsyncCallHook {
 }
 
 pub struct AsyncStdoutWriter {
-    sender: tokio_util::sync::PollSender<Vec<u8>>,
-    buffer: Vec<u8>,
+    sender: tokio_util::sync::PollSender<BytesMut>,
+    buffer: BytesMut,
 }
 
 impl AsyncStdoutWriter {
-    pub fn new(sender: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+    pub fn new(sender: tokio::sync::mpsc::Sender<BytesMut>) -> Self {
         Self {
             sender: tokio_util::sync::PollSender::new(sender),
-            buffer: Vec::with_capacity(16 * 1024),
+            buffer: BytesMut::with_capacity(16 * 1024),
         }
     }
 }
@@ -2800,9 +2797,8 @@ impl tokio::io::AsyncWrite for AsyncStdoutWriter {
     ) -> Poll<std::io::Result<usize>> {
         match self.sender.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
-                let mut buffer = std::mem::replace(&mut self.buffer, Vec::with_capacity(16 * 1024));
+                let mut buffer = self.buffer.split();
                 buffer.extend_from_slice(buf);
-                // let len = self.buffer.len();
                 let _ = self.sender.send_item(buffer);
                 Poll::Ready(Ok(buf.len()))
             }
@@ -2822,12 +2818,13 @@ impl tokio::io::AsyncWrite for AsyncStdoutWriter {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // Poll::Ready(Ok(()))
-        // self.poll_write(cx, &[]).map_ok(|_| ())
+        if self.buffer.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
 
         match self.sender.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
-                let buffer = std::mem::take(&mut self.buffer);
+                let buffer = self.buffer.split();
                 let _ = self.sender.send_item(buffer);
                 Poll::Ready(Ok(()))
             }
@@ -2846,7 +2843,7 @@ impl tokio::io::AsyncWrite for AsyncStdoutWriter {
 }
 
 struct MyStdoutStream {
-    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    sender: tokio::sync::mpsc::Sender<BytesMut>,
 }
 
 impl wasmtime_wasi::cli::StdoutStream for MyStdoutStream {

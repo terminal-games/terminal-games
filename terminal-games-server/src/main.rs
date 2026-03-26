@@ -337,11 +337,12 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
-        .unwrap_or(max_active_apps.min(3));
+        .unwrap_or(usize::MAX);
     let max_queued_apps_per_ip = std::env::var("MAX_QUEUED_APPS_PER_IP")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(max_active_apps_per_ip);
+        .filter(|&value| value > 0)
+        .unwrap_or(usize::MAX);
     let ssh_captcha_threshold =
         parse_ssh_captcha_threshold(std::env::var("SSH_CAPTCHA_THRESHOLD"))?;
     let (ban_updates, last_ban_inserted_at) = load_ip_ban_updates(&conn, None).await?;
@@ -447,7 +448,7 @@ fn load_author_env_secret_key() -> String {
 fn parse_ssh_captcha_threshold(raw: Result<String, std::env::VarError>) -> Result<Option<f64>> {
     let raw = match raw {
         Ok(raw) => raw,
-        Err(std::env::VarError::NotPresent) => return Ok(Some(0.5)),
+        Err(std::env::VarError::NotPresent) => return Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
             anyhow::bail!("SSH_CAPTCHA_THRESHOLD is not valid Unicode");
         }

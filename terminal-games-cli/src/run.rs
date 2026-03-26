@@ -773,8 +773,8 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
 
     enum DelayedData {
         Terminal {
-            raw: Arc<Vec<u8>>,
-            metered: Arc<Vec<u8>>,
+            raw: Bytes,
+            metered: Bytes,
         },
         Audio(Vec<u8>),
     }
@@ -875,7 +875,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                 let metered_data = if compress {
                     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
                     encoder.write_all(&data).ok();
-                    Arc::new(encoder.finish().unwrap_or_default())
+                    Bytes::from(encoder.finish().unwrap_or_default())
                 } else {
                     data.clone()
                 };
