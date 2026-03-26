@@ -43,9 +43,9 @@ impl GameRuntimeRegistry {
             .games
             .entry(game_id)
             .or_insert_with(|| GameRuntime::new(build_id, updated_at_ns));
-        let update_available = Arc::new(AtomicBool::new(game.build_id != build_id));
-        game.subscribe(&update_available);
         game.publish(build_id, updated_at_ns);
+        let update_available = Arc::new(AtomicBool::new(false));
+        game.subscribe(&update_available);
         update_available
     }
 

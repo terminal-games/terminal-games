@@ -81,10 +81,6 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     no_audio: bool,
 
-    /// Enable the hosted idle-timeout behavior for local debugging
-    #[arg(long)]
-    idle_timeout: bool,
-
     /// Log level for the game/app
     #[arg(long = "app-log-level", default_value = "info")]
     app_log_level: LogLevelFilter,
