@@ -772,10 +772,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     enum DelayedData {
-        Terminal {
-            raw: Bytes,
-            metered: Bytes,
-        },
+        Terminal { raw: Bytes, metered: Bytes },
         Audio(Vec<u8>),
     }
 

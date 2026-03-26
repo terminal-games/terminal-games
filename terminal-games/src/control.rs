@@ -202,6 +202,11 @@ pub struct BanIpAddRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanIpAddResponse {
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BanIpRemoveRequest {
     pub ip: String,
 }
@@ -412,7 +417,7 @@ pub trait AdminControlRpc {
     async fn discover() -> Result<RegionDiscoveryResponse, RpcError>;
     async fn local_region_status() -> Result<RegionRuntimeStatus, RpcError>;
     async fn sessions() -> Result<Vec<SessionSummary>, RpcError>;
-    async fn ban_ip_add(request: BanIpAddRequest) -> Result<(), RpcError>;
+    async fn ban_ip_add(request: BanIpAddRequest) -> Result<BanIpAddResponse, RpcError>;
     async fn ban_ip_list() -> Result<Vec<BanEntry>, RpcError>;
     async fn ban_ip_remove(request: BanIpRemoveRequest) -> Result<(), RpcError>;
     async fn apply_ban(request: BanIpRequest) -> Result<(), RpcError>;

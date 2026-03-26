@@ -3,9 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use anyhow::Result;
-use terminal_games::control::{
-    BanEntry, BanIpAddRequest, BanIpRemoveRequest, parse_optional_expiry,
-};
+use terminal_games::control::{BanEntry, BanIpAddRequest, BanIpRemoveRequest};
 
 use super::{
     AdminBanIpAddArgs, AdminBanIpCommand, AdminBanIpRemoveArgs, format_optional_unix, load_api,
@@ -22,17 +20,14 @@ pub(super) async fn run(command: AdminBanIpCommand, profile: Option<String>) -> 
 
 async fn add(args: AdminBanIpAddArgs, profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
-    let expires_at = parse_optional_expiry(
-        args.expiry.duration.as_deref(),
-        args.expiry.expires_at.as_deref(),
-    )?;
     let request = BanIpAddRequest {
         ip: args.ip,
         reason: args.reason,
         duration: args.expiry.duration,
         expires_at: args.expiry.expires_at,
     };
-    api.rpc()
+    let response = api
+        .rpc()
         .await?
         .ban_ip_add(terminal_games::control::rpc_context(), request.clone())
         .await?
@@ -42,7 +37,7 @@ async fn add(args: AdminBanIpAddArgs, profile: Option<String>) -> Result<()> {
             let apply_request = terminal_games::control::BanIpRequest {
                 ip: request.ip.clone(),
                 reason: request.reason.clone(),
-                expires_at,
+                expires_at: response.expires_at,
             };
             async move {
                 rpc.apply_ban(terminal_games::control::rpc_context(), apply_request)

@@ -40,13 +40,14 @@ use terminal_games::{
     control::{
         AdminControlRpc, AuthorControlRpc, AuthorEnvDeleteRequest, AuthorEnvListResponse,
         AuthorEnvSetRequest, AuthorSelfResponse, AuthorSummary, AuthorTokenClaims, BanEntry,
-        BanIpAddRequest, BanIpRemoveRequest, BanIpRequest, BroadcastLevel, BroadcastRequest,
-        CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest, DeleteShortnameRequest,
-        DeleteShortnameResponse, KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus,
-        RotateAuthorTokenRequest, RotateAuthorTokenResponse, RpcError, SessionSummary,
-        SpyClientMessage, SpyControlMessage, StatusBarState, StatusBroadcast, TickerAddRequest,
-        TickerEntry, TickerRemoveRequest, TickerReorderRequest, UploadGameRequest,
-        UploadGameResponse, expiry_from_duration, parse_duration_string, parse_optional_expiry,
+        BanIpAddRequest, BanIpAddResponse, BanIpRemoveRequest, BanIpRequest, BroadcastLevel,
+        BroadcastRequest, CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest,
+        DeleteShortnameRequest, DeleteShortnameResponse, KickSessionRequest,
+        RegionDiscoveryResponse, RegionRuntimeStatus, RotateAuthorTokenRequest,
+        RotateAuthorTokenResponse, RpcError, SessionSummary, SpyClientMessage, SpyControlMessage,
+        StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest,
+        TickerReorderRequest, UploadGameRequest, UploadGameResponse, expiry_from_duration,
+        parse_duration_string, parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
     mesh::{BuildId, ContentHash, GameRuntimeUpdateMessage, Mesh, hash_author_envs, hash_bytes},
@@ -438,7 +439,7 @@ impl AdminControlRpc for AdminRpcServer {
         self,
         _: context::Context,
         request: BanIpAddRequest,
-    ) -> Result<(), RpcError> {
+    ) -> Result<BanIpAddResponse, RpcError> {
         let expires_at =
             parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref())?;
         self.control
@@ -454,7 +455,7 @@ impl AdminControlRpc for AdminRpcServer {
                 libsql::params!(request.ip, request.reason.clone(), expires_at),
             )
             .await?;
-        Ok(())
+        Ok(BanIpAddResponse { expires_at })
     }
 
     async fn ban_ip_list(self, _: context::Context) -> Result<Vec<BanEntry>, RpcError> {
