@@ -165,6 +165,39 @@ async fn connect_admin_rpc(base_url: &str, bearer: &str) -> Result<AdminControlR
     Ok(AdminControlRpcClient::new(client::Config::default(), transport).spawn())
 }
 
+async fn with_admin_rpc<R, F, Fut>(base_url: &str, bearer: &str, f: F) -> Result<R>
+where
+    F: FnOnce(AdminControlRpcClient) -> Fut,
+    Fut: std::future::Future<Output = Result<R>>,
+{
+    let mut codec = LengthDelimitedCodec::new();
+    codec.set_max_frame_length(CONTROL_RPC_MAX_FRAME_LEN);
+    let transport = tarpc::serde_transport::new::<
+        _,
+        tarpc::Response<terminal_games::control::AdminControlRpcResponse>,
+        tarpc::ClientMessage<terminal_games::control::AdminControlRpcRequest>,
+        _,
+    >(
+        Framed::new(
+            connect_ws(base_url, "/control/admin/rpc", bearer).await?,
+            codec,
+        ),
+        tarpc::tokio_serde::formats::Bincode::default(),
+    );
+    let tarpc::client::NewClient { client, dispatch } =
+        AdminControlRpcClient::new(client::Config::default(), transport);
+    let dispatch_task = tokio::spawn(async move { dispatch.await.map_err(anyhow::Error::new) });
+    let result = f(client.clone()).await;
+    drop(client);
+    match tokio::time::timeout(std::time::Duration::from_secs(1), dispatch_task).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => return Err(error),
+        Ok(Err(error)) => return Err(anyhow::Error::new(error)),
+        Err(_) => anyhow::bail!("admin rpc dispatch did not shut down cleanly"),
+    }
+    result
+}
+
 async fn connect_author_rpc(claims: &AuthorTokenClaims) -> Result<AuthorControlRpcClient> {
     let mut codec = LengthDelimitedCodec::new();
     codec.set_max_frame_length(CONTROL_RPC_MAX_FRAME_LEN);
@@ -261,6 +294,23 @@ impl AdminClient {
         Ok(sessions)
     }
 
+    pub async fn completion_all_sessions(&self) -> Result<Vec<SessionSummary>> {
+        let (_, region_urls) = self.completion_discover().await?;
+        let futures = region_urls.values().cloned().map(|base_url| async move {
+            with_admin_rpc(&base_url, &self.token, |rpc| async move {
+                rpc.sessions(rpc_context())
+                    .await?
+                    .map_err(anyhow::Error::msg)
+            })
+            .await
+        });
+        let mut sessions = Vec::new();
+        for result in join_all(futures).await {
+            sessions.extend(result?);
+        }
+        Ok(sessions)
+    }
+
     pub async fn session_summary(
         &self,
         region: &str,
@@ -289,6 +339,53 @@ impl AdminClient {
             statuses.push(result?);
         }
         Ok(statuses)
+    }
+
+    pub async fn completion_author_ids(&self) -> Result<Vec<String>> {
+        let authors = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
+            rpc.author_list(rpc_context())
+                .await?
+                .map_err(anyhow::Error::msg)
+        })
+        .await?;
+        let mut ids = authors
+            .into_iter()
+            .map(|author| author.author_id.to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    pub async fn completion_ticker_ids(&self) -> Result<Vec<String>> {
+        let tickers = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
+            rpc.ticker_list(rpc_context())
+                .await?
+                .map_err(anyhow::Error::msg)
+        })
+        .await?;
+        let mut ids = tickers
+            .into_iter()
+            .map(|ticker| ticker.ticker_id.to_string())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    async fn completion_discover(
+        &self,
+    ) -> Result<(RegionDiscoveryResponse, BTreeMap<String, String>)> {
+        let discovery = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
+            rpc.discover(rpc_context())
+                .await?
+                .map_err(anyhow::Error::msg)
+        })
+        .await?;
+        Ok((
+            discovery.clone(),
+            derive_region_urls(&self.profile.url, &discovery)?,
+        ))
     }
 }
 

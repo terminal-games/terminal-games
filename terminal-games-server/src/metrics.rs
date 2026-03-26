@@ -365,7 +365,13 @@ impl ServerMetrics {
                     "terminal_games_session_ends_total",
                     "Completed sessions grouped by session attributes and close reason",
                 ),
-                &["region", "transport", "authenticated", "has_audio", "reason"],
+                &[
+                    "region",
+                    "transport",
+                    "authenticated",
+                    "has_audio",
+                    "reason",
+                ],
             )?,
         )?;
         let session_duration_seconds = register(
@@ -576,7 +582,14 @@ impl ServerMetrics {
         has_audio: bool,
         user_id: Option<u64>,
     ) -> SessionHandle {
-        let session = LiveSession::new(self.clone(), app, user_id, transport, authenticated, has_audio);
+        let session = LiveSession::new(
+            self.clone(),
+            app,
+            user_id,
+            transport,
+            authenticated,
+            has_audio,
+        );
         SessionHandle {
             live_session: session,
         }

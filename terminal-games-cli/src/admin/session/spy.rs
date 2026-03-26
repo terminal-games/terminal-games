@@ -355,7 +355,7 @@ fn render_spy_app_area(
             .map(|line| spy_line_ansi(line, width))
             .unwrap_or_default();
         frame.push_str(&format!(
-            "\x1b[{};1H{}{}\x1b[0m\x1b[K",
+            "\x1b[{};1H{}{}\x1b[0m",
             row + 1,
             line,
             fill.repeat(width.saturating_sub(shown))
@@ -714,12 +714,7 @@ impl SpyStatusBar {
                 "mode",
                 if self.read_write { "rw" } else { "readonly" },
             ),
-            status_field(
-                theme.muted,
-                theme.text,
-                "app",
-                &self.session.shortname,
-            ),
+            status_field(theme.muted, theme.text, "app", &self.session.shortname),
             status_field(
                 theme.muted,
                 theme.text,

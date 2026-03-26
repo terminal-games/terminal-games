@@ -214,15 +214,21 @@ impl SessionNotificationSender {
     }
 
     pub fn try_info(&self, content: impl Into<String>, duration: Duration) {
-        let _ = self.tx.try_send(StatusNotification::info(content, duration));
+        let _ = self
+            .tx
+            .try_send(StatusNotification::info(content, duration));
     }
 
     pub fn try_warning(&self, content: impl Into<String>, duration: Duration) {
-        let _ = self.tx.try_send(StatusNotification::warning(content, duration));
+        let _ = self
+            .tx
+            .try_send(StatusNotification::warning(content, duration));
     }
 
     pub fn try_error(&self, content: impl Into<String>, duration: Duration) {
-        let _ = self.tx.try_send(StatusNotification::error(content, duration));
+        let _ = self
+            .tx
+            .try_send(StatusNotification::error(content, duration));
     }
 }
 
@@ -253,7 +259,11 @@ impl SessionUi {
         mpsc::Receiver<StatusNotification>,
         watch::Receiver<StatusBarState>,
     ) {
-        (self.notification_tx, self.notification_rx, self.shared_state_rx)
+        (
+            self.notification_tx,
+            self.notification_rx,
+            self.shared_state_rx,
+        )
     }
 }
 
@@ -269,8 +279,9 @@ pub struct AppServer {
 pub struct AppInstantiationParams {
     pub input_receiver: tokio::sync::mpsc::Receiver<Bytes>,
     pub replay_request_receiver: tokio::sync::mpsc::Receiver<()>,
-    pub spy_snapshot_requests:
-        tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<crate::replay::ReplayTerminalSnapshot>>,
+    pub spy_snapshot_requests: tokio::sync::mpsc::Receiver<
+        tokio::sync::oneshot::Sender<crate::replay::ReplayTerminalSnapshot>,
+    >,
     pub output_sender: tokio::sync::mpsc::Sender<Arc<Vec<u8>>>,
     pub audio_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     pub window_size_receiver: tokio::sync::watch::Receiver<(u16, u16)>,
@@ -1224,7 +1235,11 @@ impl AppServer {
                 Ok(buf) => buf,
                 Err(_) => return Ok(0),
             };
-            if caller.data().status_bar_input.handle_terminal_input(buf.as_ref()) {
+            if caller
+                .data()
+                .status_bar_input
+                .handle_terminal_input(buf.as_ref())
+            {
                 continue;
             }
             if buf.len() > 4096 {
@@ -1352,26 +1367,25 @@ impl AppServer {
             let (tx, rx) = tokio::sync::oneshot::channel();
             caller.data_mut().next_app = Some(NextAppState::Pending(rx));
             tokio::task::spawn(async move {
-                let result =
-                    match Self::prepare_instantiate(
-                        &ctx,
-                        &menu_session,
-                        &session_identity,
-                        shortname,
-                    )
-                        .await
-                    {
-                        Ok(next_app) => {
-                            has_next_app.store(true, Ordering::Release);
-                            Ok(next_app)
-                        }
-                        Err(err) => {
-                            let error = NextAppPrepareError::from_anyhow(err);
-                            tracing::warn!(error = %error.message(), "change_app preload failed");
-                            has_next_app.store(false, Ordering::Release);
-                            Err(error)
-                        }
-                    };
+                let result = match Self::prepare_instantiate(
+                    &ctx,
+                    &menu_session,
+                    &session_identity,
+                    shortname,
+                )
+                .await
+                {
+                    Ok(next_app) => {
+                        has_next_app.store(true, Ordering::Release);
+                        Ok(next_app)
+                    }
+                    Err(err) => {
+                        let error = NextAppPrepareError::from_anyhow(err);
+                        tracing::warn!(error = %error.message(), "change_app preload failed");
+                        has_next_app.store(false, Ordering::Release);
+                        Err(error)
+                    }
+                };
                 let _ = tx.send(result);
             });
         }

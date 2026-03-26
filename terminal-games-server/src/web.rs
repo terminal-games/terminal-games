@@ -482,9 +482,13 @@ async fn handle_socket(
         app_input_sender.clone(),
         replay_request_tx,
     );
-    let session_metrics = server
-        .metrics
-        .start_session(session_identity.app(), Transport::Web, AuthKind::Anonymous, true, None);
+    let session_metrics = server.metrics.start_session(
+        session_identity.app(),
+        Transport::Web,
+        AuthKind::Anonymous,
+        true,
+        None,
+    );
     let mut admitted_session = admission_ticket.start_session(session_metrics.clone());
     let mut cluster_control = admitted_session.subscribe_control();
     let mut app_metrics_rx = session_identity.app_receiver();
@@ -510,7 +514,9 @@ async fn handle_socket(
         locale,
         log_backend: Arc::new(NoopLogBackend),
     });
-    let mut pending_input: Option<Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>> = None;
+    let mut pending_input: Option<
+        Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>,
+    > = None;
     let close_reason = loop {
         tokio::select! {
             biased;

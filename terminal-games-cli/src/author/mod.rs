@@ -12,6 +12,7 @@ mod upload;
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -148,7 +149,7 @@ fn complete_author_env_name_candidates_inner() -> Option<Vec<String>> {
     let author_ref = current_author_ref_from_args()?;
     let client = AuthorClient::from_ref(&author_ref).ok()?;
     let runtime = completion_runtime()?;
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         let response = client
             .rpc()
             .await
@@ -166,7 +167,9 @@ fn complete_author_env_name_candidates_inner() -> Option<Vec<String>> {
         names.sort();
         names.dedup();
         Some(names)
-    })
+    });
+    runtime.shutdown_timeout(Duration::from_millis(100));
+    result
 }
 
 pub(super) fn infer_author_profile_name(normalized_url: &str) -> Result<String> {

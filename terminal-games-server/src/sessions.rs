@@ -155,7 +155,10 @@ impl SessionRegistry {
             snapshot_tx,
             active_spies: AtomicUsize::new(0),
         });
-        self.sessions.lock().unwrap().insert(local_session_id, session);
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(local_session_id, session);
         SessionRegistration {
             identity,
             session_ui,
@@ -302,7 +305,11 @@ impl SessionRegistry {
     }
 
     fn lookup(&self, local_session_id: u64) -> Option<Arc<RuntimeSession>> {
-        self.sessions.lock().unwrap().get(&local_session_id).cloned()
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&local_session_id)
+            .cloned()
     }
 }
 

@@ -9,11 +9,11 @@ use terminput::{Event, MouseButton, MouseEventKind};
 use tokio::sync::{mpsc, watch};
 use unicode_width::UnicodeWidthStr;
 
+use crate::app::SessionAppState;
 use crate::control::{BroadcastLevel, StatusBarState, TickerEntry};
 use crate::palette::{self, Color};
 use crate::rate_limiting::NetworkInfo;
 use crate::terminal_profile::TerminalProfile;
-use crate::app::SessionAppState;
 
 fn terminal_width(str: &str) -> usize {
     strip_ansi_escapes::strip_str(str).width()

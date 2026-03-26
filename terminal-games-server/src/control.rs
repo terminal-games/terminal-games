@@ -4,7 +4,7 @@
 
 use std::{
     collections::VecDeque,
-    error::Error as StdError,
+    error::Error,
     io,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -46,8 +46,7 @@ use terminal_games::{
         RotateAuthorTokenRequest, RotateAuthorTokenResponse, RpcError, SessionSummary,
         SpyClientMessage, SpyControlMessage, StatusBarState, StatusBroadcast, TickerAddRequest,
         TickerEntry, TickerRemoveRequest, TickerReorderRequest, UploadGameRequest,
-        UploadGameResponse,
-        expiry_from_duration, parse_duration_string, parse_optional_expiry,
+        UploadGameResponse, expiry_from_duration, parse_duration_string, parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
     mesh::{BuildId, ContentHash, GameRuntimeUpdateMessage, Mesh, hash_author_envs, hash_bytes},
@@ -1148,7 +1147,11 @@ pub async fn admin_session_spy(
     State(control): State<ControlPlane>,
     _: AdminGuard,
 ) -> Response {
-    let Some(spy) = control.session_registry.spy(local_session_id, query.rw).await else {
+    let Some(spy) = control
+        .session_registry
+        .spy(local_session_id, query.rw)
+        .await
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let session_registry = control.session_registry.clone();

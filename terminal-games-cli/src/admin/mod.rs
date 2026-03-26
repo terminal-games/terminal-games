@@ -13,7 +13,6 @@ mod ticker;
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use clap_complete::{ArgValueCandidates, CompletionCandidate};
-use terminal_games::control::AuthorSummary;
 
 use crate::config::list_admin_profile_names;
 use crate::control_client::{AdminClient, completion_runtime};
@@ -246,7 +245,7 @@ fn complete_session_id_candidates_inner() -> Option<Vec<String>> {
     completion_runtime()?.block_on(async {
         let api = load_api(None).ok()?;
         let mut session_ids = api
-            .all_sessions()
+            .completion_all_sessions()
             .await
             .ok()?
             .into_iter()
@@ -271,22 +270,7 @@ fn complete_author_id_candidates() -> Vec<CompletionCandidate> {
 fn complete_author_id_candidates_inner() -> Option<Vec<String>> {
     completion_runtime()?.block_on(async {
         let api = load_api(None).ok()?;
-        let authors: Vec<AuthorSummary> = api
-            .rpc()
-            .await
-            .ok()?
-            .author_list(terminal_games::control::rpc_context())
-            .await
-            .ok()?
-            .map_err(anyhow::Error::msg)
-            .ok()?;
-        let mut ids = authors
-            .into_iter()
-            .map(|author| author.author_id.to_string())
-            .collect::<Vec<_>>();
-        ids.sort();
-        ids.dedup();
-        Some(ids)
+        api.completion_author_ids().await.ok()
     })
 }
 
@@ -303,21 +287,7 @@ fn complete_ticker_id_candidates() -> Vec<CompletionCandidate> {
 fn complete_ticker_id_candidates_inner() -> Option<Vec<String>> {
     completion_runtime()?.block_on(async {
         let api = load_api(None).ok()?;
-        let mut ids = api
-            .rpc()
-            .await
-            .ok()?
-            .ticker_list(terminal_games::control::rpc_context())
-            .await
-            .ok()?
-            .map_err(anyhow::Error::msg)
-            .ok()?
-            .into_iter()
-            .map(|ticker| ticker.ticker_id.to_string())
-            .collect::<Vec<_>>();
-        ids.sort();
-        ids.dedup();
-        Some(ids)
+        api.completion_ticker_ids().await.ok()
     })
 }
 
