@@ -3,7 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{
         Arc, Mutex,
@@ -14,10 +14,14 @@ use std::{
 
 use bytes::Bytes;
 use terminal_games::{
-    app::{SessionAppState, SessionControl, SessionEndReason, SessionIdentity, SessionUi},
+    app::{
+        SessionAppState, SessionControl, SessionEndReason, SessionIdentity, SessionOutput,
+        SessionUi,
+    },
     control::{SessionSummary, StatusBarState},
-    replay::ReplayTerminalSnapshot,
+    replay::{ReplayTerminalSnapshot, ReplayTerminalSnapshotCapture},
 };
+use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::idle::INITIAL_FUEL_SECS;
@@ -25,7 +29,7 @@ use crate::metrics::Transport;
 
 #[derive(Clone, Debug)]
 pub enum SpyEvent {
-    Output(Bytes),
+    Output { data: Bytes, sequence: u64 },
     Input { data: Bytes },
     Closed { reason: SessionEndReason },
 }
@@ -33,6 +37,7 @@ pub enum SpyEvent {
 pub struct SpySession {
     session: Arc<RuntimeSession>,
     pub snapshot: ReplayTerminalSnapshot,
+    pub pending_events: VecDeque<SpyEvent>,
     pub event_rx: broadcast::Receiver<SpyEvent>,
     pub input_tx: Option<mpsc::Sender<Bytes>>,
     pub username_rx: watch::Receiver<String>,
@@ -54,7 +59,7 @@ pub struct SessionRegistration {
     pub idle_rx: watch::Receiver<SessionIdleState>,
     pub app_input_sender: mpsc::Sender<Bytes>,
     pub app_input_receiver: mpsc::Receiver<Bytes>,
-    pub spy_snapshot_requests: mpsc::Receiver<oneshot::Sender<ReplayTerminalSnapshot>>,
+    pub spy_snapshot_requests: mpsc::Receiver<oneshot::Sender<ReplayTerminalSnapshotCapture>>,
     pub cleanup_guard: SessionCleanupGuard,
 }
 
@@ -86,7 +91,7 @@ struct RuntimeSession {
     input_tx: mpsc::Sender<Bytes>,
     control_tx: watch::Sender<SessionControl>,
     spy_tx: broadcast::Sender<SpyEvent>,
-    snapshot_tx: mpsc::Sender<oneshot::Sender<ReplayTerminalSnapshot>>,
+    snapshot_tx: mpsc::Sender<oneshot::Sender<ReplayTerminalSnapshotCapture>>,
     active_spies: AtomicUsize,
 }
 
@@ -258,14 +263,17 @@ impl SessionRegistry {
         })
     }
 
-    pub fn record_output(&self, local_session_id: u64, data: &Bytes) {
+    pub fn record_output(&self, local_session_id: u64, output: &SessionOutput) {
         let Some(session) = self.lookup(local_session_id) else {
             return;
         };
         if session.active_spies.load(Ordering::Acquire) == 0 {
             return;
         }
-        let _ = session.spy_tx.send(SpyEvent::Output(data.clone()));
+        let _ = session.spy_tx.send(SpyEvent::Output {
+            data: output.data.clone(),
+            sequence: output.sequence,
+        });
     }
 
     pub fn record_input(&self, local_session_id: u64, data: &Bytes) {
@@ -280,6 +288,7 @@ impl SessionRegistry {
 
     pub async fn spy(&self, local_session_id: u64, read_write: bool) -> Option<SpySession> {
         let session = self.lookup(local_session_id)?;
+        let mut event_rx = session.spy_tx.subscribe();
         session.active_spies.fetch_add(1, Ordering::AcqRel);
 
         let snapshot = match request_snapshot(&session).await {
@@ -292,8 +301,12 @@ impl SessionRegistry {
 
         Some(SpySession {
             session: session.clone(),
-            snapshot,
-            event_rx: session.spy_tx.subscribe(),
+            snapshot: snapshot.snapshot,
+            pending_events: drain_pending_spy_events(
+                &mut event_rx,
+                snapshot.output_sequence_cutoff,
+            ),
+            event_rx,
             input_tx: read_write.then_some(session.input_tx.clone()),
             username_rx: session.identity.username_receiver(),
             app_rx: session.identity.app_receiver(),
@@ -311,8 +324,32 @@ impl SessionRegistry {
     }
 }
 
-async fn request_snapshot(session: &RuntimeSession) -> Option<ReplayTerminalSnapshot> {
+async fn request_snapshot(session: &RuntimeSession) -> Option<ReplayTerminalSnapshotCapture> {
     let (tx, rx) = oneshot::channel();
     session.snapshot_tx.send(tx).await.ok()?;
     rx.await.ok()
+}
+
+fn drain_pending_spy_events(
+    event_rx: &mut broadcast::Receiver<SpyEvent>,
+    output_sequence_cutoff: u64,
+) -> VecDeque<SpyEvent> {
+    let mut pending_events = VecDeque::new();
+    loop {
+        match event_rx.try_recv() {
+            Ok(event) => {
+                let keep_event = match &event {
+                    SpyEvent::Output { sequence, .. } => *sequence >= output_sequence_cutoff,
+                    SpyEvent::Input { .. } | SpyEvent::Closed { .. } => true,
+                };
+                if keep_event {
+                    pending_events.push_back(event);
+                }
+            }
+            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) | Err(TryRecvError::Lagged(_)) => {
+                break;
+            }
+        }
+    }
+    pending_events
 }

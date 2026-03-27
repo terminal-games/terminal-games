@@ -41,6 +41,11 @@ pub struct ReplayTerminalSnapshot {
     pub dump: String,
 }
 
+pub struct ReplayTerminalSnapshotCapture {
+    pub snapshot: ReplayTerminalSnapshot,
+    pub output_sequence_cutoff: u64,
+}
+
 #[derive(Serialize)]
 struct AsciicastHeader<'a> {
     version: u32,

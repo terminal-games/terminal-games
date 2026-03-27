@@ -280,9 +280,9 @@ pub struct AppInstantiationParams {
     pub input_receiver: tokio::sync::mpsc::Receiver<Bytes>,
     pub replay_request_receiver: tokio::sync::mpsc::Receiver<()>,
     pub spy_snapshot_requests: tokio::sync::mpsc::Receiver<
-        tokio::sync::oneshot::Sender<crate::replay::ReplayTerminalSnapshot>,
+        tokio::sync::oneshot::Sender<crate::replay::ReplayTerminalSnapshotCapture>,
     >,
-    pub output_sender: tokio::sync::mpsc::Sender<Bytes>,
+    pub output_sender: tokio::sync::mpsc::Sender<SessionOutput>,
     pub audio_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     pub window_size_receiver: tokio::sync::watch::Receiver<(u16, u16)>,
     pub graceful_shutdown_token: CancellationToken,
@@ -297,6 +297,12 @@ pub struct AppInstantiationParams {
     pub user_id: Option<u64>,
     pub locale: String,
     pub log_backend: Arc<dyn GuestLogBackend>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionOutput {
+    pub data: Bytes,
+    pub sequence: u64,
 }
 
 impl AppServer {
@@ -495,6 +501,7 @@ impl AppServer {
                 tokio::sync::oneshot::Receiver<(StatusNotification, Option<MenuSessionState>)>,
             > = None;
             let mut replay_requests_open = true;
+            let mut next_output_sequence = 0_u64;
 
             loop {
                 let app_shortname = app.shortname.clone();
@@ -591,8 +598,14 @@ impl AppServer {
 
                                 if !output.is_empty() {
                                     let output = output.freeze();
+                                    let sequence = next_output_sequence;
+                                    next_output_sequence += 1;
                                     replay_buffer.push_output(output.clone());
-                                    if output_sender.send(output).await.is_err() {
+                                    if output_sender
+                                        .send(SessionOutput { data: output, sequence })
+                                        .await
+                                        .is_err()
+                                    {
                                         break 'block None;
                                     }
                                 }
@@ -611,8 +624,14 @@ impl AppServer {
                                 status_bar.maybe_render_into(screen, &mut output, true);
                                 if !output.is_empty() {
                                     let output = output.freeze();
+                                    let sequence = next_output_sequence;
+                                    next_output_sequence += 1;
                                     replay_buffer.push_output(output.clone());
-                                    if output_sender.send(output).await.is_err() {
+                                    if output_sender
+                                        .send(SessionOutput { data: output, sequence })
+                                        .await
+                                        .is_err()
+                                    {
                                         break 'block None;
                                     }
                                 }
@@ -627,8 +646,14 @@ impl AppServer {
                                 status_bar.maybe_render_into(terminal.screen(), &mut output, force);
                                 if !output.is_empty() {
                                     let output = output.freeze();
+                                    let sequence = next_output_sequence;
+                                    next_output_sequence += 1;
                                     replay_buffer.push_output(output.clone());
-                                    if output_sender.send(output).await.is_err() {
+                                    if output_sender
+                                        .send(SessionOutput { data: output, sequence })
+                                        .await
+                                        .is_err()
+                                    {
                                         break 'block None;
                                     }
                                 }
@@ -650,8 +675,14 @@ impl AppServer {
                                     status_bar.maybe_render_into(terminal.screen(), &mut output, true);
                                     if !output.is_empty() {
                                         let output = output.freeze();
+                                        let sequence = next_output_sequence;
+                                        next_output_sequence += 1;
                                         replay_buffer.push_output(output.clone());
-                                        if output_sender.send(output).await.is_err() {
+                                        if output_sender
+                                            .send(SessionOutput { data: output, sequence })
+                                            .await
+                                            .is_err()
+                                        {
                                             break 'block None;
                                         }
                                     }
@@ -724,7 +755,10 @@ impl AppServer {
                                 let Some(snapshot_request) = snapshot_request else {
                                     continue;
                                 };
-                                let _ = snapshot_request.send(replay_buffer.terminal_snapshot());
+                                let _ = snapshot_request.send(crate::replay::ReplayTerminalSnapshotCapture {
+                                    snapshot: replay_buffer.terminal_snapshot(),
+                                    output_sequence_cutoff: next_output_sequence,
+                                });
                             }
 
                             _ = graceful_shutdown_token.cancelled(), if graceful_shutdown_timeout.is_none() => {

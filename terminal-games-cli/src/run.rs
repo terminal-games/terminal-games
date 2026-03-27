@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, layer::SubscriberExt};
 
 use terminal_games::{
-    app::{AppInstantiationParams, AppServer, SessionIdentity, SessionUi},
+    app::{AppInstantiationParams, AppServer, SessionIdentity, SessionOutput, SessionUi},
     author_env::{encrypt_author_env_blob, validate_author_envs},
     control::{AuthorEnvVar, StatusBarState},
     input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker},
@@ -673,7 +673,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         crossterm::cursor::Hide
     )?;
 
-    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<SessionOutput>(1);
     let (resize_tx, resize_rx) = tokio::sync::watch::channel(crossterm::terminal::size()?);
     let mut background_tracker = TerminalBackgroundTracker::default();
     let (raw_input_tx, mut raw_input_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
@@ -871,13 +871,13 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
 
                 let metered_data = if compress {
                     let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
-                    encoder.write_all(&data).ok();
+                    encoder.write_all(&data.data).ok();
                     Bytes::from(encoder.finish().unwrap_or_default())
                 } else {
-                    data.clone()
+                    data.data.clone()
                 };
 
-                let _ = delayed_tx.send((DelayedData::Terminal { raw: data, metered: metered_data }, deliver_at, delay_ms));
+                let _ = delayed_tx.send((DelayedData::Terminal { raw: data.data, metered: metered_data }, deliver_at, delay_ms));
             }
 
             _ = sigwinch.recv() => {

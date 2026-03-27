@@ -1217,6 +1217,12 @@ async fn run_spy_socket(
         return;
     }
 
+    while let Some(message) = spy.pending_events.pop_front() {
+        if !send_spy_event(&mut socket, message, show_input).await {
+            return;
+        }
+    }
+
     loop {
         tokio::select! {
             message = spy.event_rx.recv() => {
@@ -1227,41 +1233,8 @@ async fn run_spy_socket(
                     }))).await;
                     break;
                 };
-                match message {
-                    crate::sessions::SpyEvent::Output(data) => {
-                        if socket.send(Message::Binary(data)).await.is_err() {
-                            break;
-                        }
-                    }
-                    crate::sessions::SpyEvent::Input { data } => {
-                        if !show_input {
-                            continue;
-                        }
-                        let Ok(payload) =
-                            serde_json::to_string(&SpyControlMessage::Input { data })
-                        else {
-                            break;
-                        };
-                        if socket.send(Message::Text(payload.into())).await.is_err() {
-                            break;
-                        }
-                    }
-                    crate::sessions::SpyEvent::Closed { reason } => {
-                        let Ok(payload) = serde_json::to_string(&SpyControlMessage::Closed {
-                            reason_slug: reason.slug().to_string(),
-                            message: reason.user_message().to_string(),
-                        }) else {
-                            break;
-                        };
-                        if socket.send(Message::Text(payload.into())).await.is_err() {
-                            break;
-                        }
-                        let _ = socket.send(Message::Close(Some(CloseFrame {
-                            code: 1000,
-                            reason: reason.user_message().into(),
-                        }))).await;
-                        break;
-                    }
+                if !send_spy_event(&mut socket, message, show_input).await {
+                    break;
                 }
             }
             changed = spy.size_rx.changed() => {
@@ -1352,6 +1325,45 @@ async fn run_spy_socket(
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+async fn send_spy_event(
+    socket: &mut WebSocket,
+    message: crate::sessions::SpyEvent,
+    show_input: bool,
+) -> bool {
+    match message {
+        crate::sessions::SpyEvent::Output { data, .. } => {
+            socket.send(Message::Binary(data)).await.is_ok()
+        }
+        crate::sessions::SpyEvent::Input { data, .. } => {
+            if !show_input {
+                return true;
+            }
+            let Ok(payload) = serde_json::to_string(&SpyControlMessage::Input { data }) else {
+                return false;
+            };
+            socket.send(Message::Text(payload.into())).await.is_ok()
+        }
+        crate::sessions::SpyEvent::Closed { reason, .. } => {
+            let Ok(payload) = serde_json::to_string(&SpyControlMessage::Closed {
+                reason_slug: reason.slug().to_string(),
+                message: reason.user_message().to_string(),
+            }) else {
+                return false;
+            };
+            if socket.send(Message::Text(payload.into())).await.is_err() {
+                return false;
+            }
+            let _ = socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: 1000,
+                    reason: reason.user_message().into(),
+                })))
+                .await;
+            false
         }
     }
 }

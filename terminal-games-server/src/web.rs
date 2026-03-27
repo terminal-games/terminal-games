@@ -48,7 +48,9 @@ use tokio_rustls::{
 use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
-use terminal_games::app::{AppInstantiationParams, AppServer, SessionControl, SessionEndReason};
+use terminal_games::app::{
+    AppInstantiationParams, AppServer, SessionControl, SessionEndReason, SessionOutput,
+};
 use terminal_games::input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker};
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
@@ -423,7 +425,7 @@ async fn handle_socket(
     let token = cancellation_token.clone();
     let background_tracker = TerminalBackgroundTracker::default();
 
-    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<SessionOutput>(1);
     let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
     let admission_ticket = server
         .admission_controller
@@ -618,12 +620,12 @@ async fn handle_socket(
                 let Some(data) = data else {
                     break SessionEndReason::NormalExit;
                 };
-                admitted_session.record_output(data.len());
+                admitted_session.record_output(data.data.len());
                 server.session_registry.record_output(local_session_id, &data);
-                let mut msg = Vec::with_capacity(data.len() / 2);
+                let mut msg = Vec::with_capacity(data.data.len() / 2);
                 {
                     let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
-                    if encoder.write_all(&data).is_err() || encoder.finish().is_err() {
+                    if encoder.write_all(&data.data).is_err() || encoder.finish().is_err() {
                         break SessionEndReason::NormalExit;
                     }
                 }

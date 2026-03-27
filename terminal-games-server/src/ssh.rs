@@ -15,7 +15,9 @@ use russh::server::*;
 use russh::{Channel, ChannelId, Pty};
 use tokio_util::sync::CancellationToken;
 
-use terminal_games::app::{AppInstantiationParams, AppServer, SessionControl, SessionEndReason};
+use terminal_games::app::{
+    AppInstantiationParams, AppServer, SessionControl, SessionEndReason, SessionOutput,
+};
 use terminal_games::input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker};
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::palette;
@@ -318,7 +320,7 @@ impl SshServer {
                 terminal_profile = terminal_profile.with_background_rgb(rgb);
             }
 
-            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(1);
+            let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<SessionOutput>(1);
             let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel(8);
             if admission_controller.should_require_captcha() {
                 let captcha = generate_captcha(7);
@@ -570,11 +572,11 @@ impl SshServer {
                         let Some(data) = data else {
                             break SessionEndReason::NormalExit;
                         };
-                        admitted_session.record_output(data.len());
-                        session_metrics.record_bytes(Direction::Out, data.len());
-                        control.record_bytes(data.len());
+                        admitted_session.record_output(data.data.len());
+                        session_metrics.record_bytes(Direction::Out, data.data.len());
+                        control.record_bytes(data.data.len());
                         session_registry.record_output(local_session_id, &data);
-                        if session_handle.data(channel_id, russh::CryptoVec::from_slice(&data)).await.is_err() {
+                        if session_handle.data(channel_id, russh::CryptoVec::from_slice(&data.data)).await.is_err() {
                             break SessionEndReason::ConnectionLost;
                         }
                     }
