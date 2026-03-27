@@ -28,7 +28,7 @@ use crate::{
     audio::{CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
     author_env::decrypt_author_env_blob,
     control::StatusBarState,
-    game_registry::GameRuntimeRegistry,
+    game_registry::{GameRuntimeRegistry, GameRuntimeSession},
     log_backend::{GuestLogBackend, LogLevel, parse_guest_log_object},
     mesh::{AppId, BuildId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
@@ -890,7 +890,7 @@ impl AppServer {
                 .map(|env| (env.name, env.value))
                 .collect();
         let app_id = AppId { game_id, build_id };
-        let update_available = ctx
+        let game_runtime_session = ctx
             .game_registry
             .subscribe(game_id, build_id, build_updated_at);
 
@@ -947,7 +947,7 @@ impl AppServer {
                 peer_rx,
                 peer_tx,
                 app_id,
-                update_available,
+                game_runtime_session,
                 shortname,
             },
             instance_pre,
@@ -2015,7 +2015,12 @@ impl AppServer {
     }
 
     fn new_version_available_poll(caller: wasmtime::Caller<'_, AppState>) -> wasmtime::Result<i32> {
-        let has_update = caller.data().app.update_available.load(Ordering::Relaxed);
+        let has_update = caller
+            .data()
+            .app
+            .game_runtime_session
+            .update_available()
+            .load(Ordering::Relaxed);
         Ok(if has_update { 1 } else { 0 })
     }
 
@@ -2253,7 +2258,7 @@ pub struct PreloadedAppState {
     peer_rx: tokio::sync::mpsc::Receiver<PeerMessageApp>,
     peer_tx: tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>,
     app_id: AppId,
-    update_available: Arc<AtomicBool>,
+    game_runtime_session: GameRuntimeSession,
     shortname: String,
 }
 
