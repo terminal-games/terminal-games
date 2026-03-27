@@ -111,7 +111,10 @@ impl ControlPlane {
         let Some(token) = bearer_token(headers) else {
             return Err((StatusCode::UNAUTHORIZED, "missing bearer token").into_response());
         };
-        if constant_time_eq(token.as_bytes(), expected.as_bytes()) {
+        if constant_time_eq(
+            sha256_bytes(token).as_slice(),
+            sha256_bytes(expected).as_slice(),
+        ) {
             Ok(())
         } else {
             Err((StatusCode::UNAUTHORIZED, "invalid bearer token").into_response())
