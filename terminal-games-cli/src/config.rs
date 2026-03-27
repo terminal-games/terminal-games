@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use terminal_games::control::{AuthorTokenClaims, RegionDiscoveryResponse};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminProfile {
@@ -295,14 +296,14 @@ pub fn read_secret_stdin() -> Result<String> {
 pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     let mut widths = headers
         .iter()
-        .map(|header| header.len())
+        .map(|header| visible_width(header))
         .collect::<Vec<_>>();
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
             if index >= widths.len() {
-                widths.push(cell.len());
+                widths.push(visible_width(cell));
             } else {
-                widths[index] = widths[index].max(cell.len());
+                widths[index] = widths[index].max(visible_width(cell));
             }
         }
     }
@@ -310,7 +311,7 @@ pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     let header = headers
         .iter()
         .enumerate()
-        .map(|(index, cell)| format!("{cell:<width$}", width = widths[index]))
+        .map(|(index, cell)| pad_visible(cell, widths[index]))
         .collect::<Vec<_>>()
         .join("  ");
     println!("{header}");
@@ -327,11 +328,20 @@ pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
             "{}",
             row.iter()
                 .enumerate()
-                .map(|(index, cell)| format!("{cell:<width$}", width = widths[index]))
+                .map(|(index, cell)| pad_visible(cell, widths[index]))
                 .collect::<Vec<_>>()
                 .join("  ")
         );
     }
+}
+
+fn visible_width(value: &str) -> usize {
+    strip_ansi_escapes::strip_str(value).width()
+}
+
+fn pad_visible(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(visible_width(value));
+    format!("{value}{}", " ".repeat(padding))
 }
 
 pub fn format_duration(seconds: u64) -> String {

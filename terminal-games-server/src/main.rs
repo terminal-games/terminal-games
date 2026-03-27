@@ -388,8 +388,7 @@ async fn main() -> Result<()> {
         .filter(|value| !value.is_empty())
         .map(Arc::<str>::from);
     let session_registry = sessions::SessionRegistry::new(region_id);
-    let initial_status_bar_state =
-        control::load_status_bar_state(&conn, &session_registry.region_id()).await?;
+    let initial_status_bar_state = control::load_status_bar_state(&conn, None).await?;
     session_registry.set_status_bar_state(initial_status_bar_state);
     let control_plane = control::ControlPlane::new(
         app_server.clone(),

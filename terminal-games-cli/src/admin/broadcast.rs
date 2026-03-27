@@ -5,30 +5,29 @@
 use anyhow::Result;
 use terminal_games::control::{BroadcastLevel, BroadcastRequest};
 
-use super::{
-    AdminBroadcastArgs, BroadcastLevelArg, load_api, parse_regions_arg, refresh_status_bar_state,
-};
+use super::{AdminBroadcastArgs, BroadcastLevelArg, load_api, parse_regions_arg};
 
 pub(super) async fn run(args: AdminBroadcastArgs, profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
-    api.rpc()
-        .await?
-        .broadcast(
-            terminal_games::control::rpc_context(),
-            BroadcastRequest {
-                level: match args.level {
-                    BroadcastLevelArg::Info => BroadcastLevel::Info,
-                    BroadcastLevelArg::Warning => BroadcastLevel::Warning,
-                    BroadcastLevelArg::Error => BroadcastLevel::Error,
-                },
-                regions: parse_regions_arg(args.regions),
-                message: args.message,
-                duration: args.duration,
-            },
-        )
-        .await?
-        .map_err(anyhow::Error::msg)?;
-    refresh_status_bar_state(&api).await?;
+    let request = BroadcastRequest {
+        level: match args.level {
+            BroadcastLevelArg::Info => BroadcastLevel::Info,
+            BroadcastLevelArg::Warning => BroadcastLevel::Warning,
+            BroadcastLevelArg::Error => BroadcastLevel::Error,
+        },
+        regions: parse_regions_arg(args.regions),
+        message: args.message,
+        duration: args.duration,
+    };
+    api.fanout(|rpc| {
+        let request = request.clone();
+        async move {
+            rpc.broadcast(terminal_games::control::rpc_context(), request)
+                .await?
+                .map_err(anyhow::Error::msg)
+        }
+    })
+    .await?;
     println!("Broadcast applied");
     Ok(())
 }

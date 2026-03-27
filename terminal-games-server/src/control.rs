@@ -40,14 +40,13 @@ use terminal_games::{
     control::{
         AdminControlRpc, AuthorControlRpc, AuthorEnvDeleteRequest, AuthorEnvListResponse,
         AuthorEnvSetRequest, AuthorSelfResponse, AuthorSummary, AuthorTokenClaims, BanEntry,
-        BanIpAddRequest, BanIpAddResponse, BanIpRemoveRequest, BanIpRequest, BroadcastLevel,
-        BroadcastRequest, CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest,
-        DeleteShortnameRequest, DeleteShortnameResponse, KickSessionRequest,
-        RegionDiscoveryResponse, RegionRuntimeStatus, RotateAuthorTokenRequest,
-        RotateAuthorTokenResponse, RpcError, SessionSummary, SpyClientMessage, SpyControlMessage,
-        StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest,
-        TickerReorderRequest, UploadGameRequest, UploadGameResponse, expiry_from_duration,
-        parse_duration_string, parse_optional_expiry,
+        BanIpAddRequest, BanIpAddResponse, BanIpRemoveRequest, BanIpRequest, BroadcastRequest,
+        CreateAuthorRequest, CreateAuthorResponse, DeleteAuthorRequest, DeleteShortnameRequest,
+        DeleteShortnameResponse, KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus,
+        RotateAuthorTokenRequest, RotateAuthorTokenResponse, RpcError, SessionSummary,
+        SpyClientMessage, SpyControlMessage, StatusBarState, StatusBroadcast, TickerAddRequest,
+        TickerEntry, TickerRemoveRequest, TickerReorderRequest, UploadGameRequest,
+        UploadGameResponse, expiry_from_duration, parse_duration_string, parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
     mesh::{BuildId, ContentHash, GameRuntimeUpdateMessage, Mesh, hash_author_envs, hash_bytes},
@@ -71,6 +70,7 @@ pub struct ControlPlane {
     app_server: Arc<AppServer>,
     admission_controller: Arc<AdmissionController>,
     session_registry: Arc<SessionRegistry>,
+    latest_broadcast: Arc<Mutex<Option<StatusBroadcast>>>,
     mesh: Mesh,
     admin_shared_secret: Option<Arc<str>>,
     bandwidth: Arc<BandwidthTracker>,
@@ -92,6 +92,7 @@ impl ControlPlane {
             app_server,
             admission_controller,
             session_registry,
+            latest_broadcast: Arc::new(Mutex::new(None)),
             mesh,
             admin_shared_secret,
             bandwidth: Arc::new(BandwidthTracker::default()),
@@ -189,9 +190,24 @@ impl ControlPlane {
     }
 
     pub async fn refresh_status_bar_state(&self) -> anyhow::Result<()> {
-        let state = load_status_bar_state(&self.app_server.db, &self.region_id).await?;
+        let state = load_status_bar_state(&self.app_server.db, self.current_broadcast()).await?;
         self.session_registry.set_status_bar_state(state);
         Ok(())
+    }
+
+    fn set_latest_broadcast(&self, broadcast: Option<StatusBroadcast>) {
+        *self.latest_broadcast.lock().unwrap() = broadcast;
+    }
+
+    fn current_broadcast(&self) -> Option<StatusBroadcast> {
+        let mut latest_broadcast = self.latest_broadcast.lock().unwrap();
+        if latest_broadcast
+            .as_ref()
+            .is_some_and(|broadcast| broadcast.expires_at <= current_unix_seconds())
+        {
+            *latest_broadcast = None;
+        }
+        latest_broadcast.clone()
     }
 
     fn local_region_status(&self) -> RegionRuntimeStatus {
@@ -650,21 +666,20 @@ impl AdminControlRpc for AdminRpcServer {
             return Err("broadcast message exceeds 240 bytes".into());
         }
         let expires_at = parse_duration_string(&request.duration).and_then(expiry_from_duration)?;
-        let regions_csv = normalize_regions_csv(&request.regions);
-        self.control
-            .app_server
-            .db
-            .execute(
-                "INSERT INTO status_broadcasts (level, regions, message, expires_at)
-             VALUES (?1, ?2, ?3, ?4)",
-                libsql::params!(
-                    broadcast_level_sql(request.level),
-                    regions_csv,
-                    request.message,
-                    expires_at
-                ),
-            )
-            .await?;
+        let regions = normalize_regions(&request.regions);
+        let broadcast = if region_matches(&self.control.region_id, &regions) {
+            Some(StatusBroadcast {
+                broadcast_id: current_unix_nanos().max(0) as u64,
+                level: request.level,
+                message: request.message,
+                expires_at,
+                created_at: current_unix_seconds(),
+                regions,
+            })
+        } else {
+            None
+        };
+        self.control.set_latest_broadcast(broadcast);
         self.control.refresh_status_bar_state().await?;
         Ok(())
     }
@@ -1553,40 +1568,12 @@ async fn load_ticker_entries(db: &libsql::Connection) -> anyhow::Result<Vec<Tick
 
 pub async fn load_status_bar_state(
     db: &libsql::Connection,
-    region_id: &str,
+    broadcast: Option<StatusBroadcast>,
 ) -> anyhow::Result<StatusBarState> {
     let tickers = load_ticker_entries(db).await?;
-    let mut rows = db
-        .query(
-            "SELECT id, level, regions, message, expires_at, created_at
-             FROM status_broadcasts
-             ORDER BY created_at ASC, id ASC",
-            (),
-        )
-        .await?;
-    let now = current_unix_seconds();
-    let mut broadcasts = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let expires_at = row.get::<i64>(4)?;
-        if expires_at <= now {
-            continue;
-        }
-        let regions = parse_regions_csv(&row.get::<String>(2)?);
-        if !regions.is_empty() && !regions.iter().any(|region| region == region_id) {
-            continue;
-        }
-        broadcasts.push(StatusBroadcast {
-            broadcast_id: row.get::<u64>(0)?,
-            level: parse_broadcast_level(&row.get::<String>(1)?)?,
-            regions,
-            message: row.get::<String>(3)?,
-            expires_at,
-            created_at: row.get::<i64>(5)?,
-        });
-    }
     Ok(StatusBarState {
         tickers,
-        broadcasts,
+        broadcasts: broadcast.into_iter().collect(),
     })
 }
 
@@ -1617,24 +1604,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-fn parse_broadcast_level(raw: &str) -> anyhow::Result<BroadcastLevel> {
-    match raw {
-        "info" => Ok(BroadcastLevel::Info),
-        "warning" => Ok(BroadcastLevel::Warning),
-        "error" => Ok(BroadcastLevel::Error),
-        other => anyhow::bail!("invalid broadcast level '{other}'"),
-    }
-}
-
-fn broadcast_level_sql(level: BroadcastLevel) -> &'static str {
-    match level {
-        BroadcastLevel::Info => "info",
-        BroadcastLevel::Warning => "warning",
-        BroadcastLevel::Error => "error",
-    }
-}
-
-fn normalize_regions_csv(regions: &[String]) -> String {
+fn normalize_regions(regions: &[String]) -> Vec<String> {
     let mut regions = regions
         .iter()
         .map(|region| region.trim().to_string())
@@ -1642,15 +1612,11 @@ fn normalize_regions_csv(regions: &[String]) -> String {
         .collect::<Vec<_>>();
     regions.sort();
     regions.dedup();
-    regions.join(",")
+    regions
 }
 
-fn parse_regions_csv(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|region| !region.is_empty())
-        .map(str::to_string)
-        .collect()
+fn region_matches(region_id: &str, regions: &[String]) -> bool {
+    regions.is_empty() || regions.iter().any(|region| region == region_id)
 }
 
 fn current_unix_seconds() -> i64 {

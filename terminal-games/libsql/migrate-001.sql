@@ -78,12 +78,3 @@ CREATE TABLE IF NOT EXISTS status_tickers (
 
 CREATE INDEX IF NOT EXISTS idx_status_tickers_sort_order
 ON status_tickers(sort_order, id);
-
-CREATE TABLE IF NOT EXISTS status_broadcasts (
-    id INTEGER PRIMARY KEY,
-    level TEXT NOT NULL,
-    regions TEXT NOT NULL DEFAULT '',
-    message TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    created_at INTEGER NOT NULL DEFAULT (unixepoch())
-);

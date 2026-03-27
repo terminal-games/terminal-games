@@ -5704,6 +5704,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "strip-ansi-escapes",
  "tarpc",
  "terminal-games",
  "terminput",

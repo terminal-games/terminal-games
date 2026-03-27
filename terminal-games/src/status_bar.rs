@@ -103,6 +103,13 @@ pub struct StatusBarInput {
 }
 
 fn style(text: impl AsRef<str>, fg: Option<Color>, bg: Option<Color>, bold: bool) -> String {
+    let Some(prefix) = style_prefix(fg, bg, bold) else {
+        return text.as_ref().to_string();
+    };
+    format!("{prefix}{}\x1b[0m", text.as_ref())
+}
+
+fn style_prefix(fg: Option<Color>, bg: Option<Color>, bold: bool) -> Option<String> {
     let mut codes = Vec::with_capacity(3);
     if bold {
         codes.push("1".to_string());
@@ -114,17 +121,33 @@ fn style(text: impl AsRef<str>, fg: Option<Color>, bg: Option<Color>, bold: bool
         codes.push(palette::render_color_code(bg, true));
     }
     if codes.is_empty() {
-        return text.as_ref().to_string();
+        return None;
     }
-    format!("\x1b[{}m{}\x1b[0m", codes.join(";"), text.as_ref())
+    Some(format!("\x1b[{}m", codes.join(";")))
 }
 
-fn style_inline_fg(text: impl AsRef<str>, fg: Color) -> String {
-    format!(
-        "\x1b[{}m{}",
-        palette::render_color_code(fg, false),
-        text.as_ref()
-    )
+fn style_ansi_text(
+    text: impl AsRef<str>,
+    fg: Option<Color>,
+    bg: Option<Color>,
+    bold: bool,
+) -> String {
+    let Some(prefix) = style_prefix(fg, bg, bold) else {
+        return text.as_ref().to_string();
+    };
+    format!("{prefix}{}\x1b]8;;\x1b\\\x1b[0m", text.as_ref())
+}
+
+fn style_padded_ansi_text(
+    text: impl AsRef<str>,
+    fg: Option<Color>,
+    bg: Option<Color>,
+    bold: bool,
+) -> String {
+    let mut out = style(" ", fg, bg, bold);
+    out.push_str(&style_ansi_text(text, fg, bg, bold));
+    out.push_str(&style(" ", fg, bg, bold));
+    out
 }
 
 impl StatusBar {
@@ -270,18 +293,25 @@ impl StatusBar {
             .iter()
             .filter(|broadcast| broadcast.expires_at > now)
             .max_by_key(|broadcast| broadcast.created_at)?;
-        let content = format!(" {} ", broadcast.message);
         Some(match broadcast.level {
-            BroadcastLevel::Info => style(
-                content.as_str(),
+            BroadcastLevel::Info => style_padded_ansi_text(
+                broadcast.message.as_str(),
                 Some(p.text),
                 Some(p.surface_bright),
                 false,
             ),
-            BroadcastLevel::Warning => {
-                style(content.as_str(), Some(p.on_primary), Some(p.warning), true)
-            }
-            BroadcastLevel::Error => style(content.as_str(), Some(p.text), Some(p.danger), true),
+            BroadcastLevel::Warning => style_padded_ansi_text(
+                broadcast.message.as_str(),
+                Some(p.on_primary),
+                Some(p.warning),
+                true,
+            ),
+            BroadcastLevel::Error => style_padded_ansi_text(
+                broadcast.message.as_str(),
+                Some(p.text),
+                Some(p.danger),
+                true,
+            ),
         })
     }
 
@@ -490,8 +520,8 @@ impl StatusBarInput {
 
 fn render_single_ticker(ticker: &TickerEntry, p: &palette::Palette) -> RenderedTicker {
     RenderedTicker {
-        text: style(
-            format!(" {} ", ticker.content),
+        text: style_padded_ansi_text(
+            ticker.content.as_str(),
             Some(p.text),
             Some(p.surface_bright),
             false,
@@ -505,24 +535,32 @@ fn render_multi_ticker(
     ticker_index: usize,
     p: &palette::Palette,
 ) -> RenderedTicker {
-    let content_width = tickers[ticker_index].content.width();
+    let content_width = terminal_width(&tickers[ticker_index].content);
     let dots_start = 1 + content_width + 1;
+    let mut text = style(" ", Some(p.text), Some(p.surface_bright), false);
+    text.push_str(&style_ansi_text(
+        tickers[ticker_index].content.as_str(),
+        Some(p.text),
+        Some(p.surface_bright),
+        false,
+    ));
+    text.push_str(&style(" ", Some(p.text), Some(p.surface_bright), false));
+    text.push_str(&style(
+        "•".repeat(ticker_index),
+        Some(p.text_subtle),
+        Some(p.surface_bright),
+        false,
+    ));
+    text.push_str(&style("•", Some(p.text), Some(p.surface_bright), false));
+    text.push_str(&style(
+        "•".repeat(tickers.len().saturating_sub(ticker_index + 1)),
+        Some(p.text_subtle),
+        Some(p.surface_bright),
+        false,
+    ));
+    text.push_str(&style(" ", Some(p.text), Some(p.surface_bright), false));
     RenderedTicker {
-        text: style(
-            format!(
-                " {} {}{}{} ",
-                tickers[ticker_index].content,
-                style_inline_fg("•".repeat(ticker_index), p.text_subtle),
-                style_inline_fg("•", p.text),
-                style_inline_fg(
-                    "•".repeat(tickers.len().saturating_sub(ticker_index + 1)),
-                    p.text_subtle
-                ),
-            ),
-            Some(p.text),
-            Some(p.surface_bright),
-            false,
-        ),
+        text,
         click_cols: (0..tickers.len()).map(|idx| dots_start + idx).collect(),
     }
 }
