@@ -413,6 +413,47 @@ async fn handle_socket(
 ) {
     let (mut sender, mut receiver) = socket.split();
 
+    let app_exists = match server
+        .app_server
+        .db
+        .query(
+            "SELECT 1 FROM games WHERE shortname = ?1 LIMIT 1",
+            libsql::params!(first_app_shortname.as_str()),
+        )
+        .await
+    {
+        Ok(mut rows) => matches!(rows.next().await, Ok(Some(_))),
+        Err(err) => {
+            tracing::warn!(error = ?err, "failed to validate requested app");
+            false
+        }
+    };
+    if !app_exists {
+        let status = if first_app_shortname == "menu" {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::NOT_FOUND
+        };
+        let message = if first_app_shortname == "menu" {
+            "menu is not installed; provision the 'menu' app via the CLI"
+        } else {
+            "unknown game shortname"
+        };
+        let _ = sender
+            .send(Message::Close(Some(CloseFrame {
+                code: 1008,
+                reason: message.into(),
+            })))
+            .await;
+        let _ = sender.close().await;
+        tracing::debug!(
+            shortname = %first_app_shortname,
+            status = status.as_u16(),
+            "rejected websocket for unavailable app"
+        );
+        return;
+    }
+
     let Some(initial_size) = recv_initial_resize(&mut receiver).await else {
         return;
     };

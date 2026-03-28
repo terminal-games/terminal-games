@@ -266,10 +266,16 @@ impl SshServer {
                 }
             };
             if !app_exists {
+                let message = if first_app_shortname == "menu" {
+                    "No menu is installed on this server. Provision the 'menu' app via the CLI."
+                        .to_string()
+                } else {
+                    format!("Unknown game shortname: {}", first_app_shortname)
+                };
                 let _ = session_handle
                     .disconnect(
                         russh::Disconnect::ByApplication,
-                        format!("Unknown game shortname: {}", first_app_shortname),
+                        message,
                         "en-US".to_string(),
                     )
                     .await;

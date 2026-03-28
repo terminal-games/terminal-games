@@ -5,7 +5,6 @@
   vars:
     server_binary_local_path: "{{ playbook_dir }}/../terminal-games-server-docker-binary"
     server_binary_remote_path: /opt/terminal-games/bin/terminal-games-server
-    game_artifacts_local_dir: "{{ playbook_dir }}/apps"
   tasks:
     - name: Ensure required secret variables are provided
       ansible.builtin.assert:
@@ -16,11 +15,13 @@
           - LIBSQL_AUTH_TOKEN | length > 0
           - LIBSQL_URL is defined
           - LIBSQL_URL | length > 0
+          - ADMIN_SHARED_SECRET is defined
+          - ADMIN_SHARED_SECRET | length > 0
           - METRICS_BEARER_TOKEN is defined
           - METRICS_BEARER_TOKEN | length > 0
           - SSH_HOST_KEY_BASE64 is defined
           - SSH_HOST_KEY_BASE64 | length > 0
-        fail_msg: "Set MESH_PINNED_PEM, LIBSQL_AUTH_TOKEN, LIBSQL_URL, METRICS_BEARER_TOKEN, and SSH_HOST_KEY_BASE64."
+        fail_msg: "Set MESH_PINNED_PEM, LIBSQL_AUTH_TOKEN, LIBSQL_URL, ADMIN_SHARED_SECRET, METRICS_BEARER_TOKEN, and SSH_HOST_KEY_BASE64."
       no_log: true
 
     - name: Verify local server binary exists
@@ -37,13 +38,6 @@
           - server_binary_stat.stat.isreg
         fail_msg: "Server binary missing at {{ server_binary_local_path }}. Build it first."
 
-    - name: Check if local game artifact directory exists
-      ansible.builtin.stat:
-        path: "{{ game_artifacts_local_dir }}"
-      register: game_artifacts_stat
-      delegate_to: localhost
-      become: false
-
     - name: Ensure runtime directories exist
       ansible.builtin.file:
         path: "{{ item }}"
@@ -53,7 +47,6 @@
         mode: "0755"
       loop:
         - /opt/terminal-games/bin
-        - /opt/terminal-games/games
         - /etc/terminal-games
 
     - name: Deploy server binary
@@ -64,15 +57,6 @@
         group: root
         mode: "0755"
       notify: Restart terminal-games-server
-
-    - name: Sync game artifacts when available
-      ansible.builtin.copy:
-        src: "{{ game_artifacts_local_dir }}/"
-        dest: /opt/terminal-games/games/
-        owner: root
-        group: root
-        mode: "0644"
-      when: game_artifacts_stat.stat.isdir | default(false)
 
     - name: Deploy server environment file
       ansible.builtin.template:

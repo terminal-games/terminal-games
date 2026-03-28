@@ -13,7 +13,7 @@ mod web;
 
 use std::{
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -23,8 +23,7 @@ use tracing_subscriber::{Layer, filter::LevelFilter, layer::SubscriberExt};
 use crate::admission::{AdmissionConfig, decode_cidr_blob};
 use terminal_games::{
     app::AppServer,
-    author_env::{AUTHOR_ENV_KEY_ENV, encrypt_author_env_blob},
-    manifest::{extract_manifest_from_wasm, sanitize_manifest},
+    author_env::AUTHOR_ENV_KEY_ENV,
     mesh::{BuildId, EnvDiscovery, GameRuntimeUpdateMessage, Mesh},
 };
 
@@ -35,74 +34,6 @@ const AUTHOR_ENV_DEV_FALLBACK_KEY: &str = "terminal-games-dev-author-env-key";
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-async fn ensure_builtin_menu(conn: &libsql::Connection, author_env_secret_key: &str) -> Result<()> {
-    static MENU_WASM: &[u8] = include_bytes!("../../cmd/menu/menu.wasm");
-
-    let Some(manifest) = extract_manifest_from_wasm(MENU_WASM)? else {
-        anyhow::bail!("embedded menu.wasm is missing terminal-games manifest");
-    };
-    let manifest = sanitize_manifest(&manifest)?;
-    let details_json = serde_json::to_string(&manifest.details)?;
-    let empty_env = encrypt_author_env_blob(author_env_secret_key, &[])?;
-    let build_id = BuildId::from_wasm_and_envs(MENU_WASM, &[]);
-
-    let tx = conn.transaction().await?;
-    let mut rows = tx
-        .query(
-            "SELECT id, wasm_hash, env_hash, details FROM games WHERE shortname = ?1 LIMIT 1",
-            libsql::params!(manifest.shortname.as_str()),
-        )
-        .await?;
-    if let Some(row) = rows.next().await? {
-        let game_id = row.get::<u64>(0)?;
-        let current_build_id =
-            BuildId::from_hash_slices(&row.get::<Vec<u8>>(1)?, &row.get::<Vec<u8>>(2)?)?;
-        let current_details = row.get::<String>(3)?;
-        if current_build_id != build_id || current_details != details_json {
-            tx.execute(
-                "UPDATE games
-                 SET wasm = ?2,
-                     details = json(?3),
-                     wasm_hash = ?4,
-                     env_hash = ?5,
-                     env_salt = ?6,
-                     env_blob = ?7,
-                     build_updated_at = ?8
-                 WHERE id = ?1",
-                libsql::params!(
-                    game_id,
-                    MENU_WASM.to_vec(),
-                    details_json.as_str(),
-                    build_id.wasm_hash.to_vec(),
-                    build_id.env_hash.to_vec(),
-                    empty_env.salt.clone(),
-                    empty_env.ciphertext.clone(),
-                    current_unix_nanos(),
-                ),
-            )
-            .await?;
-        }
-    } else {
-        tx.execute(
-            "INSERT INTO games (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
-             VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)",
-            libsql::params!(
-                manifest.shortname.as_str(),
-                MENU_WASM.to_vec(),
-                details_json.as_str(),
-                build_id.wasm_hash.to_vec(),
-                build_id.env_hash.to_vec(),
-                empty_env.salt,
-                empty_env.ciphertext,
-                current_unix_nanos()
-            ),
-        )
-        .await?;
-    }
-    tx.commit().await?;
-    Ok(())
-}
 
 async fn load_game_build_snapshot(
     conn: &libsql::Connection,
@@ -274,8 +205,6 @@ async fn main() -> Result<()> {
         .context("Failed to commit migration transaction")?;
 
     let author_env_secret_key = load_author_env_secret_key();
-    ensure_builtin_menu(&conn, &author_env_secret_key).await?;
-    tracing::info!("Ensured builtin menu is installed");
 
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
     mesh.start_discovery().await?;
@@ -463,11 +392,4 @@ fn parse_ssh_captcha_threshold(raw: Result<String, std::env::VarError>) -> Resul
 
 fn normalize_expires_at(expires_at_raw: i64) -> Option<i64> {
     (expires_at_raw >= 0).then_some(expires_at_raw)
-}
-
-fn current_unix_nanos() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as i64
 }
