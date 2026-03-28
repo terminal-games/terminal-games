@@ -54,7 +54,7 @@ use terminal_games::{
 use time::OffsetDateTime;
 
 use crate::{
-    admission::{AdmissionController, BanRule},
+    admission::{AdmissionController, decode_cidr_blob, encode_cidr_blob, parse_ban_cidr},
     sessions::SessionRegistry,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -459,19 +459,20 @@ impl AdminControlRpc for AdminRpcServer {
         _: context::Context,
         request: BanIpAddRequest,
     ) -> Result<BanIpAddResponse, RpcError> {
+        let cidr = parse_ban_cidr(request.ip)?;
         let expires_at =
             parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref())?;
         self.control
             .app_server
             .db
             .execute(
-                "INSERT INTO ip_bans (ip, reason, expires_at, inserted_at)
-             VALUES (?1, ?2, ?3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
-             ON CONFLICT(ip) DO UPDATE SET
-                 reason = excluded.reason,
-                 expires_at = excluded.expires_at,
-                 inserted_at = excluded.inserted_at",
-                libsql::params!(request.ip, request.reason.clone(), expires_at),
+                "INSERT INTO ip_bans (cidr, reason, expires_at, inserted_at)
+                 VALUES (?1, ?2, ?3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
+                 ON CONFLICT(cidr) DO UPDATE SET
+                     reason = excluded.reason,
+                     expires_at = excluded.expires_at,
+                     inserted_at = excluded.inserted_at",
+                libsql::params!(encode_cidr_blob(cidr), request.reason.clone(), expires_at),
             )
             .await?;
         Ok(BanIpAddResponse { expires_at })
@@ -483,21 +484,22 @@ impl AdminControlRpc for AdminRpcServer {
             .app_server
             .db
             .query(
-                "SELECT ip, COALESCE(reason, ''), expires_at, inserted_at
+                "SELECT cidr, COALESCE(reason, ''), expires_at, inserted_at
                  FROM ip_bans
-                 ORDER BY inserted_at DESC, ip ASC",
+                 ORDER BY inserted_at DESC, cidr ASC",
                 (),
             )
             .await?;
         let now = current_unix_seconds();
         let mut entries = Vec::new();
         while let Some(row) = rows.next().await? {
+            let cidr = decode_cidr_blob(&row.get::<Vec<u8>>(0)?)?;
             let expires_at = row.get::<Option<i64>>(2)?;
             if !is_ban_active(expires_at, now) {
                 continue;
             }
             entries.push(BanEntry {
-                ip: row.get::<String>(0)?,
+                ip: cidr.to_string(),
                 reason: row.get::<String>(1)?.trim().to_string(),
                 expires_at,
                 inserted_at: row.get::<i64>(3)?,
@@ -511,21 +513,22 @@ impl AdminControlRpc for AdminRpcServer {
         _: context::Context,
         request: BanIpRemoveRequest,
     ) -> Result<(), RpcError> {
+        let cidr = parse_ban_cidr(request.ip)?;
         self.control
             .app_server
             .db
             .execute(
-                "DELETE FROM ip_bans WHERE ip = ?1",
-                libsql::params!(request.ip),
+                "DELETE FROM ip_bans WHERE cidr = ?1",
+                libsql::params!(encode_cidr_blob(cidr)),
             )
             .await?;
         Ok(())
     }
 
     async fn apply_ban(self, _: context::Context, request: BanIpRequest) -> Result<(), RpcError> {
-        let rule = BanRule::parse(request.ip)?;
+        let cidr = parse_ban_cidr(request.ip)?;
         self.control.admission_controller.apply_ban_updates(vec![(
-            rule,
+            cidr,
             Some(request.reason),
             request.expires_at,
         )]);
@@ -537,10 +540,10 @@ impl AdminControlRpc for AdminRpcServer {
         _: context::Context,
         request: BanIpRemoveRequest,
     ) -> Result<(), RpcError> {
-        let rule = BanRule::parse(request.ip)?;
+        let cidr = parse_ban_cidr(request.ip)?;
         self.control
             .admission_controller
-            .apply_ban_updates(vec![(rule, None, Some(0))]);
+            .apply_ban_updates(vec![(cidr, None, Some(0))]);
         Ok(())
     }
 

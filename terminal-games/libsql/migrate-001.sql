@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS user_game_durations (
 );
 
 CREATE TABLE IF NOT EXISTS ip_bans (
-    ip TEXT PRIMARY KEY,
+    cidr BLOB PRIMARY KEY,
     reason TEXT,
     expires_at INTEGER,
     inserted_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000 AS INTEGER))

@@ -373,12 +373,12 @@ impl SshServer {
                 }
             }
             let mut ban_changes = admission_controller.subscribe_ban_changes();
-            if let Some(ban) = admission_controller.matching_ip_ban(client_ip) {
-                tracing::warn!(
+            if let Some((ban_rule, ban_reason)) = admission_controller.check_ip_ban(client_ip) {
+                tracing::debug!(
                     client_ip = %client_ip,
                     transport = Transport::Ssh.as_str(),
-                    ban_rule = %ban.rule,
-                    ban_reason = ban.reason.as_deref().unwrap_or("<none>"),
+                    ban_rule = %ban_rule,
+                    ban_reason = ban_reason.as_deref().unwrap_or("<none>"),
                     "Rejected client from active IP ban after admission"
                 );
                 close_terminal_session(
@@ -503,7 +503,7 @@ impl SshServer {
                         if changed.is_err() {
                             continue;
                         }
-                        if admission_controller.is_ip_banned(client_ip) {
+                        if admission_controller.check_ip_ban(client_ip).is_some() {
                             session_registry.request_close(local_session_id, SessionEndReason::BannedIp);
                         }
                     }

@@ -2716,6 +2716,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 
 [[package]]
+name = "iptrie"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc71495f3de05745b79a8cfa1d629394878f8f76173bd4b52cff39fabda918da"
+dependencies = [
+ "ipnet",
+]
+
+[[package]]
 name = "iri-string"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5756,6 +5765,7 @@ dependencies = [
  "hyper 1.8.1",
  "hyper-util",
  "ipnet",
+ "iptrie",
  "libsql",
  "mimalloc",
  "prometheus",

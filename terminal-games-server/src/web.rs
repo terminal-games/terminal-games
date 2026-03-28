@@ -443,15 +443,15 @@ async fn handle_socket(
         }
     }
     let mut ban_changes = server.admission_controller.subscribe_ban_changes();
-    if let Some(ban) = server
+    if let Some((ban_rule, ban_reason)) = server
         .admission_controller
-        .matching_ip_ban(connect_info.remote_addr.ip())
+        .check_ip_ban(connect_info.remote_addr.ip())
     {
-        tracing::warn!(
+        tracing::debug!(
             client_ip = %connect_info.remote_addr.ip(),
             transport = Transport::Web.as_str(),
-            ban_rule = %ban.rule,
-            ban_reason = ban.reason.as_deref().unwrap_or("<none>"),
+            ban_rule = %ban_rule,
+            ban_reason = ban_reason.as_deref().unwrap_or("<none>"),
             "Rejected client from active IP ban after admission"
         );
         let _ = send_rejection_and_close(&mut sender, SessionEndReason::BannedIp).await;
@@ -564,7 +564,8 @@ async fn handle_socket(
                 }
                 if server
                     .admission_controller
-                    .is_ip_banned(connect_info.remote_addr.ip())
+                    .check_ip_ban(connect_info.remote_addr.ip())
+                    .is_some()
                 {
                     server
                         .session_registry

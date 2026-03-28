@@ -12,7 +12,6 @@ mod ssh;
 mod web;
 
 use std::{
-    collections::HashMap,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -21,7 +20,7 @@ use anyhow::{Context, Result};
 use rustls::crypto::aws_lc_rs;
 use tracing_subscriber::{Layer, filter::LevelFilter, layer::SubscriberExt};
 
-use crate::admission::{AdmissionConfig, BanRule, StoredBan};
+use crate::admission::{AdmissionConfig, decode_cidr_blob};
 use terminal_games::{
     app::AppServer,
     author_env::{AUTHOR_ENV_KEY_ENV, encrypt_author_env_blob},
@@ -139,18 +138,23 @@ async fn sync_game_build_snapshot(
 async fn load_ip_ban_updates(
     conn: &libsql::Connection,
     since: Option<i64>,
-) -> Result<(Vec<(BanRule, Option<String>, Option<i64>)>, i64)> {
+) -> Result<(Vec<(ipnet::IpNet, Option<String>, Option<i64>)>, i64)> {
     let mut rows = match since {
         Some(last_inserted_at) => {
             conn.query(
-                "SELECT ip, reason, COALESCE(expires_at, -1), inserted_at FROM ip_bans WHERE inserted_at > ?1 ORDER BY inserted_at ASC",
+                "SELECT cidr, reason, COALESCE(expires_at, -1), inserted_at
+                 FROM ip_bans
+                 WHERE inserted_at > ?1
+                 ORDER BY inserted_at ASC, cidr ASC",
                 libsql::params!(last_inserted_at),
             )
             .await
         }
         None => {
             conn.query(
-                "SELECT ip, reason, COALESCE(expires_at, -1), inserted_at FROM ip_bans ORDER BY inserted_at ASC",
+                "SELECT cidr, reason, COALESCE(expires_at, -1), inserted_at
+                 FROM ip_bans
+                 ORDER BY inserted_at ASC, cidr ASC",
                 (),
             )
             .await
@@ -160,8 +164,8 @@ async fn load_ip_ban_updates(
     let mut updates = Vec::new();
     let mut newest_inserted_at = since.unwrap_or(0);
     while let Some(row) = rows.next().await.context("failed to read ip ban row")? {
-        let ip = row
-            .get::<String>(0)
+        let cidr_blob = row
+            .get::<Vec<u8>>(0)
             .context("failed to decode ip ban value")?;
         let reason = row
             .get::<Option<String>>(1)
@@ -176,34 +180,16 @@ async fn load_ip_ban_updates(
             row.get::<i64>(3)
                 .context("failed to decode ip ban inserted_at")?,
         );
-        match BanRule::parse(ip.clone()) {
-            Ok(rule) => updates.push((rule, reason, expires_at)),
-            Err(error) => tracing::warn!(ip = %ip, error = %error, "skipping invalid ip_bans row"),
+        match decode_cidr_blob(&cidr_blob) {
+            Ok(cidr) => updates.push((cidr, reason, expires_at)),
+            Err(error) => tracing::warn!(
+                cidr = %hex::encode(&cidr_blob),
+                error = %error,
+                "skipping invalid ip_bans row"
+            ),
         }
     }
     Ok((updates, newest_inserted_at))
-}
-
-fn build_ban_snapshot(
-    updates: Vec<(BanRule, Option<String>, Option<i64>)>,
-) -> HashMap<String, StoredBan> {
-    let now = current_unix_seconds();
-    let mut banned_ips = HashMap::new();
-    for (rule, reason, expires_at) in updates {
-        if is_ban_active(expires_at, now) {
-            banned_ips.insert(
-                rule.key,
-                StoredBan {
-                    matcher: rule.matcher,
-                    reason,
-                    expires_at,
-                },
-            );
-        } else {
-            banned_ips.remove(&rule.key);
-        }
-    }
-    banned_ips
 }
 
 fn spawn_ip_ban_sync_task(
@@ -345,8 +331,7 @@ async fn main() -> Result<()> {
         .unwrap_or(usize::MAX);
     let ssh_captcha_threshold =
         parse_ssh_captcha_threshold(std::env::var("SSH_CAPTCHA_THRESHOLD"))?;
-    let (ban_updates, last_ban_inserted_at) = load_ip_ban_updates(&conn, None).await?;
-    let banned_ips = build_ban_snapshot(ban_updates);
+    let (banned_ips, last_ban_inserted_at) = load_ip_ban_updates(&conn, None).await?;
     tracing::debug!(
         active_ban_count = banned_ips.len(),
         last_inserted_at = last_ban_inserted_at,
@@ -478,17 +463,6 @@ fn parse_ssh_captcha_threshold(raw: Result<String, std::env::VarError>) -> Resul
 
 fn normalize_expires_at(expires_at_raw: i64) -> Option<i64> {
     (expires_at_raw >= 0).then_some(expires_at_raw)
-}
-
-fn is_ban_active(expires_at: Option<i64>, now: i64) -> bool {
-    expires_at.is_none_or(|expires_at| expires_at > now)
-}
-
-fn current_unix_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
 }
 
 fn current_unix_nanos() -> i64 {

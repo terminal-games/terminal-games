@@ -373,6 +373,19 @@ impl AdminClient {
         Ok(ids)
     }
 
+    pub async fn completion_ban_ip_cidrs(&self) -> Result<Vec<String>> {
+        let bans = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
+            rpc.ban_ip_list(rpc_context())
+                .await?
+                .map_err(anyhow::Error::msg)
+        })
+        .await?;
+        let mut cidrs = bans.into_iter().map(|ban| ban.ip).collect::<Vec<_>>();
+        cidrs.sort();
+        cidrs.dedup();
+        Ok(cidrs)
+    }
+
     async fn completion_discover(
         &self,
     ) -> Result<(RegionDiscoveryResponse, BTreeMap<String, String>)> {

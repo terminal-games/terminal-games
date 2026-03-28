@@ -72,7 +72,7 @@ async fn list(profile: Option<String>) -> Result<()> {
             ]
         })
         .collect::<Vec<_>>();
-    print_table(&["IP", "Reason", "Expires"], &rows);
+    print_table(&["CIDR", "Reason", "Expires"], &rows);
     Ok(())
 }
 

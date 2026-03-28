@@ -90,6 +90,7 @@ pub(super) struct AdminBanIpAddArgs {
 
 #[derive(Args)]
 pub(super) struct AdminBanIpRemoveArgs {
+    #[arg(add = ArgValueCandidates::new(complete_ban_ip_candidates))]
     ip: String,
 }
 
@@ -288,6 +289,23 @@ fn complete_ticker_id_candidates_inner() -> Option<Vec<String>> {
     completion_runtime()?.block_on(async {
         let api = load_api(None).ok()?;
         api.completion_ticker_ids().await.ok()
+    })
+}
+
+fn complete_ban_ip_candidates() -> Vec<CompletionCandidate> {
+    std::panic::catch_unwind(complete_ban_ip_candidates_inner)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .into_iter()
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+fn complete_ban_ip_candidates_inner() -> Option<Vec<String>> {
+    completion_runtime()?.block_on(async {
+        let api = load_api(None).ok()?;
+        api.completion_ban_ip_cidrs().await.ok()
     })
 }
 
