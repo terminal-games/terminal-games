@@ -122,17 +122,21 @@ impl TerminalBackgroundTracker {
     pub async fn wait_for_terminal_background(
         &mut self,
         raw_input_rx: &mut mpsc::Receiver<Bytes>,
+        cancellation_token: &CancellationToken,
         timeout: Duration,
     ) -> Option<(u8, u8, u8)> {
         let deadline = tokio::time::Instant::now() + timeout;
         while self.terminal_background_rgb().is_none() {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
+            if remaining.is_zero() || cancellation_token.is_cancelled() {
                 break;
             }
-            match tokio::time::timeout(remaining, raw_input_rx.recv()).await {
-                Ok(Some(data)) => self.observe(data.as_ref()),
-                _ => break,
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                result = tokio::time::timeout(remaining, raw_input_rx.recv()) => match result {
+                    Ok(Some(data)) => self.observe(data.as_ref()),
+                    _ => break,
+                }
             }
         }
         self.terminal_background_rgb()

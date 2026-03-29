@@ -320,7 +320,11 @@ impl SshServer {
                 };
             let mut terminal_profile = TerminalProfile::from_term(term.as_deref(), None);
             if let Some(rgb) = background_tracker
-                .wait_for_terminal_background(&mut raw_input_rx, Duration::from_millis(500))
+                .wait_for_terminal_background(
+                    &mut raw_input_rx,
+                    &shutdown_token,
+                    Duration::from_millis(500),
+                )
                 .await
             {
                 terminal_profile = terminal_profile.with_background_rgb(rgb);

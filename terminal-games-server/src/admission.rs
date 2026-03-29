@@ -254,11 +254,11 @@ impl BanManager {
         }
     }
 
-    fn contains(&self, cidr: IpNet) -> bool {
+    fn is_active(&self, cidr: IpNet, now: i64) -> bool {
         self.trie
             .get(&cidr)
             .and_then(|entry| entry.as_ref())
-            .is_some()
+            .is_some_and(|(_reason, expires_at)| is_ban_active(*expires_at, now))
     }
 }
 
@@ -433,7 +433,7 @@ impl AdmissionController {
             let mut current = self.inner.ban_manager.lock().unwrap();
             for (cidr, reason, expires_at) in updates {
                 if is_ban_active(expires_at, now) {
-                    let was_active = current.contains(cidr);
+                    let was_active = current.is_active(cidr, now);
                     current.insert(cidr, reason.clone(), expires_at);
                     if !was_active {
                         newly_banned_rules.push((cidr, reason, expires_at));

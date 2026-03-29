@@ -24,9 +24,7 @@ pub struct AppManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppDetails {
-    #[serde(default)]
     pub author: String,
-    #[serde(default)]
     pub version: String,
     #[serde(default)]
     pub name: BTreeMap<String, String>,

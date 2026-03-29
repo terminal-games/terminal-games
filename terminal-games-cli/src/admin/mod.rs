@@ -417,72 +417,54 @@ fn current_completion_profile_url() -> Option<String> {
 fn cached_session_id_candidates() -> Option<Vec<String>> {
     let profile_url = current_completion_profile_url()?;
     let lookup = completion_cache::load_sessions(&profile_url).ok()?;
-    cached_admin_candidates(lookup, RefreshKind::Sessions, &profile_url, |sessions| {
-        sessions
-            .iter()
-            .map(|session| session.session_id.clone())
-            .collect::<Vec<_>>()
-    })
+    cached_admin_candidates(lookup, RefreshKind::Sessions, &profile_url)
 }
 
 fn cached_app_id_candidates() -> Option<Vec<String>> {
     let profile_url = current_completion_profile_url()?;
     let lookup = completion_cache::load_apps(&profile_url).ok()?;
-    cached_admin_candidates(lookup, RefreshKind::Apps, &profile_url, |apps| {
-        apps.iter()
-            .map(|app| app.app_id.to_string())
-            .collect::<Vec<_>>()
+    cached_admin_candidates(lookup, RefreshKind::Apps, &profile_url).map(|apps| {
+        apps.into_iter()
+            .filter_map(|app| app.split_once(':').map(|(app_id, _)| app_id.to_string()))
+            .collect()
     })
 }
 
 fn cached_app_delete_candidates() -> Option<Vec<String>> {
     let profile_url = current_completion_profile_url()?;
     let lookup = completion_cache::load_apps(&profile_url).ok()?;
-    cached_admin_candidates(lookup, RefreshKind::Apps, &profile_url, |apps| {
-        apps.iter()
-            .map(|app| format!("{}:{}", app.app_id, app.shortname))
-            .collect::<Vec<_>>()
-    })
+    cached_admin_candidates(lookup, RefreshKind::Apps, &profile_url)
 }
 
 fn cached_ticker_id_candidates() -> Option<Vec<String>> {
     let profile_url = current_completion_profile_url()?;
     let lookup = completion_cache::load_tickers(&profile_url).ok()?;
-    cached_admin_candidates(lookup, RefreshKind::Tickers, &profile_url, |tickers| {
-        tickers
-            .iter()
-            .map(|ticker| ticker.ticker_id.to_string())
-            .collect::<Vec<_>>()
-    })
+    cached_admin_candidates(lookup, RefreshKind::Tickers, &profile_url)
 }
 
 fn cached_ban_ip_candidates() -> Option<Vec<String>> {
     let profile_url = current_completion_profile_url()?;
     let lookup = completion_cache::load_bans(&profile_url).ok()?;
-    cached_admin_candidates(lookup, RefreshKind::Bans, &profile_url, |bans| {
-        bans.iter().map(|ban| ban.ip.clone()).collect::<Vec<_>>()
-    })
+    cached_admin_candidates(lookup, RefreshKind::Bans, &profile_url)
 }
 
-fn cached_admin_candidates<T>(
-    lookup: CacheLookup<Vec<T>>,
+fn cached_admin_candidates(
+    lookup: CacheLookup<Vec<String>>,
     kind: RefreshKind,
     profile_url: &str,
-    map: impl FnOnce(&[T]) -> Vec<String>,
 ) -> Option<Vec<String>> {
     match lookup {
         CacheLookup::Missing => None,
         CacheLookup::Present {
-            value,
+            mut value,
             needs_refresh,
         } => {
             if needs_refresh {
                 let _ = completion_cache::spawn_admin_refresh(kind, profile_url);
             }
-            let mut values = map(&value);
-            values.sort();
-            values.dedup();
-            Some(values)
+            value.sort();
+            value.dedup();
+            Some(value)
         }
     }
 }

@@ -13,11 +13,10 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
-use terminal_games::control::{AppSummary, BanEntry, SessionSummary, TickerEntry};
 
 use crate::{config::config_dir, control_client::AdminClient};
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 const COMPLETION_REFRESH_AGE: Duration = Duration::from_secs(5);
 const REFRESH_LOCK_TTL: Duration = Duration::from_secs(15);
 
@@ -32,13 +31,13 @@ struct CompletionCacheFile {
     #[serde(default = "cache_version")]
     version: u32,
     #[serde(default)]
-    sessions: BTreeMap<String, TimedValue<Vec<SessionSummary>>>,
+    sessions: BTreeMap<String, TimedValue<Vec<String>>>,
     #[serde(default)]
-    apps: BTreeMap<String, TimedValue<Vec<AppSummary>>>,
+    apps: BTreeMap<String, TimedValue<Vec<String>>>,
     #[serde(default)]
-    tickers: BTreeMap<String, TimedValue<Vec<TickerEntry>>>,
+    tickers: BTreeMap<String, TimedValue<Vec<String>>>,
     #[serde(default)]
-    bans: BTreeMap<String, TimedValue<Vec<BanEntry>>>,
+    bans: BTreeMap<String, TimedValue<Vec<String>>>,
 }
 
 impl Default for CompletionCacheFile {
@@ -138,35 +137,35 @@ pub fn spawn_admin_refresh(kind: RefreshKind, url: &str) -> Result<()> {
     }
 }
 
-pub fn load_sessions(url: &str) -> Result<CacheLookup<Vec<SessionSummary>>> {
+pub fn load_sessions(url: &str) -> Result<CacheLookup<Vec<String>>> {
     load_value(url, |cache| &cache.sessions)
 }
 
-pub fn store_sessions(url: &str, sessions: &[SessionSummary]) -> Result<()> {
+pub fn store_sessions(url: &str, sessions: &[String]) -> Result<()> {
     store_value(url, sessions.to_vec(), |cache| &mut cache.sessions)
 }
 
-pub fn load_apps(url: &str) -> Result<CacheLookup<Vec<AppSummary>>> {
+pub fn load_apps(url: &str) -> Result<CacheLookup<Vec<String>>> {
     load_value(url, |cache| &cache.apps)
 }
 
-pub fn store_apps(url: &str, apps: &[AppSummary]) -> Result<()> {
+pub fn store_apps(url: &str, apps: &[String]) -> Result<()> {
     store_value(url, apps.to_vec(), |cache| &mut cache.apps)
 }
 
-pub fn load_tickers(url: &str) -> Result<CacheLookup<Vec<TickerEntry>>> {
+pub fn load_tickers(url: &str) -> Result<CacheLookup<Vec<String>>> {
     load_value(url, |cache| &cache.tickers)
 }
 
-pub fn store_tickers(url: &str, tickers: &[TickerEntry]) -> Result<()> {
+pub fn store_tickers(url: &str, tickers: &[String]) -> Result<()> {
     store_value(url, tickers.to_vec(), |cache| &mut cache.tickers)
 }
 
-pub fn load_bans(url: &str) -> Result<CacheLookup<Vec<BanEntry>>> {
+pub fn load_bans(url: &str) -> Result<CacheLookup<Vec<String>>> {
     load_value(url, |cache| &cache.bans)
 }
 
-pub fn store_bans(url: &str, bans: &[BanEntry]) -> Result<()> {
+pub fn store_bans(url: &str, bans: &[String]) -> Result<()> {
     store_value(url, bans.to_vec(), |cache| &mut cache.bans)
 }
 
@@ -294,9 +293,11 @@ fn read_cache_file() -> Result<CompletionCacheFile> {
     }
     let contents =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let cache: CompletionCacheFile =
-        toml::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))?;
-    if cache.version != CACHE_VERSION && cache.version != 0 {
+    let cache = match toml::from_str::<CompletionCacheFile>(&contents) {
+        Ok(cache) => cache,
+        Err(_) => return Ok(CompletionCacheFile::default()),
+    };
+    if cache.version != CACHE_VERSION {
         return Ok(CompletionCacheFile::default());
     }
     Ok(cache)

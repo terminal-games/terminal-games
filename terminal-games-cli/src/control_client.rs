@@ -281,7 +281,11 @@ impl AdminClient {
 
     pub async fn all_sessions(&self) -> Result<Vec<SessionSummary>> {
         let sessions = self.fetch_all_sessions().await?;
-        completion_cache::store_sessions(&self.profile.url, &sessions)?;
+        let completion_sessions = sessions
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect::<Vec<_>>();
+        completion_cache::store_sessions(&self.profile.url, &completion_sessions)?;
         Ok(sessions)
     }
 
@@ -292,7 +296,11 @@ impl AdminClient {
                 .map_err(anyhow::Error::msg)
         })
         .await?;
-        completion_cache::store_apps(&self.profile.url, &app_tokens)?;
+        let completion_apps = app_tokens
+            .iter()
+            .map(|app| format!("{}:{}", app.app_id, app.shortname))
+            .collect::<Vec<_>>();
+        completion_cache::store_apps(&self.profile.url, &completion_apps)?;
         Ok(app_tokens)
     }
 
@@ -303,7 +311,11 @@ impl AdminClient {
                 .map_err(anyhow::Error::msg)
         })
         .await?;
-        completion_cache::store_tickers(&self.profile.url, &tickers)?;
+        let completion_tickers = tickers
+            .iter()
+            .map(|ticker| ticker.ticker_id.to_string())
+            .collect::<Vec<_>>();
+        completion_cache::store_tickers(&self.profile.url, &completion_tickers)?;
         Ok(tickers)
     }
 
@@ -314,7 +326,8 @@ impl AdminClient {
                 .map_err(anyhow::Error::msg)
         })
         .await?;
-        completion_cache::store_bans(&self.profile.url, &bans)?;
+        let completion_bans = bans.iter().map(|ban| ban.ip.clone()).collect::<Vec<_>>();
+        completion_cache::store_bans(&self.profile.url, &completion_bans)?;
         Ok(bans)
     }
 

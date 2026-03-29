@@ -21,6 +21,7 @@ use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
+use terminput::{Event as TerminputEvent, KeyCode, KeyEventKind, KeyModifiers};
 use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, layer::SubscriberExt};
 
 use terminal_games::{
@@ -297,6 +298,29 @@ fn compute_jittered_latency(latency_ms: u64, jitter_ms: u64) -> Duration {
     Duration::from_millis((latency_ms as i64 + jitter).max(0) as u64)
 }
 
+fn should_force_exit(data: &[u8]) -> bool {
+    if data.contains(&b'\x03') {
+        return true;
+    }
+    matches!(
+        TerminputEvent::parse_from(data),
+        Ok(Some(TerminputEvent::Key(key)))
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.modifiers.contains(KeyModifiers::CTRL)
+                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    )
+}
+
+fn restore_terminal(stdout: &mut std::io::Stdout) -> Result<()> {
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show,
+    )?;
+    crossterm::terminal::disable_raw_mode()?;
+    Ok(())
+}
+
 async fn upsert_game(
     conn: &libsql::Connection,
     app_env_secret_key: &str,
@@ -516,7 +540,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         .to_string();
     let default_details = |shortname: &str| {
         format!(
-            r#"{{"app":"Local","version":"dev","name":{{"en":"{shortname}"}},"description":{{"en":""}},"details":{{"en":""}},"screenshots":{{}}}}"#
+            r#"{{"author":"Local","version":"dev","name":{{"en":"{shortname}"}},"description":{{"en":""}},"details":{{"en":""}},"screenshots":{{}}}}"#
         )
     };
 
@@ -702,6 +726,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
     let colorterm = std::env::var("COLORTERM").ok();
 
+    let stdin_shutdown_token = graceful_shutdown_token.clone();
     thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut buf = [0u8; 4096];
@@ -709,6 +734,10 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
             match stdin.lock().read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    if should_force_exit(&buf[..n]) {
+                        stdin_shutdown_token.cancel();
+                        break;
+                    }
                     if raw_input_tx
                         .blocking_send(Bytes::copy_from_slice(&buf[..n]))
                         .is_err()
@@ -724,10 +753,20 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     stdout.write_all(b"\x1b]11;?\x07")?;
     stdout.flush()?;
     if let Some(rgb) = background_tracker
-        .wait_for_terminal_background(&mut raw_input_rx, Duration::from_millis(500))
+        .wait_for_terminal_background(
+            &mut raw_input_rx,
+            &graceful_shutdown_token,
+            Duration::from_millis(500),
+        )
         .await
     {
         terminal_profile = terminal_profile.with_background_rgb(rgb);
+    }
+    if graceful_shutdown_token.is_cancelled() {
+        restore_terminal(&mut stdout)?;
+        let _ = local_discovery.unregister().await;
+        mesh.graceful_shutdown().await;
+        return Ok(());
     }
     let (first_cols, first_rows) = *resize_rx.borrow();
     let terminal_parser = background_tracker.into_terminal_parser(first_rows, first_cols);
@@ -766,10 +805,14 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     let mut pending_input: Option<
         Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>,
     > = None;
+    let mut shutdown_started = false;
 
     let mut sigwinch =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())?;
 
     enum DelayedData {
         Terminal { raw: Bytes, metered: Bytes },
@@ -834,7 +877,18 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                 break;
             }
 
-            _ = sigint.recv() => {
+            _ = graceful_shutdown_token.cancelled(), if !shutdown_started => {
+                shutdown_started = true;
+                pending_input = None;
+            }
+
+            _ = async {
+                tokio::select! {
+                    _ = sigint.recv() => {}
+                    _ = sigterm.recv() => {}
+                    _ = sigquit.recv() => {}
+                }
+            } => {
                 graceful_shutdown_token.cancel();
             }
 
@@ -847,7 +901,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                 pending_input = None;
             }
 
-            data = raw_input_rx.recv(), if pending_input.is_none() => {
+            data = raw_input_rx.recv(), if pending_input.is_none() && !shutdown_started => {
                 let Some(data) = data else { break };
                 pending_input = Some(Box::pin(input_forwarder.prepare_input(data).send()));
             }
@@ -888,12 +942,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         }
     }
 
-    crossterm::execute!(
-        stdout,
-        crossterm::terminal::LeaveAlternateScreen,
-        crossterm::cursor::Show,
-    )?;
-    crossterm::terminal::disable_raw_mode()?;
+    restore_terminal(&mut stdout)?;
 
     let _ = local_discovery.unregister().await;
     mesh.graceful_shutdown().await;
