@@ -6,7 +6,7 @@ use anyhow::Result;
 use dialoguer::Password;
 use terminal_games::control::AuthorTokenClaims;
 
-use super::{AuthorAuthArgs, infer_author_profile_name};
+use super::AuthorAuthArgs;
 use crate::config::normalize_base_url;
 use crate::{config::read_secret_stdin, config::save_author_token};
 
@@ -21,11 +21,10 @@ pub(super) async fn run(args: AuthorAuthArgs) -> Result<()> {
     let claims = AuthorTokenClaims::decode(token.trim())?;
     let mut normalized = claims.clone();
     normalized.url = normalize_base_url(&claims.url)?;
-    let profile_name = infer_author_profile_name(&normalized.url)?;
-    save_author_token(&profile_name, &normalized)?;
+    save_author_token(&normalized)?;
     println!(
-        "Saved author token for '{}' on {} as profile '{}'",
-        normalized.shortname, normalized.url, profile_name
+        "Saved author token for '{}' on {}",
+        normalized.shortname, normalized.url
     );
     Ok(())
 }

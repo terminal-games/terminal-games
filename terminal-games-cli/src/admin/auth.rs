@@ -7,18 +7,18 @@ use dialoguer::{Confirm, Input, Password};
 
 use super::AdminAuthArgs;
 use crate::config::{
-    AdminProfile, CliConfig, load_cli_config, normalize_base_url, read_secret_stdin,
-    save_admin_profile, save_cli_config,
+    AdminProfile, CliConfig, default_url_value, load_cli_config, normalize_base_url,
+    read_secret_stdin, save_admin_profile, save_cli_config,
 };
 
-pub(super) async fn run(args: AdminAuthArgs, profile_override: Option<String>) -> Result<()> {
+pub(super) async fn run(args: AdminAuthArgs, url_override: Option<String>) -> Result<()> {
     let current_config = load_cli_config()?;
-    let url = match args.url {
+    let url = match url_override {
         Some(url) => normalize_base_url(&url)?,
         None => normalize_base_url(
             &Input::<String>::new()
                 .with_prompt("Server URL")
-                .default("terminalgames.net".to_string())
+                .default("https://terminalgames.net".to_string())
                 .interact_text()?,
         )?,
     };
@@ -32,30 +32,23 @@ pub(super) async fn run(args: AdminAuthArgs, profile_override: Option<String>) -
             .interact()?
     };
 
-    let profile_name = profile_override.unwrap_or_else(|| "default".to_string());
-    save_admin_profile(
-        &profile_name,
-        AdminProfile {
-            url: url.clone(),
-            password,
-        },
-    )?;
+    save_admin_profile(AdminProfile {
+        url: url.clone(),
+        password,
+    })?;
 
-    if profile_name == current_config.default_profile
+    if default_url_value()?.as_deref() == Some(url.as_str())
         || Confirm::new()
-            .with_prompt(format!(
-                "Set '{}' as the default admin profile?",
-                profile_name
-            ))
-            .default(profile_name == "default")
+            .with_prompt(format!("Set '{}' as the default server?", url))
+            .default(current_config.default_url.is_none())
             .interact()?
     {
         save_cli_config(&CliConfig {
-            default_profile: profile_name.clone(),
+            default_url: Some(url.clone()),
             author_env_secret_key: current_config.author_env_secret_key.clone(),
         })?;
     }
 
-    println!("Saved admin profile '{}' for {}", profile_name, url);
+    println!("Saved admin auth for {}", url);
     Ok(())
 }

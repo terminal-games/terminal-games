@@ -700,7 +700,8 @@ impl AdminControlRpc for AdminRpcServer {
         validate_shortname(&request.shortname)?;
         let secret = random_token_secret();
         let token_hash = sha256_hex(&secret);
-        self.control
+        match self
+            .control
             .app_server
             .db
             .execute(
@@ -708,7 +709,14 @@ impl AdminControlRpc for AdminRpcServer {
              VALUES (?1, ?2)",
                 libsql::params!(request.shortname.clone(), token_hash),
             )
-            .await?;
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if is_duplicate_author_shortname_error(&error) => {
+                return Err(format!("shortname '{}' already exists", request.shortname).into());
+            }
+            Err(error) => return Err(error.into()),
+        }
         let mut rows = self
             .control
             .app_server
@@ -1594,6 +1602,16 @@ fn sha256_bytes(secret: &str) -> [u8; 32] {
 
 fn sha256_hex(secret: &str) -> String {
     hex::encode(sha256_bytes(secret))
+}
+
+fn is_duplicate_author_shortname_error(error: &libsql::Error) -> bool {
+    match error {
+        libsql::Error::SqliteFailure(code, _) => *code == libsql::ffi::SQLITE_CONSTRAINT_UNIQUE,
+        libsql::Error::RemoteSqliteFailure(_, extended_code, _) => {
+            *extended_code == libsql::ffi::SQLITE_CONSTRAINT_UNIQUE
+        }
+        _ => false,
+    }
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

@@ -16,7 +16,6 @@ pub(super) async fn run() -> Result<()> {
             Ok(response) => response,
             Err(error) => {
                 warnings.push(format_author_list_warning(
-                    &entry.profile,
                     &entry.claims.shortname,
                     &entry.claims.url,
                     &error,
@@ -25,7 +24,6 @@ pub(super) async fn run() -> Result<()> {
             }
         };
         rows.push(vec![
-            entry.profile,
             if response.author_name.trim().is_empty() {
                 "-".to_string()
             } else {
@@ -37,10 +35,7 @@ pub(super) async fn run() -> Result<()> {
         ]);
     }
     rows.sort();
-    print_table(
-        &["Profile", "Author", "Shortname", "Server", "Playtime"],
-        &rows,
-    );
+    print_table(&["Author", "Shortname", "Server", "Playtime"], &rows);
     if !warnings.is_empty() {
         eprintln!("");
     }
@@ -61,24 +56,17 @@ async fn fetch_author_info(
         .map_err(anyhow::Error::msg)
 }
 
-fn format_author_list_warning(
-    profile: &str,
-    shortname: &str,
-    url: &str,
-    error: &anyhow::Error,
-) -> String {
+fn format_author_list_warning(shortname: &str, url: &str, error: &anyhow::Error) -> String {
     if is_unauthorized_error(error) {
         return format!(
-            "Skipping revoked author token '{}:{}' on {} ({})",
-            profile,
+            "Skipping revoked author token '{}' on {} ({})",
             shortname,
             url,
             error.root_cause()
         );
     }
     format!(
-        "Skipping author '{}:{}' on {} ({})",
-        profile,
+        "Skipping author '{}' on {} ({})",
         shortname,
         url,
         error.root_cause()

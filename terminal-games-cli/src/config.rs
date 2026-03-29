@@ -3,7 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
@@ -25,42 +25,31 @@ pub struct AdminProfile {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct AdminProfilesFile {
     #[serde(default)]
-    profile: BTreeMap<String, AdminProfile>,
+    server: Vec<AdminProfile>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CliConfig {
-    #[serde(rename = "default-profile", default = "default_profile_name")]
-    pub default_profile: String,
+    #[serde(rename = "default-url", default)]
+    pub default_url: Option<String>,
     #[serde(rename = "author-env-secret-key", default)]
     pub author_env_secret_key: Option<String>,
 }
 
-impl Default for CliConfig {
-    fn default() -> Self {
-        Self {
-            default_profile: default_profile_name(),
-            author_env_secret_key: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredAuthorToken {
-    pub profile: String,
+struct StoredAuthorToken {
     pub token: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct StoredAuthorTokenEntry {
-    pub profile: String,
     pub claims: AuthorTokenClaims,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct AuthorTokensFile {
     #[serde(default)]
-    token: BTreeMap<String, StoredAuthorToken>,
+    token: Vec<StoredAuthorToken>,
 }
 
 pub fn load_cli_config() -> Result<CliConfig> {
@@ -86,158 +75,164 @@ pub fn load_or_create_author_env_secret_key() -> Result<String> {
     Ok(secret_key)
 }
 
-pub fn resolve_admin_profile(profile_override: Option<&str>) -> Result<(String, AdminProfile)> {
-    let config = load_cli_config()?;
-    let profile_name = profile_override
-        .map(str::to_string)
-        .unwrap_or_else(|| config.default_profile.clone());
+pub fn resolve_admin_profile(url_override: Option<&str>) -> Result<AdminProfile> {
+    let url = resolve_target_url(url_override)?;
     let profiles: AdminProfilesFile = read_toml(admin_profiles_path())?;
-    let profile = profiles
-        .profile
-        .get(&profile_name)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("unknown admin profile '{profile_name}'"))?;
-    Ok((profile_name, profile))
+    profiles
+        .server
+        .into_iter()
+        .filter_map(|profile| normalize_admin_profile(profile).ok())
+        .find(|profile| profile.url == url)
+        .ok_or_else(|| anyhow::anyhow!("no admin auth configured for '{}'", url))
 }
 
-pub fn save_admin_profile(name: &str, profile: AdminProfile) -> Result<()> {
+pub fn save_admin_profile(profile: AdminProfile) -> Result<()> {
+    let profile = normalize_admin_profile(profile)?;
     let mut profiles: AdminProfilesFile = read_toml(admin_profiles_path())?;
-    profiles.profile.insert(name.to_string(), profile);
+    if let Some(existing) = profiles.server.iter_mut().find(|existing| {
+        normalize_base_url(&existing.url)
+            .map(|url| url == profile.url)
+            .unwrap_or(false)
+    }) {
+        *existing = profile;
+    } else {
+        profiles.server.push(profile);
+        profiles
+            .server
+            .sort_by(|left, right| left.url.cmp(&right.url));
+    }
     write_toml(admin_profiles_path(), &profiles)
 }
 
-pub fn list_admin_profile_names() -> Result<Vec<String>> {
-    let profiles: AdminProfilesFile = read_toml(admin_profiles_path())?;
-    Ok(profiles.profile.into_keys().collect())
+pub fn list_admin_urls() -> Result<Vec<String>> {
+    let mut urls = read_toml::<AdminProfilesFile>(admin_profiles_path())?
+        .server
+        .into_iter()
+        .filter_map(|profile| {
+            normalize_admin_profile(profile)
+                .ok()
+                .map(|profile| profile.url)
+        })
+        .collect::<Vec<_>>();
+    urls.sort();
+    urls.dedup();
+    Ok(urls)
 }
 
-pub fn list_admin_profiles() -> Result<Vec<(String, AdminProfile)>> {
-    let profiles: AdminProfilesFile = read_toml(admin_profiles_path())?;
-    Ok(profiles.profile.into_iter().collect())
-}
-
-pub fn default_profile_name_value() -> Result<String> {
-    Ok(load_cli_config()?.default_profile)
+pub fn default_url_value() -> Result<Option<String>> {
+    normalize_optional_url(load_cli_config()?.default_url.as_deref())
 }
 
 pub fn list_stored_author_tokens() -> Result<Vec<StoredAuthorTokenEntry>> {
     let tokens: AuthorTokensFile = read_toml(author_tokens_path())?;
-    let mut entries = Vec::new();
-    for (key, stored) in tokens.token {
-        let claims = AuthorTokenClaims::decode(&stored.token)
-            .with_context(|| format!("invalid stored author token '{key}'"))?;
-        let profile = if stored.profile.trim().is_empty() {
-            key.split_once(':')
-                .map(|(profile, _)| profile.to_string())
-                .unwrap_or_else(default_profile_name)
-        } else {
-            stored.profile
-        };
-        entries.push(StoredAuthorTokenEntry { profile, claims });
+    let mut entries = BTreeMap::new();
+    for stored in tokens.token {
+        let claims = decode_author_token(&stored.token)?;
+        entries.insert(
+            (claims.url.clone(), claims.shortname.clone()),
+            StoredAuthorTokenEntry { claims },
+        );
     }
-    Ok(entries)
+    Ok(entries.into_values().collect())
 }
 
 pub fn load_author_token_for_shortname(
     shortname: &str,
-    profile_override: Option<&str>,
+    url_override: Option<&str>,
 ) -> Result<Option<AuthorTokenClaims>> {
-    if let Ok(token) = std::env::var("TERMINAL_GAMES_AUTHOR_TOKEN") {
-        let claims = AuthorTokenClaims::decode(token.trim())?;
-        return Ok((claims.shortname == shortname).then_some(claims));
+    let requested_url = normalize_optional_url(url_override)?;
+    if let Some(claims) = load_env_author_token()? {
+        if claims.shortname == shortname
+            && requested_url
+                .as_deref()
+                .is_none_or(|requested| requested == claims.url)
+        {
+            return Ok(Some(claims));
+        }
     }
-    let profile_name = profile_override
-        .map(str::to_string)
-        .unwrap_or(default_profile_name_value()?);
-    let matches = list_stored_author_tokens()?
-        .into_iter()
-        .filter(|entry| entry.claims.shortname == shortname)
-        .collect::<Vec<_>>();
-    if let Some(entry) = matches.iter().find(|entry| entry.profile == profile_name) {
-        return Ok(Some(entry.claims.clone()));
-    }
-    if matches.is_empty() {
-        return Ok(None);
-    }
-    let available = matches
-        .into_iter()
-        .map(|entry| entry.profile)
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(anyhow::anyhow!(
-        "no author token configured for '{}' in profile '{}'; available in: {}",
+
+    let entries = list_stored_author_tokens()?;
+    select_author_claims(
+        &entries,
         shortname,
-        profile_name,
-        available
-    ))
+        requested_url.as_deref(),
+        default_url_value()?.as_deref(),
+    )
 }
 
 pub fn load_author_tokens_for_listing(
-    profile_filter: Option<&str>,
+    url_filter: Option<&str>,
 ) -> Result<Vec<StoredAuthorTokenEntry>> {
-    let mut entries = list_stored_author_tokens()?;
-    if let Ok(token) = std::env::var("TERMINAL_GAMES_AUTHOR_TOKEN") {
-        let claims = AuthorTokenClaims::decode(token.trim())?;
+    let filter_url = normalize_optional_url(url_filter)?;
+    let mut entries = BTreeMap::new();
+    for entry in list_stored_author_tokens()? {
         entries.insert(
-            0,
-            StoredAuthorTokenEntry {
-                profile: "env".to_string(),
-                claims,
-            },
+            (entry.claims.url.clone(), entry.claims.shortname.clone()),
+            entry,
         );
     }
-    if let Some(profile) = profile_filter {
-        entries.retain(|entry| entry.profile == profile);
+    if let Some(claims) = load_env_author_token()? {
+        entries.insert(
+            (claims.url.clone(), claims.shortname.clone()),
+            StoredAuthorTokenEntry { claims },
+        );
+    }
+    let mut entries = entries.into_values().collect::<Vec<_>>();
+    if let Some(filter_url) = filter_url {
+        entries.retain(|entry| entry.claims.url == filter_url);
     }
     Ok(entries)
 }
 
-pub fn list_author_refs() -> Result<Vec<String>> {
-    let mut refs = load_author_tokens_for_listing(None)?
+pub fn list_author_shortnames(url_filter: Option<&str>) -> Result<Vec<String>> {
+    let mut shortnames = load_author_tokens_for_listing(url_filter)?
         .into_iter()
-        .map(|entry| format!("{}:{}", entry.profile, entry.claims.shortname))
+        .map(|entry| entry.claims.shortname)
         .collect::<Vec<_>>();
-    refs.sort();
-    refs.dedup();
-    Ok(refs)
+    shortnames.sort();
+    shortnames.dedup();
+    Ok(shortnames)
 }
 
-pub fn parse_author_ref(value: &str) -> Result<(String, String)> {
-    let (profile, shortname) = value
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("author target must be PROFILE:SHORTNAME"))?;
-    let profile = profile.trim();
-    let shortname = shortname.trim();
-    anyhow::ensure!(!profile.is_empty(), "author target profile cannot be empty");
-    anyhow::ensure!(
-        !shortname.is_empty(),
-        "author target shortname cannot be empty"
-    );
-    Ok((profile.to_string(), shortname.to_string()))
+pub fn list_author_urls() -> Result<Vec<String>> {
+    let mut urls = load_author_tokens_for_listing(None)?
+        .into_iter()
+        .map(|entry| entry.claims.url)
+        .collect::<Vec<_>>();
+    urls.sort();
+    urls.dedup();
+    Ok(urls)
 }
 
-pub fn save_author_token(profile: &str, claims: &AuthorTokenClaims) -> Result<()> {
+pub fn save_author_token(claims: &AuthorTokenClaims) -> Result<()> {
+    let normalized = normalize_author_claims(claims.clone())?;
     let mut tokens: AuthorTokensFile = read_toml(author_tokens_path())?;
-    tokens.token.insert(
-        author_token_key(profile, claims),
-        StoredAuthorToken {
-            profile: profile.to_string(),
-            token: claims.encode()?,
-        },
-    );
+    let encoded = normalized.encode()?;
+    tokens.token.retain(|stored| {
+        decode_author_token(&stored.token)
+            .map(|claims| claims.url != normalized.url || claims.shortname != normalized.shortname)
+            .unwrap_or(true)
+    });
+    tokens.token.push(StoredAuthorToken { token: encoded });
+    tokens
+        .token
+        .sort_by(|left, right| left.token.cmp(&right.token));
     write_toml(author_tokens_path(), &tokens)
 }
 
 pub fn normalize_base_url(input: &str) -> Result<String> {
     let trimmed = input.trim();
     anyhow::ensure!(!trimmed.is_empty(), "url cannot be empty");
-    let with_scheme = if trimmed.contains("://") {
-        trimmed.to_string()
-    } else {
-        format!("https://{trimmed}")
-    };
+    anyhow::ensure!(
+        trimmed.contains("://"),
+        "url must include an explicit scheme, for example http://localhost:8080 or https://terminalgames.net"
+    );
     let mut url =
-        reqwest::Url::parse(&with_scheme).with_context(|| format!("invalid url '{trimmed}'"))?;
+        reqwest::Url::parse(trimmed).with_context(|| format!("invalid url '{trimmed}'"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "url scheme must be http:// or https://"
+    );
     url.set_path("");
     url.set_query(None);
     url.set_fragment(None);
@@ -335,15 +330,6 @@ pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     }
 }
 
-fn visible_width(value: &str) -> usize {
-    strip_ansi_escapes::strip_str(value).width()
-}
-
-fn pad_visible(value: &str, width: usize) -> String {
-    let padding = width.saturating_sub(visible_width(value));
-    format!("{value}{}", " ".repeat(padding))
-}
-
 pub fn format_duration(seconds: u64) -> String {
     let hours = seconds / 3600;
     let minutes = (seconds / 60) % 60;
@@ -370,15 +356,105 @@ pub fn format_bytes_per_second(bytes: u64) -> String {
     }
 }
 
-fn default_profile_name() -> String {
-    "default".to_string()
-}
-
-fn config_dir() -> Result<PathBuf> {
+pub(crate) fn config_dir() -> Result<PathBuf> {
     let base = dirs::config_dir().ok_or_else(|| anyhow::anyhow!("config dir not found"))?;
     let path = base.join("terminal-games-cli");
     fs::create_dir_all(&path)?;
     Ok(path)
+}
+
+fn resolve_target_url(url_override: Option<&str>) -> Result<String> {
+    if let Some(url) = normalize_optional_url(url_override)? {
+        return Ok(url);
+    }
+    default_url_value()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no default server configured; pass --url or run 'terminal-games-cli admin auth'"
+        )
+    })
+}
+
+fn select_author_claims(
+    entries: &[StoredAuthorTokenEntry],
+    shortname: &str,
+    requested_url: Option<&str>,
+    default_url: Option<&str>,
+) -> Result<Option<AuthorTokenClaims>> {
+    let matches = entries
+        .iter()
+        .filter(|entry| entry.claims.shortname == shortname)
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    if let Some(requested_url) = requested_url {
+        return matches
+            .iter()
+            .find(|entry| entry.claims.url == requested_url)
+            .map(|entry| entry.claims.clone())
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no author token configured for '{}' on '{}'; available on: {}",
+                    shortname,
+                    requested_url,
+                    available_author_urls(&matches)
+                )
+            });
+    }
+    if matches.len() == 1 {
+        return Ok(Some(matches[0].claims.clone()));
+    }
+    if let Some(default_url) = default_url {
+        if let Some(entry) = matches.iter().find(|entry| entry.claims.url == default_url) {
+            return Ok(Some(entry.claims.clone()));
+        }
+    }
+    Err(anyhow::anyhow!(
+        "multiple author tokens are configured for '{}'; pass --url to choose one of: {}",
+        shortname,
+        available_author_urls(&matches)
+    ))
+}
+
+fn available_author_urls(entries: &[&StoredAuthorTokenEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| entry.claims.url.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn load_env_author_token() -> Result<Option<AuthorTokenClaims>> {
+    match std::env::var("TERMINAL_GAMES_AUTHOR_TOKEN") {
+        Ok(token) => Ok(Some(decode_author_token(token.trim())?)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(anyhow::Error::new(error)),
+    }
+}
+
+fn decode_author_token(token: &str) -> Result<AuthorTokenClaims> {
+    normalize_author_claims(AuthorTokenClaims::decode(token)?)
+}
+
+fn normalize_admin_profile(mut profile: AdminProfile) -> Result<AdminProfile> {
+    profile.url = normalize_base_url(&profile.url)?;
+    Ok(profile)
+}
+
+fn normalize_author_claims(mut claims: AuthorTokenClaims) -> Result<AuthorTokenClaims> {
+    claims.url = normalize_base_url(&claims.url)?;
+    Ok(claims)
+}
+
+fn normalize_optional_url(input: Option<&str>) -> Result<Option<String>> {
+    input
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_base_url)
+        .transpose()
 }
 
 fn cli_config_path() -> Result<PathBuf> {
@@ -393,8 +469,13 @@ fn author_tokens_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("author.toml"))
 }
 
-fn author_token_key(profile: &str, claims: &AuthorTokenClaims) -> String {
-    format!("{profile}:{}", claims.shortname)
+fn visible_width(value: &str) -> usize {
+    strip_ansi_escapes::strip_str(value).width()
+}
+
+fn pad_visible(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(visible_width(value));
+    format!("{value}{}", " ".repeat(padding))
 }
 
 fn read_toml<T>(path: Result<PathBuf>) -> Result<T>

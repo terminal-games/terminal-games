@@ -24,12 +24,7 @@ pub(super) async fn run(command: AdminTickerCommand, profile: Option<String>) ->
 
 async fn list(profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
-    let tickers: Vec<TickerEntry> = api
-        .rpc()
-        .await?
-        .ticker_list(terminal_games::control::rpc_context())
-        .await?
-        .map_err(anyhow::Error::msg)?;
+    let tickers: Vec<TickerEntry> = api.ticker_list().await?;
     let rows = tickers
         .into_iter()
         .map(|ticker| {

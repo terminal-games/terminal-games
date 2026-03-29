@@ -9,7 +9,7 @@ use super::super::AuthorEnvSetArgs;
 use crate::control_client::AuthorClient;
 
 pub(super) async fn run(args: AuthorEnvSetArgs) -> Result<()> {
-    let client = AuthorClient::from_ref(&args.author_ref)?;
+    let client = AuthorClient::from_target(&args.shortname, args.url.as_deref())?;
     client
         .rpc()
         .await?
@@ -25,6 +25,6 @@ pub(super) async fn run(args: AuthorEnvSetArgs) -> Result<()> {
         )
         .await?
         .map_err(anyhow::Error::msg)?;
-    println!("Updated env var for '{}'", args.author_ref);
+    println!("Updated env var for '{}'", args.shortname);
     Ok(())
 }

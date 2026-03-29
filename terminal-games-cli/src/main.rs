@@ -5,6 +5,7 @@
 mod admin;
 mod audio;
 mod author;
+mod completion_cache;
 mod config;
 mod control_client;
 mod run;

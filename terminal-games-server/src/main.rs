@@ -11,10 +11,7 @@ mod sessions;
 mod ssh;
 mod web;
 
-use std::{
-    sync::Arc,
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use rustls::crypto::aws_lc_rs;

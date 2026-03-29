@@ -9,7 +9,7 @@ use super::super::AuthorEnvDeleteArgs;
 use crate::control_client::AuthorClient;
 
 pub(super) async fn run(args: AuthorEnvDeleteArgs) -> Result<()> {
-    let client = AuthorClient::from_ref(&args.author_ref)?;
+    let client = AuthorClient::from_target(&args.shortname, args.url.as_deref())?;
     client
         .rpc()
         .await?
@@ -19,6 +19,6 @@ pub(super) async fn run(args: AuthorEnvDeleteArgs) -> Result<()> {
         )
         .await?
         .map_err(anyhow::Error::msg)?;
-    println!("Deleted env var for '{}'", args.author_ref);
+    println!("Deleted env var for '{}'", args.shortname);
     Ok(())
 }

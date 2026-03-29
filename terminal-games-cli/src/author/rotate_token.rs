@@ -6,12 +6,11 @@ use anyhow::Result;
 use terminal_games::control::{AuthorTokenClaims, RotateAuthorTokenResponse};
 
 use super::AuthorRotateTokenArgs;
-use crate::config::{parse_author_ref, save_author_token};
+use crate::config::save_author_token;
 use crate::control_client::AuthorClient;
 
 pub(super) async fn run(args: AuthorRotateTokenArgs) -> Result<()> {
-    let (target_profile, _) = parse_author_ref(&args.author_ref)?;
-    let client = AuthorClient::from_ref(&args.author_ref)?;
+    let client = AuthorClient::from_target(&args.shortname, args.url.as_deref())?;
     let response: RotateAuthorTokenResponse = client
         .rpc()
         .await?
@@ -19,8 +18,8 @@ pub(super) async fn run(args: AuthorRotateTokenArgs) -> Result<()> {
         .await?
         .map_err(anyhow::Error::msg)?;
     let claims = AuthorTokenClaims::decode(&response.token)?;
-    save_author_token(&target_profile, &claims)?;
-    println!("Rotated token for '{}'", args.author_ref);
+    save_author_token(&claims)?;
+    println!("Rotated token for '{}'", args.shortname);
     println!("Token: {}", response.token);
     Ok(())
 }

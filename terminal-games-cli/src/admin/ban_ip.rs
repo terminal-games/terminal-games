@@ -52,12 +52,7 @@ async fn add(args: AdminBanIpAddArgs, profile: Option<String>) -> Result<()> {
 
 async fn list(profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
-    let bans: Vec<BanEntry> = api
-        .rpc()
-        .await?
-        .ban_ip_list(terminal_games::control::rpc_context())
-        .await?
-        .map_err(anyhow::Error::msg)?;
+    let bans: Vec<BanEntry> = api.ban_ip_list().await?;
     let rows = bans
         .into_iter()
         .map(|ban| {

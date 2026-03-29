@@ -10,7 +10,7 @@ use crate::config::print_table;
 use crate::control_client::AuthorClient;
 
 pub(super) async fn run(args: AuthorEnvListArgs) -> Result<()> {
-    let client = AuthorClient::from_ref(&args.author_ref)?;
+    let client = AuthorClient::from_target(&args.shortname, args.url.as_deref())?;
     let response: AuthorEnvListResponse = client
         .rpc()
         .await?

@@ -11,8 +11,7 @@ use terminal_games::{
 };
 
 use super::{AuthorUploadArgs, load_upload_envs};
-use crate::config::parse_author_ref;
-use crate::control_client::{AuthorClient, load_author_claims_for_ref};
+use crate::control_client::{AuthorClient, load_author_claims_for_target};
 
 pub(super) async fn run(args: AuthorUploadArgs) -> Result<()> {
     let wasm = fs::read(&args.path_to_wasm_file)
@@ -20,13 +19,13 @@ pub(super) async fn run(args: AuthorUploadArgs) -> Result<()> {
     let manifest = extract_manifest_from_wasm(&wasm)?
         .ok_or_else(|| anyhow::anyhow!("missing embedded terminal-games manifest"))?;
     validate_manifest(&manifest)?;
-    let claims = load_author_claims_for_ref(&args.author_ref)?;
-    let (_, ref_shortname) = parse_author_ref(&args.author_ref)?;
+    let target_shortname = args.shortname.as_deref().unwrap_or(&manifest.shortname);
+    let claims = load_author_claims_for_target(target_shortname, args.url.as_deref())?;
     anyhow::ensure!(
-        manifest.shortname == ref_shortname,
+        manifest.shortname == target_shortname,
         "manifest shortname '{}' does not match target '{}'",
         manifest.shortname,
-        args.author_ref
+        target_shortname
     );
 
     let client = AuthorClient::from_claims(claims)?;

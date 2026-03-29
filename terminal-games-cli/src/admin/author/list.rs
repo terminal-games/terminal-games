@@ -10,12 +10,7 @@ use crate::config::{format_seconds, print_table};
 
 pub(super) async fn run(profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
-    let authors: Vec<AuthorSummary> = api
-        .rpc()
-        .await?
-        .author_list(terminal_games::control::rpc_context())
-        .await?
-        .map_err(anyhow::Error::msg)?;
+    let authors: Vec<AuthorSummary> = api.author_list().await?;
     let rows = authors
         .into_iter()
         .map(|author| {

@@ -20,7 +20,7 @@ use clap::{Args, Subcommand};
 use clap_complete::{ArgValueCandidates, ArgValueCompleter, CompletionCandidate, PathCompleter};
 use terminal_games::control::AuthorEnvVar;
 
-use crate::config::{default_profile_name_value, list_admin_profiles, list_author_refs};
+use crate::config::{list_author_shortnames, list_author_urls};
 use crate::control_client::{AuthorClient, completion_runtime};
 
 #[derive(Args)]
@@ -57,10 +57,12 @@ pub(super) struct AuthorAuthArgs {
 
 #[derive(Args)]
 pub(super) struct AuthorUploadArgs {
-    #[arg(add = ArgValueCandidates::new(complete_author_ref_candidates))]
-    author_ref: String,
+    #[arg(long, add = ArgValueCandidates::new(complete_author_url_candidates))]
+    url: Option<String>,
     #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
     path_to_wasm_file: PathBuf,
+    #[arg(add = ArgValueCandidates::new(complete_author_shortname_candidates))]
+    shortname: Option<String>,
     /// Set env vars atomically during upload. Repeat as needed.
     #[arg(short = 'e', long = "env", value_name = "NAME=VALUE")]
     env: Vec<String>,
@@ -73,14 +75,18 @@ pub(super) struct AuthorUploadArgs {
 pub(super) struct AuthorDeleteArgs {
     #[arg(long)]
     force: bool,
-    #[arg(add = ArgValueCandidates::new(complete_author_ref_candidates))]
-    author_ref: String,
+    #[arg(long, add = ArgValueCandidates::new(complete_author_url_candidates))]
+    url: Option<String>,
+    #[arg(add = ArgValueCandidates::new(complete_author_shortname_candidates))]
+    shortname: String,
 }
 
 #[derive(Args)]
 pub(super) struct AuthorRotateTokenArgs {
-    #[arg(add = ArgValueCandidates::new(complete_author_ref_candidates))]
-    author_ref: String,
+    #[arg(long, add = ArgValueCandidates::new(complete_author_url_candidates))]
+    url: Option<String>,
+    #[arg(add = ArgValueCandidates::new(complete_author_shortname_candidates))]
+    shortname: String,
 }
 
 #[derive(Subcommand)]
@@ -96,22 +102,28 @@ pub(super) enum AuthorEnvCommand {
 
 #[derive(Args)]
 pub(super) struct AuthorEnvListArgs {
-    #[arg(add = ArgValueCandidates::new(complete_author_ref_candidates))]
-    author_ref: String,
+    #[arg(long, add = ArgValueCandidates::new(complete_author_url_candidates))]
+    url: Option<String>,
+    #[arg(add = ArgValueCandidates::new(complete_author_shortname_candidates))]
+    shortname: String,
 }
 
 #[derive(Args)]
 pub(super) struct AuthorEnvSetArgs {
-    #[arg(add = ArgValueCandidates::new(complete_author_ref_candidates))]
-    author_ref: String,
+    #[arg(long, add = ArgValueCandidates::new(complete_author_url_candidates))]
+    url: Option<String>,
+    #[arg(add = ArgValueCandidates::new(complete_author_shortname_candidates))]
+    shortname: String,
     name: String,
     value: String,
 }
 
 #[derive(Args)]
 pub(super) struct AuthorEnvDeleteArgs {
-    #[arg(add = ArgValueCandidates::new(complete_author_ref_candidates))]
-    author_ref: String,
+    #[arg(long, add = ArgValueCandidates::new(complete_author_url_candidates))]
+    url: Option<String>,
+    #[arg(add = ArgValueCandidates::new(complete_author_shortname_candidates))]
+    shortname: String,
     #[arg(add = ArgValueCandidates::new(complete_author_env_name_candidates))]
     name: String,
 }
@@ -127,8 +139,17 @@ pub async fn run(cli: AuthorCli) -> Result<()> {
     }
 }
 
-fn complete_author_ref_candidates() -> Vec<CompletionCandidate> {
-    list_author_refs()
+fn complete_author_shortname_candidates() -> Vec<CompletionCandidate> {
+    let url = current_author_url_from_args();
+    list_author_shortnames(url.as_deref())
+        .unwrap_or_default()
+        .into_iter()
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+fn complete_author_url_candidates() -> Vec<CompletionCandidate> {
+    list_author_urls()
         .unwrap_or_default()
         .into_iter()
         .map(CompletionCandidate::new)
@@ -146,8 +167,9 @@ fn complete_author_env_name_candidates() -> Vec<CompletionCandidate> {
 }
 
 fn complete_author_env_name_candidates_inner() -> Option<Vec<String>> {
-    let author_ref = current_author_ref_from_args()?;
-    let client = AuthorClient::from_ref(&author_ref).ok()?;
+    let shortname = current_author_shortname_from_args()?;
+    let url = current_author_url_from_args();
+    let client = AuthorClient::from_target(&shortname, url.as_deref()).ok()?;
     let runtime = completion_runtime()?;
     let result = runtime.block_on(async move {
         let response = client
@@ -172,36 +194,44 @@ fn complete_author_env_name_candidates_inner() -> Option<Vec<String>> {
     result
 }
 
-pub(super) fn infer_author_profile_name(normalized_url: &str) -> Result<String> {
-    let profiles = list_admin_profiles()?;
-    let matches = profiles
-        .iter()
-        .filter(|(_, profile)| profile.url == normalized_url)
-        .map(|(name, _)| name.clone())
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [only] => Ok(only.clone()),
-        [] => Ok(normalized_url.to_string()),
-        many => {
-            let default_profile = default_profile_name_value()?;
-            if many.iter().any(|name| name == &default_profile) {
-                Ok(default_profile)
-            } else {
-                anyhow::bail!(
-                    "multiple admin profiles point at '{}': {}",
-                    normalized_url,
-                    many.join(", ")
-                )
-            }
+fn current_author_url_from_args() -> Option<String> {
+    let args = std::env::args().collect::<Vec<_>>();
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(value) = arg.strip_prefix("--url=") {
+            return Some(value.to_string());
+        }
+        if arg == "--url" {
+            return args.get(index + 1).cloned();
         }
     }
+    None
 }
 
-fn current_author_ref_from_args() -> Option<String> {
+fn current_author_shortname_from_args() -> Option<String> {
     let args = std::env::args().collect::<Vec<_>>();
     let env_idx = args.iter().position(|arg| arg == "env")?;
-    match args.get(env_idx + 1).map(String::as_str) {
-        Some("list" | "set" | "delete") => args.get(env_idx + 2).cloned(),
+    let subcommand = args.get(env_idx + 1)?.as_str();
+    let mut values = Vec::new();
+    let mut index = env_idx + 2;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--url" {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with("--url=") {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        values.push(arg.clone());
+        index += 1;
+    }
+    match subcommand {
+        "list" | "set" | "delete" => values.first().cloned(),
         _ => None,
     }
 }

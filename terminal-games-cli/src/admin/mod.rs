@@ -14,21 +14,21 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use clap_complete::{ArgValueCandidates, CompletionCandidate};
 
-use crate::config::list_admin_profile_names;
+use crate::config::list_admin_urls;
 use crate::control_client::{AdminClient, completion_runtime};
 
 #[derive(Args)]
 pub struct AdminCli {
-    /// Admin profile / cluster to use. Defaults to the CLI default profile.
-    #[arg(long, global = true, add = ArgValueCandidates::new(complete_admin_profile_candidates))]
-    profile: Option<String>,
+    /// Server URL to use. Defaults to the CLI default URL.
+    #[arg(long, global = true, add = ArgValueCandidates::new(complete_admin_url_candidates))]
+    url: Option<String>,
     #[command(subcommand)]
     command: AdminCommand,
 }
 
 #[derive(Subcommand)]
 enum AdminCommand {
-    /// Configure an admin profile with server URL and shared secret.
+    /// Configure a server URL with its shared admin secret.
     Auth(AdminAuthArgs),
     #[command(subcommand)]
     /// Manage IP bans across the fleet.
@@ -50,8 +50,6 @@ enum AdminCommand {
 
 #[derive(Args)]
 pub(super) struct AdminAuthArgs {
-    #[arg(long)]
-    url: Option<String>,
     #[arg(long)]
     password: Option<String>,
     #[arg(long)]
@@ -201,8 +199,8 @@ pub(super) struct AdminAuthorCreateArgs {
 pub(super) struct AdminAuthorDeleteArgs {
     #[arg(long)]
     force: bool,
-    #[arg(add = ArgValueCandidates::new(complete_author_id_candidates))]
-    author_id: u64,
+    #[arg(add = ArgValueCandidates::new(complete_author_delete_candidates))]
+    author: String,
 }
 
 #[derive(Args)]
@@ -212,20 +210,20 @@ pub(super) struct AdminAuthorRotateTokenArgs {
 }
 
 pub async fn run(cli: AdminCli) -> Result<()> {
-    let profile = cli.profile;
+    let url = cli.url;
     match cli.command {
-        AdminCommand::Auth(args) => auth::run(args, profile).await,
-        AdminCommand::BanIp(command) => ban_ip::run(command, profile).await,
-        AdminCommand::Ticker(command) => ticker::run(command, profile).await,
-        AdminCommand::Broadcast(args) => broadcast::run(args, profile).await,
-        AdminCommand::Regions => regions::run(profile).await,
-        AdminCommand::Session(command) => session::run(command, profile).await,
-        AdminCommand::Author(command) => author::run(command, profile).await,
+        AdminCommand::Auth(args) => auth::run(args, url).await,
+        AdminCommand::BanIp(command) => ban_ip::run(command, url).await,
+        AdminCommand::Ticker(command) => ticker::run(command, url).await,
+        AdminCommand::Broadcast(args) => broadcast::run(args, url).await,
+        AdminCommand::Regions => regions::run(url).await,
+        AdminCommand::Session(command) => session::run(command, url).await,
+        AdminCommand::Author(command) => author::run(command, url).await,
     }
 }
 
-fn complete_admin_profile_candidates() -> Vec<CompletionCandidate> {
-    list_admin_profile_names()
+fn complete_admin_url_candidates() -> Vec<CompletionCandidate> {
+    list_admin_urls()
         .unwrap_or_default()
         .into_iter()
         .map(CompletionCandidate::new)
@@ -244,7 +242,8 @@ fn complete_session_id_candidates() -> Vec<CompletionCandidate> {
 
 fn complete_session_id_candidates_inner() -> Option<Vec<String>> {
     completion_runtime()?.block_on(async {
-        let api = load_api(None).ok()?;
+        let url = current_admin_url_from_args();
+        let api = load_api(url.as_deref()).ok()?;
         let mut session_ids = api
             .completion_all_sessions()
             .await
@@ -268,10 +267,29 @@ fn complete_author_id_candidates() -> Vec<CompletionCandidate> {
         .collect()
 }
 
+fn complete_author_delete_candidates() -> Vec<CompletionCandidate> {
+    std::panic::catch_unwind(complete_author_delete_candidates_inner)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .into_iter()
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
 fn complete_author_id_candidates_inner() -> Option<Vec<String>> {
     completion_runtime()?.block_on(async {
-        let api = load_api(None).ok()?;
+        let url = current_admin_url_from_args();
+        let api = load_api(url.as_deref()).ok()?;
         api.completion_author_ids().await.ok()
+    })
+}
+
+fn complete_author_delete_candidates_inner() -> Option<Vec<String>> {
+    completion_runtime()?.block_on(async {
+        let url = current_admin_url_from_args();
+        let api = load_api(url.as_deref()).ok()?;
+        api.completion_author_targets().await.ok()
     })
 }
 
@@ -287,7 +305,8 @@ fn complete_ticker_id_candidates() -> Vec<CompletionCandidate> {
 
 fn complete_ticker_id_candidates_inner() -> Option<Vec<String>> {
     completion_runtime()?.block_on(async {
-        let api = load_api(None).ok()?;
+        let url = current_admin_url_from_args();
+        let api = load_api(url.as_deref()).ok()?;
         api.completion_ticker_ids().await.ok()
     })
 }
@@ -304,13 +323,14 @@ fn complete_ban_ip_candidates() -> Vec<CompletionCandidate> {
 
 fn complete_ban_ip_candidates_inner() -> Option<Vec<String>> {
     completion_runtime()?.block_on(async {
-        let api = load_api(None).ok()?;
+        let url = current_admin_url_from_args();
+        let api = load_api(url.as_deref()).ok()?;
         api.completion_ban_ip_cidrs().await.ok()
     })
 }
 
-pub(super) fn load_api(profile_override: Option<&str>) -> Result<AdminClient> {
-    AdminClient::load(profile_override)
+pub(super) fn load_api(url_override: Option<&str>) -> Result<AdminClient> {
+    AdminClient::load(url_override)
 }
 
 pub(super) async fn refresh_status_bar_state(api: &AdminClient) -> Result<()> {
@@ -349,4 +369,29 @@ pub(super) fn format_optional_unix(value: Option<i64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "never".to_string())
+}
+
+pub(super) fn parse_author_delete_ref(value: &str) -> Result<(u64, &str)> {
+    let (author_id, shortname) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("author must be in ID:SHORTNAME format"))?;
+    let author_id = author_id
+        .parse::<u64>()
+        .with_context(|| format!("invalid author id '{author_id}'"))?;
+    let shortname = shortname.trim();
+    anyhow::ensure!(!shortname.is_empty(), "author shortname cannot be empty");
+    Ok((author_id, shortname))
+}
+
+fn current_admin_url_from_args() -> Option<String> {
+    let args = std::env::args().collect::<Vec<_>>();
+    for (index, arg) in args.iter().enumerate() {
+        if let Some(value) = arg.strip_prefix("--url=") {
+            return Some(value.to_string());
+        }
+        if arg == "--url" {
+            return args.get(index + 1).cloned();
+        }
+    }
+    None
 }

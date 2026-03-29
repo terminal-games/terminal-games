@@ -6,14 +6,15 @@ use anyhow::Result;
 use dialoguer::Confirm;
 use terminal_games::control::DeleteAuthorRequest;
 
-use super::super::{AdminAuthorDeleteArgs, load_api};
+use super::super::{AdminAuthorDeleteArgs, load_api, parse_author_delete_ref};
 
 pub(super) async fn run(args: AdminAuthorDeleteArgs, profile: Option<String>) -> Result<()> {
+    let (author_id, shortname) = parse_author_delete_ref(&args.author)?;
     if !args.force
         && !Confirm::new()
             .with_prompt(format!(
-                "Delete author {} permanently? This cannot be undone.",
-                args.author_id
+                "Delete author {}:{} permanently? This cannot be undone.",
+                author_id, shortname
             ))
             .default(false)
             .interact()?
@@ -25,13 +26,11 @@ pub(super) async fn run(args: AdminAuthorDeleteArgs, profile: Option<String>) ->
         .await?
         .author_delete(
             terminal_games::control::rpc_context(),
-            DeleteAuthorRequest {
-                author_id: args.author_id,
-            },
+            DeleteAuthorRequest { author_id },
         )
         .await?
         .map_err(anyhow::Error::msg)?
-        .ok_or_else(|| anyhow::anyhow!("unknown author {}", args.author_id))?;
-    println!("Deleted author {}", args.author_id);
+        .ok_or_else(|| anyhow::anyhow!("unknown author {}", author_id))?;
+    println!("Deleted author {}:{}", author_id, shortname);
     Ok(())
 }

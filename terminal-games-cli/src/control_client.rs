@@ -15,8 +15,8 @@ use futures::{Sink, Stream, future::join_all};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use tarpc::client;
 use terminal_games::control::{
-    AdminControlRpcClient, AuthorControlRpcClient, AuthorTokenClaims, RegionDiscoveryResponse,
-    RegionRuntimeStatus, SessionSummary, rpc_context,
+    AdminControlRpcClient, AuthorControlRpcClient, AuthorSummary, AuthorTokenClaims, BanEntry,
+    RegionDiscoveryResponse, RegionRuntimeStatus, SessionSummary, TickerEntry, rpc_context,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::{
@@ -27,9 +27,9 @@ use tokio_tungstenite::{
 };
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+use crate::completion_cache;
 use crate::config::{
-    AdminProfile, derive_region_urls, load_author_token_for_shortname, parse_author_ref,
-    resolve_admin_profile,
+    AdminProfile, derive_region_urls, load_author_token_for_shortname, resolve_admin_profile,
 };
 
 const CONTROL_RPC_MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
@@ -223,8 +223,8 @@ pub struct AdminClient {
 }
 
 impl AdminClient {
-    pub fn load(profile_override: Option<&str>) -> Result<Self> {
-        let (_, profile) = resolve_admin_profile(profile_override)?;
+    pub fn load(url_override: Option<&str>) -> Result<Self> {
+        let profile = resolve_admin_profile(url_override)?;
         Ok(Self {
             token: profile.password.clone(),
             profile,
@@ -280,6 +280,45 @@ impl AdminClient {
     }
 
     pub async fn all_sessions(&self) -> Result<Vec<SessionSummary>> {
+        let sessions = self.fetch_all_sessions().await?;
+        completion_cache::store_sessions(&self.profile.url, &sessions)?;
+        Ok(sessions)
+    }
+
+    pub async fn author_list(&self) -> Result<Vec<AuthorSummary>> {
+        let authors = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
+            rpc.author_list(rpc_context())
+                .await?
+                .map_err(anyhow::Error::msg)
+        })
+        .await?;
+        completion_cache::store_authors(&self.profile.url, &authors)?;
+        Ok(authors)
+    }
+
+    pub async fn ticker_list(&self) -> Result<Vec<TickerEntry>> {
+        let tickers = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
+            rpc.ticker_list(rpc_context())
+                .await?
+                .map_err(anyhow::Error::msg)
+        })
+        .await?;
+        completion_cache::store_tickers(&self.profile.url, &tickers)?;
+        Ok(tickers)
+    }
+
+    pub async fn ban_ip_list(&self) -> Result<Vec<BanEntry>> {
+        let bans = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
+            rpc.ban_ip_list(rpc_context())
+                .await?
+                .map_err(anyhow::Error::msg)
+        })
+        .await?;
+        completion_cache::store_bans(&self.profile.url, &bans)?;
+        Ok(bans)
+    }
+
+    async fn fetch_all_sessions(&self) -> Result<Vec<SessionSummary>> {
         let (_, region_urls) = self.discover().await?;
         let futures = region_urls.values().cloned().map(|base_url| async move {
             let rpc = connect_admin_rpc(&base_url, &self.token).await?;
@@ -295,6 +334,9 @@ impl AdminClient {
     }
 
     pub async fn completion_all_sessions(&self) -> Result<Vec<SessionSummary>> {
+        if let Some(sessions) = completion_cache::load_sessions(&self.profile.url)? {
+            return Ok(sessions);
+        }
         let (_, region_urls) = self.completion_discover().await?;
         let futures = region_urls.values().cloned().map(|base_url| async move {
             with_admin_rpc(&base_url, &self.token, |rpc| async move {
@@ -308,6 +350,7 @@ impl AdminClient {
         for result in join_all(futures).await {
             sessions.extend(result?);
         }
+        completion_cache::store_sessions(&self.profile.url, &sessions)?;
         Ok(sessions)
     }
 
@@ -342,12 +385,11 @@ impl AdminClient {
     }
 
     pub async fn completion_author_ids(&self) -> Result<Vec<String>> {
-        let authors = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
-            rpc.author_list(rpc_context())
-                .await?
-                .map_err(anyhow::Error::msg)
-        })
-        .await?;
+        let authors = if let Some(authors) = completion_cache::load_authors(&self.profile.url)? {
+            authors
+        } else {
+            self.author_list().await?
+        };
         let mut ids = authors
             .into_iter()
             .map(|author| author.author_id.to_string())
@@ -357,13 +399,27 @@ impl AdminClient {
         Ok(ids)
     }
 
+    pub async fn completion_author_targets(&self) -> Result<Vec<String>> {
+        let authors = if let Some(authors) = completion_cache::load_authors(&self.profile.url)? {
+            authors
+        } else {
+            self.author_list().await?
+        };
+        let mut targets = authors
+            .into_iter()
+            .map(|author| format!("{}:{}", author.author_id, author.shortname))
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        Ok(targets)
+    }
+
     pub async fn completion_ticker_ids(&self) -> Result<Vec<String>> {
-        let tickers = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
-            rpc.ticker_list(rpc_context())
-                .await?
-                .map_err(anyhow::Error::msg)
-        })
-        .await?;
+        let tickers = if let Some(tickers) = completion_cache::load_tickers(&self.profile.url)? {
+            tickers
+        } else {
+            self.ticker_list().await?
+        };
         let mut ids = tickers
             .into_iter()
             .map(|ticker| ticker.ticker_id.to_string())
@@ -374,12 +430,11 @@ impl AdminClient {
     }
 
     pub async fn completion_ban_ip_cidrs(&self) -> Result<Vec<String>> {
-        let bans = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
-            rpc.ban_ip_list(rpc_context())
-                .await?
-                .map_err(anyhow::Error::msg)
-        })
-        .await?;
+        let bans = if let Some(bans) = completion_cache::load_bans(&self.profile.url)? {
+            bans
+        } else {
+            self.ban_ip_list().await?
+        };
         let mut cidrs = bans.into_iter().map(|ban| ban.ip).collect::<Vec<_>>();
         cidrs.sort();
         cidrs.dedup();
@@ -412,8 +467,8 @@ impl AuthorClient {
         Ok(Self { claims })
     }
 
-    pub fn from_ref(author_ref: &str) -> Result<Self> {
-        Self::from_claims(load_author_claims_for_ref(author_ref)?)
+    pub fn from_target(shortname: &str, url_override: Option<&str>) -> Result<Self> {
+        Self::from_claims(load_author_claims_for_target(shortname, url_override)?)
     }
 
     pub async fn rpc(&self) -> Result<AuthorControlRpcClient> {
@@ -421,13 +476,19 @@ impl AuthorClient {
     }
 }
 
-pub fn load_author_claims_for_ref(author_ref: &str) -> Result<AuthorTokenClaims> {
-    let (profile, shortname) = parse_author_ref(author_ref)?;
-    load_author_token_for_shortname(&shortname, Some(&profile))?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no author token configured for '{}' in profile '{}'",
-            shortname,
-            profile
-        )
+pub fn load_author_claims_for_target(
+    shortname: &str,
+    url_override: Option<&str>,
+) -> Result<AuthorTokenClaims> {
+    load_author_token_for_shortname(shortname, url_override)?.ok_or_else(|| {
+        if let Some(url) = url_override {
+            anyhow::anyhow!(
+                "no author token configured for '{}' on '{}'",
+                shortname,
+                url
+            )
+        } else {
+            anyhow::anyhow!("no author token configured for '{}'", shortname)
+        }
     })
 }
