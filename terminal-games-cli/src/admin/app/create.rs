@@ -3,26 +3,26 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use anyhow::Result;
-use terminal_games::control::{CreateAuthorRequest, CreateAuthorResponse};
+use terminal_games::control::{CreateAppRequest, CreateAppResponse};
 
-use super::super::{AdminAuthorCreateArgs, load_api};
+use super::super::{AdminAppCreateArgs, load_api};
 
-pub(super) async fn run(args: AdminAuthorCreateArgs, profile: Option<String>) -> Result<()> {
+pub(super) async fn run(args: AdminAppCreateArgs, profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
-    let response: CreateAuthorResponse = api
+    let response: CreateAppResponse = api
         .rpc()
         .await?
-        .author_create(
+        .app_create(
             terminal_games::control::rpc_context(),
-            CreateAuthorRequest {
+            CreateAppRequest {
                 shortname: args.shortname,
                 base_url: api.profile.url.clone(),
             },
         )
         .await?
         .map_err(anyhow::Error::msg)?;
-    println!("Author ID: {}", response.author.author_id);
-    println!("Shortname: {}", response.author.shortname);
+    println!("App ID: {}", response.app.app_id);
+    println!("Shortname: {}", response.app.shortname);
     println!("Token: {}", response.token);
     Ok(())
 }

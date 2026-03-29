@@ -3,19 +3,19 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use anyhow::Result;
-use terminal_games::control::AuthorEnvDeleteRequest;
+use terminal_games::control::AppEnvDeleteRequest;
 
-use super::super::AuthorEnvDeleteArgs;
-use crate::control_client::AuthorClient;
+use super::super::AppEnvDeleteArgs;
+use crate::control_client::AppClient;
 
-pub(super) async fn run(args: AuthorEnvDeleteArgs) -> Result<()> {
-    let client = AuthorClient::from_target(&args.shortname, args.url.as_deref())?;
+pub(super) async fn run(args: AppEnvDeleteArgs, profile: Option<String>) -> Result<()> {
+    let client = AppClient::from_target(&args.shortname, profile.as_deref())?;
     client
         .rpc()
         .await?
         .env_delete(
             terminal_games::control::rpc_context(),
-            AuthorEnvDeleteRequest { name: args.name },
+            AppEnvDeleteRequest { name: args.name },
         )
         .await?
         .map_err(anyhow::Error::msg)?;

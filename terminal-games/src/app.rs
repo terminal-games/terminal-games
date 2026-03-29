@@ -25,10 +25,10 @@ use wasmtime::InstanceAllocationStrategy;
 use wasmtime_wasi::I32Exit;
 
 use crate::{
+    app_env::decrypt_app_env_blob,
+    app_registry::{AppRuntimeRegistry, AppRuntimeSession},
     audio::{CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
-    author_env::decrypt_author_env_blob,
     control::StatusBarState,
-    game_registry::{GameRuntimeRegistry, GameRuntimeSession},
     log_backend::{GuestLogBackend, LogLevel, parse_guest_log_object},
     mesh::{AppId, BuildId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
@@ -272,8 +272,8 @@ pub struct AppServer {
     engine: wasmtime::Engine,
     pub db: libsql::Connection,
     mesh: Mesh,
-    author_env_secret_key: Arc<str>,
-    game_registry: GameRuntimeRegistry,
+    app_env_secret_key: Arc<str>,
+    app_registry: AppRuntimeRegistry,
 }
 
 pub struct AppInstantiationParams {
@@ -309,7 +309,7 @@ impl AppServer {
     pub fn new(
         mesh: Mesh,
         db: libsql::Connection,
-        author_env_secret_key: impl Into<Arc<str>>,
+        app_env_secret_key: impl Into<Arc<str>>,
     ) -> anyhow::Result<Self> {
         let mut config = wasmtime::Config::new();
         let cache_config = wasmtime::CacheConfig::new();
@@ -356,18 +356,18 @@ impl AppServer {
             linker: Arc::new(linker),
             mesh,
             db,
-            author_env_secret_key: author_env_secret_key.into(),
+            app_env_secret_key: app_env_secret_key.into(),
             engine,
-            game_registry: GameRuntimeRegistry::default(),
+            app_registry: AppRuntimeRegistry::default(),
         })
     }
 
-    pub fn author_env_secret_key(&self) -> &str {
-        &self.author_env_secret_key
+    pub fn app_env_secret_key(&self) -> &str {
+        &self.app_env_secret_key
     }
 
-    pub fn game_registry(&self) -> &GameRuntimeRegistry {
-        &self.game_registry
+    pub fn app_registry(&self) -> &AppRuntimeRegistry {
+        &self.app_registry
     }
 
     /// Run an app with IO defined in [`params`] in the background
@@ -381,8 +381,8 @@ impl AppServer {
         let db = self.db.clone();
         let engine = self.engine.clone();
         let linker = self.linker.clone();
-        let game_registry = self.game_registry.clone();
-        let author_env_secret_key = self.author_env_secret_key.clone();
+        let app_registry = self.app_registry.clone();
+        let app_env_secret_key = self.app_env_secret_key.clone();
 
         tokio::task::spawn(async move {
             let AppInstantiationParams {
@@ -448,8 +448,8 @@ impl AppServer {
                 db: db.clone(),
                 linker,
                 mesh,
-                author_env_secret_key,
-                game_registry,
+                app_env_secret_key,
+                app_registry,
                 app_output_sender,
                 remote_sshid,
                 term,
@@ -697,7 +697,7 @@ impl AppServer {
                                 let menu_username = session_identity.username();
                                 tokio::spawn(async move {
                                     let (result, update) = match request.kind {
-                                        MenuRequestKind::GamesList { current_shortname } => {
+                                        MenuRequestKind::AppsList { current_shortname } => {
                                             let result = Self::load_menu_games(db, current_shortname).await;
                                             (result, MenuUpdate::default())
                                         }
@@ -867,7 +867,7 @@ impl AppServer {
             .db
             .query(
                 "SELECT id, wasm, wasm_hash, env_hash, env_salt, env_blob, build_updated_at
-                 FROM games
+                 FROM apps
                  WHERE shortname = ?1
                  LIMIT 1",
                 [shortname.as_str()],
@@ -877,7 +877,7 @@ impl AppServer {
             .next()
             .await?
             .ok_or_else(|| UnknownGameShortnameError(shortname.clone()))?;
-        let game_id = app_row.get::<u64>(0)?;
+        let app_id = app_row.get::<u64>(0)?;
         let wasm_bytes = app_row.get::<Vec<u8>>(1)?;
         let build_id =
             BuildId::from_hash_slices(&app_row.get::<Vec<u8>>(2)?, &app_row.get::<Vec<u8>>(3)?)?;
@@ -885,16 +885,16 @@ impl AppServer {
         let env_blob = app_row.get::<Vec<u8>>(5)?;
         let build_updated_at = app_row.get::<i64>(6)?;
         let mut envs: Vec<(String, String)> =
-            decrypt_author_env_blob(ctx.author_env_secret_key.as_ref(), &env_salt, &env_blob)?
+            decrypt_app_env_blob(ctx.app_env_secret_key.as_ref(), &env_salt, &env_blob)?
                 .into_iter()
                 .map(|env| (env.name, env.value))
                 .collect();
-        let app_id = AppId { game_id, build_id };
-        let game_runtime_session = ctx
-            .game_registry
-            .subscribe(game_id, build_id, build_updated_at);
+        let runtime_app_id = AppId { app_id, build_id };
+        let app_runtime_session = ctx
+            .app_registry
+            .subscribe(app_id, build_id, build_updated_at);
 
-        let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(app_id).await;
+        let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(runtime_app_id).await;
         envs.push(("REMOTE_SSHID".to_string(), ctx.remote_sshid.clone()));
         let username = session_identity.username();
         let mut locale = ctx.locale.clone();
@@ -937,7 +937,7 @@ impl AppServer {
             .build_p1();
 
         let module = ctx
-            .game_registry
+            .app_registry
             .load_or_compile_module(&wasm_bytes, ctx.linker.engine())?;
         let instance_pre = ctx.linker.instantiate_pre(&module)?;
 
@@ -946,8 +946,8 @@ impl AppServer {
                 wasi_ctx,
                 peer_rx,
                 peer_tx,
-                app_id,
-                game_runtime_session,
+                app_id: runtime_app_id,
+                app_runtime_session,
                 shortname,
             },
             instance_pre,
@@ -1633,7 +1633,7 @@ impl AppServer {
         let request = match typ {
             MENU_REQ_GAMES_LIST => MenuRequestJob {
                 request_id: request_id_u,
-                kind: MenuRequestKind::GamesList {
+                kind: MenuRequestKind::AppsList {
                     current_shortname: caller.data().app.shortname.clone(),
                 },
             },
@@ -1782,41 +1782,41 @@ impl AppServer {
         current_shortname: String,
     ) -> Result<Vec<u8>, String> {
         #[derive(serde::Serialize)]
-        struct GameOut {
+        struct AppOut {
             id: u64,
             shortname: String,
             details: serde_json::Value,
         }
 
         #[derive(serde::Serialize)]
-        struct GamesOut {
-            games: Vec<GameOut>,
+        struct AppsOut {
+            apps: Vec<AppOut>,
         }
 
         let mut rows = db
             .query(
-                "SELECT id, shortname, details FROM games WHERE shortname != ?1 ORDER BY id",
+                "SELECT id, shortname, details FROM apps WHERE shortname != ?1 ORDER BY id",
                 libsql::params!(current_shortname),
             )
             .await
             .map_err(|e| e.to_string())?;
 
-        let mut games = Vec::<GameOut>::new();
+        let mut apps = Vec::<AppOut>::new();
         while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
             let id = row.get::<u64>(0).map_err(|e| e.to_string())?;
             let shortname = row.get::<String>(1).map_err(|e| e.to_string())?;
             let details_json = row.get::<String>(2).map_err(|e| e.to_string())?;
             let details = serde_json::from_str::<serde_json::Value>(&details_json)
                 .unwrap_or_else(|_| serde_json::json!({}));
-            let game = GameOut {
+            let app = AppOut {
                 id,
                 shortname,
                 details,
             };
-            games.push(game);
+            apps.push(app);
         }
 
-        serde_json::to_vec(&GamesOut { games }).map_err(|e| e.to_string())
+        serde_json::to_vec(&AppsOut { apps }).map_err(|e| e.to_string())
     }
 
     async fn load_menu_profile(
@@ -1903,7 +1903,7 @@ impl AppServer {
         struct ReplayOut {
             created_at: i64,
             asciinema_url: String,
-            game_title: String,
+            app_title: String,
         }
 
         #[derive(serde::Serialize)]
@@ -1916,7 +1916,7 @@ impl AppServer {
         if let Some(user_id) = user_id {
             let mut rows = match db
                 .query(
-                    "SELECT r.created_at, r.asciinema_url, g.shortname, g.details FROM replays r LEFT JOIN games g ON r.game_id = g.id WHERE r.user_id = ?1 ORDER BY r.created_at DESC",
+                    "SELECT r.created_at, r.asciinema_url, g.shortname, g.details FROM replays r LEFT JOIN apps g ON r.app_id = g.id WHERE r.user_id = ?1 ORDER BY r.created_at DESC",
                     libsql::params!(user_id),
                 )
                 .await
@@ -1946,7 +1946,7 @@ impl AppServer {
                 replays.push(ReplayOut {
                     created_at,
                     asciinema_url,
-                    game_title: Self::game_title_from_details(&shortname, &details, &locale),
+                    app_title: Self::app_title_from_details(&shortname, &details, &locale),
                 });
             }
         } else {
@@ -1956,8 +1956,8 @@ impl AppServer {
                 let mut details = String::new();
                 if let Ok(mut rows) = db
                     .query(
-                        "SELECT shortname, details FROM games WHERE id = ?1 LIMIT 1",
-                        libsql::params!(replay.game_id),
+                        "SELECT shortname, details FROM apps WHERE id = ?1 LIMIT 1",
+                        libsql::params!(replay.app_id),
                     )
                     .await
                     && let Ok(Some(row)) = rows.next().await
@@ -1968,7 +1968,7 @@ impl AppServer {
                 replays.push(ReplayOut {
                     created_at: replay.created_at,
                     asciinema_url: replay.asciinema_url,
-                    game_title: Self::game_title_from_details(&shortname, &details, &locale),
+                    app_title: Self::app_title_from_details(&shortname, &details, &locale),
                 });
             }
         }
@@ -1977,7 +1977,7 @@ impl AppServer {
         (result, MenuUpdate::default())
     }
 
-    fn game_title_from_details(shortname: &str, details_json: &str, locale: &str) -> String {
+    fn app_title_from_details(shortname: &str, details_json: &str, locale: &str) -> String {
         serde_json::from_str::<GameDetailsOut>(details_json)
             .map(|details| details.name.resolve(locale, shortname))
             .unwrap_or_else(|_| shortname.to_string())
@@ -2018,7 +2018,7 @@ impl AppServer {
         let has_update = caller
             .data()
             .app
-            .game_runtime_session
+            .app_runtime_session
             .update_available()
             .load(Ordering::Relaxed);
         Ok(if has_update { 1 } else { 0 })
@@ -2258,7 +2258,7 @@ pub struct PreloadedAppState {
     peer_rx: tokio::sync::mpsc::Receiver<PeerMessageApp>,
     peer_tx: tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>,
     app_id: AppId,
-    game_runtime_session: GameRuntimeSession,
+    app_runtime_session: AppRuntimeSession,
     shortname: String,
 }
 
@@ -2266,12 +2266,12 @@ pub struct PreloadedAppState {
 pub struct AppContext {
     db: libsql::Connection,
     mesh: Mesh,
-    author_env_secret_key: Arc<str>,
+    app_env_secret_key: Arc<str>,
     remote_sshid: String,
     audio_enabled: bool,
     term: Option<String>,
     linker: Arc<wasmtime::Linker<AppState>>,
-    game_registry: GameRuntimeRegistry,
+    app_registry: AppRuntimeRegistry,
     app_output_sender: tokio::sync::mpsc::Sender<BytesMut>,
     user_id: Option<u64>,
     locale: String,
@@ -2379,7 +2379,7 @@ struct UnknownGameShortnameError(String);
 
 impl std::fmt::Display for UnknownGameShortnameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Unknown game shortname: {}", self.0)
+        write!(f, "Unknown app shortname: {}", self.0)
     }
 }
 
@@ -2542,7 +2542,7 @@ pub enum MenuRequestState {
 #[derive(Clone)]
 pub struct SessionReplay {
     created_at: i64,
-    game_id: u64,
+    app_id: u64,
     asciinema_url: String,
 }
 
@@ -2604,7 +2604,7 @@ pub struct MenuSessionState {
 
 #[derive(Clone)]
 enum MenuRequestKind {
-    GamesList { current_shortname: String },
+    AppsList { current_shortname: String },
     ProfileGet,
     ProfileSet { username: String, locale: String },
     ReplaysList { locale: String },
@@ -2983,8 +2983,8 @@ async fn save_replay(
             .as_secs() as i64;
         let _ = db
             .execute(
-                "INSERT INTO replays (asciinema_url, user_id, game_id, created_at) VALUES (?1, ?2, ?3, ?4)",
-                libsql::params!(url.as_str(), uid, app_id.game_id, now),
+                "INSERT INTO replays (asciinema_url, user_id, app_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                libsql::params!(url.as_str(), uid, app_id.app_id, now),
             )
             .await;
         (Ok(url), None)
@@ -2995,7 +2995,7 @@ async fn save_replay(
             .as_secs() as i64;
         menu_session.replays.push(SessionReplay {
             created_at: now,
-            game_id: app_id.game_id,
+            app_id: app_id.app_id,
             asciinema_url: url.clone(),
         });
         (Ok(url), Some(menu_session))

@@ -4,17 +4,17 @@
 
 use anyhow::Result;
 use dialoguer::Confirm;
-use terminal_games::control::DeleteAuthorRequest;
+use terminal_games::control::DeleteAppRequest;
 
-use super::super::{AdminAuthorDeleteArgs, load_api, parse_author_delete_ref};
+use super::super::{AdminAppDeleteArgs, load_api, parse_app_delete_ref};
 
-pub(super) async fn run(args: AdminAuthorDeleteArgs, profile: Option<String>) -> Result<()> {
-    let (author_id, shortname) = parse_author_delete_ref(&args.author)?;
+pub(super) async fn run(args: AdminAppDeleteArgs, profile: Option<String>) -> Result<()> {
+    let (app_id, shortname) = parse_app_delete_ref(&args.app)?;
     if !args.force
         && !Confirm::new()
             .with_prompt(format!(
-                "Delete author {}:{} permanently? This cannot be undone.",
-                author_id, shortname
+                "Delete app {}:{} permanently? This cannot be undone.",
+                app_id, shortname
             ))
             .default(false)
             .interact()?
@@ -24,13 +24,13 @@ pub(super) async fn run(args: AdminAuthorDeleteArgs, profile: Option<String>) ->
     let api = load_api(profile.as_deref())?;
     api.rpc()
         .await?
-        .author_delete(
+        .app_delete(
             terminal_games::control::rpc_context(),
-            DeleteAuthorRequest { author_id },
+            DeleteAppRequest { app_id },
         )
         .await?
         .map_err(anyhow::Error::msg)?
-        .ok_or_else(|| anyhow::anyhow!("unknown author {}", author_id))?;
-    println!("Deleted author {}:{}", author_id, shortname);
+        .ok_or_else(|| anyhow::anyhow!("unknown app {}", app_id))?;
+    println!("Deleted app {}:{}", app_id, shortname);
     Ok(())
 }

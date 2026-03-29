@@ -4,14 +4,14 @@
 
 use anyhow::Result;
 
-use crate::config::{format_seconds, load_author_tokens_for_listing, print_table};
-use crate::control_client::AuthorClient;
+use crate::config::{format_seconds, load_app_tokens_for_listing, print_table};
+use crate::control_client::AppClient;
 
 pub(super) async fn run() -> Result<()> {
     let mut rows = Vec::new();
     let mut warnings = Vec::new();
-    for entry in load_author_tokens_for_listing(None)? {
-        let client = AuthorClient::from_claims(entry.claims.clone())?;
+    for entry in load_app_tokens_for_listing(None)? {
+        let client = AppClient::from_claims(entry.claims.clone())?;
         let response = match fetch_author_info(&client).await {
             Ok(response) => response,
             Err(error) => {
@@ -30,12 +30,16 @@ pub(super) async fn run() -> Result<()> {
                 response.author_name
             },
             response.shortname,
+            entry.claims.url,
             response.server,
             format_seconds(response.playtime_seconds),
         ]);
     }
     rows.sort();
-    print_table(&["Author", "Shortname", "Server", "Playtime"], &rows);
+    print_table(
+        &["App", "Shortname", "Profile", "Server", "Playtime"],
+        &rows,
+    );
     if !warnings.is_empty() {
         eprintln!("");
     }
@@ -45,9 +49,7 @@ pub(super) async fn run() -> Result<()> {
     Ok(())
 }
 
-async fn fetch_author_info(
-    client: &AuthorClient,
-) -> Result<terminal_games::control::AuthorSelfResponse> {
+async fn fetch_author_info(client: &AppClient) -> Result<terminal_games::control::AppSelfResponse> {
     client
         .rpc()
         .await?
@@ -59,14 +61,14 @@ async fn fetch_author_info(
 fn format_author_list_warning(shortname: &str, url: &str, error: &anyhow::Error) -> String {
     if is_unauthorized_error(error) {
         return format!(
-            "Skipping revoked author token '{}' on {} ({})",
+            "Skipping revoked app token '{}' on {} ({})",
             shortname,
             url,
             error.root_cause()
         );
     }
     format!(
-        "Skipping author '{}' on {} ({})",
+        "Skipping app '{}' on {} ({})",
         shortname,
         url,
         error.root_cause()

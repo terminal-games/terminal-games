@@ -15,15 +15,15 @@ const MAX_SCREENSHOT_CONTENT_LEN: usize = 128 * 1024;
 const MAX_SCREENSHOTS_PER_LOCALE: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GameManifest {
+pub struct AppManifest {
     pub terminal_games_manifest_version: u32,
     pub shortname: String,
     #[serde(default)]
-    pub details: GameDetails,
+    pub details: AppDetails,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GameDetails {
+pub struct AppDetails {
     #[serde(default)]
     pub author: String,
     #[serde(default)]
@@ -46,7 +46,7 @@ pub struct Screenshot {
     pub caption: String,
 }
 
-impl GameManifest {
+impl AppManifest {
     pub fn validate(&self) -> Result<(), String> {
         if self.terminal_games_manifest_version != MANIFEST_VERSION {
             return Err(format!(
@@ -86,9 +86,9 @@ impl GameManifest {
     }
 }
 
-pub fn parse_and_validate_manifest_json(bytes: &[u8]) -> Result<GameManifest, String> {
+pub fn parse_and_validate_manifest_json(bytes: &[u8]) -> Result<AppManifest, String> {
     let manifest =
-        serde_json::from_slice::<GameManifest>(bytes).map_err(|error| error.to_string())?;
+        serde_json::from_slice::<AppManifest>(bytes).map_err(|error| error.to_string())?;
     manifest.validate()?;
     Ok(manifest)
 }

@@ -25,19 +25,19 @@ use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, laye
 
 use terminal_games::{
     app::{AppInstantiationParams, AppServer, SessionIdentity, SessionOutput, SessionUi},
-    author_env::{encrypt_author_env_blob, validate_author_envs},
-    control::{AuthorEnvVar, StatusBarState},
+    app_env::{encrypt_app_env_blob, validate_app_envs},
+    control::{AppEnvVar, StatusBarState},
     input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker},
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
-    mesh::GameRuntimeUpdateMessage,
+    mesh::AppRuntimeUpdateMessage,
     mesh::{BuildId, LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
     terminal_profile::TerminalProfile,
 };
 
+use crate::app::load_upload_envs;
 use crate::audio;
-use crate::author::load_upload_envs;
-use crate::config::load_or_create_author_env_secret_key;
+use crate::config::load_or_create_app_env_secret_key;
 
 #[derive(Args)]
 pub(crate) struct RunArgs {
@@ -45,9 +45,9 @@ pub(crate) struct RunArgs {
     #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
     pub(crate) wasm_file: Option<String>,
 
-    /// Additional games in shortname=path format
-    #[arg(short, long = "game", value_name = "SHORTNAME=PATH")]
-    games: Vec<String>,
+    /// Additional apps in shortname=path format
+    #[arg(short, long = "app", value_name = "SHORTNAME=PATH")]
+    apps: Vec<String>,
 
     /// Set env vars for the primary wasm app. Repeat as needed.
     #[arg(short = 'e', long = "env", value_name = "NAME=VALUE")]
@@ -81,7 +81,7 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     no_audio: bool,
 
-    /// Log level for the game/app
+    /// Log level for the app
     #[arg(long = "app-log-level", default_value = "info")]
     app_log_level: LogLevelFilter,
 
@@ -299,30 +299,30 @@ fn compute_jittered_latency(latency_ms: u64, jitter_ms: u64) -> Duration {
 
 async fn upsert_game(
     conn: &libsql::Connection,
-    author_env_secret_key: &str,
+    app_env_secret_key: &str,
     shortname: &str,
     path: &str,
     details: &str,
-    envs: &[AuthorEnvVar],
-) -> Result<Option<GameRuntimeUpdateMessage>> {
+    envs: &[AppEnvVar],
+) -> Result<Option<AppRuntimeUpdateMessage>> {
     let wasm = fs::read(path).with_context(|| format!("Failed to read wasm for {shortname}"))?;
     let build_id = BuildId::from_wasm_and_envs(&wasm, envs);
-    let encrypted_env = encrypt_author_env_blob(author_env_secret_key, envs)?;
+    let encrypted_env = encrypt_app_env_blob(app_env_secret_key, envs)?;
     let tx = conn.transaction().await?;
     let mut rows = tx
         .query(
-            "SELECT id, wasm_hash, env_hash FROM games WHERE shortname = ?1 LIMIT 1",
+            "SELECT id, wasm_hash, env_hash FROM apps WHERE shortname = ?1 LIMIT 1",
             libsql::params!(shortname),
         )
         .await
-        .with_context(|| format!("Failed to query existing game {shortname}"))?;
+        .with_context(|| format!("Failed to query existing app {shortname}"))?;
     let update = if let Some(row) = rows.next().await? {
-        let game_id = row.get::<u64>(0)?;
+        let app_id = row.get::<u64>(0)?;
         let existing_build_id =
             BuildId::from_hash_slices(&row.get::<Vec<u8>>(1)?, &row.get::<Vec<u8>>(2)?)?;
         if existing_build_id == build_id {
             tx.execute(
-                "UPDATE games
+                "UPDATE apps
                  SET details = json(?2),
                      wasm = ?3,
                      wasm_hash = ?4,
@@ -331,7 +331,7 @@ async fn upsert_game(
                      env_blob = ?7
                  WHERE id = ?1",
                 libsql::params!(
-                    game_id,
+                    app_id,
                     details,
                     wasm,
                     build_id.wasm_hash.to_vec(),
@@ -341,12 +341,12 @@ async fn upsert_game(
                 ),
             )
             .await
-            .with_context(|| format!("Failed to refresh game metadata {shortname}"))?;
+            .with_context(|| format!("Failed to refresh app metadata {shortname}"))?;
             None
         } else {
             let updated_at_ns = current_unix_nanos();
             tx.execute(
-                "UPDATE games
+                "UPDATE apps
                  SET wasm = ?2,
                      details = json(?3),
                      wasm_hash = ?4,
@@ -356,7 +356,7 @@ async fn upsert_game(
                      build_updated_at = ?8
                  WHERE id = ?1",
                 libsql::params!(
-                    game_id,
+                    app_id,
                     wasm,
                     details,
                     build_id.wasm_hash.to_vec(),
@@ -367,9 +367,9 @@ async fn upsert_game(
                 ),
             )
             .await
-            .with_context(|| format!("Failed to update game {shortname}"))?;
-            Some(GameRuntimeUpdateMessage::published(
-                game_id,
+            .with_context(|| format!("Failed to update app {shortname}"))?;
+            Some(AppRuntimeUpdateMessage::published(
+                app_id,
                 build_id,
                 updated_at_ns,
             ))
@@ -377,7 +377,7 @@ async fn upsert_game(
     } else {
         let updated_at_ns = current_unix_nanos();
         tx.execute(
-            "INSERT INTO games (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
+            "INSERT INTO apps (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
              VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)",
             libsql::params!(
                 shortname,
@@ -391,15 +391,15 @@ async fn upsert_game(
             ),
         )
         .await
-        .with_context(|| format!("Failed to insert game {shortname}"))?;
+        .with_context(|| format!("Failed to insert app {shortname}"))?;
         let mut id_rows = tx.query("SELECT last_insert_rowid()", ()).await?;
-        let game_id = id_rows
+        let app_id = id_rows
             .next()
             .await?
             .ok_or_else(|| anyhow::anyhow!("missing last_insert_rowid"))?
             .get::<u64>(0)?;
-        Some(GameRuntimeUpdateMessage::published(
-            game_id,
+        Some(AppRuntimeUpdateMessage::published(
+            app_id,
             build_id,
             updated_at_ns,
         ))
@@ -408,19 +408,19 @@ async fn upsert_game(
     Ok(update)
 }
 
-async fn load_local_game_build_snapshot(
+async fn load_local_app_build_snapshot(
     conn: &libsql::Connection,
-) -> Result<Vec<GameRuntimeUpdateMessage>> {
+) -> Result<Vec<AppRuntimeUpdateMessage>> {
     let mut updates = Vec::new();
     let mut game_rows = conn
         .query(
-            "SELECT id, wasm_hash, env_hash, build_updated_at FROM games",
+            "SELECT id, wasm_hash, env_hash, build_updated_at FROM apps",
             (),
         )
         .await
-        .context("Failed to query local game builds")?;
+        .context("Failed to query local app builds")?;
     while let Some(row) = game_rows.next().await? {
-        updates.push(GameRuntimeUpdateMessage::published(
+        updates.push(AppRuntimeUpdateMessage::published(
             row.get::<u64>(0)?,
             BuildId::from_hash_slices(&row.get::<Vec<u8>>(1)?, &row.get::<Vec<u8>>(2)?)?,
             row.get::<i64>(3)?,
@@ -437,14 +437,14 @@ fn current_unix_nanos() -> i64 {
         .as_nanos() as i64
 }
 
-async fn sync_local_game_build_snapshot(
+async fn sync_local_app_build_snapshot(
     conn: &libsql::Connection,
     app_server: &AppServer,
     mesh: &Mesh,
 ) -> Result<()> {
-    let snapshot = load_local_game_build_snapshot(conn).await?;
-    app_server.game_registry().sync_snapshot(snapshot.clone());
-    mesh.replace_game_runtime_snapshot(snapshot).await;
+    let snapshot = load_local_app_build_snapshot(conn).await?;
+    app_server.app_registry().sync_snapshot(snapshot.clone());
+    mesh.replace_app_runtime_snapshot(snapshot).await;
     Ok(())
 }
 
@@ -453,9 +453,9 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         .wasm_file
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("missing wasm file"))?;
-    let author_env_secret_key = load_or_create_author_env_secret_key()?;
+    let app_env_secret_key = load_or_create_app_env_secret_key()?;
     let primary_envs = load_upload_envs(&args.env, args.env_file.as_deref())?.unwrap_or_default();
-    validate_author_envs(&primary_envs)?;
+    validate_app_envs(&primary_envs)?;
 
     let (log_writer, _flush_guard) = BufferedLogWriter::new();
     let platform_filter: LevelFilter = args.platform_log_level.into();
@@ -516,14 +516,14 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         .to_string();
     let default_details = |shortname: &str| {
         format!(
-            r#"{{"author":"Local","version":"dev","name":{{"en":"{shortname}"}},"description":{{"en":""}},"details":{{"en":""}},"screenshots":{{}}}}"#
+            r#"{{"app":"Local","version":"dev","name":{{"en":"{shortname}"}},"description":{{"en":""}},"details":{{"en":""}},"screenshots":{{}}}}"#
         )
     };
 
-    let mut local_game_updates = Vec::new();
+    let mut local_app_updates = Vec::new();
     if let Some(update) = upsert_game(
         &conn,
-        &author_env_secret_key,
+        &app_env_secret_key,
         first_app_shortname.as_str(),
         wasm_path.as_str(),
         default_details(first_app_shortname.as_str()).as_str(),
@@ -531,19 +531,19 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     )
     .await?
     {
-        local_game_updates.push(update);
+        local_app_updates.push(update);
     }
 
-    for game in &args.games {
-        if let Some((shortname, path)) = game.split_once('=') {
+    for app in &args.apps {
+        if let Some((shortname, path)) = app.split_once('=') {
             let path = Path::new(path)
                 .canonicalize()
-                .context("Failed to resolve game path")?
+                .context("Failed to resolve app path")?
                 .display()
                 .to_string();
             if let Some(update) = upsert_game(
                 &conn,
-                &author_env_secret_key,
+                &app_env_secret_key,
                 shortname,
                 path.as_str(),
                 default_details(shortname).as_str(),
@@ -551,7 +551,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
             )
             .await?
             {
-                local_game_updates.push(update);
+                local_app_updates.push(update);
             }
         }
     }
@@ -626,13 +626,13 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     let app_server = Arc::new(AppServer::new(
         mesh.clone(),
         conn,
-        author_env_secret_key.clone(),
+        app_env_secret_key.clone(),
     )?);
     let graceful_shutdown_token = CancellationToken::new();
     {
         let app_server = app_server.clone();
         let mesh = mesh.clone();
-        let mut updates = mesh.subscribe_game_runtime_updates();
+        let mut updates = mesh.subscribe_app_runtime_updates();
         let graceful_shutdown_token = graceful_shutdown_token.clone();
         tokio::spawn(async move {
             loop {
@@ -640,16 +640,16 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                     _ = graceful_shutdown_token.cancelled() => break,
                     result = updates.recv() => match result {
                         Ok(update) => {
-                            let _ = app_server.game_registry().apply_update(update);
+                            let _ = app_server.app_registry().apply_update(update);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(skipped, "lagged mesh game runtime updates");
+                            tracing::warn!(skipped, "lagged mesh app runtime updates");
                             if let Err(error) =
-                                sync_local_game_build_snapshot(&app_server.db, &app_server, &mesh).await
+                                sync_local_app_build_snapshot(&app_server.db, &app_server, &mesh).await
                             {
                                 tracing::warn!(
                                     error = ?error,
-                                    "failed to resync local game runtime snapshot after lag"
+                                    "failed to resync local app runtime snapshot after lag"
                                 );
                             }
                         }
@@ -659,11 +659,11 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
             }
         });
     }
-    for update in local_game_updates {
-        let _ = app_server.game_registry().apply_update(update);
-        mesh.propagate_game_runtime_update(update).await;
+    for update in local_app_updates {
+        let _ = app_server.app_registry().apply_update(update);
+        mesh.propagate_app_runtime_update(update).await;
     }
-    sync_local_game_build_snapshot(&app_server.db, &app_server, &mesh).await?;
+    sync_local_app_build_snapshot(&app_server.db, &app_server, &mesh).await?;
 
     let mut stdout = std::io::stdout();
     crossterm::terminal::enable_raw_mode()?;

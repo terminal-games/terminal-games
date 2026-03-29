@@ -13,9 +13,19 @@ use crate::config::{
 
 pub(super) async fn run(args: AdminAuthArgs, url_override: Option<String>) -> Result<()> {
     let current_config = load_cli_config()?;
-    let url = match url_override {
-        Some(url) => normalize_base_url(&url)?,
-        None => normalize_base_url(
+    let url = match (args.url.as_deref(), url_override.as_deref()) {
+        (Some(url), Some(profile)) => {
+            let url = normalize_base_url(url)?;
+            let profile = normalize_base_url(profile)?;
+            anyhow::ensure!(
+                url == profile,
+                "admin auth received both --url and --profile with different values"
+            );
+            url
+        }
+        (Some(url), None) => normalize_base_url(url)?,
+        (None, Some(url)) => normalize_base_url(url)?,
+        (None, None) => normalize_base_url(
             &Input::<String>::new()
                 .with_prompt("Server URL")
                 .default("https://terminalgames.net".to_string())
@@ -45,7 +55,7 @@ pub(super) async fn run(args: AdminAuthArgs, url_override: Option<String>) -> Re
     {
         save_cli_config(&CliConfig {
             default_url: Some(url.clone()),
-            author_env_secret_key: current_config.author_env_secret_key.clone(),
+            app_env_secret_key: current_config.app_env_secret_key.clone(),
         })?;
     }
 

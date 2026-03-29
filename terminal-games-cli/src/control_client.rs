@@ -15,7 +15,7 @@ use futures::{Sink, Stream, future::join_all};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use tarpc::client;
 use terminal_games::control::{
-    AdminControlRpcClient, AuthorControlRpcClient, AuthorSummary, AuthorTokenClaims, BanEntry,
+    AdminControlRpcClient, AppControlRpcClient, AppSummary, AppTokenClaims, BanEntry,
     RegionDiscoveryResponse, RegionRuntimeStatus, SessionSummary, TickerEntry, rpc_context,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -29,7 +29,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::completion_cache;
 use crate::config::{
-    AdminProfile, derive_region_urls, load_author_token_for_shortname, resolve_admin_profile,
+    AdminProfile, derive_region_urls, load_app_token_for_shortname, resolve_admin_profile,
 };
 
 const CONTROL_RPC_MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
@@ -198,22 +198,22 @@ where
     result
 }
 
-async fn connect_author_rpc(claims: &AuthorTokenClaims) -> Result<AuthorControlRpcClient> {
+async fn connect_app_rpc(claims: &AppTokenClaims) -> Result<AppControlRpcClient> {
     let mut codec = LengthDelimitedCodec::new();
     codec.set_max_frame_length(CONTROL_RPC_MAX_FRAME_LEN);
     let transport = tarpc::serde_transport::new::<
         _,
-        tarpc::Response<terminal_games::control::AuthorControlRpcResponse>,
-        tarpc::ClientMessage<terminal_games::control::AuthorControlRpcRequest>,
+        tarpc::Response<terminal_games::control::AppControlRpcResponse>,
+        tarpc::ClientMessage<terminal_games::control::AppControlRpcRequest>,
         _,
     >(
         Framed::new(
-            connect_ws(&claims.url, "/control/author/rpc", &claims.encode()?).await?,
+            connect_ws(&claims.url, "/control/app/rpc", &claims.encode()?).await?,
             codec,
         ),
         tarpc::tokio_serde::formats::Bincode::default(),
     );
-    Ok(AuthorControlRpcClient::new(client::Config::default(), transport).spawn())
+    Ok(AppControlRpcClient::new(client::Config::default(), transport).spawn())
 }
 
 #[derive(Clone)]
@@ -285,15 +285,15 @@ impl AdminClient {
         Ok(sessions)
     }
 
-    pub async fn author_list(&self) -> Result<Vec<AuthorSummary>> {
-        let authors = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
-            rpc.author_list(rpc_context())
+    pub async fn app_list(&self) -> Result<Vec<AppSummary>> {
+        let app_tokens = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
+            rpc.app_list(rpc_context())
                 .await?
                 .map_err(anyhow::Error::msg)
         })
         .await?;
-        completion_cache::store_authors(&self.profile.url, &authors)?;
-        Ok(authors)
+        completion_cache::store_apps(&self.profile.url, &app_tokens)?;
+        Ok(app_tokens)
     }
 
     pub async fn ticker_list(&self) -> Result<Vec<TickerEntry>> {
@@ -334,24 +334,7 @@ impl AdminClient {
     }
 
     pub async fn completion_all_sessions(&self) -> Result<Vec<SessionSummary>> {
-        if let Some(sessions) = completion_cache::load_sessions(&self.profile.url)? {
-            return Ok(sessions);
-        }
-        let (_, region_urls) = self.completion_discover().await?;
-        let futures = region_urls.values().cloned().map(|base_url| async move {
-            with_admin_rpc(&base_url, &self.token, |rpc| async move {
-                rpc.sessions(rpc_context())
-                    .await?
-                    .map_err(anyhow::Error::msg)
-            })
-            .await
-        });
-        let mut sessions = Vec::new();
-        for result in join_all(futures).await {
-            sessions.extend(result?);
-        }
-        completion_cache::store_sessions(&self.profile.url, &sessions)?;
-        Ok(sessions)
+        self.all_sessions().await
     }
 
     pub async fn session_summary(
@@ -384,30 +367,22 @@ impl AdminClient {
         Ok(statuses)
     }
 
-    pub async fn completion_author_ids(&self) -> Result<Vec<String>> {
-        let authors = if let Some(authors) = completion_cache::load_authors(&self.profile.url)? {
-            authors
-        } else {
-            self.author_list().await?
-        };
-        let mut ids = authors
+    pub async fn completion_app_ids(&self) -> Result<Vec<String>> {
+        let app_tokens = self.app_list().await?;
+        let mut ids = app_tokens
             .into_iter()
-            .map(|author| author.author_id.to_string())
+            .map(|app| app.app_id.to_string())
             .collect::<Vec<_>>();
         ids.sort();
         ids.dedup();
         Ok(ids)
     }
 
-    pub async fn completion_author_targets(&self) -> Result<Vec<String>> {
-        let authors = if let Some(authors) = completion_cache::load_authors(&self.profile.url)? {
-            authors
-        } else {
-            self.author_list().await?
-        };
-        let mut targets = authors
+    pub async fn completion_app_targets(&self) -> Result<Vec<String>> {
+        let app_tokens = self.app_list().await?;
+        let mut targets = app_tokens
             .into_iter()
-            .map(|author| format!("{}:{}", author.author_id, author.shortname))
+            .map(|app| format!("{}:{}", app.app_id, app.shortname))
             .collect::<Vec<_>>();
         targets.sort();
         targets.dedup();
@@ -415,11 +390,7 @@ impl AdminClient {
     }
 
     pub async fn completion_ticker_ids(&self) -> Result<Vec<String>> {
-        let tickers = if let Some(tickers) = completion_cache::load_tickers(&self.profile.url)? {
-            tickers
-        } else {
-            self.ticker_list().await?
-        };
+        let tickers = self.ticker_list().await?;
         let mut ids = tickers
             .into_iter()
             .map(|ticker| ticker.ticker_id.to_string())
@@ -430,65 +401,42 @@ impl AdminClient {
     }
 
     pub async fn completion_ban_ip_cidrs(&self) -> Result<Vec<String>> {
-        let bans = if let Some(bans) = completion_cache::load_bans(&self.profile.url)? {
-            bans
-        } else {
-            self.ban_ip_list().await?
-        };
+        let bans = self.ban_ip_list().await?;
         let mut cidrs = bans.into_iter().map(|ban| ban.ip).collect::<Vec<_>>();
         cidrs.sort();
         cidrs.dedup();
         Ok(cidrs)
     }
-
-    async fn completion_discover(
-        &self,
-    ) -> Result<(RegionDiscoveryResponse, BTreeMap<String, String>)> {
-        let discovery = with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
-            rpc.discover(rpc_context())
-                .await?
-                .map_err(anyhow::Error::msg)
-        })
-        .await?;
-        Ok((
-            discovery.clone(),
-            derive_region_urls(&self.profile.url, &discovery)?,
-        ))
-    }
 }
 
 #[derive(Clone)]
-pub struct AuthorClient {
-    pub claims: AuthorTokenClaims,
+pub struct AppClient {
+    pub claims: AppTokenClaims,
 }
 
-impl AuthorClient {
-    pub fn from_claims(claims: AuthorTokenClaims) -> Result<Self> {
+impl AppClient {
+    pub fn from_claims(claims: AppTokenClaims) -> Result<Self> {
         Ok(Self { claims })
     }
 
     pub fn from_target(shortname: &str, url_override: Option<&str>) -> Result<Self> {
-        Self::from_claims(load_author_claims_for_target(shortname, url_override)?)
+        Self::from_claims(load_app_claims_for_target(shortname, url_override)?)
     }
 
-    pub async fn rpc(&self) -> Result<AuthorControlRpcClient> {
-        connect_author_rpc(&self.claims).await
+    pub async fn rpc(&self) -> Result<AppControlRpcClient> {
+        connect_app_rpc(&self.claims).await
     }
 }
 
-pub fn load_author_claims_for_target(
+pub fn load_app_claims_for_target(
     shortname: &str,
     url_override: Option<&str>,
-) -> Result<AuthorTokenClaims> {
-    load_author_token_for_shortname(shortname, url_override)?.ok_or_else(|| {
+) -> Result<AppTokenClaims> {
+    load_app_token_for_shortname(shortname, url_override)?.ok_or_else(|| {
         if let Some(url) = url_override {
-            anyhow::anyhow!(
-                "no author token configured for '{}' on '{}'",
-                shortname,
-                url
-            )
+            anyhow::anyhow!("no app token configured for '{}' on '{}'", shortname, url)
         } else {
-            anyhow::anyhow!("no author token configured for '{}'", shortname)
+            anyhow::anyhow!("no app token configured for '{}'", shortname)
         }
     })
 }

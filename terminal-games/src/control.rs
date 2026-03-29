@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 use tarpc::context;
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 
-pub use crate::author_env::AuthorEnvVar;
+pub use crate::app_env::AppEnvVar;
 
-const AUTHOR_TOKEN_PREFIX: &str = "tga1.";
-const AUTHOR_TOKEN_VERSION: u32 = 1;
+const APP_TOKEN_PREFIX: &str = "tga1.";
+const APP_TOKEN_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RpcError {
@@ -65,17 +65,17 @@ impl From<&str> for RpcError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorTokenClaims {
+pub struct AppTokenClaims {
     pub version: u32,
     pub url: String,
     pub shortname: String,
     pub secret: String,
 }
 
-impl AuthorTokenClaims {
+impl AppTokenClaims {
     pub fn new(url: String, shortname: String, secret: String) -> Self {
         Self {
-            version: AUTHOR_TOKEN_VERSION,
+            version: APP_TOKEN_VERSION,
             url,
             shortname,
             secret,
@@ -84,28 +84,28 @@ impl AuthorTokenClaims {
 
     pub fn encode(&self) -> anyhow::Result<String> {
         anyhow::ensure!(
-            self.version == AUTHOR_TOKEN_VERSION,
-            "unsupported author token version {}",
+            self.version == APP_TOKEN_VERSION,
+            "unsupported app token version {}",
             self.version
         );
         let json = serde_json::to_vec(self)?;
         Ok(format!(
-            "{AUTHOR_TOKEN_PREFIX}{}",
+            "{APP_TOKEN_PREFIX}{}",
             URL_SAFE_NO_PAD.encode(json)
         ))
     }
 
     pub fn decode(token: &str) -> anyhow::Result<Self> {
         let encoded = token
-            .strip_prefix(AUTHOR_TOKEN_PREFIX)
-            .ok_or_else(|| anyhow::anyhow!("invalid author token prefix"))?;
+            .strip_prefix(APP_TOKEN_PREFIX)
+            .ok_or_else(|| anyhow::anyhow!("invalid app token prefix"))?;
         let bytes = URL_SAFE_NO_PAD
             .decode(encoded)
-            .map_err(|error| anyhow::anyhow!("invalid author token encoding: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("invalid app token encoding: {error}"))?;
         let claims = serde_json::from_slice::<Self>(&bytes)?;
         anyhow::ensure!(
-            claims.version == AUTHOR_TOKEN_VERSION,
-            "unsupported author token version {}",
+            claims.version == APP_TOKEN_VERSION,
+            "unsupported app token version {}",
             claims.version
         );
         Ok(claims)
@@ -225,39 +225,39 @@ pub struct KickSessionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateAuthorRequest {
+pub struct CreateAppRequest {
     pub shortname: String,
     pub base_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthorSummary {
-    pub author_id: u64,
+pub struct AppSummary {
+    pub app_id: u64,
     pub author_name: String,
     pub shortname: String,
     pub playtime_seconds: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateAuthorResponse {
-    pub author: AuthorSummary,
+pub struct CreateAppResponse {
+    pub app: AppSummary,
     pub token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteAuthorRequest {
-    pub author_id: u64,
+pub struct DeleteAppRequest {
+    pub app_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RotateAuthorTokenRequest {
-    pub author_id: u64,
+pub struct RotateAppTokenRequest {
+    pub app_id: u64,
     pub base_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RotateAuthorTokenResponse {
-    pub author: AuthorSummary,
+pub struct RotateAppTokenResponse {
+    pub app: AppSummary,
     pub token: String,
 }
 
@@ -272,39 +272,39 @@ pub struct DeleteShortnameResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UploadGameResponse {
+pub struct UploadAppResponse {
     pub shortname: String,
     pub build_id: String,
-    pub game_id: u64,
+    pub app_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UploadGameRequest {
+pub struct UploadAppRequest {
     pub wasm: Vec<u8>,
-    pub envs: Option<Vec<AuthorEnvVar>>,
+    pub envs: Option<Vec<AppEnvVar>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthorEnvListResponse {
+pub struct AppEnvListResponse {
     pub shortname: String,
-    pub envs: Vec<AuthorEnvVar>,
+    pub envs: Vec<AppEnvVar>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthorEnvSetRequest {
-    pub envs: Vec<AuthorEnvVar>,
+pub struct AppEnvSetRequest {
+    pub envs: Vec<AppEnvVar>,
     #[serde(default)]
     pub replace: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthorEnvDeleteRequest {
+pub struct AppEnvDeleteRequest {
     pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthorSelfResponse {
-    pub author_id: u64,
+pub struct AppSelfResponse {
+    pub app_id: u64,
     pub author_name: String,
     pub shortname: String,
     pub server: String,
@@ -430,24 +430,24 @@ pub trait AdminControlRpc {
     async fn ticker_reorder(request: TickerReorderRequest) -> Result<(), RpcError>;
     async fn broadcast(request: BroadcastRequest) -> Result<(), RpcError>;
     async fn status_bar_refresh() -> Result<(), RpcError>;
-    async fn author_create(request: CreateAuthorRequest) -> Result<CreateAuthorResponse, RpcError>;
-    async fn author_list() -> Result<Vec<AuthorSummary>, RpcError>;
-    async fn author_rotate_token(
-        request: RotateAuthorTokenRequest,
-    ) -> Result<RotateAuthorTokenResponse, RpcError>;
-    async fn author_delete(
-        request: DeleteAuthorRequest,
+    async fn app_create(request: CreateAppRequest) -> Result<CreateAppResponse, RpcError>;
+    async fn app_list() -> Result<Vec<AppSummary>, RpcError>;
+    async fn app_rotate_token(
+        request: RotateAppTokenRequest,
+    ) -> Result<RotateAppTokenResponse, RpcError>;
+    async fn app_delete(
+        request: DeleteAppRequest,
     ) -> Result<Option<DeleteShortnameResponse>, RpcError>;
 }
 
 #[tarpc::service]
-pub trait AuthorControlRpc {
-    async fn self_info() -> Result<AuthorSelfResponse, RpcError>;
-    async fn env_list() -> Result<AuthorEnvListResponse, RpcError>;
-    async fn env_set(request: AuthorEnvSetRequest) -> Result<(), RpcError>;
-    async fn env_delete(request: AuthorEnvDeleteRequest) -> Result<(), RpcError>;
-    async fn rotate_token() -> Result<RotateAuthorTokenResponse, RpcError>;
-    async fn upload(request: UploadGameRequest) -> Result<UploadGameResponse, RpcError>;
+pub trait AppControlRpc {
+    async fn self_info() -> Result<AppSelfResponse, RpcError>;
+    async fn env_list() -> Result<AppEnvListResponse, RpcError>;
+    async fn env_set(request: AppEnvSetRequest) -> Result<(), RpcError>;
+    async fn env_delete(request: AppEnvDeleteRequest) -> Result<(), RpcError>;
+    async fn rotate_token() -> Result<RotateAppTokenResponse, RpcError>;
+    async fn upload(request: UploadAppRequest) -> Result<UploadAppResponse, RpcError>;
     async fn delete_shortname(
         request: DeleteShortnameRequest,
     ) -> Result<Option<DeleteShortnameResponse>, RpcError>;

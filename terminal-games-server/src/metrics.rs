@@ -704,15 +704,15 @@ async fn persist_duration_record(db: &libsql::Connection, record: &DurationRecor
 
     let affected = tx
         .execute(
-            "UPDATE games
+            "UPDATE apps
              SET duration_seconds = duration_seconds + ?2
              WHERE shortname = ?1",
             libsql::params!(record.shortname.as_str(), record.seconds),
         )
         .await
-        .context("failed to update global game duration")?;
+        .context("failed to update global app duration")?;
     if affected == 0 {
-        tracing::warn!(shortname = %record.shortname, "no game row found while persisting duration");
+        tracing::warn!(shortname = %record.shortname, "no app row found while persisting duration");
     }
 
     if let Some(user_id) = record.user_id {
@@ -730,14 +730,14 @@ async fn persist_duration_record(db: &libsql::Connection, record: &DurationRecor
         }
 
         tx.execute(
-            "INSERT INTO user_game_durations (user_id, game_id, duration_seconds)
-             SELECT ?1, id, ?3 FROM games WHERE shortname = ?2
-             ON CONFLICT(user_id, game_id) DO UPDATE
-             SET duration_seconds = user_game_durations.duration_seconds + excluded.duration_seconds",
+            "INSERT INTO user_app_durations (user_id, app_id, duration_seconds)
+             SELECT ?1, id, ?3 FROM apps WHERE shortname = ?2
+             ON CONFLICT(user_id, app_id) DO UPDATE
+             SET duration_seconds = user_app_durations.duration_seconds + excluded.duration_seconds",
             libsql::params!(user_id, record.shortname.as_str(), record.seconds),
         )
         .await
-        .context("failed to upsert user game duration")?;
+        .context("failed to upsert user app duration")?;
     }
 
     tx.commit()
@@ -750,12 +750,12 @@ async fn load_persisted_shortname_durations(db: &libsql::Connection) -> Result<V
     let mut rows = db
         .query(
             "SELECT shortname, CAST(duration_seconds AS REAL)
-             FROM games
+             FROM apps
              WHERE duration_seconds > 0",
             (),
         )
         .await
-        .context("failed to load persisted game durations")?;
+        .context("failed to load persisted app durations")?;
 
     let mut durations = Vec::new();
     while let Some(row) = rows.next().await.context("failed to read duration row")? {

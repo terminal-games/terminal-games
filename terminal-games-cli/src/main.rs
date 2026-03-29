@@ -3,8 +3,8 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 mod admin;
+mod app;
 mod audio;
-mod author;
 mod completion_cache;
 mod config;
 mod control_client;
@@ -16,15 +16,21 @@ use clap::{
 };
 use clap_complete::CompleteEnv;
 use rustls::crypto::aws_lc_rs;
+use std::collections::BTreeSet;
+
+use crate::config::{list_admin_urls, list_app_urls};
 
 #[derive(Parser)]
 #[command(
     about = "Terminal Games CLI",
     arg_required_else_help = true,
-    subcommand_negates_reqs = true,
-    args_conflicts_with_subcommands = true
+    subcommand_negates_reqs = true
 )]
 struct Cli {
+    /// Server profile URL to use for commands that need one.
+    #[arg(long, global = true, add = clap_complete::ArgValueCandidates::new(complete_profile_candidates))]
+    profile: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -34,10 +40,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Administer running terminal games servers.
+    /// Administer running Terminal Games servers.
     Admin(admin::AdminCli),
-    /// Upload and manage games as an author.
-    Author(author::AuthorCli),
+    /// Upload and manage apps.
+    App(app::AppCli),
+    #[command(hide = true, name = "completion-refresh")]
+    CompletionRefresh(completion_cache::RefreshCli),
     #[command(hide = true, name = "readme-help")]
     ReadmeHelp,
 }
@@ -53,10 +61,12 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
+    let profile = cli.profile.clone();
     if let Some(command) = cli.command {
         return match command {
-            Command::Admin(cli) => admin::run(cli).await,
-            Command::Author(cli) => author::run(cli).await,
+            Command::Admin(cli) => admin::run(cli, profile).await,
+            Command::App(cli) => app::run(cli, profile).await,
+            Command::CompletionRefresh(cli) => completion_cache::run_refresh(cli, profile).await,
             Command::ReadmeHelp => {
                 print_readme_help();
                 Ok(())
@@ -69,6 +79,20 @@ async fn async_main() -> Result<()> {
             .exit();
     }
     run::run(cli.run).await
+}
+
+fn complete_profile_candidates() -> Vec<clap_complete::CompletionCandidate> {
+    let mut values = BTreeSet::new();
+    if let Ok(urls) = list_admin_urls() {
+        values.extend(urls);
+    }
+    if let Ok(urls) = list_app_urls() {
+        values.extend(urls);
+    }
+    values
+        .into_iter()
+        .map(clap_complete::CompletionCandidate::new)
+        .collect()
 }
 
 fn print_readme_help() {

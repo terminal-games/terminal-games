@@ -8,7 +8,7 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-pub const AUTHOR_ENV_KEY_ENV: &str = "AUTHOR_ENV_SECRET_KEY";
+pub const APP_ENV_KEY_ENV: &str = "AUTHOR_ENV_SECRET_KEY";
 pub const MAX_AUTHOR_ENVS: usize = 64;
 pub const MAX_AUTHOR_ENV_NAME_BYTES: usize = 64;
 pub const MAX_AUTHOR_ENV_VALUE_BYTES: usize = 8 * 1024;
@@ -17,12 +17,12 @@ pub const AUTHOR_ENV_SALT_BYTES: usize = 16;
 pub const AUTHOR_ENV_BLOB_BYTES: usize = 64 * 1024;
 const AUTHOR_ENV_TAG_BYTES: usize = 16;
 const AUTHOR_ENV_PLAINTEXT_BYTES: usize = AUTHOR_ENV_BLOB_BYTES - AUTHOR_ENV_TAG_BYTES;
-const AUTHOR_ENV_KEY_INFO: &[u8] = b"terminal-games author env key v1";
-const AUTHOR_ENV_NONCE_INFO: &[u8] = b"terminal-games author env nonce v1";
+const APP_ENV_KEY_INFO: &[u8] = b"terminal-games app env key v1";
+const APP_ENV_NONCE_INFO: &[u8] = b"terminal-games app env nonce v1";
 const AUTHOR_ENV_LENGTH_BYTES: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuthorEnvVar {
+pub struct AppEnvVar {
     pub name: String,
     pub value: String,
 }
@@ -33,7 +33,7 @@ pub struct EncryptedAuthorEnvBlob {
     pub ciphertext: Vec<u8>,
 }
 
-pub fn validate_author_envs(envs: &[AuthorEnvVar]) -> anyhow::Result<()> {
+pub fn validate_app_envs(envs: &[AppEnvVar]) -> anyhow::Result<()> {
     anyhow::ensure!(
         envs.len() <= MAX_AUTHOR_ENVS,
         "too many env vars (max {})",
@@ -42,7 +42,7 @@ pub fn validate_author_envs(envs: &[AuthorEnvVar]) -> anyhow::Result<()> {
     let mut seen = std::collections::BTreeSet::new();
     let mut total_bytes = 0usize;
     for env in envs {
-        validate_author_env_name(&env.name)?;
+        validate_app_env_name(&env.name)?;
         anyhow::ensure!(
             env.value.len() <= MAX_AUTHOR_ENV_VALUE_BYTES,
             "env value for '{}' exceeds {} bytes",
@@ -64,7 +64,7 @@ pub fn validate_author_envs(envs: &[AuthorEnvVar]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn validate_author_env_name(name: &str) -> anyhow::Result<()> {
+pub fn validate_app_env_name(name: &str) -> anyhow::Result<()> {
     anyhow::ensure!(!name.is_empty(), "env name cannot be empty");
     anyhow::ensure!(
         name.len() <= MAX_AUTHOR_ENV_NAME_BYTES,
@@ -89,11 +89,11 @@ pub fn validate_author_env_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn encrypt_author_env_blob(
+pub fn encrypt_app_env_blob(
     secret_key: &str,
-    envs: &[AuthorEnvVar],
+    envs: &[AppEnvVar],
 ) -> anyhow::Result<EncryptedAuthorEnvBlob> {
-    validate_author_envs(envs)?;
+    validate_app_envs(envs)?;
     let encoded = serde_json::to_vec(envs)?;
     anyhow::ensure!(
         encoded.len() + AUTHOR_ENV_LENGTH_BYTES <= AUTHOR_ENV_PLAINTEXT_BYTES,
@@ -123,11 +123,11 @@ pub fn encrypt_author_env_blob(
     })
 }
 
-pub fn decrypt_author_env_blob(
+pub fn decrypt_app_env_blob(
     secret_key: &str,
     salt: &[u8],
     ciphertext: &[u8],
-) -> anyhow::Result<Vec<AuthorEnvVar>> {
+) -> anyhow::Result<Vec<AppEnvVar>> {
     anyhow::ensure!(
         salt.len() == AUTHOR_ENV_SALT_BYTES,
         "invalid env salt length {}",
@@ -157,10 +157,10 @@ pub fn decrypt_author_env_blob(
         "invalid env blob payload length {}",
         encoded_len
     );
-    let envs = serde_json::from_slice::<Vec<AuthorEnvVar>>(
+    let envs = serde_json::from_slice::<Vec<AppEnvVar>>(
         &plaintext[AUTHOR_ENV_LENGTH_BYTES..AUTHOR_ENV_LENGTH_BYTES + encoded_len],
     )?;
-    validate_author_envs(&envs)?;
+    validate_app_envs(&envs)?;
     Ok(envs)
 }
 
@@ -170,11 +170,11 @@ fn cipher_and_nonce_from_salt(
 ) -> anyhow::Result<(XChaCha20Poly1305, XNonce)> {
     let hk = Hkdf::<Sha256>::new(Some(salt), secret_key.as_bytes());
     let mut key = [0u8; 32];
-    hk.expand(AUTHOR_ENV_KEY_INFO, &mut key)
-        .map_err(|_| anyhow::anyhow!("failed to derive author env encryption key"))?;
+    hk.expand(APP_ENV_KEY_INFO, &mut key)
+        .map_err(|_| anyhow::anyhow!("failed to derive app env encryption key"))?;
     let mut nonce = [0u8; 24];
-    hk.expand(AUTHOR_ENV_NONCE_INFO, &mut nonce)
-        .map_err(|_| anyhow::anyhow!("failed to derive author env nonce"))?;
+    hk.expand(APP_ENV_NONCE_INFO, &mut nonce)
+        .map_err(|_| anyhow::anyhow!("failed to derive app env nonce"))?;
     Ok((
         XChaCha20Poly1305::new(&key.into()),
         *XNonce::from_slice(&nonce),

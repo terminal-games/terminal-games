@@ -6,10 +6,10 @@ use anyhow::Result;
 use dialoguer::Confirm;
 use terminal_games::control::DeleteShortnameResponse;
 
-use super::AuthorDeleteArgs;
-use crate::control_client::AuthorClient;
+use super::AppDeleteArgs;
+use crate::control_client::AppClient;
 
-pub(super) async fn run(args: AuthorDeleteArgs) -> Result<()> {
+pub(super) async fn run(args: AppDeleteArgs, profile: Option<String>) -> Result<()> {
     if !args.force
         && !Confirm::new()
             .with_prompt(format!(
@@ -22,7 +22,7 @@ pub(super) async fn run(args: AuthorDeleteArgs) -> Result<()> {
         return Ok(());
     }
 
-    let client = AuthorClient::from_target(&args.shortname, args.url.as_deref())?;
+    let client = AppClient::from_target(&args.shortname, profile.as_deref())?;
     let response: DeleteShortnameResponse = client
         .rpc()
         .await?

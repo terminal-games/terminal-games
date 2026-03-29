@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS users (
     session_time REAL NOT NULL DEFAULT(0)
 );
 
-CREATE TABLE IF NOT EXISTS games (
+CREATE TABLE IF NOT EXISTS apps (
     id INTEGER PRIMARY KEY,
     shortname TEXT NOT NULL UNIQUE,
     wasm BLOB NOT NULL,
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS games (
     duration_seconds REAL NOT NULL DEFAULT(0)
 );
 
-CREATE TABLE IF NOT EXISTS authors (
+CREATE TABLE IF NOT EXISTS app_tokens (
     id INTEGER PRIMARY KEY,
     shortname TEXT NOT NULL UNIQUE,
     token_hash TEXT NOT NULL UNIQUE,
@@ -29,10 +29,10 @@ CREATE TABLE IF NOT EXISTS authors (
 CREATE TABLE IF NOT EXISTS replays (
     asciinema_url TEXT NOT NULL,
     user_id INTEGER NOT NULL,
-    game_id INTEGER NOT NULL,
+    app_id INTEGER NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (unixepoch()),
     FOREIGN KEY(user_id) REFERENCES users(id),
-    FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE,
+    FOREIGN KEY(app_id) REFERENCES apps(id) ON DELETE CASCADE,
     PRIMARY KEY(user_id, created_at DESC)
 );
 
@@ -50,13 +50,13 @@ BEGIN
       );
 END;
 
-CREATE TABLE IF NOT EXISTS user_game_durations (
+CREATE TABLE IF NOT EXISTS user_app_durations (
     user_id INTEGER NOT NULL,
-    game_id INTEGER NOT NULL,
+    app_id INTEGER NOT NULL,
     duration_seconds REAL NOT NULL DEFAULT(0),
-    PRIMARY KEY(user_id, game_id),
+    PRIMARY KEY(user_id, app_id),
     FOREIGN KEY(user_id) REFERENCES users(id),
-    FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE
+    FOREIGN KEY(app_id) REFERENCES apps(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS ip_bans (

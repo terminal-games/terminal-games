@@ -3,20 +3,20 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use anyhow::Result;
-use terminal_games::control::{AuthorEnvSetRequest, AuthorEnvVar};
+use terminal_games::control::{AppEnvSetRequest, AppEnvVar};
 
-use super::super::AuthorEnvSetArgs;
-use crate::control_client::AuthorClient;
+use super::super::AppEnvSetArgs;
+use crate::control_client::AppClient;
 
-pub(super) async fn run(args: AuthorEnvSetArgs) -> Result<()> {
-    let client = AuthorClient::from_target(&args.shortname, args.url.as_deref())?;
+pub(super) async fn run(args: AppEnvSetArgs, profile: Option<String>) -> Result<()> {
+    let client = AppClient::from_target(&args.shortname, profile.as_deref())?;
     client
         .rpc()
         .await?
         .env_set(
             terminal_games::control::rpc_context(),
-            AuthorEnvSetRequest {
-                envs: vec![AuthorEnvVar {
+            AppEnvSetRequest {
+                envs: vec![AppEnvVar {
                     name: args.name,
                     value: args.value,
                 }],

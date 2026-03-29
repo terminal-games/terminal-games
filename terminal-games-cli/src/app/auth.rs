@@ -4,26 +4,26 @@
 
 use anyhow::Result;
 use dialoguer::Password;
-use terminal_games::control::AuthorTokenClaims;
+use terminal_games::control::AppTokenClaims;
 
-use super::AuthorAuthArgs;
+use super::AppAuthArgs;
 use crate::config::normalize_base_url;
-use crate::{config::read_secret_stdin, config::save_author_token};
+use crate::{config::read_secret_stdin, config::save_app_token};
 
-pub(super) async fn run(args: AuthorAuthArgs) -> Result<()> {
+pub(super) async fn run(args: AppAuthArgs) -> Result<()> {
     let token = if let Some(token) = args.token {
         token
     } else if args.token_stdin {
         read_secret_stdin()?
     } else {
-        Password::new().with_prompt("Author token").interact()?
+        Password::new().with_prompt("App token").interact()?
     };
-    let claims = AuthorTokenClaims::decode(token.trim())?;
+    let claims = AppTokenClaims::decode(token.trim())?;
     let mut normalized = claims.clone();
     normalized.url = normalize_base_url(&claims.url)?;
-    save_author_token(&normalized)?;
+    save_app_token(&normalized)?;
     println!(
-        "Saved author token for '{}' on {}",
+        "Saved app token for '{}' on {}",
         normalized.shortname, normalized.url
     );
     Ok(())

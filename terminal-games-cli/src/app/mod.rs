@@ -18,37 +18,38 @@ use std::{
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use clap_complete::{ArgValueCandidates, ArgValueCompleter, CompletionCandidate, PathCompleter};
-use terminal_games::control::AuthorEnvVar;
+use terminal_games::control::AppEnvVar;
 
-use crate::config::{list_author_shortnames, list_author_urls};
-use crate::control_client::{AuthorClient, completion_runtime};
+use crate::config::list_app_shortnames;
+use crate::control_client::{AppClient, completion_runtime};
 
 #[derive(Args)]
-pub struct AuthorCli {
+pub struct AppCli {
     #[command(subcommand)]
-    command: AuthorCommand,
+    command: AppCommand,
 }
 
 #[derive(Subcommand)]
-enum AuthorCommand {
-    /// Save an author token for future uploads and management.
-    Auth(AuthorAuthArgs),
+enum AppCommand {
+    /// Save an app token for future uploads and management.
+    Auth(AppAuthArgs),
     /// Upload a new wasm build for the reserved shortname.
-    Upload(AuthorUploadArgs),
+    /// `TERMINAL_GAMES_AUTHOR_TOKEN` can be used instead of prior `app auth` setup.
+    Upload(AppUploadArgs),
     #[command(subcommand)]
     /// Manage encrypted app environment variables.
-    Env(AuthorEnvCommand),
-    /// List configured author tokens and app playtime.
+    Env(AppEnvCommand),
+    /// List configured app tokens and app playtime.
     #[command(visible_alias = "ls")]
     List,
-    /// Rotate the current author token and save the replacement locally.
-    RotateToken(AuthorRotateTokenArgs),
+    /// Rotate the current app token and save the replacement locally.
+    RotateToken(AppRotateTokenArgs),
     /// Delete the reserved shortname and invalidate its token.
-    Delete(AuthorDeleteArgs),
+    Delete(AppDeleteArgs),
 }
 
 #[derive(Args)]
-pub(super) struct AuthorAuthArgs {
+pub(super) struct AppAuthArgs {
     #[arg(long)]
     token: Option<String>,
     #[arg(long)]
@@ -56,12 +57,10 @@ pub(super) struct AuthorAuthArgs {
 }
 
 #[derive(Args)]
-pub(super) struct AuthorUploadArgs {
-    #[arg(long, add = ArgValueCandidates::new(complete_author_url_candidates))]
-    url: Option<String>,
+pub(super) struct AppUploadArgs {
     #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
     path_to_wasm_file: PathBuf,
-    #[arg(add = ArgValueCandidates::new(complete_author_shortname_candidates))]
+    #[arg(add = ArgValueCandidates::new(complete_app_shortname_candidates))]
     shortname: Option<String>,
     /// Set env vars atomically during upload. Repeat as needed.
     #[arg(short = 'e', long = "env", value_name = "NAME=VALUE")]
@@ -72,92 +71,74 @@ pub(super) struct AuthorUploadArgs {
 }
 
 #[derive(Args)]
-pub(super) struct AuthorDeleteArgs {
+pub(super) struct AppDeleteArgs {
     #[arg(long)]
     force: bool,
-    #[arg(long, add = ArgValueCandidates::new(complete_author_url_candidates))]
-    url: Option<String>,
-    #[arg(add = ArgValueCandidates::new(complete_author_shortname_candidates))]
+    #[arg(add = ArgValueCandidates::new(complete_app_shortname_candidates))]
     shortname: String,
 }
 
 #[derive(Args)]
-pub(super) struct AuthorRotateTokenArgs {
-    #[arg(long, add = ArgValueCandidates::new(complete_author_url_candidates))]
-    url: Option<String>,
-    #[arg(add = ArgValueCandidates::new(complete_author_shortname_candidates))]
+pub(super) struct AppRotateTokenArgs {
+    #[arg(add = ArgValueCandidates::new(complete_app_shortname_candidates))]
     shortname: String,
 }
 
 #[derive(Subcommand)]
-pub(super) enum AuthorEnvCommand {
+pub(super) enum AppEnvCommand {
     /// List decrypted env vars for this shortname.
     #[command(visible_alias = "ls")]
-    List(AuthorEnvListArgs),
+    List(AppEnvListArgs),
     /// Set or overwrite one env var.
-    Set(AuthorEnvSetArgs),
+    Set(AppEnvSetArgs),
     /// Delete one env var.
-    Delete(AuthorEnvDeleteArgs),
+    Delete(AppEnvDeleteArgs),
 }
 
 #[derive(Args)]
-pub(super) struct AuthorEnvListArgs {
-    #[arg(long, add = ArgValueCandidates::new(complete_author_url_candidates))]
-    url: Option<String>,
-    #[arg(add = ArgValueCandidates::new(complete_author_shortname_candidates))]
+pub(super) struct AppEnvListArgs {
+    #[arg(add = ArgValueCandidates::new(complete_app_shortname_candidates))]
     shortname: String,
 }
 
 #[derive(Args)]
-pub(super) struct AuthorEnvSetArgs {
-    #[arg(long, add = ArgValueCandidates::new(complete_author_url_candidates))]
-    url: Option<String>,
-    #[arg(add = ArgValueCandidates::new(complete_author_shortname_candidates))]
+pub(super) struct AppEnvSetArgs {
+    #[arg(add = ArgValueCandidates::new(complete_app_shortname_candidates))]
     shortname: String,
     name: String,
     value: String,
 }
 
 #[derive(Args)]
-pub(super) struct AuthorEnvDeleteArgs {
-    #[arg(long, add = ArgValueCandidates::new(complete_author_url_candidates))]
-    url: Option<String>,
-    #[arg(add = ArgValueCandidates::new(complete_author_shortname_candidates))]
+pub(super) struct AppEnvDeleteArgs {
+    #[arg(add = ArgValueCandidates::new(complete_app_shortname_candidates))]
     shortname: String,
-    #[arg(add = ArgValueCandidates::new(complete_author_env_name_candidates))]
+    #[arg(add = ArgValueCandidates::new(complete_app_env_name_candidates))]
     name: String,
 }
 
-pub async fn run(cli: AuthorCli) -> Result<()> {
+pub async fn run(cli: AppCli, profile: Option<String>) -> Result<()> {
     match cli.command {
-        AuthorCommand::Auth(args) => auth::run(args).await,
-        AuthorCommand::Upload(args) => upload::run(args).await,
-        AuthorCommand::Env(command) => env::run(command).await,
-        AuthorCommand::List => list::run().await,
-        AuthorCommand::RotateToken(args) => rotate_token::run(args).await,
-        AuthorCommand::Delete(args) => delete::run(args).await,
+        AppCommand::Auth(args) => auth::run(args).await,
+        AppCommand::Upload(args) => upload::run(args, profile).await,
+        AppCommand::Env(command) => env::run(command, profile).await,
+        AppCommand::List => list::run().await,
+        AppCommand::RotateToken(args) => rotate_token::run(args, profile).await,
+        AppCommand::Delete(args) => delete::run(args, profile).await,
     }
 }
 
-fn complete_author_shortname_candidates() -> Vec<CompletionCandidate> {
-    let url = current_author_url_from_args();
-    list_author_shortnames(url.as_deref())
+fn complete_app_shortname_candidates() -> Vec<CompletionCandidate> {
+    let profile = current_profile_from_args();
+    list_app_shortnames(profile.as_deref())
         .unwrap_or_default()
         .into_iter()
         .map(CompletionCandidate::new)
         .collect()
 }
 
-fn complete_author_url_candidates() -> Vec<CompletionCandidate> {
-    list_author_urls()
-        .unwrap_or_default()
-        .into_iter()
-        .map(CompletionCandidate::new)
-        .collect()
-}
-
-fn complete_author_env_name_candidates() -> Vec<CompletionCandidate> {
-    std::panic::catch_unwind(complete_author_env_name_candidates_inner)
+fn complete_app_env_name_candidates() -> Vec<CompletionCandidate> {
+    std::panic::catch_unwind(complete_app_env_name_candidates_inner)
         .ok()
         .flatten()
         .unwrap_or_default()
@@ -166,10 +147,10 @@ fn complete_author_env_name_candidates() -> Vec<CompletionCandidate> {
         .collect()
 }
 
-fn complete_author_env_name_candidates_inner() -> Option<Vec<String>> {
-    let shortname = current_author_shortname_from_args()?;
-    let url = current_author_url_from_args();
-    let client = AuthorClient::from_target(&shortname, url.as_deref()).ok()?;
+fn complete_app_env_name_candidates_inner() -> Option<Vec<String>> {
+    let shortname = current_app_shortname_from_args()?;
+    let profile = current_profile_from_args();
+    let client = AppClient::from_target(&shortname, profile.as_deref()).ok()?;
     let runtime = completion_runtime()?;
     let result = runtime.block_on(async move {
         let response = client
@@ -194,20 +175,20 @@ fn complete_author_env_name_candidates_inner() -> Option<Vec<String>> {
     result
 }
 
-fn current_author_url_from_args() -> Option<String> {
+fn current_profile_from_args() -> Option<String> {
     let args = std::env::args().collect::<Vec<_>>();
     for (index, arg) in args.iter().enumerate() {
-        if let Some(value) = arg.strip_prefix("--url=") {
+        if let Some(value) = arg.strip_prefix("--profile=") {
             return Some(value.to_string());
         }
-        if arg == "--url" {
+        if arg == "--profile" {
             return args.get(index + 1).cloned();
         }
     }
     None
 }
 
-fn current_author_shortname_from_args() -> Option<String> {
+fn current_app_shortname_from_args() -> Option<String> {
     let args = std::env::args().collect::<Vec<_>>();
     let env_idx = args.iter().position(|arg| arg == "env")?;
     let subcommand = args.get(env_idx + 1)?.as_str();
@@ -215,11 +196,11 @@ fn current_author_shortname_from_args() -> Option<String> {
     let mut index = env_idx + 2;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "--url" {
+        if arg == "--profile" {
             index += 2;
             continue;
         }
-        if arg.starts_with("--url=") {
+        if arg.starts_with("--profile=") {
             index += 1;
             continue;
         }
@@ -239,7 +220,7 @@ fn current_author_shortname_from_args() -> Option<String> {
 pub(crate) fn load_upload_envs(
     inline: &[String],
     env_file: Option<&Path>,
-) -> Result<Option<Vec<AuthorEnvVar>>> {
+) -> Result<Option<Vec<AppEnvVar>>> {
     if inline.is_empty() && env_file.is_none() {
         return Ok(None);
     }
@@ -259,7 +240,7 @@ pub(crate) fn load_upload_envs(
                     env_file.display()
                 );
             };
-            envs.push(AuthorEnvVar {
+            envs.push(AppEnvVar {
                 name: name.trim().to_string(),
                 value: value.to_string(),
             });
@@ -269,7 +250,7 @@ pub(crate) fn load_upload_envs(
         let Some((name, value)) = pair.split_once('=') else {
             anyhow::bail!("invalid env assignment '{}'; expected NAME=VALUE", pair);
         };
-        envs.push(AuthorEnvVar {
+        envs.push(AppEnvVar {
             name: name.to_string(),
             value: value.to_string(),
         });

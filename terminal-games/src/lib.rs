@@ -3,10 +3,10 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 pub mod app;
+pub mod app_env;
+pub mod app_registry;
 mod audio;
-pub mod author_env;
 pub mod control;
-pub mod game_registry;
 pub mod input_guard;
 pub mod log_backend;
 pub mod manifest;

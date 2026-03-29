@@ -254,7 +254,7 @@ impl SshServer {
             let app_exists = match app_server
                 .db
                 .query(
-                    "SELECT 1 FROM games WHERE shortname = ?1 LIMIT 1",
+                    "SELECT 1 FROM apps WHERE shortname = ?1 LIMIT 1",
                     libsql::params!(first_app_shortname.as_str()),
                 )
                 .await
@@ -270,7 +270,7 @@ impl SshServer {
                     "No menu is installed on this server. Provision the 'menu' app via the CLI."
                         .to_string()
                 } else {
-                    format!("Unknown game shortname: {}", first_app_shortname)
+                    format!("Unknown app shortname: {}", first_app_shortname)
                 };
                 let _ = session_handle
                     .disconnect(

@@ -417,7 +417,7 @@ async fn handle_socket(
         .app_server
         .db
         .query(
-            "SELECT 1 FROM games WHERE shortname = ?1 LIMIT 1",
+            "SELECT 1 FROM apps WHERE shortname = ?1 LIMIT 1",
             libsql::params!(first_app_shortname.as_str()),
         )
         .await
@@ -437,7 +437,7 @@ async fn handle_socket(
         let message = if first_app_shortname == "menu" {
             "menu is not installed; provision the 'menu' app via the CLI"
         } else {
-            "unknown game shortname"
+            "unknown app shortname"
         };
         let _ = sender
             .send(Message::Close(Some(CloseFrame {

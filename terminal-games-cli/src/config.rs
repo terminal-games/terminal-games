@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use terminal_games::control::{AuthorTokenClaims, RegionDiscoveryResponse};
+use terminal_games::control::{AppTokenClaims, RegionDiscoveryResponse};
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,24 +32,24 @@ struct AdminProfilesFile {
 pub struct CliConfig {
     #[serde(rename = "default-url", default)]
     pub default_url: Option<String>,
-    #[serde(rename = "author-env-secret-key", default)]
-    pub author_env_secret_key: Option<String>,
+    #[serde(rename = "app-env-secret-key", default)]
+    pub app_env_secret_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredAuthorToken {
+struct StoredAppToken {
     pub token: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct StoredAuthorTokenEntry {
-    pub claims: AuthorTokenClaims,
+pub struct StoredAppTokenEntry {
+    pub claims: AppTokenClaims,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct AuthorTokensFile {
+struct AppTokensFile {
     #[serde(default)]
-    token: Vec<StoredAuthorToken>,
+    token: Vec<StoredAppToken>,
 }
 
 pub fn load_cli_config() -> Result<CliConfig> {
@@ -60,17 +60,17 @@ pub fn save_cli_config(config: &CliConfig) -> Result<()> {
     write_toml(cli_config_path(), config)
 }
 
-pub fn load_or_create_author_env_secret_key() -> Result<String> {
+pub fn load_or_create_app_env_secret_key() -> Result<String> {
     let mut config = load_cli_config()?;
     if let Some(secret_key) = config
-        .author_env_secret_key
+        .app_env_secret_key
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
         return Ok(secret_key.to_string());
     }
     let secret_key = generate_secret_key();
-    config.author_env_secret_key = Some(secret_key.clone());
+    config.app_env_secret_key = Some(secret_key.clone());
     save_cli_config(&config)?;
     Ok(secret_key)
 }
@@ -123,25 +123,25 @@ pub fn default_url_value() -> Result<Option<String>> {
     normalize_optional_url(load_cli_config()?.default_url.as_deref())
 }
 
-pub fn list_stored_author_tokens() -> Result<Vec<StoredAuthorTokenEntry>> {
-    let tokens: AuthorTokensFile = read_toml(author_tokens_path())?;
+pub fn list_stored_app_tokens() -> Result<Vec<StoredAppTokenEntry>> {
+    let tokens: AppTokensFile = read_toml(app_tokens_path())?;
     let mut entries = BTreeMap::new();
     for stored in tokens.token {
-        let claims = decode_author_token(&stored.token)?;
+        let claims = decode_app_token(&stored.token)?;
         entries.insert(
             (claims.url.clone(), claims.shortname.clone()),
-            StoredAuthorTokenEntry { claims },
+            StoredAppTokenEntry { claims },
         );
     }
     Ok(entries.into_values().collect())
 }
 
-pub fn load_author_token_for_shortname(
+pub fn load_app_token_for_shortname(
     shortname: &str,
     url_override: Option<&str>,
-) -> Result<Option<AuthorTokenClaims>> {
+) -> Result<Option<AppTokenClaims>> {
     let requested_url = normalize_optional_url(url_override)?;
-    if let Some(claims) = load_env_author_token()? {
+    if let Some(claims) = load_env_app_token()? {
         if claims.shortname == shortname
             && requested_url
                 .as_deref()
@@ -151,8 +151,8 @@ pub fn load_author_token_for_shortname(
         }
     }
 
-    let entries = list_stored_author_tokens()?;
-    select_author_claims(
+    let entries = list_stored_app_tokens()?;
+    select_app_claims(
         &entries,
         shortname,
         requested_url.as_deref(),
@@ -160,21 +160,19 @@ pub fn load_author_token_for_shortname(
     )
 }
 
-pub fn load_author_tokens_for_listing(
-    url_filter: Option<&str>,
-) -> Result<Vec<StoredAuthorTokenEntry>> {
+pub fn load_app_tokens_for_listing(url_filter: Option<&str>) -> Result<Vec<StoredAppTokenEntry>> {
     let filter_url = normalize_optional_url(url_filter)?;
     let mut entries = BTreeMap::new();
-    for entry in list_stored_author_tokens()? {
+    for entry in list_stored_app_tokens()? {
         entries.insert(
             (entry.claims.url.clone(), entry.claims.shortname.clone()),
             entry,
         );
     }
-    if let Some(claims) = load_env_author_token()? {
+    if let Some(claims) = load_env_app_token()? {
         entries.insert(
             (claims.url.clone(), claims.shortname.clone()),
-            StoredAuthorTokenEntry { claims },
+            StoredAppTokenEntry { claims },
         );
     }
     let mut entries = entries.into_values().collect::<Vec<_>>();
@@ -184,8 +182,8 @@ pub fn load_author_tokens_for_listing(
     Ok(entries)
 }
 
-pub fn list_author_shortnames(url_filter: Option<&str>) -> Result<Vec<String>> {
-    let mut shortnames = load_author_tokens_for_listing(url_filter)?
+pub fn list_app_shortnames(url_filter: Option<&str>) -> Result<Vec<String>> {
+    let mut shortnames = load_app_tokens_for_listing(url_filter)?
         .into_iter()
         .map(|entry| entry.claims.shortname)
         .collect::<Vec<_>>();
@@ -194,8 +192,8 @@ pub fn list_author_shortnames(url_filter: Option<&str>) -> Result<Vec<String>> {
     Ok(shortnames)
 }
 
-pub fn list_author_urls() -> Result<Vec<String>> {
-    let mut urls = load_author_tokens_for_listing(None)?
+pub fn list_app_urls() -> Result<Vec<String>> {
+    let mut urls = load_app_tokens_for_listing(None)?
         .into_iter()
         .map(|entry| entry.claims.url)
         .collect::<Vec<_>>();
@@ -204,20 +202,20 @@ pub fn list_author_urls() -> Result<Vec<String>> {
     Ok(urls)
 }
 
-pub fn save_author_token(claims: &AuthorTokenClaims) -> Result<()> {
-    let normalized = normalize_author_claims(claims.clone())?;
-    let mut tokens: AuthorTokensFile = read_toml(author_tokens_path())?;
+pub fn save_app_token(claims: &AppTokenClaims) -> Result<()> {
+    let normalized = normalize_app_claims(claims.clone())?;
+    let mut tokens: AppTokensFile = read_toml(app_tokens_path())?;
     let encoded = normalized.encode()?;
     tokens.token.retain(|stored| {
-        decode_author_token(&stored.token)
+        decode_app_token(&stored.token)
             .map(|claims| claims.url != normalized.url || claims.shortname != normalized.shortname)
             .unwrap_or(true)
     });
-    tokens.token.push(StoredAuthorToken { token: encoded });
+    tokens.token.push(StoredAppToken { token: encoded });
     tokens
         .token
         .sort_by(|left, right| left.token.cmp(&right.token));
-    write_toml(author_tokens_path(), &tokens)
+    write_toml(app_tokens_path(), &tokens)
 }
 
 pub fn normalize_base_url(input: &str) -> Result<String> {
@@ -369,17 +367,17 @@ fn resolve_target_url(url_override: Option<&str>) -> Result<String> {
     }
     default_url_value()?.ok_or_else(|| {
         anyhow::anyhow!(
-            "no default server configured; pass --url or run 'terminal-games-cli admin auth'"
+            "no default server configured; pass --profile or run 'terminal-games-cli admin auth'"
         )
     })
 }
 
-fn select_author_claims(
-    entries: &[StoredAuthorTokenEntry],
+fn select_app_claims(
+    entries: &[StoredAppTokenEntry],
     shortname: &str,
     requested_url: Option<&str>,
     default_url: Option<&str>,
-) -> Result<Option<AuthorTokenClaims>> {
+) -> Result<Option<AppTokenClaims>> {
     let matches = entries
         .iter()
         .filter(|entry| entry.claims.shortname == shortname)
@@ -395,10 +393,10 @@ fn select_author_claims(
             .map(Some)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "no author token configured for '{}' on '{}'; available on: {}",
+                    "no app token configured for '{}' on '{}'; available on: {}",
                     shortname,
                     requested_url,
-                    available_author_urls(&matches)
+                    available_app_urls(&matches)
                 )
             });
     }
@@ -411,13 +409,13 @@ fn select_author_claims(
         }
     }
     Err(anyhow::anyhow!(
-        "multiple author tokens are configured for '{}'; pass --url to choose one of: {}",
+        "multiple app tokens are configured for '{}'; pass --profile to choose one of: {}",
         shortname,
-        available_author_urls(&matches)
+        available_app_urls(&matches)
     ))
 }
 
-fn available_author_urls(entries: &[&StoredAuthorTokenEntry]) -> String {
+fn available_app_urls(entries: &[&StoredAppTokenEntry]) -> String {
     entries
         .iter()
         .map(|entry| entry.claims.url.clone())
@@ -427,16 +425,28 @@ fn available_author_urls(entries: &[&StoredAuthorTokenEntry]) -> String {
         .join(", ")
 }
 
-fn load_env_author_token() -> Result<Option<AuthorTokenClaims>> {
-    match std::env::var("TERMINAL_GAMES_AUTHOR_TOKEN") {
-        Ok(token) => Ok(Some(decode_author_token(token.trim())?)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(error) => Err(anyhow::Error::new(error)),
+fn load_env_app_token() -> Result<Option<AppTokenClaims>> {
+    let author_token = std::env::var("TERMINAL_GAMES_AUTHOR_TOKEN");
+    let app_token = std::env::var("TERMINAL_GAMES_APP_TOKEN");
+    match (author_token, app_token) {
+        (Ok(author_token), Ok(app_token)) => {
+            anyhow::ensure!(
+                author_token.trim() == app_token.trim(),
+                "both TERMINAL_GAMES_AUTHOR_TOKEN and TERMINAL_GAMES_APP_TOKEN are set with different values"
+            );
+            Ok(Some(decode_app_token(author_token.trim())?))
+        }
+        (Ok(token), Err(std::env::VarError::NotPresent))
+        | (Err(std::env::VarError::NotPresent), Ok(token)) => {
+            Ok(Some(decode_app_token(token.trim())?))
+        }
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => Ok(None),
+        (Err(error), _) | (_, Err(error)) => Err(anyhow::Error::new(error)),
     }
 }
 
-fn decode_author_token(token: &str) -> Result<AuthorTokenClaims> {
-    normalize_author_claims(AuthorTokenClaims::decode(token)?)
+fn decode_app_token(token: &str) -> Result<AppTokenClaims> {
+    normalize_app_claims(AppTokenClaims::decode(token)?)
 }
 
 fn normalize_admin_profile(mut profile: AdminProfile) -> Result<AdminProfile> {
@@ -444,7 +454,7 @@ fn normalize_admin_profile(mut profile: AdminProfile) -> Result<AdminProfile> {
     Ok(profile)
 }
 
-fn normalize_author_claims(mut claims: AuthorTokenClaims) -> Result<AuthorTokenClaims> {
+fn normalize_app_claims(mut claims: AppTokenClaims) -> Result<AppTokenClaims> {
     claims.url = normalize_base_url(&claims.url)?;
     Ok(claims)
 }
@@ -465,8 +475,8 @@ fn admin_profiles_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("admin.toml"))
 }
 
-fn author_tokens_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("author.toml"))
+fn app_tokens_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("app.toml"))
 }
 
 fn visible_width(value: &str) -> usize {

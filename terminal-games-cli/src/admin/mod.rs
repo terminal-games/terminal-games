@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+mod app;
 mod auth;
-mod author;
 mod ban_ip;
 mod broadcast;
 mod regions;
@@ -14,14 +14,14 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use clap_complete::{ArgValueCandidates, CompletionCandidate};
 
-use crate::config::list_admin_urls;
-use crate::control_client::{AdminClient, completion_runtime};
+use crate::{
+    completion_cache::{self, CacheLookup, RefreshKind},
+    config::{default_url_value, normalize_base_url},
+    control_client::{AdminClient, completion_runtime},
+};
 
 #[derive(Args)]
 pub struct AdminCli {
-    /// Server URL to use. Defaults to the CLI default URL.
-    #[arg(long, global = true, add = ArgValueCandidates::new(complete_admin_url_candidates))]
-    url: Option<String>,
     #[command(subcommand)]
     command: AdminCommand,
 }
@@ -44,14 +44,19 @@ enum AdminCommand {
     /// Inspect and control live sessions.
     Session(AdminSessionCommand),
     #[command(subcommand)]
-    /// Manage author tokens and reservations.
-    Author(AdminAuthorCommand),
+    /// Manage app tokens and reservations.
+    App(AdminAppCommand),
 }
 
 #[derive(Args)]
 pub(super) struct AdminAuthArgs {
+    /// Server URL to save admin auth for.
+    #[arg(long)]
+    url: Option<String>,
+    /// Shared admin secret to save without prompting.
     #[arg(long)]
     password: Option<String>,
+    /// Read the shared admin secret from stdin.
     #[arg(long)]
     password_stdin: bool,
 }
@@ -178,56 +183,47 @@ pub(super) struct AdminSessionSpyArgs {
 }
 
 #[derive(Subcommand)]
-pub(super) enum AdminAuthorCommand {
-    /// Reserve a shortname and mint a new author token.
-    Create(AdminAuthorCreateArgs),
-    /// List all reserved author shortnames and their playtime.
+pub(super) enum AdminAppCommand {
+    /// Reserve a shortname and mint a new app token.
+    Create(AdminAppCreateArgs),
+    /// List all reserved app shortnames and their playtime.
     #[command(visible_alias = "ls")]
     List,
-    /// Rotate an author token and print the new value.
-    RotateToken(AdminAuthorRotateTokenArgs),
-    /// Delete an author reservation and its shortname permanently.
-    Delete(AdminAuthorDeleteArgs),
+    /// Rotate an app token and print the new value.
+    RotateToken(AdminAppRotateTokenArgs),
+    /// Delete an app reservation and its shortname permanently.
+    Delete(AdminAppDeleteArgs),
 }
 
 #[derive(Args)]
-pub(super) struct AdminAuthorCreateArgs {
+pub(super) struct AdminAppCreateArgs {
     shortname: String,
 }
 
 #[derive(Args)]
-pub(super) struct AdminAuthorDeleteArgs {
+pub(super) struct AdminAppDeleteArgs {
     #[arg(long)]
     force: bool,
-    #[arg(add = ArgValueCandidates::new(complete_author_delete_candidates))]
-    author: String,
+    #[arg(add = ArgValueCandidates::new(complete_app_delete_candidates))]
+    app: String,
 }
 
 #[derive(Args)]
-pub(super) struct AdminAuthorRotateTokenArgs {
-    #[arg(add = ArgValueCandidates::new(complete_author_id_candidates))]
-    author_id: u64,
+pub(super) struct AdminAppRotateTokenArgs {
+    #[arg(add = ArgValueCandidates::new(complete_app_id_candidates))]
+    app_id: u64,
 }
 
-pub async fn run(cli: AdminCli) -> Result<()> {
-    let url = cli.url;
+pub async fn run(cli: AdminCli, profile: Option<String>) -> Result<()> {
     match cli.command {
-        AdminCommand::Auth(args) => auth::run(args, url).await,
-        AdminCommand::BanIp(command) => ban_ip::run(command, url).await,
-        AdminCommand::Ticker(command) => ticker::run(command, url).await,
-        AdminCommand::Broadcast(args) => broadcast::run(args, url).await,
-        AdminCommand::Regions => regions::run(url).await,
-        AdminCommand::Session(command) => session::run(command, url).await,
-        AdminCommand::Author(command) => author::run(command, url).await,
+        AdminCommand::Auth(args) => auth::run(args, profile).await,
+        AdminCommand::BanIp(command) => ban_ip::run(command, profile).await,
+        AdminCommand::Ticker(command) => ticker::run(command, profile).await,
+        AdminCommand::Broadcast(args) => broadcast::run(args, profile).await,
+        AdminCommand::Regions => regions::run(profile).await,
+        AdminCommand::Session(command) => session::run(command, profile).await,
+        AdminCommand::App(command) => app::run(command, profile).await,
     }
-}
-
-fn complete_admin_url_candidates() -> Vec<CompletionCandidate> {
-    list_admin_urls()
-        .unwrap_or_default()
-        .into_iter()
-        .map(CompletionCandidate::new)
-        .collect()
 }
 
 fn complete_session_id_candidates() -> Vec<CompletionCandidate> {
@@ -241,9 +237,12 @@ fn complete_session_id_candidates() -> Vec<CompletionCandidate> {
 }
 
 fn complete_session_id_candidates_inner() -> Option<Vec<String>> {
+    if let Some(session_ids) = cached_session_id_candidates() {
+        return Some(session_ids);
+    }
     completion_runtime()?.block_on(async {
-        let url = current_admin_url_from_args();
-        let api = load_api(url.as_deref()).ok()?;
+        let profile = current_profile_from_args();
+        let api = load_api(profile.as_deref()).ok()?;
         let mut session_ids = api
             .completion_all_sessions()
             .await
@@ -257,8 +256,8 @@ fn complete_session_id_candidates_inner() -> Option<Vec<String>> {
     })
 }
 
-fn complete_author_id_candidates() -> Vec<CompletionCandidate> {
-    std::panic::catch_unwind(complete_author_id_candidates_inner)
+fn complete_app_id_candidates() -> Vec<CompletionCandidate> {
+    std::panic::catch_unwind(complete_app_id_candidates_inner)
         .ok()
         .flatten()
         .unwrap_or_default()
@@ -267,8 +266,8 @@ fn complete_author_id_candidates() -> Vec<CompletionCandidate> {
         .collect()
 }
 
-fn complete_author_delete_candidates() -> Vec<CompletionCandidate> {
-    std::panic::catch_unwind(complete_author_delete_candidates_inner)
+fn complete_app_delete_candidates() -> Vec<CompletionCandidate> {
+    std::panic::catch_unwind(complete_app_delete_candidates_inner)
         .ok()
         .flatten()
         .unwrap_or_default()
@@ -277,19 +276,25 @@ fn complete_author_delete_candidates() -> Vec<CompletionCandidate> {
         .collect()
 }
 
-fn complete_author_id_candidates_inner() -> Option<Vec<String>> {
+fn complete_app_id_candidates_inner() -> Option<Vec<String>> {
+    if let Some(app_ids) = cached_app_id_candidates() {
+        return Some(app_ids);
+    }
     completion_runtime()?.block_on(async {
-        let url = current_admin_url_from_args();
-        let api = load_api(url.as_deref()).ok()?;
-        api.completion_author_ids().await.ok()
+        let profile = current_profile_from_args();
+        let api = load_api(profile.as_deref()).ok()?;
+        api.completion_app_ids().await.ok()
     })
 }
 
-fn complete_author_delete_candidates_inner() -> Option<Vec<String>> {
+fn complete_app_delete_candidates_inner() -> Option<Vec<String>> {
+    if let Some(app_targets) = cached_app_delete_candidates() {
+        return Some(app_targets);
+    }
     completion_runtime()?.block_on(async {
-        let url = current_admin_url_from_args();
-        let api = load_api(url.as_deref()).ok()?;
-        api.completion_author_targets().await.ok()
+        let profile = current_profile_from_args();
+        let api = load_api(profile.as_deref()).ok()?;
+        api.completion_app_targets().await.ok()
     })
 }
 
@@ -304,9 +309,12 @@ fn complete_ticker_id_candidates() -> Vec<CompletionCandidate> {
 }
 
 fn complete_ticker_id_candidates_inner() -> Option<Vec<String>> {
+    if let Some(ticker_ids) = cached_ticker_id_candidates() {
+        return Some(ticker_ids);
+    }
     completion_runtime()?.block_on(async {
-        let url = current_admin_url_from_args();
-        let api = load_api(url.as_deref()).ok()?;
+        let profile = current_profile_from_args();
+        let api = load_api(profile.as_deref()).ok()?;
         api.completion_ticker_ids().await.ok()
     })
 }
@@ -322,9 +330,12 @@ fn complete_ban_ip_candidates() -> Vec<CompletionCandidate> {
 }
 
 fn complete_ban_ip_candidates_inner() -> Option<Vec<String>> {
+    if let Some(ban_ips) = cached_ban_ip_candidates() {
+        return Some(ban_ips);
+    }
     completion_runtime()?.block_on(async {
-        let url = current_admin_url_from_args();
-        let api = load_api(url.as_deref()).ok()?;
+        let profile = current_profile_from_args();
+        let api = load_api(profile.as_deref()).ok()?;
         api.completion_ban_ip_cidrs().await.ok()
     })
 }
@@ -371,27 +382,107 @@ pub(super) fn format_optional_unix(value: Option<i64>) -> String {
         .unwrap_or_else(|| "never".to_string())
 }
 
-pub(super) fn parse_author_delete_ref(value: &str) -> Result<(u64, &str)> {
-    let (author_id, shortname) = value
+pub(super) fn parse_app_delete_ref(value: &str) -> Result<(u64, &str)> {
+    let (app_id, shortname) = value
         .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("author must be in ID:SHORTNAME format"))?;
-    let author_id = author_id
+        .ok_or_else(|| anyhow::anyhow!("app must be in ID:SHORTNAME format"))?;
+    let app_id = app_id
         .parse::<u64>()
-        .with_context(|| format!("invalid author id '{author_id}'"))?;
+        .with_context(|| format!("invalid app id '{app_id}'"))?;
     let shortname = shortname.trim();
-    anyhow::ensure!(!shortname.is_empty(), "author shortname cannot be empty");
-    Ok((author_id, shortname))
+    anyhow::ensure!(!shortname.is_empty(), "app shortname cannot be empty");
+    Ok((app_id, shortname))
 }
 
-fn current_admin_url_from_args() -> Option<String> {
+fn current_profile_from_args() -> Option<String> {
     let args = std::env::args().collect::<Vec<_>>();
     for (index, arg) in args.iter().enumerate() {
-        if let Some(value) = arg.strip_prefix("--url=") {
+        if let Some(value) = arg.strip_prefix("--profile=") {
             return Some(value.to_string());
         }
-        if arg == "--url" {
+        if arg == "--profile" {
             return args.get(index + 1).cloned();
         }
     }
     None
+}
+
+fn current_completion_profile_url() -> Option<String> {
+    if let Some(profile) = current_profile_from_args() {
+        return normalize_base_url(&profile).ok();
+    }
+    default_url_value().ok().flatten()
+}
+
+fn cached_session_id_candidates() -> Option<Vec<String>> {
+    let profile_url = current_completion_profile_url()?;
+    let lookup = completion_cache::load_sessions(&profile_url).ok()?;
+    cached_admin_candidates(lookup, RefreshKind::Sessions, &profile_url, |sessions| {
+        sessions
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect::<Vec<_>>()
+    })
+}
+
+fn cached_app_id_candidates() -> Option<Vec<String>> {
+    let profile_url = current_completion_profile_url()?;
+    let lookup = completion_cache::load_apps(&profile_url).ok()?;
+    cached_admin_candidates(lookup, RefreshKind::Apps, &profile_url, |apps| {
+        apps.iter()
+            .map(|app| app.app_id.to_string())
+            .collect::<Vec<_>>()
+    })
+}
+
+fn cached_app_delete_candidates() -> Option<Vec<String>> {
+    let profile_url = current_completion_profile_url()?;
+    let lookup = completion_cache::load_apps(&profile_url).ok()?;
+    cached_admin_candidates(lookup, RefreshKind::Apps, &profile_url, |apps| {
+        apps.iter()
+            .map(|app| format!("{}:{}", app.app_id, app.shortname))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn cached_ticker_id_candidates() -> Option<Vec<String>> {
+    let profile_url = current_completion_profile_url()?;
+    let lookup = completion_cache::load_tickers(&profile_url).ok()?;
+    cached_admin_candidates(lookup, RefreshKind::Tickers, &profile_url, |tickers| {
+        tickers
+            .iter()
+            .map(|ticker| ticker.ticker_id.to_string())
+            .collect::<Vec<_>>()
+    })
+}
+
+fn cached_ban_ip_candidates() -> Option<Vec<String>> {
+    let profile_url = current_completion_profile_url()?;
+    let lookup = completion_cache::load_bans(&profile_url).ok()?;
+    cached_admin_candidates(lookup, RefreshKind::Bans, &profile_url, |bans| {
+        bans.iter().map(|ban| ban.ip.clone()).collect::<Vec<_>>()
+    })
+}
+
+fn cached_admin_candidates<T>(
+    lookup: CacheLookup<Vec<T>>,
+    kind: RefreshKind,
+    profile_url: &str,
+    map: impl FnOnce(&[T]) -> Vec<String>,
+) -> Option<Vec<String>> {
+    match lookup {
+        CacheLookup::Missing => None,
+        CacheLookup::Present {
+            value,
+            needs_refresh,
+        } => {
+            if needs_refresh {
+                let _ = completion_cache::spawn_admin_refresh(kind, profile_url);
+            }
+            let mut values = map(&value);
+            values.sort();
+            values.dedup();
+            Some(values)
+        }
+    }
 }

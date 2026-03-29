@@ -20,11 +20,11 @@ use tracing_subscriber::{Layer, filter::LevelFilter, layer::SubscriberExt};
 use crate::admission::{AdmissionConfig, decode_cidr_blob};
 use terminal_games::{
     app::AppServer,
-    author_env::AUTHOR_ENV_KEY_ENV,
-    mesh::{BuildId, EnvDiscovery, GameRuntimeUpdateMessage, Mesh},
+    app_env::APP_ENV_KEY_ENV,
+    mesh::{AppRuntimeUpdateMessage, BuildId, EnvDiscovery, Mesh},
 };
 
-const AUTHOR_ENV_DEV_FALLBACK_KEY: &str = "terminal-games-dev-author-env-key";
+const APP_ENV_DEV_FALLBACK_KEY: &str = "terminal-games-dev-app-env-key";
 
 // Avoid musl's default allocator due to lackluster performance
 // https://nickb.dev/blog/default-musl-allocator-considered-harmful-to-performance
@@ -32,18 +32,18 @@ const AUTHOR_ENV_DEV_FALLBACK_KEY: &str = "terminal-games-dev-author-env-key";
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-async fn load_game_build_snapshot(
+async fn load_app_build_snapshot(
     conn: &libsql::Connection,
-) -> Result<Vec<GameRuntimeUpdateMessage>> {
+) -> Result<Vec<AppRuntimeUpdateMessage>> {
     let mut updates = Vec::new();
     let mut game_rows = conn
         .query(
-            "SELECT id, wasm_hash, env_hash, build_updated_at FROM games",
+            "SELECT id, wasm_hash, env_hash, build_updated_at FROM apps",
             (),
         )
         .await?;
     while let Some(row) = game_rows.next().await? {
-        updates.push(GameRuntimeUpdateMessage::published(
+        updates.push(AppRuntimeUpdateMessage::published(
             row.get::<u64>(0)?,
             BuildId::from_hash_slices(&row.get::<Vec<u8>>(1)?, &row.get::<Vec<u8>>(2)?)?,
             row.get::<i64>(3)?,
@@ -52,14 +52,14 @@ async fn load_game_build_snapshot(
     Ok(updates)
 }
 
-async fn sync_game_build_snapshot(
+async fn sync_app_build_snapshot(
     conn: &libsql::Connection,
     app_server: &AppServer,
     mesh: &Mesh,
 ) -> Result<()> {
-    let snapshot = load_game_build_snapshot(conn).await?;
-    app_server.game_registry().sync_snapshot(snapshot.clone());
-    mesh.replace_game_runtime_snapshot(snapshot).await;
+    let snapshot = load_app_build_snapshot(conn).await?;
+    app_server.app_registry().sync_snapshot(snapshot.clone());
+    mesh.replace_app_runtime_snapshot(snapshot).await;
     Ok(())
 }
 
@@ -201,7 +201,7 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to commit migration transaction")?;
 
-    let author_env_secret_key = load_author_env_secret_key();
+    let app_env_secret_key = load_app_env_secret_key();
 
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
     mesh.start_discovery().await?;
@@ -210,28 +210,27 @@ async fn main() -> Result<()> {
     let app_server = Arc::new(AppServer::new(
         mesh.clone(),
         conn.clone(),
-        author_env_secret_key,
+        app_env_secret_key,
     )?);
-    sync_game_build_snapshot(&conn, &app_server, &mesh).await?;
+    sync_app_build_snapshot(&conn, &app_server, &mesh).await?;
     {
         let app_server = app_server.clone();
         let conn = conn.clone();
         let mesh = mesh.clone();
-        let mut updates = mesh.subscribe_game_runtime_updates();
+        let mut updates = mesh.subscribe_app_runtime_updates();
         tokio::spawn(async move {
             loop {
                 match updates.recv().await {
                     Ok(update) => {
-                        let _ = app_server.game_registry().apply_update(update);
+                        let _ = app_server.app_registry().apply_update(update);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "lagged mesh game runtime updates");
-                        if let Err(error) =
-                            sync_game_build_snapshot(&conn, &app_server, &mesh).await
+                        tracing::warn!(skipped, "lagged mesh app runtime updates");
+                        if let Err(error) = sync_app_build_snapshot(&conn, &app_server, &mesh).await
                         {
                             tracing::warn!(
                                 error = ?error,
-                                "failed to resync game runtime snapshot after lag"
+                                "failed to resync app runtime snapshot after lag"
                             );
                         }
                     }
@@ -343,14 +342,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn load_author_env_secret_key() -> String {
-    match std::env::var(AUTHOR_ENV_KEY_ENV) {
+fn load_app_env_secret_key() -> String {
+    match std::env::var(APP_ENV_KEY_ENV) {
         Ok(value) if !value.trim().is_empty() => value,
         _ => {
             tracing::warn!(
-                "{AUTHOR_ENV_KEY_ENV} is not set; using the built-in development fallback key"
+                "{APP_ENV_KEY_ENV} is not set; using the built-in development fallback key"
             );
-            AUTHOR_ENV_DEV_FALLBACK_KEY.to_string()
+            APP_ENV_DEV_FALLBACK_KEY.to_string()
         }
     }
 }

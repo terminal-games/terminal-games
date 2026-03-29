@@ -32,7 +32,7 @@ use tokio_util::{
     task::TaskTracker,
 };
 
-use crate::{author_env::AuthorEnvVar, rate_limiting::get_tcp_rtt_from_fd};
+use crate::{app_env::AppEnvVar, rate_limiting::get_tcp_rtt_from_fd};
 
 pub type ContentHash = [u8; 32];
 
@@ -43,10 +43,10 @@ pub struct BuildId {
 }
 
 impl BuildId {
-    pub fn from_wasm_and_envs(wasm: &[u8], envs: &[AuthorEnvVar]) -> Self {
+    pub fn from_wasm_and_envs(wasm: &[u8], envs: &[AppEnvVar]) -> Self {
         Self {
             wasm_hash: hash_bytes(wasm),
-            env_hash: hash_author_envs(envs),
+            env_hash: hash_app_envs(envs),
         }
     }
 
@@ -69,7 +69,7 @@ pub fn hash_bytes(data: &[u8]) -> ContentHash {
     Sha256::digest(data).into()
 }
 
-pub fn hash_author_envs(envs: &[AuthorEnvVar]) -> ContentHash {
+pub fn hash_app_envs(envs: &[AppEnvVar]) -> ContentHash {
     let mut pairs = envs
         .iter()
         .map(|env| (env.name.as_str(), env.value.as_str()))
@@ -100,7 +100,7 @@ enum Message {
     PeerListSync(PeerListSyncMessage),
     PeerAdded(PeerChangeMessage),
     PeerRemoved(PeerChangeMessage),
-    GameRuntimeUpdated(GameRuntimeUpdateMessage),
+    AppRuntimeUpdated(AppRuntimeUpdateMessage),
 }
 
 #[tarpc::service]
@@ -109,7 +109,7 @@ trait MeshRpc {
     async fn peer_list_sync(msg: PeerListSyncMessage);
     async fn peer_added(msg: PeerChangeMessage);
     async fn peer_removed(msg: PeerChangeMessage);
-    async fn game_runtime_updated(msg: GameRuntimeUpdateMessage);
+    async fn app_runtime_updated(msg: AppRuntimeUpdateMessage);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,43 +125,43 @@ struct PeerChangeMessage {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum GameRuntimeUpdateKind {
+pub enum AppRuntimeUpdateKind {
     Published,
     Deleted,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GameRuntimeUpdateMessage {
-    pub game_id: u64,
+pub struct AppRuntimeUpdateMessage {
+    pub app_id: u64,
     pub build_id: BuildId,
     pub updated_at_ns: i64,
-    pub kind: GameRuntimeUpdateKind,
+    pub kind: AppRuntimeUpdateKind,
 }
 
-impl GameRuntimeUpdateMessage {
-    pub fn published(game_id: u64, build_id: BuildId, updated_at_ns: i64) -> Self {
+impl AppRuntimeUpdateMessage {
+    pub fn published(app_id: u64, build_id: BuildId, updated_at_ns: i64) -> Self {
         Self {
-            game_id,
+            app_id,
             build_id,
             updated_at_ns,
-            kind: GameRuntimeUpdateKind::Published,
+            kind: AppRuntimeUpdateKind::Published,
         }
     }
 
-    pub fn deleted(game_id: u64, build_id: BuildId, updated_at_ns: i64) -> Self {
+    pub fn deleted(app_id: u64, build_id: BuildId, updated_at_ns: i64) -> Self {
         Self {
-            game_id,
+            app_id,
             build_id,
             updated_at_ns,
-            kind: GameRuntimeUpdateKind::Deleted,
+            kind: AppRuntimeUpdateKind::Deleted,
         }
     }
 
     fn supersedes(&self, other: &Self) -> bool {
         self.updated_at_ns > other.updated_at_ns
             || (self.updated_at_ns == other.updated_at_ns
-                && self.kind == GameRuntimeUpdateKind::Deleted
-                && other.kind == GameRuntimeUpdateKind::Published)
+                && self.kind == AppRuntimeUpdateKind::Deleted
+                && other.kind == AppRuntimeUpdateKind::Published)
     }
 }
 
@@ -244,7 +244,7 @@ pub struct PeerMessage {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct AppId {
-    pub game_id: u64,
+    pub app_id: u64,
     pub build_id: BuildId,
 }
 
@@ -253,7 +253,7 @@ impl Display for AppId {
         write!(
             f,
             "{}:{}:{}",
-            self.game_id,
+            self.app_id,
             hex::encode(self.build_id.wasm_hash),
             hex::encode(self.build_id.env_hash)
         )
@@ -524,12 +524,12 @@ struct MeshInner {
     regions: Mutex<HashMap<RegionId, RegionState>>,
     peers: Mutex<HashMap<AppId, HashMap<PeerId, tokio::sync::mpsc::Sender<PeerMessageApp>>>>,
     global_peers: Mutex<HashMap<AppId, HashSet<PeerId>>>,
-    latest_game_runtime_updates: Mutex<HashMap<u64, GameRuntimeUpdateMessage>>,
+    latest_app_runtime_updates: Mutex<HashMap<u64, AppRuntimeUpdateMessage>>,
     discovery: Arc<dyn Discovery>,
     cancel: CancellationToken,
     tasks: TaskTracker,
     heal_now: Notify,
-    game_runtime_updates: broadcast::Sender<GameRuntimeUpdateMessage>,
+    app_runtime_updates: broadcast::Sender<AppRuntimeUpdateMessage>,
 }
 
 #[derive(Clone)]
@@ -550,12 +550,12 @@ impl Mesh {
     pub fn with_region(discovery: Arc<dyn Discovery>, region: RegionId) -> Self {
         Self {
             inner: Arc::new(MeshInner {
-                game_runtime_updates: broadcast::channel(64).0,
+                app_runtime_updates: broadcast::channel(64).0,
                 region,
                 regions: Default::default(),
                 peers: Default::default(),
                 global_peers: Default::default(),
-                latest_game_runtime_updates: Default::default(),
+                latest_app_runtime_updates: Default::default(),
                 discovery,
                 cancel: CancellationToken::new(),
                 tasks: TaskTracker::new(),
@@ -741,20 +741,20 @@ impl Mesh {
         tracing::debug!("Mesh graceful shutdown complete");
     }
 
-    pub fn subscribe_game_runtime_updates(&self) -> broadcast::Receiver<GameRuntimeUpdateMessage> {
-        self.inner.game_runtime_updates.subscribe()
+    pub fn subscribe_app_runtime_updates(&self) -> broadcast::Receiver<AppRuntimeUpdateMessage> {
+        self.inner.app_runtime_updates.subscribe()
     }
 
-    pub async fn replace_game_runtime_snapshot(&self, updates: Vec<GameRuntimeUpdateMessage>) {
-        self.inner.replace_game_runtime_snapshot(updates).await;
+    pub async fn replace_app_runtime_snapshot(&self, updates: Vec<AppRuntimeUpdateMessage>) {
+        self.inner.replace_app_runtime_snapshot(updates).await;
     }
 
-    pub async fn propagate_game_runtime_update(&self, update: GameRuntimeUpdateMessage) {
-        if !self.inner.remember_game_runtime_update(update).await {
+    pub async fn propagate_app_runtime_update(&self, update: AppRuntimeUpdateMessage) {
+        if !self.inner.remember_app_runtime_update(update).await {
             return;
         }
         self.inner
-            .broadcast(Message::GameRuntimeUpdated(update))
+            .broadcast(Message::AppRuntimeUpdated(update))
             .await;
     }
 }
@@ -1016,8 +1016,8 @@ impl MeshInner {
                 .iter()
                 .map(|(app_id, peer_map)| (*app_id, peer_map.keys().copied().collect()))
                 .collect();
-            let local_game_runtime_updates = self
-                .latest_game_runtime_updates
+            let local_app_runtime_updates = self
+                .latest_app_runtime_updates
                 .lock()
                 .await
                 .values()
@@ -1033,12 +1033,12 @@ impl MeshInner {
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to send initial peer list sync: {}", e))?;
-            for update in local_game_runtime_updates {
+            for update in local_app_runtime_updates {
                 rpc_client
-                    .game_runtime_updated(context::current(), update)
+                    .app_runtime_updated(context::current(), update)
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!("Failed to send initial game runtime sync: {}", e)
+                        anyhow::anyhow!("Failed to send initial app runtime sync: {}", e)
                     })?;
             }
 
@@ -1056,7 +1056,7 @@ impl MeshInner {
                                 Message::PeerListSync(msg) => rpc_client.peer_list_sync(context::current(), msg).await,
                                 Message::PeerAdded(msg) => rpc_client.peer_added(context::current(), msg).await,
                                 Message::PeerRemoved(msg) => rpc_client.peer_removed(context::current(), msg).await,
-                                Message::GameRuntimeUpdated(msg) => rpc_client.game_runtime_updated(context::current(), msg).await,
+                                Message::AppRuntimeUpdated(msg) => rpc_client.app_runtime_updated(context::current(), msg).await,
                             };
                             if let Err(error) = send_result {
                                 tracing::warn!(region=%their_region, ?error, "RPC send failed");
@@ -1232,32 +1232,32 @@ impl MeshInner {
         }
     }
 
-    async fn handle_game_runtime_updated(&self, msg: GameRuntimeUpdateMessage) {
-        if self.remember_game_runtime_update(msg).await {
-            let _ = self.game_runtime_updates.send(msg);
+    async fn handle_app_runtime_updated(&self, msg: AppRuntimeUpdateMessage) {
+        if self.remember_app_runtime_update(msg).await {
+            let _ = self.app_runtime_updates.send(msg);
         }
     }
 
-    async fn replace_game_runtime_snapshot(&self, updates: Vec<GameRuntimeUpdateMessage>) {
+    async fn replace_app_runtime_snapshot(&self, updates: Vec<AppRuntimeUpdateMessage>) {
         let snapshot_ids = updates
             .iter()
-            .map(|update| update.game_id)
+            .map(|update| update.app_id)
             .collect::<HashSet<_>>();
-        let mut latest = self.latest_game_runtime_updates.lock().await;
-        latest.retain(|game_id, update| {
-            snapshot_ids.contains(game_id) || update.kind == GameRuntimeUpdateKind::Deleted
+        let mut latest = self.latest_app_runtime_updates.lock().await;
+        latest.retain(|app_id, update| {
+            snapshot_ids.contains(app_id) || update.kind == AppRuntimeUpdateKind::Deleted
         });
         for update in updates {
-            latest.insert(update.game_id, update);
+            latest.insert(update.app_id, update);
         }
     }
 
-    async fn remember_game_runtime_update(&self, update: GameRuntimeUpdateMessage) -> bool {
-        let mut latest = self.latest_game_runtime_updates.lock().await;
-        match latest.get(&update.game_id) {
+    async fn remember_app_runtime_update(&self, update: AppRuntimeUpdateMessage) -> bool {
+        let mut latest = self.latest_app_runtime_updates.lock().await;
+        match latest.get(&update.app_id) {
             Some(existing) if !update.supersedes(existing) => false,
             _ => {
-                latest.insert(update.game_id, update);
+                latest.insert(update.app_id, update);
                 true
             }
         }
@@ -1551,7 +1551,7 @@ impl MeshRpc for MeshRpcServer {
         self.inner.handle_peer_removed(msg).await;
     }
 
-    async fn game_runtime_updated(self, _: context::Context, msg: GameRuntimeUpdateMessage) {
-        self.inner.handle_game_runtime_updated(msg).await;
+    async fn app_runtime_updated(self, _: context::Context, msg: AppRuntimeUpdateMessage) {
+        self.inner.handle_app_runtime_updated(msg).await;
     }
 }

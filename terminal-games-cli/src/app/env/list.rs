@@ -3,15 +3,15 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use anyhow::Result;
-use terminal_games::control::AuthorEnvListResponse;
+use terminal_games::control::AppEnvListResponse;
 
-use super::super::AuthorEnvListArgs;
+use super::super::AppEnvListArgs;
 use crate::config::print_table;
-use crate::control_client::AuthorClient;
+use crate::control_client::AppClient;
 
-pub(super) async fn run(args: AuthorEnvListArgs) -> Result<()> {
-    let client = AuthorClient::from_target(&args.shortname, args.url.as_deref())?;
-    let response: AuthorEnvListResponse = client
+pub(super) async fn run(args: AppEnvListArgs, profile: Option<String>) -> Result<()> {
+    let client = AppClient::from_target(&args.shortname, profile.as_deref())?;
+    let response: AppEnvListResponse = client
         .rpc()
         .await?
         .env_list(terminal_games::control::rpc_context())

@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-pub use terminal_games_manifest::{GameDetails, GameManifest, MANIFEST_VERSION, Screenshot};
+pub use terminal_games_manifest::{AppDetails, AppManifest, MANIFEST_VERSION, Screenshot};
 use unicode_width::UnicodeWidthChar;
 use wasmparser::{Parser, Payload};
 
@@ -10,11 +10,11 @@ const MANIFEST_MARKER: &[u8] = br#""terminal_games_manifest_version""#;
 const SCREENSHOT_COLS: usize = 80;
 const SCREENSHOT_ROWS: usize = 24;
 
-pub fn validate_manifest(manifest: &GameManifest) -> anyhow::Result<()> {
-    terminal_games_manifest::GameManifest::validate(manifest).map_err(anyhow::Error::msg)
+pub fn validate_manifest(manifest: &AppManifest) -> anyhow::Result<()> {
+    terminal_games_manifest::AppManifest::validate(manifest).map_err(anyhow::Error::msg)
 }
 
-pub fn sanitize_manifest(manifest: &GameManifest) -> anyhow::Result<GameManifest> {
+pub fn sanitize_manifest(manifest: &AppManifest) -> anyhow::Result<AppManifest> {
     validate_manifest(manifest)?;
     let mut out = manifest.clone();
     out.details.author = sanitize_wrapped_text(&out.details.author);
@@ -37,7 +37,7 @@ pub fn sanitize_manifest(manifest: &GameManifest) -> anyhow::Result<GameManifest
     Ok(out)
 }
 
-pub fn extract_manifest_from_wasm(bytes: &[u8]) -> anyhow::Result<Option<GameManifest>> {
+pub fn extract_manifest_from_wasm(bytes: &[u8]) -> anyhow::Result<Option<AppManifest>> {
     for payload in Parser::new(0).parse_all(bytes) {
         match payload? {
             Payload::CustomSection(section) => {
@@ -59,7 +59,7 @@ pub fn extract_manifest_from_wasm(bytes: &[u8]) -> anyhow::Result<Option<GameMan
     Ok(None)
 }
 
-fn extract_manifest_from_blob(bytes: &[u8]) -> Option<GameManifest> {
+fn extract_manifest_from_blob(bytes: &[u8]) -> Option<AppManifest> {
     let mut marker_search_from = 0usize;
     while let Some(marker_pos) = find_subslice(bytes, MANIFEST_MARKER, marker_search_from) {
         marker_search_from = marker_pos + MANIFEST_MARKER.len();
@@ -69,7 +69,7 @@ fn extract_manifest_from_blob(bytes: &[u8]) -> Option<GameManifest> {
                 continue;
             }
             let mut stream =
-                serde_json::Deserializer::from_slice(&bytes[start..]).into_iter::<GameManifest>();
+                serde_json::Deserializer::from_slice(&bytes[start..]).into_iter::<AppManifest>();
             let Some(Ok(manifest)) = stream.next() else {
                 continue;
             };
