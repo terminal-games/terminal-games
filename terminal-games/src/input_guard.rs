@@ -7,25 +7,19 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use headless_terminal::{Color, Parser};
-use terminput::Event;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::terminal_profile::TerminalProfile;
 
-const FORWARD_CHANNEL_CAPACITY: usize = 12;
-const INITIAL_FUEL: i32 = 60;
-const FUEL_LOSS_PER_TICK: i32 = 1;
-const FUEL_GAIN_WITH_INPUT_PER_TICK: i32 = FUEL_LOSS_PER_TICK + 5;
-
 pub type TerminalParser = Parser;
 
 #[derive(Debug)]
-pub enum InputGuardError {
+pub enum InputForwardError {
     InputClosed,
 }
 
-impl fmt::Display for InputGuardError {
+impl fmt::Display for InputForwardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InputClosed => write!(f, "input channel closed"),
@@ -33,7 +27,7 @@ impl fmt::Display for InputGuardError {
     }
 }
 
-impl std::error::Error for InputGuardError {}
+impl std::error::Error for InputForwardError {}
 
 pub struct PendingInput {
     input_tx: mpsc::Sender<Bytes>,
@@ -41,62 +35,51 @@ pub struct PendingInput {
 }
 
 impl PendingInput {
-    pub fn try_send(self) -> Result<(), InputGuardError> {
+    pub fn try_send(self) -> Result<(), InputForwardError> {
         self.input_tx
             .try_send(self.data)
-            .map_err(|_| InputGuardError::InputClosed)
+            .map_err(|_| InputForwardError::InputClosed)
     }
 
-    pub async fn send(self) -> Result<(), InputGuardError> {
+    pub async fn send(self) -> Result<(), InputForwardError> {
         self.input_tx
             .send(self.data)
             .await
-            .map_err(|_| InputGuardError::InputClosed)
+            .map_err(|_| InputForwardError::InputClosed)
     }
 }
 
-pub struct InputGuard {
+pub struct InputForwarder {
     cancellation_token: CancellationToken,
     input_tx: mpsc::Sender<Bytes>,
     replay_request_tx: mpsc::Sender<()>,
-    fuel_tx: watch::Sender<i32>,
-    current_fuel: i32,
-    saw_input_this_tick: bool,
-    terminal_parser: Option<Parser>,
 }
 
-impl InputGuard {
+impl InputForwarder {
     pub fn new(
         cancellation_token: CancellationToken,
         replay_request_tx: mpsc::Sender<()>,
-    ) -> (Self, mpsc::Receiver<Bytes>, watch::Receiver<i32>) {
-        let (input_tx, input_rx) = mpsc::channel(FORWARD_CHANNEL_CAPACITY);
-        let (fuel_tx, fuel_rx) = watch::channel(INITIAL_FUEL);
+    ) -> (Self, mpsc::Receiver<Bytes>) {
+        let (input_tx, input_rx) = mpsc::channel(12);
         (
-            Self {
-                cancellation_token,
-                input_tx,
-                replay_request_tx,
-                fuel_tx,
-                current_fuel: INITIAL_FUEL,
-                saw_input_this_tick: false,
-                terminal_parser: Some(Parser::default()),
-            },
+            Self::new_with_sender(cancellation_token, input_tx, replay_request_tx),
             input_rx,
-            fuel_rx,
         )
     }
 
-    pub fn tick_interval() -> tokio::time::Interval {
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        tick
+    pub fn new_with_sender(
+        cancellation_token: CancellationToken,
+        input_tx: mpsc::Sender<Bytes>,
+        replay_request_tx: mpsc::Sender<()>,
+    ) -> Self {
+        Self {
+            cancellation_token,
+            input_tx,
+            replay_request_tx,
+        }
     }
 
-    pub fn prepare_input(&mut self, data: Bytes) -> PendingInput {
-        if let Some(parser) = &mut self.terminal_parser {
-            parser.process(&data);
-        }
+    pub fn prepare_input(&self, data: Bytes) -> PendingInput {
         self.observe_input(data.as_ref());
         PendingInput {
             input_tx: self.input_tx.clone(),
@@ -104,8 +87,31 @@ impl InputGuard {
         }
     }
 
-    pub async fn handle_input(&mut self, data: Bytes) -> Result<(), InputGuardError> {
-        self.prepare_input(data).send().await
+    fn observe_input(&self, data: &[u8]) {
+        if is_interrupt(data) {
+            self.cancellation_token.cancel();
+        }
+        if is_replay_request(data) {
+            let _ = self.replay_request_tx.try_send(());
+        }
+    }
+}
+
+pub struct TerminalBackgroundTracker {
+    parser: Parser,
+}
+
+impl Default for TerminalBackgroundTracker {
+    fn default() -> Self {
+        Self {
+            parser: Parser::default(),
+        }
+    }
+}
+
+impl TerminalBackgroundTracker {
+    pub fn observe(&mut self, data: &[u8]) {
+        self.parser.process(data);
     }
 
     pub fn terminal_profile(&self, profile: TerminalProfile) -> TerminalProfile {
@@ -116,27 +122,28 @@ impl InputGuard {
     pub async fn wait_for_terminal_background(
         &mut self,
         raw_input_rx: &mut mpsc::Receiver<Bytes>,
+        cancellation_token: &CancellationToken,
         timeout: Duration,
-    ) -> Result<Option<(u8, u8, u8)>, InputGuardError> {
+    ) -> Option<(u8, u8, u8)> {
         let deadline = tokio::time::Instant::now() + timeout;
         while self.terminal_background_rgb().is_none() {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
+            if remaining.is_zero() || cancellation_token.is_cancelled() {
                 break;
             }
-            match tokio::time::timeout(remaining, raw_input_rx.recv()).await {
-                Ok(Some(data)) => {
-                    let _ = self.prepare_input(data);
+            tokio::select! {
+                _ = cancellation_token.cancelled() => break,
+                result = tokio::time::timeout(remaining, raw_input_rx.recv()) => match result {
+                    Ok(Some(data)) => self.observe(data.as_ref()),
+                    _ => break,
                 }
-                _ => break,
             }
         }
-        Ok(self.terminal_background_rgb())
+        self.terminal_background_rgb()
     }
 
-    pub fn take_terminal_parser(&mut self, rows: u16, cols: u16) -> Parser {
+    pub fn into_terminal_parser(self, rows: u16, cols: u16) -> Parser {
         let background = self.terminal_background_rgb();
-        self.terminal_parser = None;
         let mut parser = Parser::default();
         parser.screen_mut().set_size(rows, cols);
         if let Some((r, g, b)) = background {
@@ -146,57 +153,11 @@ impl InputGuard {
         parser
     }
 
-    pub fn tick(&mut self) {
-        self.current_fuel = (self.current_fuel - FUEL_LOSS_PER_TICK
-            + if self.saw_input_this_tick {
-                FUEL_GAIN_WITH_INPUT_PER_TICK
-            } else {
-                0
-            })
-        .clamp(0, INITIAL_FUEL);
-        self.saw_input_this_tick = false;
-        let _ = self.fuel_tx.send(self.current_fuel);
-        if self.current_fuel == 0 {
-            self.cancellation_token.cancel();
-        }
-    }
-
-    pub fn is_idle_timed_out(&self) -> bool {
-        self.current_fuel == 0
-    }
-
-    fn observe_input(&mut self, data: &[u8]) {
-        if is_interrupt(data) {
-            self.cancellation_token.cancel();
-        }
-        if is_replay_request(data) {
-            let _ = self.replay_request_tx.try_send(());
-        }
-        if has_user_input(data) {
-            self.saw_input_this_tick = true;
-        }
-    }
-
     fn terminal_background_rgb(&self) -> Option<(u8, u8, u8)> {
-        match self
-            .terminal_parser
-            .as_ref()
-            .map(|parser| parser.screen().terminal_background())
-        {
-            Some(Some(Color::Rgb(r, g, b))) => Some((r, g, b)),
+        match self.parser.screen().terminal_background() {
+            Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
             _ => None,
         }
-    }
-}
-
-fn has_user_input(data: &[u8]) -> bool {
-    if data.starts_with(b"\x1b]") {
-        return false;
-    }
-    match Event::parse_from(data) {
-        Ok(Some(Event::Key(_) | Event::Mouse(_))) => true,
-        Ok(Some(_)) => false,
-        Ok(None) | Err(_) => false,
     }
 }
 

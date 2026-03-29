@@ -2,7 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -10,7 +13,7 @@ use prometheus::{
     Encoder, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder, core::Collector,
 };
 use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-use terminal_games::app::ActiveShortnameTracker;
+use terminal_games::app::{SessionAppState, SessionEndReason};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Transport {
@@ -63,13 +66,22 @@ struct DurationRecord {
     seconds: f64,
 }
 
-pub struct SessionGuard {
+#[derive(Clone)]
+pub struct SessionHandle {
     live_session: Arc<LiveSession>,
 }
 
-impl SessionGuard {
-    pub fn active_shortname_tracker(&self) -> Arc<dyn ActiveShortnameTracker> {
-        self.live_session.clone()
+impl SessionHandle {
+    pub fn set_active_app(&self, app: &SessionAppState) {
+        self.live_session.set_active_shortname(&app.shortname);
+    }
+
+    pub fn record_bytes(&self, direction: Direction, bytes: usize) {
+        self.live_session.record_bytes(direction, bytes);
+    }
+
+    pub fn finish(&self, reason: SessionEndReason) {
+        self.live_session.finish(reason);
     }
 }
 
@@ -85,24 +97,29 @@ struct LiveSession {
     authenticated: AuthKind,
     has_audio: bool,
     current: Mutex<Option<ActiveSegment>>,
+    finished: AtomicBool,
 }
 
 impl LiveSession {
     fn new(
         metrics: Arc<ServerMetrics>,
+        app: SessionAppState,
         user_id: Option<u64>,
         transport: Transport,
         authenticated: AuthKind,
         has_audio: bool,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let session = Arc::new(Self {
             metrics,
             user_id,
             transport,
             authenticated,
             has_audio,
             current: Mutex::new(None),
-        })
+            finished: AtomicBool::new(false),
+        });
+        session.set_active_shortname(&app.shortname);
+        session
     }
 
     fn segment_labels<'a>(&'a self, shortname: &'a str) -> [&'a str; 5] {
@@ -130,9 +147,7 @@ impl LiveSession {
         self.metrics
             .record_persisted_duration(self.user_id, &segment.shortname, elapsed);
     }
-}
 
-impl ActiveShortnameTracker for LiveSession {
     fn set_active_shortname(&self, shortname: &str) {
         let mut guard = match self.current.lock() {
             Ok(guard) => guard,
@@ -162,6 +177,33 @@ impl ActiveShortnameTracker for LiveSession {
             started_at: Instant::now(),
         });
     }
+
+    fn record_bytes(&self, direction: Direction, bytes: usize) {
+        self.metrics
+            .bytes_total
+            .with_label_values(&[
+                direction.as_str(),
+                self.metrics.region.as_str(),
+                self.transport.as_str(),
+            ])
+            .inc_by(bytes as u64);
+    }
+
+    fn finish(&self, reason: SessionEndReason) {
+        if self.finished.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.metrics
+            .session_ends_total
+            .with_label_values(&[
+                self.metrics.region.as_str(),
+                self.transport.as_str(),
+                self.authenticated.as_str(),
+                bool_label(self.has_audio),
+                reason.slug(),
+            ])
+            .inc();
+    }
 }
 
 impl Drop for LiveSession {
@@ -187,6 +229,7 @@ pub struct ServerMetrics {
     cluster_enforcement_total: IntCounterVec,
     active_sessions: IntGaugeVec,
     sessions_total: IntCounterVec,
+    session_ends_total: IntCounterVec,
     session_duration_seconds: GaugeVec,
     bytes_total: IntCounterVec,
     process_resident_memory_bytes: IntGaugeVec,
@@ -315,6 +358,22 @@ impl ServerMetrics {
                 ],
             )?,
         )?;
+        let session_ends_total = register(
+            &registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "terminal_games_session_ends_total",
+                    "Completed sessions grouped by session attributes and close reason",
+                ),
+                &[
+                    "region",
+                    "transport",
+                    "authenticated",
+                    "has_audio",
+                    "reason",
+                ],
+            )?,
+        )?;
         let session_duration_seconds = register(
             &registry,
             GaugeVec::new(
@@ -429,6 +488,7 @@ impl ServerMetrics {
             cluster_enforcement_total,
             active_sessions,
             sessions_total,
+            session_ends_total,
             session_duration_seconds,
             bytes_total,
             process_resident_memory_bytes,
@@ -516,13 +576,21 @@ impl ServerMetrics {
 
     pub fn start_session(
         self: &Arc<Self>,
+        app: SessionAppState,
         transport: Transport,
         authenticated: AuthKind,
         has_audio: bool,
         user_id: Option<u64>,
-    ) -> SessionGuard {
-        let session = LiveSession::new(self.clone(), user_id, transport, authenticated, has_audio);
-        SessionGuard {
+    ) -> SessionHandle {
+        let session = LiveSession::new(
+            self.clone(),
+            app,
+            user_id,
+            transport,
+            authenticated,
+            has_audio,
+        );
+        SessionHandle {
             live_session: session,
         }
     }
@@ -636,15 +704,15 @@ async fn persist_duration_record(db: &libsql::Connection, record: &DurationRecor
 
     let affected = tx
         .execute(
-            "UPDATE games
+            "UPDATE apps
              SET duration_seconds = duration_seconds + ?2
              WHERE shortname = ?1",
             libsql::params!(record.shortname.as_str(), record.seconds),
         )
         .await
-        .context("failed to update global game duration")?;
+        .context("failed to update global app duration")?;
     if affected == 0 {
-        tracing::warn!(shortname = %record.shortname, "no game row found while persisting duration");
+        tracing::warn!(shortname = %record.shortname, "no app row found while persisting duration");
     }
 
     if let Some(user_id) = record.user_id {
@@ -662,14 +730,14 @@ async fn persist_duration_record(db: &libsql::Connection, record: &DurationRecor
         }
 
         tx.execute(
-            "INSERT INTO user_game_durations (user_id, game_id, duration_seconds)
-             SELECT ?1, id, ?3 FROM games WHERE shortname = ?2
-             ON CONFLICT(user_id, game_id) DO UPDATE
-             SET duration_seconds = user_game_durations.duration_seconds + excluded.duration_seconds",
+            "INSERT INTO user_app_durations (user_id, app_id, duration_seconds)
+             SELECT ?1, id, ?3 FROM apps WHERE shortname = ?2
+             ON CONFLICT(user_id, app_id) DO UPDATE
+             SET duration_seconds = user_app_durations.duration_seconds + excluded.duration_seconds",
             libsql::params!(user_id, record.shortname.as_str(), record.seconds),
         )
         .await
-        .context("failed to upsert user game duration")?;
+        .context("failed to upsert user app duration")?;
     }
 
     tx.commit()
@@ -681,13 +749,13 @@ async fn persist_duration_record(db: &libsql::Connection, record: &DurationRecor
 async fn load_persisted_shortname_durations(db: &libsql::Connection) -> Result<Vec<(String, f64)>> {
     let mut rows = db
         .query(
-            "SELECT shortname, duration_seconds
-             FROM games
+            "SELECT shortname, CAST(duration_seconds AS REAL)
+             FROM apps
              WHERE duration_seconds > 0",
             (),
         )
         .await
-        .context("failed to load persisted game durations")?;
+        .context("failed to load persisted app durations")?;
 
     let mut durations = Vec::new();
     while let Some(row) = rows.next().await.context("failed to read duration row")? {

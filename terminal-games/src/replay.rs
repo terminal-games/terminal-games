@@ -4,10 +4,10 @@
 
 use std::{
     collections::VecDeque,
-    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
+use bytes::Bytes;
 use serde::Serialize;
 
 use crate::mesh::AppId;
@@ -16,7 +16,7 @@ const REPLAY_DURATION: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub enum ReplayEvent {
-    Output(Arc<Vec<u8>>),
+    Output(Bytes),
     Resize { cols: u16, rows: u16 },
     AppSwitch { app_id: AppId, shortname: String },
 }
@@ -33,6 +33,17 @@ pub struct ReplayBuffer {
     initial_shortname: String,
     initial_app_id: AppId,
     term_type: Option<String>,
+}
+
+pub struct ReplayTerminalSnapshot {
+    pub cols: u16,
+    pub rows: u16,
+    pub dump: String,
+}
+
+pub struct ReplayTerminalSnapshotCapture {
+    pub snapshot: ReplayTerminalSnapshot,
+    pub output_sequence_cutoff: u64,
 }
 
 #[derive(Serialize)]
@@ -71,7 +82,7 @@ impl ReplayBuffer {
         }
     }
 
-    pub fn push_output(&mut self, data: Arc<Vec<u8>>) {
+    pub fn push_output(&mut self, data: Bytes) {
         let now = Instant::now();
         self.prune(now);
         self.events.push_back(TimestampedEvent {
@@ -125,6 +136,38 @@ impl ReplayBuffer {
                 }
             }
             self.vt_timestamp = Some(event.timestamp);
+        }
+    }
+
+    pub fn terminal_snapshot(&self) -> ReplayTerminalSnapshot {
+        let (cols, rows) = self.vt.size();
+        let mut vt = avt::Vt::new(cols.max(1), rows.max(1));
+        let dump = self.vt.dump();
+        if !dump.is_empty() {
+            vt.feed_str(&dump);
+        }
+        for event in &self.events {
+            if self
+                .vt_timestamp
+                .is_some_and(|timestamp| event.timestamp <= timestamp)
+            {
+                continue;
+            }
+            match &event.event {
+                ReplayEvent::Output(data) => {
+                    vt.feed_str(&String::from_utf8_lossy(data));
+                }
+                ReplayEvent::Resize { cols, rows } => {
+                    vt.resize((*cols as usize).max(1), (*rows as usize).max(1));
+                }
+                ReplayEvent::AppSwitch { .. } => {}
+            }
+        }
+        let (cols, rows) = vt.size();
+        ReplayTerminalSnapshot {
+            cols: cols as u16,
+            rows: rows as u16,
+            dump: vt.dump(),
         }
     }
 

@@ -10,9 +10,11 @@ audiopus_sys = { version = "0.2", features = ["static"] }
 avt = "0.17"
 base64 = "0.22"
 bytes = "1"
+chacha20poly1305 = "0.10"
 futures = "0.3"
 headless-terminal = { path = "../headless-terminal" }
 hex = "0.4"
+hkdf = "0.12"
 ipnet = "2"
 libc = "0.2"
 libsql = "0.9"
@@ -25,10 +27,13 @@ rustls-pemfile = "2"
 rustls-platform-verifier = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 smallvec = "1"
 strip-ansi-escapes = "0.2"
 tarpc = { version = "0.37", features = ["serde", "serde-transport", "serde-transport-bincode", "tokio1"] }
+terminal-games-manifest = { path = "../terminal-games-manifest" }
 terminput = "0.5"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12",] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -37,5 +42,6 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
+wasmparser = "0.245"
 wasmtime = { version = "42", features = ["call-hook"] }
 wasmtime-wasi = { version = "42", default-features = false, features = ["p1"] }

@@ -1,5 +1,8 @@
 {
   "terminal_games_manifest_version": 1,
   "shortname": "menu",
-  "details": {}
+  "details": {
+    "author": "Terminal Games",
+    "version": "builtin"
+  }
 }

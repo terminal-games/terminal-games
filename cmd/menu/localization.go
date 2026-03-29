@@ -146,7 +146,7 @@ func (l localizer) Text(key textKey) string {
 		case textHelpPrevTab:
 			return "voriger Tab"
 		case textGamesListTitle:
-			return "Offizielle Spiele"
+			return "Alle Spiele"
 		case textGamesNoMatch:
 			return "Keine Spiele entsprechen dem aktuellen Filter."
 		case textCarouselScreenshots:
@@ -249,7 +249,7 @@ func (l localizer) Text(key textKey) string {
 	case textHelpPrevTab:
 		return "prev tab"
 	case textGamesListTitle:
-		return "Official Games"
+		return "All Games"
 	case textGamesNoMatch:
 		return "No games match the current filter."
 	case textCarouselScreenshots:

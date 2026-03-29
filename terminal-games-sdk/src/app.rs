@@ -64,6 +64,11 @@ pub fn graceful_shutdown_poll() -> bool {
     return unsafe { crate::internal::graceful_shutdown_poll() } > 0;
 }
 
+/// Polls whether a newer uploaded version of the current app is available.
+pub fn is_new_version_available() -> bool {
+    (unsafe { crate::internal::new_version_available_poll() }) > 0
+}
+
 /// Information about the current session's network connection to the host.
 #[derive(Debug, Clone)]
 pub struct NetworkInfo {

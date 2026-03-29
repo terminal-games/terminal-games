@@ -12,6 +12,7 @@ pub mod terminal;
 #[cfg(feature = "network")]
 pub mod network;
 
+pub use terminal_games_manifest as manifest;
 pub use terminput;
 
 mod internal {
@@ -24,6 +25,7 @@ mod internal {
         pub(crate) fn change_app(address_ptr: *const u8, address_len: u32) -> i32;
         pub(crate) fn next_app_ready() -> i32;
         pub(crate) fn graceful_shutdown_poll() -> i32;
+        pub(crate) fn new_version_available_poll() -> i32;
 
         #[cfg(feature = "network")]
         pub(crate) fn dial(address_ptr: *const u8, address_len: u32, mode: u32) -> i32;

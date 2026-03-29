@@ -1,0 +1,955 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+use std::{
+    fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{Context as _, Result};
+use bytes::Bytes;
+use clap::Args;
+use clap_complete::{ArgValueCompleter, PathCompleter};
+use flate2::{Compression, write::DeflateEncoder};
+use rand::Rng;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
+use terminput::{Event as TerminputEvent, KeyCode, KeyEventKind, KeyModifiers};
+use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, layer::SubscriberExt};
+
+use terminal_games::{
+    app::{AppInstantiationParams, AppServer, SessionIdentity, SessionOutput, SessionUi},
+    app_env::{encrypt_app_env_blob, validate_app_envs},
+    control::{AppEnvVar, StatusBarState},
+    input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker},
+    log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
+    mesh::AppRuntimeUpdateMessage,
+    mesh::{BuildId, LocalDiscovery, Mesh},
+    rate_limiting::{NetworkInformation, RateLimitedStream},
+    terminal_profile::TerminalProfile,
+};
+
+use crate::app::load_upload_envs;
+use crate::audio;
+use crate::config::load_or_create_app_env_secret_key;
+
+#[derive(Args)]
+pub(crate) struct RunArgs {
+    /// Path to the wasm file to run
+    #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
+    pub(crate) wasm_file: Option<String>,
+
+    /// Additional apps in shortname=path format
+    #[arg(short, long = "app", value_name = "SHORTNAME=PATH")]
+    apps: Vec<String>,
+
+    /// Set env vars for the primary wasm app. Repeat as needed.
+    #[arg(short = 'e', long = "env", value_name = "NAME=VALUE")]
+    env: Vec<String>,
+
+    /// Load env vars for the primary wasm app from a dotenv-style file.
+    #[arg(long = "env-file", add = ArgValueCompleter::new(PathCompleter::file()))]
+    env_file: Option<PathBuf>,
+
+    /// Enable flate2 compression on output
+    #[arg(short = 'C', long)]
+    compress: bool,
+
+    /// Simulated network latency in milliseconds
+    #[arg(long, default_value = "0")]
+    latency: u64,
+
+    /// Simulated latency jitter in milliseconds (±)
+    #[arg(long, default_value = "0")]
+    jitter: u64,
+
+    /// Bandwidth token bucket refill rate in bytes per second
+    #[arg(long, default_value = "65536")]
+    bandwidth: u64,
+
+    /// Bandwidth token bucket capacity in bytes
+    #[arg(long, default_value = "131072")]
+    bandwidth_capacity: u64,
+
+    /// Disable audio playback
+    #[arg(long)]
+    no_audio: bool,
+
+    /// Log level for the app
+    #[arg(long = "app-log-level", default_value = "info")]
+    app_log_level: LogLevelFilter,
+
+    /// Log level for the platform
+    #[arg(long = "platform-log-level", default_value = "warn")]
+    platform_log_level: LogLevelFilter,
+
+    /// Username for CLI auth [default: $USER]
+    #[arg(long)]
+    username: Option<String>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum LogLevelFilter {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<LogLevelFilter> for tracing_subscriber::filter::LevelFilter {
+    fn from(f: LogLevelFilter) -> Self {
+        use tracing_subscriber::filter::LevelFilter;
+        match f {
+            LogLevelFilter::Off => LevelFilter::OFF,
+            LogLevelFilter::Error => LevelFilter::ERROR,
+            LogLevelFilter::Warn => LevelFilter::WARN,
+            LogLevelFilter::Info => LevelFilter::INFO,
+            LogLevelFilter::Debug => LevelFilter::DEBUG,
+            LogLevelFilter::Trace => LevelFilter::TRACE,
+        }
+    }
+}
+
+impl LogLevelFilter {
+    fn allows(self, level: LogLevel) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Error => level >= LogLevel::Error,
+            Self::Warn => level >= LogLevel::Warn,
+            Self::Info => level >= LogLevel::Info,
+            Self::Debug => level >= LogLevel::Debug,
+            Self::Trace => true,
+        }
+    }
+}
+
+struct BufferedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+struct FlushGuard(Arc<Mutex<Vec<u8>>>);
+
+impl BufferedLogWriter {
+    fn new() -> (Self, FlushGuard) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        (Self(buf.clone()), FlushGuard(buf))
+    }
+
+    fn append(&self, buf: &[u8]) {
+        let mut locked = match self.0.lock() {
+            Ok(locked) => locked,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        locked.extend_from_slice(buf);
+    }
+}
+
+impl Clone for BufferedLogWriter {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        let logs = match self.0.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let _ = std::io::stderr().write_all(&logs);
+    }
+}
+
+impl Write for BufferedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.append(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CliTimer;
+
+impl FormatTime for CliTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let (h, m, s) = (
+            (t.as_secs() / 3600) % 24,
+            (t.as_secs() / 60) % 60,
+            t.as_secs() % 60,
+        );
+        write!(w, "{h:02}:{m:02}:{s:02}.{:06} ", t.subsec_micros())
+    }
+}
+
+struct CliLogBackend {
+    level_filter: LogLevelFilter,
+    writer: BufferedLogWriter,
+}
+
+const DIM: &str = "\x1b[2m";
+const ITALIC: &str = "\x1b[3m";
+const PURPLE: &str = "\x1b[35m";
+const BLUE: &str = "\x1b[34m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
+
+impl GuestLogBackend for CliLogBackend {
+    fn log(&self, shortname: &str, _: Option<u64>, record: &GuestLogRecord) {
+        if !self.level_filter.allows(record.level) {
+            return;
+        }
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let ts = format!(
+            "{:02}:{:02}:{:02}.{:06}",
+            (t.as_secs() / 3600) % 24,
+            (t.as_secs() / 60) % 60,
+            t.as_secs() % 60,
+            t.subsec_micros()
+        );
+        let (level_color, level) = match record.level {
+            LogLevel::Error => (RED, "ERROR"),
+            LogLevel::Warn => (YELLOW, "WARN "),
+            LogLevel::Info => (GREEN, "INFO "),
+            LogLevel::Debug => (BLUE, "DEBUG"),
+            LogLevel::Trace => (PURPLE, "TRACE"),
+        };
+        let loc = record
+            .file
+            .as_ref()
+            .map(|f| match record.line {
+                Some(l) => format!("{f}:{l}: "),
+                None => format!("{f}: "),
+            })
+            .unwrap_or_default();
+        let attrs: Vec<_> = record
+            .attributes
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "shortname" | "module_path" | "file" | "line"))
+            .map(|(k, v)| {
+                format!(
+                    "{ITALIC}{k}{RESET}={}",
+                    v.as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| v.to_string())
+                )
+            })
+            .collect();
+        let attrs_str = if attrs.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", attrs.join(" "))
+        };
+        let line = format!(
+            "{DIM}{ts}{RESET} {level_color}{level}{RESET} {shortname}: {DIM}{loc}{RESET}{}{attrs_str}\n",
+            record.message
+        );
+        self.writer.append(line.as_bytes());
+    }
+}
+
+struct NullSink;
+
+impl AsyncWrite for NullSink {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn compute_jittered_latency(latency_ms: u64, jitter_ms: u64) -> Duration {
+    if latency_ms == 0 && jitter_ms == 0 {
+        return Duration::ZERO;
+    }
+    let jitter = if jitter_ms > 0 {
+        let mut rng = rand::rng();
+        rng.random_range(0..=jitter_ms * 2) as i64 - jitter_ms as i64
+    } else {
+        0
+    };
+    Duration::from_millis((latency_ms as i64 + jitter).max(0) as u64)
+}
+
+fn should_force_exit(data: &[u8]) -> bool {
+    if data.contains(&b'\x03') {
+        return true;
+    }
+    matches!(
+        TerminputEvent::parse_from(data),
+        Ok(Some(TerminputEvent::Key(key)))
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && key.modifiers.contains(KeyModifiers::CTRL)
+                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+    )
+}
+
+fn restore_terminal(stdout: &mut std::io::Stdout) -> Result<()> {
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show,
+    )?;
+    crossterm::terminal::disable_raw_mode()?;
+    Ok(())
+}
+
+async fn upsert_game(
+    conn: &libsql::Connection,
+    app_env_secret_key: &str,
+    shortname: &str,
+    path: &str,
+    details: &str,
+    envs: &[AppEnvVar],
+) -> Result<Option<AppRuntimeUpdateMessage>> {
+    let wasm = fs::read(path).with_context(|| format!("Failed to read wasm for {shortname}"))?;
+    let build_id = BuildId::from_wasm_and_envs(&wasm, envs);
+    let encrypted_env = encrypt_app_env_blob(app_env_secret_key, envs)?;
+    let tx = conn.transaction().await?;
+    let mut rows = tx
+        .query(
+            "SELECT id, wasm_hash, env_hash FROM apps WHERE shortname = ?1 LIMIT 1",
+            libsql::params!(shortname),
+        )
+        .await
+        .with_context(|| format!("Failed to query existing app {shortname}"))?;
+    let update = if let Some(row) = rows.next().await? {
+        let app_id = row.get::<u64>(0)?;
+        let existing_build_id =
+            BuildId::from_hash_slices(&row.get::<Vec<u8>>(1)?, &row.get::<Vec<u8>>(2)?)?;
+        if existing_build_id == build_id {
+            tx.execute(
+                "UPDATE apps
+                 SET details = json(?2),
+                     wasm = ?3,
+                     wasm_hash = ?4,
+                     env_hash = ?5,
+                     env_salt = ?6,
+                     env_blob = ?7
+                 WHERE id = ?1",
+                libsql::params!(
+                    app_id,
+                    details,
+                    wasm,
+                    build_id.wasm_hash.to_vec(),
+                    build_id.env_hash.to_vec(),
+                    encrypted_env.salt,
+                    encrypted_env.ciphertext
+                ),
+            )
+            .await
+            .with_context(|| format!("Failed to refresh app metadata {shortname}"))?;
+            None
+        } else {
+            let updated_at_ns = current_unix_nanos();
+            tx.execute(
+                "UPDATE apps
+                 SET wasm = ?2,
+                     details = json(?3),
+                     wasm_hash = ?4,
+                     env_hash = ?5,
+                     env_salt = ?6,
+                     env_blob = ?7,
+                     build_updated_at = ?8
+                 WHERE id = ?1",
+                libsql::params!(
+                    app_id,
+                    wasm,
+                    details,
+                    build_id.wasm_hash.to_vec(),
+                    build_id.env_hash.to_vec(),
+                    encrypted_env.salt,
+                    encrypted_env.ciphertext,
+                    updated_at_ns
+                ),
+            )
+            .await
+            .with_context(|| format!("Failed to update app {shortname}"))?;
+            Some(AppRuntimeUpdateMessage::published(
+                app_id,
+                build_id,
+                updated_at_ns,
+            ))
+        }
+    } else {
+        let updated_at_ns = current_unix_nanos();
+        tx.execute(
+            "INSERT INTO apps (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
+             VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)",
+            libsql::params!(
+                shortname,
+                wasm,
+                details,
+                build_id.wasm_hash.to_vec(),
+                build_id.env_hash.to_vec(),
+                encrypted_env.salt,
+                encrypted_env.ciphertext,
+                updated_at_ns
+            ),
+        )
+        .await
+        .with_context(|| format!("Failed to insert app {shortname}"))?;
+        let mut id_rows = tx.query("SELECT last_insert_rowid()", ()).await?;
+        let app_id = id_rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("missing last_insert_rowid"))?
+            .get::<u64>(0)?;
+        Some(AppRuntimeUpdateMessage::published(
+            app_id,
+            build_id,
+            updated_at_ns,
+        ))
+    };
+    tx.commit().await?;
+    Ok(update)
+}
+
+async fn load_local_app_build_snapshot(
+    conn: &libsql::Connection,
+) -> Result<Vec<AppRuntimeUpdateMessage>> {
+    let mut updates = Vec::new();
+    let mut game_rows = conn
+        .query(
+            "SELECT id, wasm_hash, env_hash, build_updated_at FROM apps",
+            (),
+        )
+        .await
+        .context("Failed to query local app builds")?;
+    while let Some(row) = game_rows.next().await? {
+        updates.push(AppRuntimeUpdateMessage::published(
+            row.get::<u64>(0)?,
+            BuildId::from_hash_slices(&row.get::<Vec<u8>>(1)?, &row.get::<Vec<u8>>(2)?)?,
+            row.get::<i64>(3)?,
+        ));
+    }
+
+    Ok(updates)
+}
+
+fn current_unix_nanos() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64
+}
+
+async fn sync_local_app_build_snapshot(
+    conn: &libsql::Connection,
+    app_server: &AppServer,
+    mesh: &Mesh,
+) -> Result<()> {
+    let snapshot = load_local_app_build_snapshot(conn).await?;
+    app_server.app_registry().sync_snapshot(snapshot.clone());
+    mesh.replace_app_runtime_snapshot(snapshot).await;
+    Ok(())
+}
+
+pub(crate) async fn run(args: RunArgs) -> Result<()> {
+    let wasm_file = args
+        .wasm_file
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("missing wasm file"))?;
+    let app_env_secret_key = load_or_create_app_env_secret_key()?;
+    let primary_envs = load_upload_envs(&args.env, args.env_file.as_deref())?.unwrap_or_default();
+    validate_app_envs(&primary_envs)?;
+
+    let (log_writer, _flush_guard) = BufferedLogWriter::new();
+    let platform_filter: LevelFilter = args.platform_log_level.into();
+    let filter = tracing_subscriber::filter::Targets::new()
+        .with_target("terminal_games", platform_filter)
+        .with_target("terminal_games_cli", platform_filter)
+        .with_default(LevelFilter::OFF);
+    let log_writer_for_sub = log_writer.clone();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .compact()
+            .with_ansi(true)
+            .with_timer(CliTimer)
+            .with_writer(move || log_writer_for_sub.clone())
+            .with_filter(filter),
+    );
+    tracing::subscriber::set_global_default(subscriber)?;
+    let guest_log_backend = Arc::new(CliLogBackend {
+        level_filter: args.app_log_level,
+        writer: log_writer,
+    });
+
+    let data_dir = dirs::data_dir()
+        .expect("Failed to determine data directory")
+        .join("terminal-games-cli");
+    std::fs::create_dir_all(&data_dir)?;
+    let db_path = data_dir.join("terminal-games.db");
+
+    let db = libsql::Builder::new_local(&db_path)
+        .build()
+        .await
+        .context("Failed to initialize local libsql client")?;
+
+    let conn = db
+        .connect()
+        .context("Failed to connect to local database")?;
+
+    let tx = conn
+        .transaction()
+        .await
+        .context("Failed to start migration transaction")?;
+    tx.execute_batch(include_str!("../../terminal-games/libsql/migrate-001.sql"))
+        .await
+        .context("Failed to run migrate-001.sql")?;
+    tx.commit()
+        .await
+        .context("Failed to commit migration transaction")?;
+
+    let wasm_path = Path::new(wasm_file)
+        .canonicalize()
+        .context("Failed to resolve wasm file path")?
+        .display()
+        .to_string();
+    let first_app_shortname = Path::new(&wasm_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("app")
+        .to_string();
+    let default_details = |shortname: &str| {
+        format!(
+            r#"{{"author":"Local","version":"dev","name":{{"en":"{shortname}"}},"description":{{"en":""}},"details":{{"en":""}},"screenshots":{{}}}}"#
+        )
+    };
+
+    let mut local_app_updates = Vec::new();
+    if let Some(update) = upsert_game(
+        &conn,
+        &app_env_secret_key,
+        first_app_shortname.as_str(),
+        wasm_path.as_str(),
+        default_details(first_app_shortname.as_str()).as_str(),
+        &primary_envs,
+    )
+    .await?
+    {
+        local_app_updates.push(update);
+    }
+
+    for app in &args.apps {
+        if let Some((shortname, path)) = app.split_once('=') {
+            let path = Path::new(path)
+                .canonicalize()
+                .context("Failed to resolve app path")?
+                .display()
+                .to_string();
+            if let Some(update) = upsert_game(
+                &conn,
+                &app_env_secret_key,
+                shortname,
+                path.as_str(),
+                default_details(shortname).as_str(),
+                &[],
+            )
+            .await?
+            {
+                local_app_updates.push(update);
+            }
+        }
+    }
+
+    let username = args
+        .username
+        .clone()
+        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "cli".to_string()));
+    let user_id = match conn
+        .query(
+            "SELECT id FROM users WHERE username = ?1 AND pubkey_fingerprint IS NULL LIMIT 1",
+            libsql::params!(username.as_str()),
+        )
+        .await
+    {
+        Ok(mut rows) => match rows.next().await {
+            Ok(Some(row)) => row.get::<u64>(0).ok(),
+            _ => None,
+        },
+        Err(_) => None,
+    };
+    let user_id = if user_id.is_none() {
+        match conn
+            .query(
+                "INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (NULL, ?1, 'en') RETURNING id",
+                libsql::params!(username.as_str()),
+            )
+            .await
+        {
+            Ok(mut rows) => match rows.next().await {
+                Ok(Some(row)) => row.get::<u64>(0).ok(),
+                _ => None,
+            },
+            Err(_) => None,
+        }
+    } else {
+        user_id
+    };
+    let locale = if let Some(uid) = user_id {
+        match conn
+            .query(
+                "SELECT locale FROM users WHERE id = ?1 LIMIT 1",
+                libsql::params!(uid),
+            )
+            .await
+        {
+            Ok(mut rows) => match rows.next().await {
+                Ok(Some(row)) => row.get::<String>(0).unwrap_or_else(|_| "en".to_string()),
+                _ => "en".to_string(),
+            },
+            Err(_) => "en".to_string(),
+        }
+    } else {
+        "en".to_string()
+    };
+
+    let local_discovery = Arc::new(LocalDiscovery::new());
+    let region = local_discovery
+        .allocate_region()
+        .expect("Failed to allocate region");
+    let mesh = Mesh::with_region(local_discovery.clone(), region);
+    let local_addr = mesh
+        .serve_on(([127, 0, 0, 1], 0).into())
+        .await
+        .expect("Failed to start mesh server");
+    local_discovery
+        .register(region, local_addr.port())
+        .await
+        .expect("Failed to register with local discovery");
+    mesh.start_discovery().await?;
+
+    let app_server = Arc::new(AppServer::new(
+        mesh.clone(),
+        conn,
+        app_env_secret_key.clone(),
+    )?);
+    let graceful_shutdown_token = CancellationToken::new();
+    {
+        let app_server = app_server.clone();
+        let mesh = mesh.clone();
+        let mut updates = mesh.subscribe_app_runtime_updates();
+        let graceful_shutdown_token = graceful_shutdown_token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = graceful_shutdown_token.cancelled() => break,
+                    result = updates.recv() => match result {
+                        Ok(update) => {
+                            let _ = app_server.app_registry().apply_update(update);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "lagged mesh app runtime updates");
+                            if let Err(error) =
+                                sync_local_app_build_snapshot(&app_server.db, &app_server, &mesh).await
+                            {
+                                tracing::warn!(
+                                    error = ?error,
+                                    "failed to resync local app runtime snapshot after lag"
+                                );
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        });
+    }
+    for update in local_app_updates {
+        let _ = app_server.app_registry().apply_update(update);
+        mesh.propagate_app_runtime_update(update).await;
+    }
+    sync_local_app_build_snapshot(&app_server.db, &app_server, &mesh).await?;
+
+    let mut stdout = std::io::stdout();
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::cursor::Hide
+    )?;
+
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<SessionOutput>(1);
+    let (resize_tx, resize_rx) = tokio::sync::watch::channel(crossterm::terminal::size()?);
+    let mut background_tracker = TerminalBackgroundTracker::default();
+    let (raw_input_tx, mut raw_input_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+    let (_snapshot_tx, snapshot_rx) = tokio::sync::mpsc::channel(1);
+    let network_info = Arc::new(NetworkInformation::new_simulated(args.latency));
+    let compress = args.compress;
+    let bandwidth = args.bandwidth;
+    let bandwidth_capacity = args.bandwidth_capacity;
+    let latency = args.latency;
+    let jitter = args.jitter;
+    let audio_enabled = !args.no_audio;
+
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let audio_player = if audio_enabled {
+        match audio::spawn_audio_player() {
+            Ok(player) => Some(player),
+            Err(e) => {
+                tracing::error!(?e, "Failed to initialize audio");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+    let colorterm = std::env::var("COLORTERM").ok();
+
+    let stdin_shutdown_token = graceful_shutdown_token.clone();
+    thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.lock().read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if should_force_exit(&buf[..n]) {
+                        stdin_shutdown_token.cancel();
+                        break;
+                    }
+                    if raw_input_tx
+                        .blocking_send(Bytes::copy_from_slice(&buf[..n]))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut terminal_profile = TerminalProfile::from_term(Some(&term), colorterm.as_deref());
+    stdout.write_all(b"\x1b]11;?\x07")?;
+    stdout.flush()?;
+    if let Some(rgb) = background_tracker
+        .wait_for_terminal_background(
+            &mut raw_input_rx,
+            &graceful_shutdown_token,
+            Duration::from_millis(500),
+        )
+        .await
+    {
+        terminal_profile = terminal_profile.with_background_rgb(rgb);
+    }
+    if graceful_shutdown_token.is_cancelled() {
+        restore_terminal(&mut stdout)?;
+        let _ = local_discovery.unregister().await;
+        mesh.graceful_shutdown().await;
+        return Ok(());
+    }
+    let (first_cols, first_rows) = *resize_rx.borrow();
+    let terminal_parser = background_tracker.into_terminal_parser(first_rows, first_cols);
+    let (_status_bar_state_tx, status_bar_state_rx) =
+        tokio::sync::watch::channel(StatusBarState::default());
+    let session_identity = SessionIdentity::new(username.clone(), first_app_shortname);
+    let session_ui = SessionUi::new(status_bar_state_rx);
+    let (app_input_tx, app_input_rx) = tokio::sync::mpsc::channel::<Bytes>(12);
+    let (replay_request_tx, replay_request_rx) = tokio::sync::mpsc::channel(1);
+    let input_forwarder = InputForwarder::new_with_sender(
+        graceful_shutdown_token.clone(),
+        app_input_tx,
+        replay_request_tx,
+    );
+
+    let mut exit_rx = app_server.instantiate_app(AppInstantiationParams {
+        args: None,
+        input_receiver: app_input_rx,
+        replay_request_receiver: replay_request_rx,
+        spy_snapshot_requests: snapshot_rx,
+        output_sender: output_tx,
+        audio_sender: audio_player.as_ref().map(|_| audio_tx),
+        remote_sshid: "cli".to_string(),
+        term: Some(term.clone()),
+        session_identity,
+        session_ui,
+        window_size_receiver: resize_rx,
+        graceful_shutdown_token: graceful_shutdown_token.clone(),
+        network_info: network_info.clone(),
+        terminal_profile,
+        terminal_parser,
+        user_id,
+        locale,
+        log_backend: guest_log_backend,
+    });
+    let mut pending_input: Option<
+        Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>,
+    > = None;
+    let mut shutdown_started = false;
+
+    let mut sigwinch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())?;
+
+    enum DelayedData {
+        Terminal { raw: Bytes, metered: Bytes },
+        Audio(Vec<u8>),
+    }
+
+    let (delayed_tx, mut delayed_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        let mut rate_limited = RateLimitedStream::with_rate(
+            NullSink,
+            network_info.clone(),
+            bandwidth,
+            bandwidth_capacity,
+        );
+        let mut stdout = std::io::stdout();
+
+        while let Some((data, deliver_at, delay_ms)) = delayed_rx.recv().await {
+            tokio::time::sleep_until(deliver_at).await;
+            network_info.set_simulated_latency(delay_ms);
+
+            match data {
+                DelayedData::Terminal { raw, metered } => {
+                    if rate_limited.write_all(&metered).await.is_err() {
+                        break;
+                    }
+                    if stdout.write_all(&raw).is_err() || stdout.flush().is_err() {
+                        break;
+                    }
+                }
+                DelayedData::Audio(audio_data) => {
+                    if rate_limited.write_all(&audio_data).await.is_err() {
+                        break;
+                    }
+                    if let Some(ref player) = audio_player {
+                        player.push_audio(audio_data);
+                    }
+                }
+            }
+        }
+    });
+
+    let mut app_error = None;
+    loop {
+        tokio::select! {
+            biased;
+
+            exit_code = &mut exit_rx => {
+                match exit_code {
+                    Ok(Ok(exit_code)) => {
+                        tracing::trace!(?exit_code, "App exited");
+                    }
+                    Ok(Err(error)) => {
+                        tracing::error!(error = %error, "App exited with error");
+                        app_error = Some(anyhow::Error::new(error));
+                    }
+                    Err(error) => {
+                        tracing::error!(?error, "App exit channel dropped");
+                        app_error = Some(anyhow::anyhow!("app exit channel dropped"));
+                    }
+                }
+                break;
+            }
+
+            _ = graceful_shutdown_token.cancelled(), if !shutdown_started => {
+                shutdown_started = true;
+                pending_input = None;
+            }
+
+            _ = async {
+                tokio::select! {
+                    _ = sigint.recv() => {}
+                    _ = sigterm.recv() => {}
+                    _ = sigquit.recv() => {}
+                }
+            } => {
+                graceful_shutdown_token.cancel();
+            }
+
+            result = async {
+                pending_input.as_mut().expect("guarded by select").await
+            }, if pending_input.is_some() => {
+                if result.is_err() {
+                    break;
+                }
+                pending_input = None;
+            }
+
+            data = raw_input_rx.recv(), if pending_input.is_none() && !shutdown_started => {
+                let Some(data) = data else { break };
+                pending_input = Some(Box::pin(input_forwarder.prepare_input(data).send()));
+            }
+
+            data = audio_rx.recv(), if audio_enabled => {
+                let Some(data) = data else { break };
+
+                let delay = compute_jittered_latency(latency, jitter);
+                let delay_ms = delay.as_millis() as u64;
+                let deliver_at = tokio::time::Instant::now() + delay;
+
+                let _ = delayed_tx.send((DelayedData::Audio(data), deliver_at, delay_ms));
+            }
+
+            data = output_rx.recv() => {
+                let Some(data) = data else { break };
+
+                let delay = compute_jittered_latency(latency, jitter);
+                let delay_ms = delay.as_millis() as u64;
+                let deliver_at = tokio::time::Instant::now() + delay;
+
+                let metered_data = if compress {
+                    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+                    encoder.write_all(&data.data).ok();
+                    Bytes::from(encoder.finish().unwrap_or_default())
+                } else {
+                    data.data.clone()
+                };
+
+                let _ = delayed_tx.send((DelayedData::Terminal { raw: data.data, metered: metered_data }, deliver_at, delay_ms));
+            }
+
+            _ = sigwinch.recv() => {
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    let _ = resize_tx.send((cols, rows));
+                }
+            }
+        }
+    }
+
+    restore_terminal(&mut stdout)?;
+
+    let _ = local_discovery.unregister().await;
+    mesh.graceful_shutdown().await;
+
+    if let Some(error) = app_error {
+        return Err(error);
+    }
+
+    Ok(())
+}

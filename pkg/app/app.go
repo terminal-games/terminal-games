@@ -33,6 +33,10 @@ func next_app_ready() int32
 //go:noescape
 func graceful_shutdown_poll() int32
 
+//go:wasmimport terminal_games new_version_available_poll
+//go:noescape
+func new_version_available_poll() int32
+
 // Change asks the host to switch to another app identified by its shortname.
 // The current guest should exit after calling this function so the host can
 // start the next app.
@@ -79,6 +83,11 @@ func Ready() (bool, error) {
 // before the host forces a hard shutdown.
 func GracefulShutdownPoll() bool {
 	return graceful_shutdown_poll() > 0
+}
+
+// IsNewVersionAvailable polls whether a newer uploaded version of the current app is available.
+func IsNewVersionAvailable() bool {
+	return new_version_available_poll() > 0
 }
 
 //go:wasmimport terminal_games network_info

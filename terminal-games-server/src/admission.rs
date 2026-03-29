@@ -5,17 +5,18 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ipnet::IpNet;
+use iptrie::IpRTrieMap;
 use smallvec::SmallVec;
 use tokio::sync::{mpsc, watch};
 
 use crate::cluster_detection::{
     self, ClusterEvaluation, ClusterEvaluationJob, HistoricalSignature, NetworkPrefix,
 };
-use crate::metrics::{ServerMetrics, SessionGuard, Transport};
+use crate::metrics::{ServerMetrics, SessionHandle, Transport};
 use terminal_games::app::{SessionControl, SessionEndReason};
 
 pub(crate) const INPUT_WINDOW_MS: u64 = 8 * 60_000;
@@ -61,7 +62,7 @@ pub struct AdmissionController {
 
 struct Inner {
     config: AdmissionConfig,
-    banned_ips: Mutex<HashMap<String, StoredBan>>,
+    ban_manager: Mutex<BanManager>,
     ban_changes: watch::Sender<()>,
     metrics: Arc<ServerMetrics>,
     next_id: AtomicU64,
@@ -153,7 +154,7 @@ pub struct AdmissionTicket {
     control_rx: watch::Receiver<SessionControl>,
     pending_output_bytes: usize,
     pending_output_started_at_ms: Option<u64>,
-    session_guard: Option<SessionGuard>,
+    session_guard: Option<SessionHandle>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -164,40 +165,101 @@ pub struct BanUpdateSummary {
     pub active_ban_count: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BanRule {
-    pub(crate) key: String,
-    pub(crate) matcher: IpNet,
-}
-
-impl BanRule {
-    pub(crate) fn parse(raw: impl Into<String>) -> Result<Self, String> {
-        let key = raw.into();
-        let value = key.trim();
-        if value.is_empty() {
-            return Err("ban rule is empty".to_string());
-        }
-        if let Ok(network) = value.parse::<IpNet>() {
-            return Ok(Self {
-                key,
-                matcher: network,
-            });
-        }
-        Err("ban rule must be a valid CIDR range".to_string())
+pub(crate) fn parse_ban_cidr(raw: impl AsRef<str>) -> Result<IpNet, String> {
+    let value = raw.as_ref().trim();
+    if value.is_empty() {
+        return Err("ban rule is empty".to_string());
     }
+    if let Ok(network) = value.parse::<IpNet>() {
+        return Ok(network);
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Ok(IpNet::from(ip));
+    }
+    Err("ban rule must be a valid IPv4/IPv6 address or CIDR range".to_string())
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct StoredBan {
-    pub(crate) matcher: IpNet,
-    pub(crate) reason: Option<String>,
-    pub(crate) expires_at: Option<i64>,
+pub(crate) struct BanManager {
+    trie: IpRTrieMap<Option<(Option<String>, Option<i64>)>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MatchedBan {
-    pub(crate) rule: String,
-    pub(crate) reason: Option<String>,
+impl BanManager {
+    fn new(initial_bans: Vec<(IpNet, Option<String>, Option<i64>)>) -> Self {
+        let mut manager = Self {
+            trie: IpRTrieMap::new(),
+        };
+        let now = current_unix_seconds();
+        for (cidr, reason, expires_at) in initial_bans {
+            if is_ban_active(expires_at, now) {
+                manager.insert(cidr, reason, expires_at);
+            }
+        }
+        manager
+    }
+
+    fn active_len(&self) -> usize {
+        let now = current_unix_seconds();
+        self.trie
+            .iter()
+            .filter_map(|(_cidr, entry)| entry.as_ref())
+            .filter(|(_reason, expires_at)| is_ban_active(*expires_at, now))
+            .count()
+    }
+
+    fn check(&mut self, client_ip: IpAddr) -> Option<(IpNet, Option<String>)> {
+        let now = current_unix_seconds();
+        let needle = IpNet::from(client_ip);
+        loop {
+            let (matched_prefix, entry) = self.trie.lookup(&needle);
+            let Some((reason, expires_at)) = entry.clone() else {
+                return None;
+            };
+            if is_ban_active(expires_at, now) {
+                return Some((matched_prefix, reason));
+            }
+            self.clear(matched_prefix);
+        }
+    }
+
+    fn insert(&mut self, cidr: IpNet, reason: Option<String>, expires_at: Option<i64>) {
+        self.set(cidr, Some((reason, expires_at)));
+    }
+
+    fn remove(&mut self, cidr: IpNet) -> bool {
+        self.clear(cidr)
+    }
+
+    fn set(&mut self, cidr: IpNet, value: Option<(Option<String>, Option<i64>)>) {
+        if cidr.prefix_len() == 0 {
+            *self
+                .trie
+                .get_mut(&cidr)
+                .expect("ip trie root must always exist") = value;
+        } else {
+            self.trie.insert(cidr, value);
+        }
+    }
+
+    fn clear(&mut self, cidr: IpNet) -> bool {
+        if cidr.prefix_len() == 0 {
+            let slot = self
+                .trie
+                .get_mut(&cidr)
+                .expect("ip trie root must always exist");
+            let removed = slot.is_some();
+            *slot = None;
+            removed
+        } else {
+            self.trie.remove(&cidr).flatten().is_some()
+        }
+    }
+
+    fn is_active(&self, cidr: IpNet, now: i64) -> bool {
+        self.trie
+            .get(&cidr)
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|(_reason, expires_at)| is_ban_active(*expires_at, now))
+    }
 }
 
 #[derive(Clone)]
@@ -256,7 +318,7 @@ struct ClusterManager {
 impl AdmissionController {
     pub fn new(
         config: AdmissionConfig,
-        initial_banned_ips: HashMap<String, StoredBan>,
+        initial_banned_ips: Vec<(IpNet, Option<String>, Option<i64>)>,
         metrics: Arc<ServerMetrics>,
     ) -> Self {
         let (ban_changes, _) = watch::channel(());
@@ -264,7 +326,7 @@ impl AdmissionController {
         let controller = Self {
             inner: Arc::new(Inner {
                 config,
-                banned_ips: Mutex::new(initial_banned_ips),
+                ban_manager: Mutex::new(BanManager::new(initial_banned_ips)),
                 ban_changes,
                 metrics,
                 next_id: AtomicU64::new(1),
@@ -273,8 +335,8 @@ impl AdmissionController {
             }),
         };
         let active_bans = {
-            let guard = lock(&controller.inner.banned_ips);
-            guard.len()
+            let guard = controller.inner.ban_manager.lock().unwrap();
+            guard.active_len()
         };
         controller
             .inner
@@ -286,16 +348,16 @@ impl AdmissionController {
     pub fn issue_ticket(&self, transport: Transport, client_ip: IpAddr) -> AdmissionTicket {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = watch::channel(AdmissionState::Queued(1));
-        let matched_ban = self.matching_ip_ban(client_ip);
+        let matched_ban = self.check_ip_ban(client_ip);
 
         {
-            let mut state = lock(&self.inner.state);
-            if let Some(ban) = matched_ban {
-                tracing::warn!(
+            let mut state = self.inner.state.lock().unwrap();
+            if let Some((ban_rule, ban_reason)) = matched_ban {
+                tracing::debug!(
                     client_ip = %client_ip,
                     transport = transport.as_str(),
-                    ban_rule = %ban.rule,
-                    ban_reason = ban.reason.as_deref().unwrap_or("<none>"),
+                    ban_rule = %ban_rule,
+                    ban_reason = ban_reason.as_deref().unwrap_or("<none>"),
                     running = state.running.len(),
                     running_for_ip = state.running_for_ip(client_ip),
                     queued_for_ip = state.queued_for_ip(client_ip),
@@ -345,7 +407,7 @@ impl AdmissionController {
         let Some(threshold) = self.inner.config.ssh_captcha_threshold else {
             return false;
         };
-        let state = lock(&self.inner.state);
+        let state = self.inner.state.lock().unwrap();
         cluster_detection::compute_pressure(state.running.len(), self.inner.config.max_running)
             >= threshold
     }
@@ -354,53 +416,37 @@ impl AdmissionController {
         self.inner.ban_changes.subscribe()
     }
 
-    pub fn matching_ip_ban(&self, client_ip: IpAddr) -> Option<MatchedBan> {
-        let mut banned_ips = lock(&self.inner.banned_ips);
-        matching_ban_for_ip(&mut banned_ips, client_ip)
-    }
-
-    pub fn is_ip_banned(&self, client_ip: IpAddr) -> bool {
-        self.matching_ip_ban(client_ip).is_some()
+    pub fn check_ip_ban(&self, client_ip: IpAddr) -> Option<(IpNet, Option<String>)> {
+        let mut ban_manager = self.inner.ban_manager.lock().unwrap();
+        ban_manager.check(client_ip)
     }
 
     pub fn apply_ban_updates(
         &self,
-        updates: Vec<(BanRule, Option<String>, Option<i64>)>,
+        updates: Vec<(IpNet, Option<String>, Option<i64>)>,
     ) -> BanUpdateSummary {
         let now = current_unix_seconds();
         let mut newly_banned_rules = Vec::new();
         let mut deactivated_rules = Vec::new();
-        let mut deactivated = 0usize;
-        let mut activated = 0usize;
         let active_ban_count;
         {
-            let mut current = lock(&self.inner.banned_ips);
-            for (rule, reason, expires_at) in updates {
-                let was_active = current
-                    .get(&rule.key)
-                    .is_some_and(|entry| is_ban_active(entry.expires_at, now));
+            let mut current = self.inner.ban_manager.lock().unwrap();
+            for (cidr, reason, expires_at) in updates {
                 if is_ban_active(expires_at, now) {
-                    current.insert(
-                        rule.key.clone(),
-                        StoredBan {
-                            matcher: rule.matcher.clone(),
-                            reason: reason.clone(),
-                            expires_at,
-                        },
-                    );
+                    let was_active = current.is_active(cidr, now);
+                    current.insert(cidr, reason.clone(), expires_at);
                     if !was_active {
-                        newly_banned_rules.push((rule, reason, expires_at));
-                        activated += 1;
+                        newly_banned_rules.push((cidr, reason, expires_at));
                     }
-                } else {
-                    if current.remove(&rule.key).is_some() {
-                        deactivated += 1;
-                        deactivated_rules.push(rule);
-                    }
+                } else if current.remove(cidr) {
+                    deactivated_rules.push(cidr);
                 }
             }
-            active_ban_count = current.len();
+            active_ban_count = current.active_len();
         }
+
+        let activated = newly_banned_rules.len();
+        let deactivated = deactivated_rules.len();
 
         if newly_banned_rules.is_empty() {
             let summary = BanUpdateSummary {
@@ -409,9 +455,9 @@ impl AdmissionController {
                 evicted_from_queue: 0,
                 active_ban_count,
             };
-            for rule in deactivated_rules {
-                tracing::info!(
-                    ban_rule = %rule.key,
+            for cidr in deactivated_rules {
+                tracing::debug!(
+                    ban_rule = %cidr,
                     active_ban_count = summary.active_ban_count,
                     "Deactivated IP ban"
                 );
@@ -425,14 +471,14 @@ impl AdmissionController {
             return summary;
         }
         let _ = self.inner.ban_changes.send(());
-        let mut state = lock(&self.inner.state);
+        let mut state = self.inner.state.lock().unwrap();
         let mut idx = 0usize;
         let mut removed_any = false;
         let mut evicted_from_queue = 0usize;
         while idx < state.queue.len() {
             if newly_banned_rules
                 .iter()
-                .any(|(rule, _, _)| rule.matcher.contains(&state.queue[idx].client_ip))
+                .any(|(cidr, _, _)| cidr.contains(&state.queue[idx].client_ip))
             {
                 let ticket = state.queue.remove(idx).expect("index checked against len");
                 let _ = ticket
@@ -454,9 +500,9 @@ impl AdmissionController {
             evicted_from_queue,
             active_ban_count,
         };
-        for (rule, reason, expires_at) in newly_banned_rules {
-            tracing::warn!(
-                ban_rule = %rule.key,
+        for (cidr, reason, expires_at) in newly_banned_rules {
+            tracing::debug!(
+                ban_rule = %cidr,
                 ban_reason = reason.as_deref().unwrap_or("<none>"),
                 expires_at,
                 evicted_from_queue,
@@ -464,9 +510,9 @@ impl AdmissionController {
                 "Activated IP ban"
             );
         }
-        for rule in deactivated_rules {
-            tracing::info!(
-                ban_rule = %rule.key,
+        for cidr in deactivated_rules {
+            tracing::debug!(
+                ban_rule = %cidr,
                 active_ban_count = summary.active_ban_count,
                 "Deactivated IP ban"
             );
@@ -482,11 +528,15 @@ impl AdmissionController {
 }
 
 impl AdmissionTicket {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<AdmissionState> {
         self.rx.clone()
     }
 
-    pub fn start_session(mut self, session_guard: SessionGuard) -> Self {
+    pub fn start_session(mut self, session_guard: SessionHandle) -> Self {
         let now_ms = monotonic_millis();
         let (control_tx, control_rx) = watch::channel(SessionControl::Active);
         let _ = self
@@ -575,7 +625,7 @@ impl Drop for AdmissionTicket {
                 .cluster_tx
                 .send(ClusterEvent::SessionEnded(self.id));
         }
-        let mut state = lock(&self.controller.state);
+        let mut state = self.controller.state.lock().unwrap();
         match *self.rx.borrow() {
             AdmissionState::Allowed => {
                 if let Some(idx) = state.running.iter().position(|(id, _)| *id == self.id) {
@@ -832,44 +882,75 @@ fn is_ban_active(expires_at: Option<i64>, now: i64) -> bool {
     expires_at.is_none_or(|expires_at| expires_at > now)
 }
 
-fn matching_ban_for_ip(
-    banned_ips: &mut HashMap<String, StoredBan>,
-    client_ip: IpAddr,
-) -> Option<MatchedBan> {
-    let now = current_unix_seconds();
-    let mut expired_keys = Vec::new();
-    let mut best_match: Option<(MatchedBan, u8)> = None;
-    for (key, entry) in banned_ips.iter() {
-        if !is_ban_active(entry.expires_at, now) {
-            expired_keys.push(key.clone());
-            continue;
-        }
-        if !entry.matcher.contains(&client_ip) {
-            continue;
-        }
-        let candidate = MatchedBan {
-            rule: key.clone(),
-            reason: entry.reason.clone(),
-        };
-        let specificity = entry.matcher.prefix_len();
-        if best_match.as_ref().is_none_or(|(current, current_specificity)| {
-            specificity > *current_specificity
-                || (specificity == *current_specificity && candidate.rule < current.rule)
-        }) {
-            best_match = Some((candidate, specificity));
-        }
-    }
-    for key in expired_keys {
-        banned_ips.remove(&key);
-    }
-    best_match.map(|(ban, _)| ban)
-}
-
 fn current_unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+pub(crate) fn encode_cidr_blob(matcher: IpNet) -> Vec<u8> {
+    // Compact standalone prefix encoding:
+    // - IPv4 headers are 0..=32 and store the prefix length directly
+    // - IPv6 headers are 64..=192 and store prefix length as 64 + len
+    // - payload stores only the bytes covered by the prefix
+    match matcher {
+        IpNet::V4(network) => {
+            let prefix_len = network.prefix_len();
+            let payload_len = prefix_payload_len(prefix_len);
+            let mut out = Vec::with_capacity(1 + payload_len);
+            out.push(prefix_len);
+            out.extend_from_slice(&network.network().octets()[..payload_len]);
+            out
+        }
+        IpNet::V6(network) => {
+            let prefix_len = network.prefix_len();
+            let payload_len = prefix_payload_len(prefix_len);
+            let mut out = Vec::with_capacity(1 + payload_len);
+            out.push(64 + prefix_len);
+            out.extend_from_slice(&network.network().octets()[..payload_len]);
+            out
+        }
+    }
+}
+
+pub(crate) fn decode_cidr_blob(raw: &[u8]) -> Result<IpNet, String> {
+    if raw.is_empty() {
+        return Err("cidr blob too short".to_string());
+    }
+    match raw[0] {
+        0..=32 => {
+            let prefix_len = raw[0];
+            let expected_len = 1 + prefix_payload_len(prefix_len);
+            if raw.len() != expected_len {
+                return Err("invalid ipv4 cidr blob length".to_string());
+            }
+            let mut octets = [0u8; 4];
+            octets[..expected_len - 1].copy_from_slice(&raw[1..]);
+            let network = ipnet::Ipv4Net::new(std::net::Ipv4Addr::from(octets), prefix_len)
+                .map_err(|error| error.to_string())?;
+            Ok(IpNet::V4(network))
+        }
+        // 33..=63 is intentionally unused to keep family decoding simple and leave
+        // room for future format variants.
+        64..=192 => {
+            let prefix_len = raw[0] - 64;
+            let expected_len = 1 + prefix_payload_len(prefix_len);
+            if raw.len() != expected_len {
+                return Err("invalid ipv6 cidr blob length".to_string());
+            }
+            let mut octets = [0u8; 16];
+            octets[..expected_len - 1].copy_from_slice(&raw[1..]);
+            let network = ipnet::Ipv6Net::new(std::net::Ipv6Addr::from(octets), prefix_len)
+                .map_err(|error| error.to_string())?;
+            Ok(IpNet::V6(network))
+        }
+        other => Err(format!("unsupported cidr blob header byte {other}")),
+    }
+}
+
+fn prefix_payload_len(prefix_len: u8) -> usize {
+    usize::from(prefix_len).div_ceil(8)
 }
 
 fn monotonic_millis() -> u64 {
@@ -879,11 +960,4 @@ fn monotonic_millis() -> u64 {
         .elapsed()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
 }

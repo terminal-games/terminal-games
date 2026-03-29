@@ -17,12 +17,13 @@ use base64::Engine as _;
 use futures::StreamExt;
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tarpc::server::Channel;
 use tarpc::{client, context, server};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::{Mutex, Notify},
+    sync::{Mutex, Notify, broadcast},
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector, rustls};
 use tokio_util::{
@@ -31,7 +32,67 @@ use tokio_util::{
     task::TaskTracker,
 };
 
-use crate::rate_limiting::get_tcp_rtt_from_fd;
+use crate::{app_env::AppEnvVar, rate_limiting::get_tcp_rtt_from_fd};
+
+pub type ContentHash = [u8; 32];
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BuildId {
+    pub wasm_hash: ContentHash,
+    pub env_hash: ContentHash,
+}
+
+impl BuildId {
+    pub fn from_wasm_and_envs(wasm: &[u8], envs: &[AppEnvVar]) -> Self {
+        Self {
+            wasm_hash: hash_bytes(wasm),
+            env_hash: hash_app_envs(envs),
+        }
+    }
+
+    pub fn from_hash_slices(wasm_hash: &[u8], env_hash: &[u8]) -> anyhow::Result<Self> {
+        Ok(Self {
+            wasm_hash: content_hash_from_slice(wasm_hash)?,
+            env_hash: content_hash_from_slice(env_hash)?,
+        })
+    }
+
+    pub fn id_string(self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.wasm_hash);
+        hasher.update(self.env_hash);
+        hex::encode(hasher.finalize())
+    }
+}
+
+pub fn hash_bytes(data: &[u8]) -> ContentHash {
+    Sha256::digest(data).into()
+}
+
+pub fn hash_app_envs(envs: &[AppEnvVar]) -> ContentHash {
+    let mut pairs = envs
+        .iter()
+        .map(|env| (env.name.as_str(), env.value.as_str()))
+        .collect::<Vec<_>>();
+    pairs.sort_unstable();
+
+    let mut hasher = Sha256::new();
+    for (name, value) in pairs {
+        let name_bytes = name.as_bytes();
+        let value_bytes = value.as_bytes();
+        hasher.update((name_bytes.len() as u64).to_le_bytes());
+        hasher.update(name_bytes);
+        hasher.update((value_bytes.len() as u64).to_le_bytes());
+        hasher.update(value_bytes);
+    }
+    hasher.finalize().into()
+}
+
+pub fn content_hash_from_slice(bytes: &[u8]) -> anyhow::Result<ContentHash> {
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid hash length {}", bytes.len()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Message {
@@ -39,6 +100,7 @@ enum Message {
     PeerListSync(PeerListSyncMessage),
     PeerAdded(PeerChangeMessage),
     PeerRemoved(PeerChangeMessage),
+    AppRuntimeUpdated(AppRuntimeUpdateMessage),
 }
 
 #[tarpc::service]
@@ -47,6 +109,7 @@ trait MeshRpc {
     async fn peer_list_sync(msg: PeerListSyncMessage);
     async fn peer_added(msg: PeerChangeMessage);
     async fn peer_removed(msg: PeerChangeMessage);
+    async fn app_runtime_updated(msg: AppRuntimeUpdateMessage);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +122,47 @@ struct PeerListSyncMessage {
 struct PeerChangeMessage {
     peer_id: PeerId,
     app_id: AppId,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AppRuntimeUpdateKind {
+    Published,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppRuntimeUpdateMessage {
+    pub app_id: u64,
+    pub build_id: BuildId,
+    pub updated_at_ns: i64,
+    pub kind: AppRuntimeUpdateKind,
+}
+
+impl AppRuntimeUpdateMessage {
+    pub fn published(app_id: u64, build_id: BuildId, updated_at_ns: i64) -> Self {
+        Self {
+            app_id,
+            build_id,
+            updated_at_ns,
+            kind: AppRuntimeUpdateKind::Published,
+        }
+    }
+
+    pub fn deleted(app_id: u64, build_id: BuildId, updated_at_ns: i64) -> Self {
+        Self {
+            app_id,
+            build_id,
+            updated_at_ns,
+            kind: AppRuntimeUpdateKind::Deleted,
+        }
+    }
+
+    fn supersedes(&self, other: &Self) -> bool {
+        self.updated_at_ns > other.updated_at_ns
+            || (self.updated_at_ns == other.updated_at_ns
+                && self.kind == AppRuntimeUpdateKind::Deleted
+                && other.kind == AppRuntimeUpdateKind::Published)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -138,12 +242,21 @@ pub struct PeerMessage {
     data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash)]
-pub struct AppId(pub u64);
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash, PartialOrd, Ord)]
+pub struct AppId {
+    pub app_id: u64,
+    pub build_id: BuildId,
+}
 
 impl Display for AppId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        write!(
+            f,
+            "{}:{}:{}",
+            self.app_id,
+            hex::encode(self.build_id.wasm_hash),
+            hex::encode(self.build_id.env_hash)
+        )
     }
 }
 
@@ -411,10 +524,12 @@ struct MeshInner {
     regions: Mutex<HashMap<RegionId, RegionState>>,
     peers: Mutex<HashMap<AppId, HashMap<PeerId, tokio::sync::mpsc::Sender<PeerMessageApp>>>>,
     global_peers: Mutex<HashMap<AppId, HashSet<PeerId>>>,
+    latest_app_runtime_updates: Mutex<HashMap<u64, AppRuntimeUpdateMessage>>,
     discovery: Arc<dyn Discovery>,
     cancel: CancellationToken,
     tasks: TaskTracker,
     heal_now: Notify,
+    app_runtime_updates: broadcast::Sender<AppRuntimeUpdateMessage>,
 }
 
 #[derive(Clone)]
@@ -435,10 +550,12 @@ impl Mesh {
     pub fn with_region(discovery: Arc<dyn Discovery>, region: RegionId) -> Self {
         Self {
             inner: Arc::new(MeshInner {
+                app_runtime_updates: broadcast::channel(64).0,
                 region,
                 regions: Default::default(),
                 peers: Default::default(),
                 global_peers: Default::default(),
+                latest_app_runtime_updates: Default::default(),
                 discovery,
                 cancel: CancellationToken::new(),
                 tasks: TaskTracker::new(),
@@ -601,12 +718,44 @@ impl Mesh {
             .and_then(|conn| get_tcp_rtt_from_fd(conn.conn_fd).ok())
     }
 
+    pub async fn discover_regions(&self) -> anyhow::Result<Vec<RegionId>> {
+        let mut regions = self
+            .inner
+            .discovery
+            .discover_peers()
+            .await?
+            .into_iter()
+            .map(|(region, _)| region)
+            .collect::<Vec<_>>();
+        regions.push(self.inner.region);
+        regions.sort_unstable();
+        regions.dedup();
+        Ok(regions)
+    }
+
     pub async fn graceful_shutdown(&self) {
         tracing::debug!("Mesh graceful shutdown initiated");
         self.inner.cancel.cancel();
         self.inner.tasks.close();
         self.inner.tasks.wait().await;
         tracing::debug!("Mesh graceful shutdown complete");
+    }
+
+    pub fn subscribe_app_runtime_updates(&self) -> broadcast::Receiver<AppRuntimeUpdateMessage> {
+        self.inner.app_runtime_updates.subscribe()
+    }
+
+    pub async fn replace_app_runtime_snapshot(&self, updates: Vec<AppRuntimeUpdateMessage>) {
+        self.inner.replace_app_runtime_snapshot(updates).await;
+    }
+
+    pub async fn propagate_app_runtime_update(&self, update: AppRuntimeUpdateMessage) {
+        if !self.inner.remember_app_runtime_update(update).await {
+            return;
+        }
+        self.inner
+            .broadcast(Message::AppRuntimeUpdated(update))
+            .await;
     }
 }
 
@@ -867,6 +1016,13 @@ impl MeshInner {
                 .iter()
                 .map(|(app_id, peer_map)| (*app_id, peer_map.keys().copied().collect()))
                 .collect();
+            let local_app_runtime_updates = self
+                .latest_app_runtime_updates
+                .lock()
+                .await
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
             rpc_client
                 .peer_list_sync(
                     context::current(),
@@ -877,6 +1033,14 @@ impl MeshInner {
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to send initial peer list sync: {}", e))?;
+            for update in local_app_runtime_updates {
+                rpc_client
+                    .app_runtime_updated(context::current(), update)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to send initial app runtime sync: {}", e)
+                    })?;
+            }
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
             let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
@@ -892,6 +1056,7 @@ impl MeshInner {
                                 Message::PeerListSync(msg) => rpc_client.peer_list_sync(context::current(), msg).await,
                                 Message::PeerAdded(msg) => rpc_client.peer_added(context::current(), msg).await,
                                 Message::PeerRemoved(msg) => rpc_client.peer_removed(context::current(), msg).await,
+                                Message::AppRuntimeUpdated(msg) => rpc_client.app_runtime_updated(context::current(), msg).await,
                             };
                             if let Err(error) = send_result {
                                 tracing::warn!(region=%their_region, ?error, "RPC send failed");
@@ -1063,6 +1228,37 @@ impl MeshInner {
                 if app_peers.is_empty() {
                     peers.remove(&msg.app_id);
                 }
+            }
+        }
+    }
+
+    async fn handle_app_runtime_updated(&self, msg: AppRuntimeUpdateMessage) {
+        if self.remember_app_runtime_update(msg).await {
+            let _ = self.app_runtime_updates.send(msg);
+        }
+    }
+
+    async fn replace_app_runtime_snapshot(&self, updates: Vec<AppRuntimeUpdateMessage>) {
+        let snapshot_ids = updates
+            .iter()
+            .map(|update| update.app_id)
+            .collect::<HashSet<_>>();
+        let mut latest = self.latest_app_runtime_updates.lock().await;
+        latest.retain(|app_id, update| {
+            snapshot_ids.contains(app_id) || update.kind == AppRuntimeUpdateKind::Deleted
+        });
+        for update in updates {
+            latest.insert(update.app_id, update);
+        }
+    }
+
+    async fn remember_app_runtime_update(&self, update: AppRuntimeUpdateMessage) -> bool {
+        let mut latest = self.latest_app_runtime_updates.lock().await;
+        match latest.get(&update.app_id) {
+            Some(existing) if !update.supersedes(existing) => false,
+            _ => {
+                latest.insert(update.app_id, update);
+                true
             }
         }
     }
@@ -1353,5 +1549,9 @@ impl MeshRpc for MeshRpcServer {
 
     async fn peer_removed(self, _: context::Context, msg: PeerChangeMessage) {
         self.inner.handle_peer_removed(msg).await;
+    }
+
+    async fn app_runtime_updated(self, _: context::Context, msg: AppRuntimeUpdateMessage) {
+        self.inner.handle_app_runtime_updated(msg).await;
     }
 }

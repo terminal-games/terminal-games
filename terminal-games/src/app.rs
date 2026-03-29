@@ -12,10 +12,9 @@ use std::{
     },
     task::{Context, Poll},
     time::{Duration, UNIX_EPOCH},
-    u64,
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use headless_terminal::{Color, Parser};
 use hex::ToHex;
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -26,12 +25,15 @@ use wasmtime::InstanceAllocationStrategy;
 use wasmtime_wasi::I32Exit;
 
 use crate::{
+    app_env::decrypt_app_env_blob,
+    app_registry::{AppRuntimeRegistry, AppRuntimeSession},
     audio::{CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
+    control::StatusBarState,
     log_backend::{GuestLogBackend, LogLevel, parse_guest_log_object},
-    mesh::{AppId, Mesh, PeerId, PeerMessageApp, RegionId},
+    mesh::{AppId, BuildId, Mesh, PeerId, PeerMessageApp, RegionId},
     rate_limiting::{NetworkInfo, TokenBucket},
     replay::ReplayBuffer,
-    status_bar::{StatusBar, StatusNotification},
+    status_bar::{StatusBar, StatusBarInput, StatusNotification},
     terminal_profile::TerminalProfile,
 };
 
@@ -42,10 +44,8 @@ const MAX_CONNECTIONS: usize = 8;
 const MAX_OUTBOUND_BANDWIDTH: u64 = 20 * 1024;
 
 const REPLAY_RATE_LIMIT_SECS: u64 = 10;
-const IDLE_TIMEOUT_WARNING_SECS: i32 = 10;
 const REPLAY_UPLOAD_NOTIFICATION_SECS: u64 = 30;
 const REPLAY_RESULT_NOTIFICATION_SECS: u64 = 15;
-
 // Dial error codes
 const DIAL_ERR_ADDRESS_TOO_LONG: i32 = -1;
 const DIAL_ERR_TOO_MANY_CONNECTIONS: i32 = -2;
@@ -113,6 +113,7 @@ pub enum SessionEndReason {
     BannedIp,
     TooManyConnectionsFromIp,
     ClusterLimited,
+    KickedByAdmin,
 }
 
 impl SessionEndReason {
@@ -124,6 +125,7 @@ impl SessionEndReason {
             Self::BannedIp => "banned_ip",
             Self::TooManyConnectionsFromIp => "too_many_connections_from_ip",
             Self::ClusterLimited => "cluster_limited",
+            Self::KickedByAdmin => "kicked_by_admin",
         }
     }
 
@@ -135,6 +137,7 @@ impl SessionEndReason {
             Self::BannedIp => "Connections from your IP address are blocked",
             Self::TooManyConnectionsFromIp => "Too many active sessions from your IP address",
             Self::ClusterLimited => "Kicked for likely bot activity",
+            Self::KickedByAdmin => "Disconnected by an administrator.",
         }
     }
 
@@ -143,8 +146,125 @@ impl SessionEndReason {
     }
 }
 
-pub trait ActiveShortnameTracker: Send + Sync {
-    fn set_active_shortname(&self, shortname: &str);
+#[derive(Clone)]
+pub struct SessionIdentity {
+    username_tx: watch::Sender<String>,
+    app_tx: watch::Sender<SessionAppState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAppState {
+    pub app_id: Option<AppId>,
+    pub shortname: String,
+}
+
+impl SessionIdentity {
+    pub fn new(username: String, shortname: String) -> Self {
+        let (username_tx, _) = watch::channel(username);
+        let (app_tx, _) = watch::channel(SessionAppState {
+            app_id: None,
+            shortname,
+        });
+        Self {
+            username_tx,
+            app_tx,
+        }
+    }
+
+    pub fn username(&self) -> String {
+        self.username_tx.borrow().clone()
+    }
+
+    pub fn app(&self) -> SessionAppState {
+        self.app_tx.borrow().clone()
+    }
+
+    pub fn shortname(&self) -> String {
+        self.app_tx.borrow().shortname.clone()
+    }
+
+    pub fn username_receiver(&self) -> watch::Receiver<String> {
+        self.username_tx.subscribe()
+    }
+
+    pub fn app_receiver(&self) -> watch::Receiver<SessionAppState> {
+        self.app_tx.subscribe()
+    }
+
+    pub fn set_username(&self, username: &str) {
+        self.username_tx.send_replace(username.to_string());
+    }
+
+    pub fn set_app(&self, app_id: AppId, shortname: &str) {
+        self.app_tx.send_replace(SessionAppState {
+            app_id: Some(app_id),
+            shortname: shortname.to_string(),
+        });
+    }
+}
+
+#[derive(Clone)]
+pub struct SessionNotificationSender {
+    tx: mpsc::Sender<StatusNotification>,
+}
+
+impl SessionNotificationSender {
+    fn new(tx: mpsc::Sender<StatusNotification>) -> Self {
+        Self { tx }
+    }
+
+    pub fn try_info(&self, content: impl Into<String>, duration: Duration) {
+        let _ = self
+            .tx
+            .try_send(StatusNotification::info(content, duration));
+    }
+
+    pub fn try_warning(&self, content: impl Into<String>, duration: Duration) {
+        let _ = self
+            .tx
+            .try_send(StatusNotification::warning(content, duration));
+    }
+
+    pub fn try_error(&self, content: impl Into<String>, duration: Duration) {
+        let _ = self
+            .tx
+            .try_send(StatusNotification::error(content, duration));
+    }
+}
+
+pub struct SessionUi {
+    notification_tx: SessionNotificationSender,
+    notification_rx: mpsc::Receiver<StatusNotification>,
+    shared_state_rx: watch::Receiver<StatusBarState>,
+}
+
+impl SessionUi {
+    pub fn new(shared_state_rx: watch::Receiver<StatusBarState>) -> Self {
+        let (notification_tx, notification_rx) = mpsc::channel::<StatusNotification>(8);
+        Self {
+            notification_tx: SessionNotificationSender::new(notification_tx),
+            notification_rx,
+            shared_state_rx,
+        }
+    }
+
+    pub fn notification_sender(&self) -> SessionNotificationSender {
+        self.notification_tx.clone()
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        SessionNotificationSender,
+        mpsc::Receiver<StatusNotification>,
+        watch::Receiver<StatusBarState>,
+    ) {
+        (
+            self.notification_tx,
+            self.notification_rx,
+            self.shared_state_rx,
+        )
+    }
 }
 
 pub struct AppServer {
@@ -152,33 +272,45 @@ pub struct AppServer {
     engine: wasmtime::Engine,
     pub db: libsql::Connection,
     mesh: Mesh,
-    module_cache: Arc<tokio::sync::RwLock<HashMap<u64, wasmtime::Module>>>,
+    app_env_secret_key: Arc<str>,
+    app_registry: AppRuntimeRegistry,
 }
 
 pub struct AppInstantiationParams {
     pub input_receiver: tokio::sync::mpsc::Receiver<Bytes>,
     pub replay_request_receiver: tokio::sync::mpsc::Receiver<()>,
-    pub output_sender: tokio::sync::mpsc::Sender<Arc<Vec<u8>>>,
+    pub spy_snapshot_requests: tokio::sync::mpsc::Receiver<
+        tokio::sync::oneshot::Sender<crate::replay::ReplayTerminalSnapshotCapture>,
+    >,
+    pub output_sender: tokio::sync::mpsc::Sender<SessionOutput>,
     pub audio_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     pub window_size_receiver: tokio::sync::watch::Receiver<(u16, u16)>,
     pub graceful_shutdown_token: CancellationToken,
-    pub username: String,
+    pub session_identity: SessionIdentity,
+    pub session_ui: SessionUi,
     pub remote_sshid: String,
     pub term: Option<String>,
     pub args: Option<Vec<u8>>,
     pub network_info: Arc<dyn NetworkInfo>,
     pub terminal_profile: TerminalProfile,
     pub terminal_parser: Parser,
-    pub first_app_shortname: String,
     pub user_id: Option<u64>,
     pub locale: String,
     pub log_backend: Arc<dyn GuestLogBackend>,
-    pub active_shortname_tracker: Option<Arc<dyn ActiveShortnameTracker>>,
-    pub idle_fuel_receiver: Option<watch::Receiver<i32>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionOutput {
+    pub data: Bytes,
+    pub sequence: u64,
 }
 
 impl AppServer {
-    pub fn new(mesh: Mesh, db: libsql::Connection) -> anyhow::Result<Self> {
+    pub fn new(
+        mesh: Mesh,
+        db: libsql::Connection,
+        app_env_secret_key: impl Into<Arc<str>>,
+    ) -> anyhow::Result<Self> {
         let mut config = wasmtime::Config::new();
         let cache_config = wasmtime::CacheConfig::new();
         config.cache(Some(wasmtime::Cache::new(cache_config)?));
@@ -208,6 +340,11 @@ impl AppServer {
             "graceful_shutdown_poll",
             Self::graceful_shutdown_poll,
         )?;
+        linker.func_wrap(
+            "terminal_games",
+            "new_version_available_poll",
+            Self::new_version_available_poll,
+        )?;
         linker.func_wrap("terminal_games", "network_info", Self::host_network_info)?;
         linker.func_wrap("terminal_games", "terminal_info", Self::host_terminal_info)?;
         linker.func_wrap("terminal_games", "audio_write", Self::audio_write)?;
@@ -219,9 +356,18 @@ impl AppServer {
             linker: Arc::new(linker),
             mesh,
             db,
+            app_env_secret_key: app_env_secret_key.into(),
             engine,
-            module_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            app_registry: AppRuntimeRegistry::default(),
         })
+    }
+
+    pub fn app_env_secret_key(&self) -> &str {
+        &self.app_env_secret_key
+    }
+
+    pub fn app_registry(&self) -> &AppRuntimeRegistry {
+        &self.app_registry
     }
 
     /// Run an app with IO defined in [`params`] in the background
@@ -235,31 +381,32 @@ impl AppServer {
         let db = self.db.clone();
         let engine = self.engine.clone();
         let linker = self.linker.clone();
-        let module_cache = self.module_cache.clone();
+        let app_registry = self.app_registry.clone();
+        let app_env_secret_key = self.app_env_secret_key.clone();
 
         tokio::task::spawn(async move {
             let AppInstantiationParams {
-                mut input_receiver,
+                input_receiver: mut raw_input_receiver,
                 mut replay_request_receiver,
+                mut spy_snapshot_requests,
                 output_sender,
                 audio_sender,
                 mut window_size_receiver,
                 mut graceful_shutdown_token,
-                username,
+                session_identity,
+                session_ui,
                 remote_sshid,
                 term,
                 args: _args,
                 network_info,
                 terminal_profile,
                 mut terminal_parser,
-                first_app_shortname,
                 user_id,
                 locale,
                 log_backend,
-                active_shortname_tracker,
-                idle_fuel_receiver,
             } = params;
-            let startup_shortname = first_app_shortname.clone();
+            let startup_shortname = session_identity.shortname();
+            let (notification_tx, notification_rx, status_bar_state_rx) = session_ui.into_parts();
 
             let (first_cols, first_rows) = *window_size_receiver.borrow();
             terminal_parser
@@ -270,10 +417,8 @@ impl AppServer {
             let hard_shutdown_token = CancellationToken::new();
 
             let (app_output_sender, mut app_output_receiver) =
-                tokio::sync::mpsc::channel::<Vec<u8>>(1);
+                tokio::sync::mpsc::channel::<BytesMut>(1);
             let has_next_app_shortname = Arc::new(AtomicBool::new(false));
-            let (notification_tx, notification_rx) =
-                tokio::sync::mpsc::channel::<StatusNotification>(1);
 
             let audio_enabled = audio_sender.is_some();
             let mut maybe_mixer = if let Some(audio_tx) = audio_sender {
@@ -299,12 +444,12 @@ impl AppServer {
                 locale: locale.clone(),
                 replays: Vec::new(),
             };
-            let mut menu_username = username;
             let mut ctx = AppContext {
                 db: db.clone(),
                 linker,
                 mesh,
-                module_cache,
+                app_env_secret_key,
+                app_registry,
                 app_output_sender,
                 remote_sshid,
                 term,
@@ -316,8 +461,8 @@ impl AppServer {
             let (mut app, mut instance_pre) = match Self::prepare_instantiate(
                 &ctx,
                 &menu_session,
-                &menu_username,
-                first_app_shortname,
+                &session_identity,
+                startup_shortname.clone(),
             )
             .await
             {
@@ -330,9 +475,7 @@ impl AppServer {
                     return;
                 }
             };
-            if let Some(tracker) = &active_shortname_tracker {
-                tracker.set_active_shortname(&app.shortname);
-            }
+            session_identity.set_app(app.app_id, &app.shortname);
 
             let mut replay_buffer = ReplayBuffer::new(
                 first_cols,
@@ -341,23 +484,24 @@ impl AppServer {
                 app.app_id,
                 ctx.term.as_deref(),
             );
+            let status_bar_input = StatusBarInput::new();
             let mut status_bar = StatusBar::new(
-                app.shortname.clone(),
-                &menu_username,
+                session_identity.app_receiver(),
+                session_identity.username_receiver(),
                 network_info.clone(),
                 terminal_profile,
                 notification_rx,
+                status_bar_state_rx,
+                status_bar_input.clone(),
             );
             let mut escape_buffer = EscapeSequenceBuffer::new();
-            let mut status_bar_interval = tokio::time::interval(Duration::from_secs(1));
             let mut graceful_shutdown_timeout: Option<Pin<Box<tokio::time::Sleep>>> = None;
             let mut replay_last_at = Duration::ZERO;
-            let mut replay_requests_open = true;
-            let mut idle_fuel_receiver = idle_fuel_receiver;
-            let mut idle_timeout_warning_sent = false;
             let mut pending_replay_upload: Option<
                 tokio::sync::oneshot::Receiver<(StatusNotification, Option<MenuSessionState>)>,
             > = None;
+            let mut replay_requests_open = true;
+            let mut next_output_sequence = 0_u64;
 
             loop {
                 let app_shortname = app.shortname.clone();
@@ -370,15 +514,16 @@ impl AppServer {
                     menu_completed_rx,
                     menu_request_tx,
                     menu_session: menu_session.clone(),
-                    menu_username: menu_username.clone(),
+                    session_identity: session_identity.clone(),
                     limits: AppLimiter::default(),
                     next_app: None,
-                    input_receiver,
+                    input_receiver: raw_input_receiver,
                     has_next_app: has_next_app_shortname.clone(),
                     graceful_shutdown_token: graceful_shutdown_token.clone(),
                     network_info: network_info.clone(),
                     terminal_profile,
                     audio: maybe_mixer,
+                    status_bar_input: status_bar_input.clone(),
                     terminal_snapshot: terminal_snapshot.clone(),
                 };
 
@@ -452,9 +597,15 @@ impl AppServer {
                                 terminal_snapshot.sync_from_screen(screen);
 
                                 if !output.is_empty() {
-                                    let output = Arc::new(output);
+                                    let output = output.freeze();
+                                    let sequence = next_output_sequence;
+                                    next_output_sequence += 1;
                                     replay_buffer.push_output(output.clone());
-                                    if output_sender.send(output).await.is_err() {
+                                    if output_sender
+                                        .send(SessionOutput { data: output, sequence })
+                                        .await
+                                        .is_err()
+                                    {
                                         break 'block None;
                                     }
                                 }
@@ -467,58 +618,44 @@ impl AppServer {
                                 let (width, height) = *window_size_receiver.borrow();
                                 replay_buffer.push_resize(width, height);
 
-                                let mut output = Vec::new();
                                 let screen = terminal.screen_mut();
                                 screen.set_size(height, width);
+                                let mut output = BytesMut::new();
                                 status_bar.maybe_render_into(screen, &mut output, true);
+                                if !output.is_empty() {
+                                    let output = output.freeze();
+                                    let sequence = next_output_sequence;
+                                    next_output_sequence += 1;
+                                    replay_buffer.push_output(output.clone());
+                                    if output_sender
+                                        .send(SessionOutput { data: output, sequence })
+                                        .await
+                                        .is_err()
+                                    {
+                                        break 'block None;
+                                    }
+                                }
                                 terminal_snapshot.sync_from_screen(screen);
-                                if !output.is_empty() {
-                                    let output = Arc::new(output);
-                                    replay_buffer.push_output(output.clone());
-                                    if output_sender.send(output).await.is_err() {
-                                        break 'block None;
-                                    }
-                                }
                             }
 
-                            _ = status_bar_interval.tick() => {
-                                let mut output = Vec::new();
-                                status_bar.maybe_render_into(terminal.screen(), &mut output, false);
+                            status_bar_render = status_bar.drive() => {
+                                let Some(force) = status_bar_render else {
+                                    break 'block None;
+                                };
+                                let mut output = BytesMut::new();
+                                status_bar.maybe_render_into(terminal.screen(), &mut output, force);
                                 if !output.is_empty() {
-                                    let output = Arc::new(output);
+                                    let output = output.freeze();
+                                    let sequence = next_output_sequence;
+                                    next_output_sequence += 1;
                                     replay_buffer.push_output(output.clone());
-                                    if output_sender.send(output).await.is_err() {
+                                    if output_sender
+                                        .send(SessionOutput { data: output, sequence })
+                                        .await
+                                        .is_err()
+                                    {
                                         break 'block None;
                                     }
-                                }
-                            }
-
-                            result = async {
-                                idle_fuel_receiver
-                                    .as_mut()
-                                    .expect("guarded by select")
-                                    .changed()
-                                    .await
-                            }, if idle_fuel_receiver.is_some() => {
-                                if result.is_err() {
-                                    idle_fuel_receiver = None;
-                                    continue;
-                                }
-
-                                let fuel = *idle_fuel_receiver
-                                    .as_mut()
-                                    .expect("receiver still present")
-                                    .borrow_and_update();
-                                if fuel <= IDLE_TIMEOUT_WARNING_SECS && !idle_timeout_warning_sent {
-                                    let _ = notification_tx.try_send(StatusNotification::warning(
-                                        format!(
-                                            " Idle timeout in {IDLE_TIMEOUT_WARNING_SECS} seconds. "
-                                        ),
-                                        Duration::from_secs(IDLE_TIMEOUT_WARNING_SECS as u64),
-                                    ));
-                                    idle_timeout_warning_sent = true;
-                                } else if fuel > IDLE_TIMEOUT_WARNING_SECS {
-                                    idle_timeout_warning_sent = false;
                                 }
                             }
 
@@ -526,8 +663,7 @@ impl AppServer {
                                 if let Some((request_id, result, update)) = msg {
                                     let _ = menu_completed_tx.try_send((request_id, result));
                                     if let Some(username) = update.username {
-                                        menu_username = username;
-                                        status_bar.set_username(&menu_username);
+                                        session_identity.set_username(&username);
                                     }
                                     if let Some(locale) = update.locale {
                                         menu_session.locale = locale;
@@ -535,12 +671,18 @@ impl AppServer {
                                     if let Some(replays) = update.replays {
                                         menu_session.replays = replays;
                                     }
-                                    let mut output = Vec::new();
+                                    let mut output = BytesMut::new();
                                     status_bar.maybe_render_into(terminal.screen(), &mut output, true);
                                     if !output.is_empty() {
-                                        let output = Arc::new(output);
+                                        let output = output.freeze();
+                                        let sequence = next_output_sequence;
+                                        next_output_sequence += 1;
                                         replay_buffer.push_output(output.clone());
-                                        if output_sender.send(output).await.is_err() {
+                                        if output_sender
+                                            .send(SessionOutput { data: output, sequence })
+                                            .await
+                                            .is_err()
+                                        {
                                             break 'block None;
                                         }
                                     }
@@ -552,10 +694,10 @@ impl AppServer {
                                 let db = db.clone();
                                 let menu_result_tx = menu_result_tx.clone();
                                 let menu_session = menu_session.clone();
-                                let menu_username = menu_username.clone();
+                                let menu_username = session_identity.username();
                                 tokio::spawn(async move {
                                     let (result, update) = match request.kind {
-                                        MenuRequestKind::GamesList { current_shortname } => {
+                                        MenuRequestKind::AppsList { current_shortname } => {
                                             let result = Self::load_menu_games(db, current_shortname).await;
                                             (result, MenuUpdate::default())
                                         }
@@ -596,66 +738,27 @@ impl AppServer {
                                     replay_requests_open = false;
                                     continue;
                                 }
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or(Duration::ZERO);
-                                if now.saturating_sub(replay_last_at) < Duration::from_secs(REPLAY_RATE_LIMIT_SECS) {
-                                    let _ = notification_tx.try_send(StatusNotification::warning(
-                                        " Please wait 10 seconds between replays. ",
-                                        Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
-                                    ));
-                                    continue;
-                                }
-
-                                replay_last_at = now;
-                                let _ = notification_tx.try_send(StatusNotification::info(
-                                    " \x1b[3mUploading replay... ",
-                                    Duration::from_secs(REPLAY_UPLOAD_NOTIFICATION_SECS),
-                                ));
-                                let (initial_app_id, asciicast) = match replay_buffer.serialize_asciicast() {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "Failed to serialize replay");
-                                        let _ = notification_tx.try_send(StatusNotification::error(
-                                            " Failed to serialize replay. ",
-                                            Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
-                                        ));
-                                        continue;
-                                    }
-                                };
-                                let db = db.clone();
-                                let menu_session = menu_session.clone();
-                                let username = menu_username.clone();
-                                let (tx, rx) = tokio::sync::oneshot::channel();
-                                tokio::spawn(async move {
-                                    let (notif, session_update) = save_replay(
-                                        &db,
-                                        menu_session,
+                                pending_replay_upload = pending_replay_upload.or_else(|| {
+                                    trigger_replay_upload(
+                                        &notification_tx,
+                                        &replay_buffer,
+                                        &mut replay_last_at,
+                                        db.clone(),
+                                        menu_session.clone(),
                                         user_id,
-                                        initial_app_id,
-                                        &username,
-                                        &asciicast,
+                                        session_identity.username(),
                                     )
-                                    .await;
-                                    let notif = match notif {
-                                        Ok(url) => {
-                                            tracing::info!(%url, "Uploaded replay");
-                                            StatusNotification::info(
-                                                format!(
-                                                    " \x1b[3mReplay saved: \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ",
-                                                    url, url
-                                                ),
-                                                Duration::from_secs(REPLAY_RESULT_NOTIFICATION_SECS),
-                                            )
-                                        }
-                                        Err(e) => StatusNotification::error(
-                                            format!(" {} ", e),
-                                            Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
-                                        ),
-                                    };
-                                    let _ = tx.send((notif, session_update));
                                 });
-                                pending_replay_upload = Some(rx);
+                            }
+
+                            snapshot_request = spy_snapshot_requests.recv() => {
+                                let Some(snapshot_request) = snapshot_request else {
+                                    continue;
+                                };
+                                let _ = snapshot_request.send(crate::replay::ReplayTerminalSnapshotCapture {
+                                    snapshot: replay_buffer.terminal_snapshot(),
+                                    output_sequence_cutoff: next_output_sequence,
+                                });
                             }
 
                             _ = graceful_shutdown_token.cancelled(), if graceful_shutdown_timeout.is_none() => {
@@ -686,7 +789,7 @@ impl AppServer {
                                 if let Some(session) = session_update {
                                     menu_session = session;
                                 }
-                                let _ = notification_tx.try_send(notif);
+                                let _ = notification_tx.tx.try_send(notif);
                             }
                         }
                     }
@@ -712,7 +815,7 @@ impl AppServer {
                 menu_completed_rx = state.menu_completed_rx;
                 menu_request_tx = state.menu_request_tx;
                 graceful_shutdown_token = state.graceful_shutdown_token;
-                input_receiver = state.input_receiver;
+                raw_input_receiver = state.input_receiver;
                 terminal_snapshot = state.terminal_snapshot;
                 maybe_mixer = state.audio;
                 ctx = state.ctx;
@@ -738,10 +841,7 @@ impl AppServer {
 
                     let shortname = next_app.shortname.clone();
                     replay_buffer.push_app_switch(next_app.app_id, &shortname);
-                    if let Some(tracker) = &active_shortname_tracker {
-                        tracker.set_active_shortname(&shortname);
-                    }
-                    status_bar.shortname = shortname;
+                    session_identity.set_app(next_app.app_id, &shortname);
                     app = next_app;
                     instance_pre = next_instance_pre;
                     continue;
@@ -760,36 +860,43 @@ impl AppServer {
     async fn prepare_instantiate(
         ctx: &AppContext,
         menu_session: &MenuSessionState,
-        menu_username: &str,
+        session_identity: &SessionIdentity,
         shortname: String,
     ) -> anyhow::Result<(PreloadedAppState, wasmtime::InstancePre<AppState>)> {
-        let mut app_id_rows = ctx
+        let mut app_rows = ctx
             .db
             .query(
-                "SELECT id FROM games WHERE shortname = ?1",
+                "SELECT id, wasm, wasm_hash, env_hash, env_salt, env_blob, build_updated_at
+                 FROM apps
+                 WHERE shortname = ?1
+                 LIMIT 1",
                 [shortname.as_str()],
             )
             .await?;
-        let app_id_row = app_id_rows
+        let app_row = app_rows
             .next()
             .await?
             .ok_or_else(|| UnknownGameShortnameError(shortname.clone()))?;
-        let app_id = app_id_row.get::<u64>(0)?;
+        let app_id = app_row.get::<u64>(0)?;
+        let wasm_bytes = app_row.get::<Vec<u8>>(1)?;
+        let build_id =
+            BuildId::from_hash_slices(&app_row.get::<Vec<u8>>(2)?, &app_row.get::<Vec<u8>>(3)?)?;
+        let env_salt = app_row.get::<Vec<u8>>(4)?;
+        let env_blob = app_row.get::<Vec<u8>>(5)?;
+        let build_updated_at = app_row.get::<i64>(6)?;
+        let mut envs: Vec<(String, String)> =
+            decrypt_app_env_blob(ctx.app_env_secret_key.as_ref(), &env_salt, &env_blob)?
+                .into_iter()
+                .map(|env| (env.name, env.value))
+                .collect();
+        let runtime_app_id = AppId { app_id, build_id };
+        let app_runtime_session = ctx
+            .app_registry
+            .subscribe(app_id, build_id, build_updated_at);
 
-        let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(AppId(app_id)).await;
-
-        let mut envs = vec![];
-        let mut rows = ctx
-            .db
-            .query("SELECT name, value FROM envs WHERE game_id = ?1", [app_id])
-            .await?;
-        while let Some(row) = rows.next().await? {
-            let name = row.get(0)?;
-            let value = row.get(1)?;
-            envs.push((name, value));
-        }
+        let (peer_id, peer_rx, peer_tx) = ctx.mesh.new_peer(runtime_app_id).await;
         envs.push(("REMOTE_SSHID".to_string(), ctx.remote_sshid.clone()));
-        let username = menu_username.to_string();
+        let username = session_identity.username();
         let mut locale = ctx.locale.clone();
         if !menu_session.locale.is_empty() {
             locale = menu_session.locale.clone();
@@ -797,6 +904,7 @@ impl AppServer {
         envs.push(("USERNAME".to_string(), username));
         envs.push(("PEER_ID".to_string(), peer_id.to_bytes().encode_hex()));
         envs.push(("APP_SHORTNAME".to_string(), shortname.to_string()));
+        envs.push(("APP_VERSION_ID".to_string(), build_id.id_string()));
         envs.push((
             "AUDIO_ENABLED".to_string(),
             if ctx.audio_enabled { "1" } else { "0" }.to_string(),
@@ -807,19 +915,17 @@ impl AppServer {
         if let Some(user_id) = ctx.user_id {
             envs.push(("USER_ID".to_string(), user_id.to_string()));
         }
-        if let Some(user_id) = ctx.user_id {
-            if let Ok(mut rows) = ctx
+        if let Some(user_id) = ctx.user_id
+            && let Ok(mut rows) = ctx
                 .db
                 .query(
                     "SELECT locale FROM users WHERE id = ?1 LIMIT 1",
                     libsql::params!(user_id),
                 )
                 .await
-            {
-                if let Ok(Some(row)) = rows.next().await {
-                    locale = row.get::<String>(0).unwrap_or(locale);
-                }
-            }
+            && let Ok(Some(row)) = rows.next().await
+        {
+            locale = row.get::<String>(0).unwrap_or(locale);
         }
         envs.push(("LOCALE".to_string(), locale.clone()));
 
@@ -830,20 +936,9 @@ impl AppServer {
             .envs(&envs)
             .build_p1();
 
-        let mut rows = ctx
-            .db
-            .query(
-                "SELECT path FROM games WHERE id = ?1",
-                libsql::params![app_id],
-            )
-            .await?;
-
-        let row = rows
-            .next()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Missing wasm path for game id {app_id}"))?;
-        let wasm_path: String = row.get(0)?;
-        let module = Self::load_or_compile_module(ctx, app_id, &wasm_path).await?;
+        let module = ctx
+            .app_registry
+            .load_or_compile_module(&wasm_bytes, ctx.linker.engine())?;
         let instance_pre = ctx.linker.instantiate_pre(&module)?;
 
         Ok((
@@ -851,29 +946,12 @@ impl AppServer {
                 wasi_ctx,
                 peer_rx,
                 peer_tx,
-                app_id: AppId(app_id),
+                app_id: runtime_app_id,
+                app_runtime_session,
                 shortname,
             },
             instance_pre,
         ))
-    }
-
-    async fn load_or_compile_module(
-        ctx: &AppContext,
-        app_id: u64,
-        wasm_path: &str,
-    ) -> anyhow::Result<wasmtime::Module> {
-        {
-            let cache = ctx.module_cache.read().await;
-            if let Some(module) = cache.get(&app_id) {
-                return Ok(module.clone());
-            }
-        }
-
-        let module = wasmtime::Module::from_file(ctx.linker.engine(), wasm_path)?;
-        let mut cache = ctx.module_cache.write().await;
-        let entry = cache.entry(app_id).or_insert(module);
-        Ok(entry.clone())
     }
 
     fn host_dial(
@@ -1186,19 +1264,27 @@ impl AppServer {
         ptr: i32,
         _len: u32,
     ) -> wasmtime::Result<i32> {
-        match caller.data_mut().input_receiver.try_recv() {
-            Ok(buf) => {
-                if buf.len() > 4096 {
-                    return Ok(0);
-                }
-                let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                    wasmtime::bail!("terminal_read: failed to find host memory");
-                };
-                let offset = ptr as u32 as usize;
-                mem.write(&mut caller, offset, buf.as_ref())?;
-                Ok(buf.len() as i32)
+        loop {
+            let buf = match caller.data_mut().input_receiver.try_recv() {
+                Ok(buf) => buf,
+                Err(_) => return Ok(0),
+            };
+            if caller
+                .data()
+                .status_bar_input
+                .handle_terminal_input(buf.as_ref())
+            {
+                continue;
             }
-            Err(_) => Ok(0),
+            if buf.len() > 4096 {
+                return Ok(0);
+            }
+            let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                wasmtime::bail!("terminal_read: failed to find host memory");
+            };
+            let offset = ptr as u32 as usize;
+            mem.write(&mut caller, offset, buf.as_ref())?;
+            return Ok(buf.len() as i32);
         }
     }
 
@@ -1311,25 +1397,29 @@ impl AppServer {
             has_next_app.store(false, Ordering::Release);
             let ctx = caller.data().ctx.clone();
             let menu_session = caller.data().menu_session.clone();
-            let menu_username = caller.data().menu_username.clone();
+            let session_identity = caller.data().session_identity.clone();
             let (tx, rx) = tokio::sync::oneshot::channel();
             caller.data_mut().next_app = Some(NextAppState::Pending(rx));
             tokio::task::spawn(async move {
-                let result =
-                    match Self::prepare_instantiate(&ctx, &menu_session, &menu_username, shortname)
-                        .await
-                    {
-                        Ok(next_app) => {
-                            has_next_app.store(true, Ordering::Release);
-                            Ok(next_app)
-                        }
-                        Err(err) => {
-                            let error = NextAppPrepareError::from_anyhow(err);
-                            tracing::warn!(error = %error.message(), "change_app preload failed");
-                            has_next_app.store(false, Ordering::Release);
-                            Err(error)
-                        }
-                    };
+                let result = match Self::prepare_instantiate(
+                    &ctx,
+                    &menu_session,
+                    &session_identity,
+                    shortname,
+                )
+                .await
+                {
+                    Ok(next_app) => {
+                        has_next_app.store(true, Ordering::Release);
+                        Ok(next_app)
+                    }
+                    Err(err) => {
+                        let error = NextAppPrepareError::from_anyhow(err);
+                        tracing::warn!(error = %error.message(), "change_app preload failed");
+                        has_next_app.store(false, Ordering::Release);
+                        Err(error)
+                    }
+                };
                 let _ = tx.send(result);
             });
         }
@@ -1543,7 +1633,7 @@ impl AppServer {
         let request = match typ {
             MENU_REQ_GAMES_LIST => MenuRequestJob {
                 request_id: request_id_u,
-                kind: MenuRequestKind::GamesList {
+                kind: MenuRequestKind::AppsList {
                     current_shortname: caller.data().app.shortname.clone(),
                 },
             },
@@ -1692,41 +1782,41 @@ impl AppServer {
         current_shortname: String,
     ) -> Result<Vec<u8>, String> {
         #[derive(serde::Serialize)]
-        struct GameOut {
+        struct AppOut {
             id: u64,
             shortname: String,
             details: serde_json::Value,
         }
 
         #[derive(serde::Serialize)]
-        struct GamesOut {
-            games: Vec<GameOut>,
+        struct AppsOut {
+            apps: Vec<AppOut>,
         }
 
         let mut rows = db
             .query(
-                "SELECT id, shortname, details FROM games WHERE shortname != ?1 ORDER BY id",
+                "SELECT id, shortname, details FROM apps WHERE shortname != ?1 ORDER BY id",
                 libsql::params!(current_shortname),
             )
             .await
             .map_err(|e| e.to_string())?;
 
-        let mut games = Vec::<GameOut>::new();
+        let mut apps = Vec::<AppOut>::new();
         while let Some(row) = rows.next().await.map_err(|e| e.to_string())? {
             let id = row.get::<u64>(0).map_err(|e| e.to_string())?;
             let shortname = row.get::<String>(1).map_err(|e| e.to_string())?;
             let details_json = row.get::<String>(2).map_err(|e| e.to_string())?;
             let details = serde_json::from_str::<serde_json::Value>(&details_json)
                 .unwrap_or_else(|_| serde_json::json!({}));
-            let game = GameOut {
+            let app = AppOut {
                 id,
                 shortname,
                 details,
             };
-            games.push(game);
+            apps.push(app);
         }
 
-        serde_json::to_vec(&GamesOut { games }).map_err(|e| e.to_string())
+        serde_json::to_vec(&AppsOut { apps }).map_err(|e| e.to_string())
     }
 
     async fn load_menu_profile(
@@ -1813,7 +1903,7 @@ impl AppServer {
         struct ReplayOut {
             created_at: i64,
             asciinema_url: String,
-            game_title: String,
+            app_title: String,
         }
 
         #[derive(serde::Serialize)]
@@ -1826,7 +1916,7 @@ impl AppServer {
         if let Some(user_id) = user_id {
             let mut rows = match db
                 .query(
-                    "SELECT r.created_at, r.asciinema_url, g.shortname, g.details FROM replays r LEFT JOIN games g ON r.game_id = g.id WHERE r.user_id = ?1 ORDER BY r.created_at DESC",
+                    "SELECT r.created_at, r.asciinema_url, g.shortname, g.details FROM replays r LEFT JOIN apps g ON r.app_id = g.id WHERE r.user_id = ?1 ORDER BY r.created_at DESC",
                     libsql::params!(user_id),
                 )
                 .await
@@ -1856,7 +1946,7 @@ impl AppServer {
                 replays.push(ReplayOut {
                     created_at,
                     asciinema_url,
-                    game_title: Self::game_title_from_details(&shortname, &details, &locale),
+                    app_title: Self::app_title_from_details(&shortname, &details, &locale),
                 });
             }
         } else {
@@ -1866,20 +1956,19 @@ impl AppServer {
                 let mut details = String::new();
                 if let Ok(mut rows) = db
                     .query(
-                        "SELECT shortname, details FROM games WHERE id = ?1 LIMIT 1",
-                        libsql::params!(replay.game_id),
+                        "SELECT shortname, details FROM apps WHERE id = ?1 LIMIT 1",
+                        libsql::params!(replay.app_id),
                     )
                     .await
+                    && let Ok(Some(row)) = rows.next().await
                 {
-                    if let Ok(Some(row)) = rows.next().await {
-                        shortname = row.get::<String>(0).unwrap_or_default();
-                        details = row.get::<String>(1).unwrap_or_default();
-                    }
+                    shortname = row.get::<String>(0).unwrap_or_default();
+                    details = row.get::<String>(1).unwrap_or_default();
                 }
                 replays.push(ReplayOut {
                     created_at: replay.created_at,
                     asciinema_url: replay.asciinema_url,
-                    game_title: Self::game_title_from_details(&shortname, &details, &locale),
+                    app_title: Self::app_title_from_details(&shortname, &details, &locale),
                 });
             }
         }
@@ -1888,7 +1977,7 @@ impl AppServer {
         (result, MenuUpdate::default())
     }
 
-    fn game_title_from_details(shortname: &str, details_json: &str, locale: &str) -> String {
+    fn app_title_from_details(shortname: &str, details_json: &str, locale: &str) -> String {
         serde_json::from_str::<GameDetailsOut>(details_json)
             .map(|details| details.name.resolve(locale, shortname))
             .unwrap_or_else(|_| shortname.to_string())
@@ -1923,6 +2012,16 @@ impl AppServer {
         // tracing::info!(fuel=?caller.get_fuel(), shortname=caller.data().app.shortname, "graceful_shutdown_poll");
         let is_cancelled = caller.data().graceful_shutdown_token.is_cancelled();
         Ok(if is_cancelled { 1 } else { 0 })
+    }
+
+    fn new_version_available_poll(caller: wasmtime::Caller<'_, AppState>) -> wasmtime::Result<i32> {
+        let has_update = caller
+            .data()
+            .app
+            .app_runtime_session
+            .update_available()
+            .load(Ordering::Relaxed);
+        Ok(if has_update { 1 } else { 0 })
     }
 
     fn host_network_info(
@@ -2090,11 +2189,76 @@ impl AppServer {
     }
 }
 
+fn trigger_replay_upload(
+    notification_tx: &SessionNotificationSender,
+    replay_buffer: &ReplayBuffer,
+    replay_last_at: &mut Duration,
+    db: libsql::Connection,
+    menu_session: MenuSessionState,
+    user_id: Option<u64>,
+    username: String,
+) -> Option<tokio::sync::oneshot::Receiver<(StatusNotification, Option<MenuSessionState>)>> {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    if now.saturating_sub(*replay_last_at) < Duration::from_secs(REPLAY_RATE_LIMIT_SECS) {
+        notification_tx.try_warning(
+            " Please wait 10 seconds between replays. ",
+            Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
+        );
+        return None;
+    }
+
+    *replay_last_at = now;
+    notification_tx.try_info(
+        " \x1b[3mUploading replay... ",
+        Duration::from_secs(REPLAY_UPLOAD_NOTIFICATION_SECS),
+    );
+
+    let Ok((initial_app_id, asciicast)) = replay_buffer.serialize_asciicast() else {
+        tracing::error!("Failed to serialize replay");
+        notification_tx.try_error(
+            " Failed to serialize replay. ",
+            Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
+        );
+        return None;
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (notif, session_update) = save_replay(
+            &db,
+            menu_session,
+            user_id,
+            initial_app_id,
+            &username,
+            &asciicast,
+        )
+        .await;
+        let notif = match notif {
+            Ok(url) => {
+                tracing::info!(%url, "Uploaded replay");
+                StatusNotification::info(
+                    format!(" \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\ ", url, url),
+                    Duration::from_secs(REPLAY_RESULT_NOTIFICATION_SECS),
+                )
+            }
+            Err(e) => StatusNotification::error(
+                format!(" {} ", e),
+                Duration::from_secs(REPLAY_RATE_LIMIT_SECS),
+            ),
+        };
+        let _ = tx.send((notif, session_update));
+    });
+    Some(rx)
+}
+
 pub struct PreloadedAppState {
     wasi_ctx: wasmtime_wasi::p1::WasiP1Ctx,
     peer_rx: tokio::sync::mpsc::Receiver<PeerMessageApp>,
     peer_tx: tokio::sync::mpsc::Sender<(Vec<PeerId>, Vec<u8>)>,
     app_id: AppId,
+    app_runtime_session: AppRuntimeSession,
     shortname: String,
 }
 
@@ -2102,12 +2266,13 @@ pub struct PreloadedAppState {
 pub struct AppContext {
     db: libsql::Connection,
     mesh: Mesh,
+    app_env_secret_key: Arc<str>,
     remote_sshid: String,
     audio_enabled: bool,
     term: Option<String>,
     linker: Arc<wasmtime::Linker<AppState>>,
-    module_cache: Arc<tokio::sync::RwLock<HashMap<u64, wasmtime::Module>>>,
-    app_output_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    app_registry: AppRuntimeRegistry,
+    app_output_sender: tokio::sync::mpsc::Sender<BytesMut>,
     user_id: Option<u64>,
     locale: String,
     log_backend: Arc<dyn GuestLogBackend>,
@@ -2122,11 +2287,12 @@ pub struct AppState {
     menu_completed_rx: mpsc::Receiver<(usize, Result<Vec<u8>, String>)>,
     menu_request_tx: mpsc::Sender<MenuRequestJob>,
     menu_session: MenuSessionState,
-    menu_username: String,
+    session_identity: SessionIdentity,
     limits: AppLimiter,
     next_app: Option<NextAppState>,
     has_next_app: Arc<AtomicBool>,
     input_receiver: tokio::sync::mpsc::Receiver<Bytes>,
+    status_bar_input: StatusBarInput,
     graceful_shutdown_token: CancellationToken,
     network_info: Arc<dyn NetworkInfo>,
     terminal_profile: TerminalProfile,
@@ -2213,7 +2379,7 @@ struct UnknownGameShortnameError(String);
 
 impl std::fmt::Display for UnknownGameShortnameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Unknown game shortname: {}", self.0)
+        write!(f, "Unknown app shortname: {}", self.0)
     }
 }
 
@@ -2376,7 +2542,7 @@ pub enum MenuRequestState {
 #[derive(Clone)]
 pub struct SessionReplay {
     created_at: i64,
-    game_id: u64,
+    app_id: u64,
     asciinema_url: String,
 }
 
@@ -2438,7 +2604,7 @@ pub struct MenuSessionState {
 
 #[derive(Clone)]
 enum MenuRequestKind {
-    GamesList { current_shortname: String },
+    AppsList { current_shortname: String },
     ProfileGet,
     ProfileSet { username: String, locale: String },
     ReplaysList { locale: String },
@@ -2450,38 +2616,21 @@ struct MenuRequestJob {
     kind: MenuRequestKind,
 }
 
+#[derive(Default)]
 struct MenuUpdate {
     username: Option<String>,
     locale: Option<String>,
     replays: Option<Vec<SessionReplay>>,
 }
 
-impl Default for MenuUpdate {
-    fn default() -> Self {
-        Self {
-            username: None,
-            locale: None,
-            replays: None,
-        }
-    }
-}
-
 pub struct Connection {
     stream: Stream,
 }
 
+#[derive(Default)]
 struct AppLimiter {
     memory_total: usize,
     table_total: usize,
-}
-
-impl Default for AppLimiter {
-    fn default() -> Self {
-        AppLimiter {
-            memory_total: 0,
-            table_total: 0,
-        }
-    }
 }
 
 impl wasmtime::ResourceLimiter for AppLimiter {
@@ -2525,13 +2674,13 @@ impl wasmtime::ResourceLimiter for AppLimiter {
 }
 
 struct EscapeSequenceBuffer {
-    buffer: Vec<u8>,
+    buffer: BytesMut,
 }
 
 impl EscapeSequenceBuffer {
     fn new() -> Self {
         Self {
-            buffer: Vec::with_capacity(64),
+            buffer: BytesMut::with_capacity(64),
         }
     }
 
@@ -2618,7 +2767,7 @@ impl EscapeSequenceBuffer {
 
     /// Add data to the buffer and return data that's safe to send
     #[inline]
-    fn push(&mut self, mut data: Vec<u8>) -> Vec<u8> {
+    fn push(&mut self, mut data: BytesMut) -> BytesMut {
         // Fast path: buffer is empty, check if incoming data is complete
         if self.buffer.is_empty() {
             let incomplete_len = Self::incomplete_escape_len(&data);
@@ -2627,27 +2776,24 @@ impl EscapeSequenceBuffer {
             }
             if incomplete_len == data.len() {
                 self.buffer = data;
-                return Vec::new();
+                return BytesMut::new();
             }
             let split_at = data.len() - incomplete_len;
-            self.buffer.extend_from_slice(&data[split_at..]);
-            data.truncate(split_at);
+            self.buffer = data.split_off(split_at);
             return data;
         }
 
         // Slow path: we have buffered data, need to combine
-        self.buffer.append(&mut data);
+        self.buffer.extend_from_slice(&data);
 
         let incomplete_len = Self::incomplete_escape_len(&self.buffer);
         if incomplete_len == 0 {
-            std::mem::take(&mut self.buffer)
+            self.buffer.split()
         } else if incomplete_len < self.buffer.len() {
-            let split_at = self.buffer.len() - incomplete_len;
-            let incomplete = self.buffer.split_off(split_at);
-            let complete = std::mem::replace(&mut self.buffer, incomplete);
-            complete
+            let complete_len = self.buffer.len() - incomplete_len;
+            self.buffer.split_to(complete_len)
         } else {
-            Vec::new()
+            BytesMut::new()
         }
     }
 }
@@ -2669,15 +2815,15 @@ impl wasmtime::CallHookHandler<AppState> for AsyncCallHook {
 }
 
 pub struct AsyncStdoutWriter {
-    sender: tokio_util::sync::PollSender<Vec<u8>>,
-    buffer: Vec<u8>,
+    sender: tokio_util::sync::PollSender<BytesMut>,
+    buffer: BytesMut,
 }
 
 impl AsyncStdoutWriter {
-    pub fn new(sender: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+    pub fn new(sender: tokio::sync::mpsc::Sender<BytesMut>) -> Self {
         Self {
             sender: tokio_util::sync::PollSender::new(sender),
-            buffer: Vec::with_capacity(16 * 1024),
+            buffer: BytesMut::with_capacity(16 * 1024),
         }
     }
 }
@@ -2690,9 +2836,8 @@ impl tokio::io::AsyncWrite for AsyncStdoutWriter {
     ) -> Poll<std::io::Result<usize>> {
         match self.sender.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
-                let mut buffer = std::mem::replace(&mut self.buffer, Vec::with_capacity(16 * 1024));
+                let mut buffer = self.buffer.split();
                 buffer.extend_from_slice(buf);
-                // let len = self.buffer.len();
                 let _ = self.sender.send_item(buffer);
                 Poll::Ready(Ok(buf.len()))
             }
@@ -2712,12 +2857,13 @@ impl tokio::io::AsyncWrite for AsyncStdoutWriter {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        // Poll::Ready(Ok(()))
-        // self.poll_write(cx, &[]).map_ok(|_| ())
+        if self.buffer.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
 
         match self.sender.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
-                let buffer = std::mem::take(&mut self.buffer);
+                let buffer = self.buffer.split();
                 let _ = self.sender.send_item(buffer);
                 Poll::Ready(Ok(()))
             }
@@ -2736,7 +2882,7 @@ impl tokio::io::AsyncWrite for AsyncStdoutWriter {
 }
 
 struct MyStdoutStream {
-    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    sender: tokio::sync::mpsc::Sender<BytesMut>,
 }
 
 impl wasmtime_wasi::cli::StdoutStream for MyStdoutStream {
@@ -2837,8 +2983,8 @@ async fn save_replay(
             .as_secs() as i64;
         let _ = db
             .execute(
-                "INSERT INTO replays (asciinema_url, user_id, game_id, created_at) VALUES (?1, ?2, ?3, ?4)",
-                libsql::params!(url.as_str(), uid, app_id.0, now),
+                "INSERT INTO replays (asciinema_url, user_id, app_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+                libsql::params!(url.as_str(), uid, app_id.app_id, now),
             )
             .await;
         (Ok(url), None)
@@ -2849,7 +2995,7 @@ async fn save_replay(
             .as_secs() as i64;
         menu_session.replays.push(SessionReplay {
             created_at: now,
-            game_id: app_id.0,
+            app_id: app_id.app_id,
             asciinema_url: url.clone(),
         });
         (Ok(url), Some(menu_session))
