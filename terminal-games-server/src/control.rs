@@ -1202,7 +1202,7 @@ async fn run_spy_socket(
     mut spy: crate::sessions::SpySession,
     session_registry: Arc<SessionRegistry>,
     local_session_id: u64,
-    rw: bool,
+    mut rw: bool,
     show_input: bool,
 ) {
     let init = serde_json::to_string(&SpyControlMessage::Init {
@@ -1344,6 +1344,10 @@ async fn run_spy_socket(
                         match message {
                             SpyClientMessage::SetIdlePaused { paused } => {
                                 session_registry.set_idle_paused(local_session_id, paused);
+                            }
+                            SpyClientMessage::SetReadWrite { read_write } => {
+                                rw = read_write;
+                                spy.set_read_write(read_write);
                             }
                             SpyClientMessage::Kick => {
                                 session_registry.kick(local_session_id);

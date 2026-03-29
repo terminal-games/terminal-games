@@ -52,6 +52,12 @@ impl Drop for SpySession {
     }
 }
 
+impl SpySession {
+    pub fn set_read_write(&mut self, read_write: bool) {
+        self.input_tx = read_write.then_some(self.session.input_tx.clone());
+    }
+}
+
 pub struct SessionRegistration {
     pub identity: SessionIdentity,
     pub session_ui: SessionUi,

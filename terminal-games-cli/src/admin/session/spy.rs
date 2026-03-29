@@ -93,7 +93,7 @@ pub(super) async fn session_spy(args: AdminSessionSpyArgs, profile: Option<Strin
                         Message::Binary(data) => {
                             let vt = vt.as_mut().ok_or_else(|| anyhow::anyhow!("missing spy init frame"))?;
                             vt.feed_str(&String::from_utf8_lossy(&data));
-                            if args.rw {
+                            if status_bar.is_read_write() {
                                 sync_mouse_capture(
                                     scan_mouse_modes(&String::from_utf8_lossy(&data), &mut mouse_modes),
                                     &mut local_mouse_capture,
@@ -106,7 +106,7 @@ pub(super) async fn session_spy(args: AdminSessionSpyArgs, profile: Option<Strin
                                 SpyControlMessage::Init { cols, rows, dump } => {
                                     let mut next_vt = avt::Vt::new((cols as usize).max(1), (rows as usize).max(1));
                                     next_vt.feed_str(&dump);
-                                    if args.rw {
+                                    if status_bar.is_read_write() {
                                         mouse_modes.clear();
                                         sync_mouse_capture(
                                             scan_mouse_modes(&dump, &mut mouse_modes),
@@ -211,7 +211,7 @@ pub(super) async fn session_spy(args: AdminSessionSpyArgs, profile: Option<Strin
                             .send(Message::Text(serde_json::to_string(&message)?.into()))
                             .await?;
                     }
-                    if args.rw && !forwarded.is_empty() {
+                    if status_bar.is_read_write() && !forwarded.is_empty() {
                         write.send(Message::Binary(forwarded.into())).await?;
                     }
                 }
@@ -581,6 +581,12 @@ async fn apply_spy_local_shortcuts(
                 forwarded.clear();
                 command = Some(SpyClientMessage::SetIdlePaused { paused });
             }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                let read_write = status_bar.toggle_read_write();
+                toggled = true;
+                forwarded.clear();
+                command = Some(SpyClientMessage::SetReadWrite { read_write });
+            }
             KeyCode::Char('k') | KeyCode::Char('K') => {
                 forwarded.clear();
                 command = Some(SpyClientMessage::Kick);
@@ -605,6 +611,12 @@ async fn apply_spy_local_shortcuts(
                 toggled = true;
                 forwarded.clear();
                 command = Some(SpyClientMessage::SetIdlePaused { paused });
+            }
+            [0x12] => {
+                let read_write = status_bar.toggle_read_write();
+                toggled = true;
+                forwarded.clear();
+                command = Some(SpyClientMessage::SetReadWrite { read_write });
             }
             [0x0b] => {
                 forwarded.clear();
@@ -682,18 +694,22 @@ impl SpyStatusBar {
             "pause idle"
         };
         let hint_plain = format!(
-            "ctrl+t: {input_hint_value} ctrl+p: {idle_hint_value} ctrl+k: kick ctrl+c: exit"
+            "ctrl+t: {input_hint_value} ctrl+p: {idle_hint_value} ctrl+r: {} ctrl+k: kick ctrl+c: exit",
+            if self.read_write { "readonly" } else { "rw" }
         );
         let hint = StatusField {
             width: visible_width(&hint_plain),
             ansi: format!(
-                "\x1b[{}mctrl+t:\x1b[{}m {} \x1b[{}mctrl+p:\x1b[{}m {} \x1b[{}mctrl+k:\x1b[{}m kick \x1b[{}mctrl+c:\x1b[{}m exit",
+                "\x1b[{}mctrl+t:\x1b[{}m {} \x1b[{}mctrl+p:\x1b[{}m {} \x1b[{}mctrl+r:\x1b[{}m {} \x1b[{}mctrl+k:\x1b[{}m kick \x1b[{}mctrl+c:\x1b[{}m exit",
                 palette::render_color_code(theme.muted, false),
                 palette::render_color_code(theme.text, false),
                 input_hint_value,
                 palette::render_color_code(theme.muted, false),
                 palette::render_color_code(theme.text, false),
                 idle_hint_value,
+                palette::render_color_code(theme.muted, false),
+                palette::render_color_code(theme.text, false),
+                if self.read_write { "readonly" } else { "rw" },
                 palette::render_color_code(theme.muted, false),
                 palette::render_color_code(theme.text, false),
                 palette::render_color_code(theme.muted, false),
@@ -708,12 +724,6 @@ impl SpyStatusBar {
             remaining_width
         };
         let fields = [
-            status_field(
-                theme.muted,
-                theme.text,
-                "mode",
-                if self.read_write { "rw" } else { "readonly" },
-            ),
             status_field(theme.muted, theme.text, "app", &self.session.shortname),
             status_field(
                 theme.muted,
@@ -816,6 +826,15 @@ impl SpyStatusBar {
     fn toggle_idle_paused(&mut self) -> bool {
         self.idle_paused = !self.idle_paused;
         self.idle_paused
+    }
+
+    fn toggle_read_write(&mut self) -> bool {
+        self.read_write = !self.read_write;
+        self.read_write
+    }
+
+    fn is_read_write(&self) -> bool {
+        self.read_write
     }
 
     fn show_input_overlay(&self) -> bool {

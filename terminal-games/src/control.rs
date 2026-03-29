@@ -409,6 +409,7 @@ pub enum SpyControlMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SpyClientMessage {
     SetIdlePaused { paused: bool },
+    SetReadWrite { read_write: bool },
     Kick,
 }
 
