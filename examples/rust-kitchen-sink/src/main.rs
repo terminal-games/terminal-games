@@ -25,8 +25,7 @@ use terminal_games_sdk::{
     terminput,
 };
 
-#[used]
-static TERMINAL_GAMES_MANIFEST: &[u8] = include_bytes!("../terminal-games.json");
+terminal_games_sdk::embed_manifest!();
 
 const SONG_DATA: &[u8] = include_bytes!("../../kitchen-sink/Mesmerizing Galaxy Loop.ogg");
 

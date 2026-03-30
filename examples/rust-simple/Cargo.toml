@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 ratatui = { version = "0.30", default-features = false }
 terminal-games-sdk = { path = "../../terminal-games-sdk" }
+
+[build-dependencies]
+terminal-games-manifest = { path = "../../terminal-games-manifest" }

@@ -2,16 +2,50 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-pub use terminal_games_manifest::{AppDetails, AppManifest, MANIFEST_VERSION, Screenshot};
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 use wasmparser::{Parser, Payload};
 
 const MANIFEST_MARKER: &[u8] = br#""terminal_games_manifest_version""#;
+pub const MANIFEST_VERSION: u32 = 1;
 const SCREENSHOT_COLS: usize = 80;
 const SCREENSHOT_ROWS: usize = 24;
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppManifest {
+    pub terminal_games_manifest_version: u32,
+    pub shortname: String,
+    #[serde(default)]
+    pub details: AppDetails,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppDetails {
+    pub author: String,
+    pub version: String,
+    #[serde(default)]
+    pub name: BTreeMap<String, String>,
+    #[serde(default)]
+    pub description: BTreeMap<String, String>,
+    #[serde(default)]
+    pub details: BTreeMap<String, String>,
+    #[serde(default)]
+    pub screenshots: BTreeMap<String, Vec<Screenshot>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Screenshot {
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub caption: String,
+}
+
 pub fn validate_manifest(manifest: &AppManifest) -> anyhow::Result<()> {
-    terminal_games_manifest::AppManifest::validate(manifest).map_err(anyhow::Error::msg)
+    let bytes = serde_json::to_vec(manifest)?;
+    terminal_games_manifest::validate_manifest_json(&bytes).map_err(anyhow::Error::msg)
 }
 
 pub fn sanitize_manifest(manifest: &AppManifest) -> anyhow::Result<AppManifest> {
@@ -41,14 +75,14 @@ pub fn extract_manifest_from_wasm(bytes: &[u8]) -> anyhow::Result<Option<AppMani
     for payload in Parser::new(0).parse_all(bytes) {
         match payload? {
             Payload::CustomSection(section) => {
-                if let Some(manifest) = extract_manifest_from_blob(section.data()) {
+                if let Some(manifest) = extract_manifest_from_blob(section.data())? {
                     return Ok(Some(manifest));
                 }
             }
             Payload::DataSection(reader) => {
                 for data in reader {
                     let data = data?;
-                    if let Some(manifest) = extract_manifest_from_blob(data.data) {
+                    if let Some(manifest) = extract_manifest_from_blob(data.data)? {
                         return Ok(Some(manifest));
                     }
                 }
@@ -59,33 +93,43 @@ pub fn extract_manifest_from_wasm(bytes: &[u8]) -> anyhow::Result<Option<AppMani
     Ok(None)
 }
 
-fn extract_manifest_from_blob(bytes: &[u8]) -> Option<AppManifest> {
+fn extract_manifest_from_blob(bytes: &[u8]) -> anyhow::Result<Option<AppManifest>> {
     let mut marker_search_from = 0usize;
     while let Some(marker_pos) = find_subslice(bytes, MANIFEST_MARKER, marker_search_from) {
         marker_search_from = marker_pos + MANIFEST_MARKER.len();
         let scan_start = marker_pos.saturating_sub(128 * 1024);
+        let mut found_json_start = false;
         for start in (scan_start..=marker_pos).rev() {
             if bytes[start] != b'{' {
                 continue;
             }
-            let mut stream =
-                serde_json::Deserializer::from_slice(&bytes[start..]).into_iter::<AppManifest>();
-            let Some(Ok(manifest)) = stream.next() else {
+            found_json_start = true;
+            let Some(end) = find_json_object_end(bytes, start) else {
                 continue;
             };
-            if start + stream.byte_offset() <= marker_pos {
+            if end <= marker_pos {
                 continue;
             }
-            if manifest.terminal_games_manifest_version != MANIFEST_VERSION {
+            let candidate = &bytes[start..end];
+            if !candidate
+                .windows(MANIFEST_MARKER.len())
+                .any(|window| window == MANIFEST_MARKER)
+            {
                 continue;
             }
-            if manifest.shortname.trim().is_empty() {
-                continue;
-            }
-            return Some(manifest);
+            terminal_games_manifest::validate_manifest_json(candidate).map_err(|error| {
+                anyhow::anyhow!("invalid embedded terminal-games manifest: {error}")
+            })?;
+            let manifest = serde_json::from_slice::<AppManifest>(candidate)?;
+            return Ok(Some(manifest));
+        }
+        if found_json_start {
+            return Err(anyhow::anyhow!(
+                "found embedded terminal-games manifest marker but failed to recover a complete JSON object"
+            ));
         }
     }
-    None
+    Ok(None)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8], start_at: usize) -> Option<usize> {
@@ -98,8 +142,63 @@ fn find_subslice(haystack: &[u8], needle: &[u8], start_at: usize) -> Option<usiz
         .map(|offset| start_at + offset)
 }
 
+fn find_json_object_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, byte) in bytes[start..].iter().copied().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn validate_shortname(shortname: &str) -> anyhow::Result<()> {
-    terminal_games_manifest::validate_shortname(shortname).map_err(anyhow::Error::msg)
+    if shortname.is_empty() || shortname.len() > 32 {
+        anyhow::bail!("shortname must be between 1 and 32 characters");
+    }
+    if !shortname
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        anyhow::bail!("shortname must contain only lowercase ASCII letters, digits, or '-'");
+    }
+    if !shortname
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        anyhow::bail!("shortname must start with a lowercase ASCII letter or digit");
+    }
+    if !shortname
+        .bytes()
+        .last()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        anyhow::bail!("shortname must end with a lowercase ASCII letter or digit");
+    }
+    Ok(())
 }
 
 fn sanitize_wrapped_text(input: &str) -> String {

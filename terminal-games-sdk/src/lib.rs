@@ -15,6 +15,18 @@ pub mod network;
 pub use terminal_games_manifest as manifest;
 pub use terminput;
 
+#[macro_export]
+macro_rules! embed_manifest {
+    () => {
+        #[used]
+        static TERMINAL_GAMES_MANIFEST: &[u8] = include_bytes!("../terminal-games.json");
+    };
+    ($path:literal) => {
+        #[used]
+        static TERMINAL_GAMES_MANIFEST: &[u8] = include_bytes!($path);
+    };
+}
+
 mod internal {
     #[link(wasm_import_module = "terminal_games")]
     unsafe extern "C" {
