@@ -24,9 +24,7 @@
       "maxLength": 32,
       "pattern": "^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$",
       "examples": [
-        "kitchen-sink",
-        "rust-simple",
-        "menu"
+        "my-app-name"
       ]
     },
     "details": {
@@ -42,15 +40,15 @@
     {
       "$schema": "../../terminal-games.schema.json",
       "terminal_games_manifest_version": 1,
-      "shortname": "rust-simple",
+      "shortname": "my-app-name",
       "details": {
-        "author": "Terminal Games",
+        "author": "My Game Studio",
         "version": "1.0.0",
         "name": {
-          "en": "Rust Simple"
+          "en": "My Game"
         },
         "description": {
-          "en": "Minimal Rust example."
+          "en": "Fun experience on the terminal!"
         }
       }
     }
@@ -93,7 +91,7 @@
       "properties": {
         "content": {
           "type": "string",
-          "description": "Rendered terminal screenshot content. The host sanitizes and crops this when displaying it.",
+          "description": "Rendered terminal screenshot content of 80x24. The host sanitizes and crops this when displaying it.",
           "default": "",
           "maxLength": 131072,
           "examples": [
@@ -106,7 +104,7 @@
           "default": "",
           "maxLength": 16384,
           "examples": [
-            "Actual screenshot of the app"
+            "Should be an actual screenshot of the game"
           ]
         }
       }
@@ -140,8 +138,7 @@
           "maxLength": 256,
           "pattern": ".*\\S.*",
           "examples": [
-            "Terminal Games",
-            "mbund"
+            "My Game Studio"
           ]
         },
         "version": {
@@ -152,8 +149,8 @@
           "pattern": ".*\\S.*",
           "examples": [
             "1.0.0",
-            "builtin",
-            "2026.03.29"
+            "2026-03-29",
+            "v1"
           ]
         },
         "name": {
@@ -179,22 +176,22 @@
       ],
       "examples": [
         {
-          "author": "Terminal Games",
+          "author": "My Game Studio",
           "version": "1.0.0",
           "name": {
-            "en": "Rust Kitchen Sink"
+            "en": "My Game"
           },
           "description": {
-            "en": "Advanced Rust feature suite."
+            "en": "Fun experience on the terminal!"
           },
           "details": {
-            "en": "The kitchen sink example, but in Rust."
+            "en": "A significantly longer and detailed description.\n\nCan include multiple paragraphs."
           },
           "screenshots": {
             "en": [
               {
-                "content": "example screenshot",
-                "caption": "Main menu"
+                "content": "┌───────────────────────────────────────────────────────────────────────────────\n│ Hello from Terminal Games\n└───────────────────────────────────────────────────────────────────────────────",
+                "caption": "Should be an actual screenshot of the game"
               }
             ]
           }
