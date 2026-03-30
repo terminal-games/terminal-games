@@ -85,6 +85,7 @@ func init() {
 	if len(terminalGamesManifestJSON) == 0 {
 		panic("missing terminal-games.json")
 	}
+
 	var err error
 	songResource, err = audio.NewResourceFromOGGVorbis(songEmbed)
 	if err != nil {

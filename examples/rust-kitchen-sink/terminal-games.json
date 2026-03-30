@@ -1,9 +1,10 @@
 {
+  "$schema": "../../terminal-games.schema.json",
   "terminal_games_manifest_version": 1,
   "shortname": "rust-kitchen-sink",
   "details": {
     "author": "Terminal Games",
-    "version": "1.0.0",
+    "version": "$CARGO_PKG_VERSION",
     "name": {
       "en": "Rust Kitchen Sink"
     },

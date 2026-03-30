@@ -6,6 +6,7 @@ mod auth;
 mod delete;
 mod env;
 mod list;
+mod manifest;
 mod rotate_token;
 mod upload;
 
@@ -36,6 +37,8 @@ enum AppCommand {
     /// Upload a new wasm build for the reserved shortname.
     /// `TERMINAL_GAMES_AUTHOR_TOKEN` can be used instead of prior `app auth` setup.
     Upload(AppUploadArgs),
+    /// Extract, validate, and print the embedded manifest from a wasm file.
+    Manifest(AppManifestArgs),
     #[command(subcommand)]
     /// Manage encrypted app environment variables.
     Env(AppEnvCommand),
@@ -68,6 +71,12 @@ pub(super) struct AppUploadArgs {
     /// Load env vars from a dotenv-style file and replace the full set atomically.
     #[arg(long = "env-file", add = ArgValueCompleter::new(PathCompleter::file()))]
     env_file: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub(super) struct AppManifestArgs {
+    #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
+    path_to_wasm_file: PathBuf,
 }
 
 #[derive(Args)]
@@ -121,6 +130,7 @@ pub async fn run(cli: AppCli, profile: Option<String>) -> Result<()> {
     match cli.command {
         AppCommand::Auth(args) => auth::run(args).await,
         AppCommand::Upload(args) => upload::run(args, profile).await,
+        AppCommand::Manifest(args) => manifest::run(args).await,
         AppCommand::Env(command) => env::run(command, profile).await,
         AppCommand::List => list::run().await,
         AppCommand::RotateToken(args) => rotate_token::run(args, profile).await,

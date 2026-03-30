@@ -2,167 +2,107 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::collections::BTreeMap;
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    sync::{LazyLock, OnceLock},
+};
 
-use serde::{Deserialize, Serialize};
+use boon::{Compiler, Draft, SchemaIndex, Schemas};
 
-pub const MANIFEST_VERSION: u32 = 1;
-const MAX_SHORTNAME_LEN: usize = 32;
-const MAX_AUTHOR_LEN: usize = 256;
-const MAX_VERSION_LEN: usize = 128;
-const MAX_LOCALIZED_VALUE_LEN: usize = 16 * 1024;
-const MAX_SCREENSHOT_CONTENT_LEN: usize = 128 * 1024;
-const MAX_SCREENSHOTS_PER_LOCALE: usize = 8;
+const APP_MANIFEST_SCHEMA_ID: &str = "urn:terminal-games:manifest-schema:v1";
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AppManifest {
-    pub terminal_games_manifest_version: u32,
-    pub shortname: String,
-    #[serde(default)]
-    pub details: AppDetails,
+static APP_MANIFEST_SCHEMA_VALUE: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../../terminal-games.schema.json"))
+        .expect("manifest schema must be valid JSON")
+});
+
+static COMPILED_APP_MANIFEST_SCHEMA: OnceLock<Result<CompiledManifestSchema, String>> =
+    OnceLock::new();
+
+struct CompiledManifestSchema {
+    schemas: Schemas,
+    schema_index: SchemaIndex,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AppDetails {
-    pub author: String,
-    pub version: String,
-    #[serde(default)]
-    pub name: BTreeMap<String, String>,
-    #[serde(default)]
-    pub description: BTreeMap<String, String>,
-    #[serde(default)]
-    pub details: BTreeMap<String, String>,
-    #[serde(default)]
-    pub screenshots: BTreeMap<String, Vec<Screenshot>>,
+pub fn validate_manifest_json(bytes: &[u8]) -> Result<(), String> {
+    let instance =
+        serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| error.to_string())?;
+    validate_manifest_json_value(&instance)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Screenshot {
-    #[serde(default)]
-    pub content: String,
-    #[serde(default)]
-    pub caption: String,
+pub fn validate_manifest_file(path: impl AsRef<Path>) -> Result<(), String> {
+    let path = path.as_ref();
+    let bytes =
+        fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    validate_manifest_json(&bytes)
 }
 
-impl AppManifest {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.terminal_games_manifest_version != MANIFEST_VERSION {
-            return Err(format!(
-                "terminal_games_manifest_version must be {}",
-                MANIFEST_VERSION
-            ));
-        }
-        validate_shortname(&self.shortname)?;
-        validate_author(&self.details.author)?;
-        validate_version(&self.details.version)?;
-        validate_localized_map("details.name", &self.details.name)?;
-        validate_localized_map("details.description", &self.details.description)?;
-        validate_localized_map("details.details", &self.details.details)?;
-        for (locale, screenshots) in &self.details.screenshots {
-            validate_locale(locale)?;
-            if screenshots.len() > MAX_SCREENSHOTS_PER_LOCALE {
-                return Err(format!(
-                    "details.screenshots.{locale} exceeds {MAX_SCREENSHOTS_PER_LOCALE} entries"
-                ));
-            }
-            for (index, screenshot) in screenshots.iter().enumerate() {
-                if screenshot.content.len() > MAX_SCREENSHOT_CONTENT_LEN {
-                    return Err(format!(
-                        "details.screenshots.{locale}[{index}].content exceeds {} bytes",
-                        MAX_SCREENSHOT_CONTENT_LEN
-                    ));
-                }
-                if screenshot.caption.len() > MAX_LOCALIZED_VALUE_LEN {
-                    return Err(format!(
-                        "details.screenshots.{locale}[{index}].caption exceeds {} bytes",
-                        MAX_LOCALIZED_VALUE_LEN
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-pub fn parse_and_validate_manifest_json(bytes: &[u8]) -> Result<AppManifest, String> {
-    let manifest =
-        serde_json::from_slice::<AppManifest>(bytes).map_err(|error| error.to_string())?;
-    manifest.validate()?;
-    Ok(manifest)
-}
-
-pub fn validate_shortname(shortname: &str) -> Result<(), String> {
-    if shortname.is_empty() || shortname.len() > MAX_SHORTNAME_LEN {
-        return Err(format!(
-            "shortname must be between 1 and {} characters",
-            MAX_SHORTNAME_LEN
-        ));
-    }
-    if !shortname
-        .bytes()
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
-        return Err("shortname must contain only lowercase ASCII letters, digits, or '-'".into());
-    }
-    if !shortname
-        .bytes()
-        .next()
-        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-    {
-        return Err("shortname must start with a lowercase ASCII letter or digit".into());
-    }
-    if !shortname
-        .bytes()
-        .last()
-        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-    {
-        return Err("shortname must end with a lowercase ASCII letter or digit".into());
-    }
+pub fn setup_build() -> Result<(), String> {
+    let cargo_manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").map_err(|error| error.to_string())?);
+    let out_dir = PathBuf::from(env::var("OUT_DIR").map_err(|error| error.to_string())?);
+    let manifest_path = cargo_manifest_dir.join("terminal-games.json");
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
+    prepare_embedded_manifest(&manifest_path, &out_dir)
+        .map_err(|error| format!("invalid {}: {error}", manifest_path.display()))?;
     Ok(())
 }
 
-fn validate_author(author: &str) -> Result<(), String> {
-    if author.trim().is_empty() || author.len() > MAX_AUTHOR_LEN {
-        return Err(format!(
-            "details.author must be between 1 and {} bytes",
-            MAX_AUTHOR_LEN
-        ));
-    }
-    Ok(())
+fn prepare_embedded_manifest(
+    manifest_path: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+) -> Result<PathBuf, String> {
+    let manifest_path = manifest_path.as_ref();
+    let out_dir = out_dir.as_ref();
+    let bytes = fs::read(manifest_path)
+        .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?;
+    let processed = process_manifest_json(&bytes)?;
+    let out_path = out_dir.join("terminal-games.embed.json");
+    fs::write(&out_path, processed)
+        .map_err(|error| format!("failed to write {}: {error}", out_path.display()))?;
+    Ok(out_path)
 }
 
-fn validate_version(version: &str) -> Result<(), String> {
-    if version.trim().is_empty() || version.len() > MAX_VERSION_LEN {
-        return Err(format!(
-            "details.version must be between 1 and {} bytes",
-            MAX_VERSION_LEN
-        ));
-    }
-    Ok(())
+fn validate_manifest_json_value(instance: &serde_json::Value) -> Result<(), String> {
+    let compiled = compiled_manifest_schema()?;
+    compiled
+        .schemas
+        .validate(instance, compiled.schema_index)
+        .map_err(|error| format!("{error:#}"))
 }
 
-fn validate_localized_map(path: &str, values: &BTreeMap<String, String>) -> Result<(), String> {
-    for (locale, value) in values {
-        validate_locale(locale)?;
-        if value.len() > MAX_LOCALIZED_VALUE_LEN {
-            return Err(format!(
-                "{path}.{locale} exceeds {} bytes",
-                MAX_LOCALIZED_VALUE_LEN
-            ));
+fn process_manifest_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut instance =
+        serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| error.to_string())?;
+    
+    if let Some(value) = instance.pointer_mut("/details/version") {
+        if value.as_str() == Some("$CARGO_PKG_VERSION") {
+            *value = serde_json::Value::String(std::env::var("CARGO_PKG_VERSION").unwrap());
         }
     }
-    Ok(())
+
+    validate_manifest_json_value(&instance)?;
+    serde_json::to_vec(&instance).map_err(|error| error.to_string())
 }
 
-fn validate_locale(locale: &str) -> Result<(), String> {
-    if locale.trim().is_empty() {
-        return Err("locale keys cannot be empty".into());
-    }
-    if !locale
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err("locale keys must be ASCII alphanumeric plus '-' or '_'".into());
-    }
-    Ok(())
+fn compiled_manifest_schema() -> Result<&'static CompiledManifestSchema, String> {
+    COMPILED_APP_MANIFEST_SCHEMA
+        .get_or_init(|| {
+            let mut schemas = Schemas::new();
+            let mut compiler = Compiler::new();
+            compiler.set_default_draft(Draft::V2020_12);
+            compiler
+                .add_resource(APP_MANIFEST_SCHEMA_ID, APP_MANIFEST_SCHEMA_VALUE.clone())
+                .map_err(|error| format!("{error:#}"))?;
+            let schema_index = compiler
+                .compile(APP_MANIFEST_SCHEMA_ID, &mut schemas)
+                .map_err(|error| format!("{error:#}"))?;
+            Ok(CompiledManifestSchema {
+                schemas,
+                schema_index,
+            })
+        })
+        .as_ref()
+        .map_err(Clone::clone)
 }

@@ -1,4 +1,5 @@
 {
+  "$schema": "../../terminal-games.schema.json",
   "terminal_games_manifest_version": 1,
   "shortname": "menu",
   "details": {

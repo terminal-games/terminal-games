@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:terminal-games:manifest-schema:v1",
+  "title": "Terminal Games App Manifest",
+  "description": "Manifest embedded into a Terminal Games WebAssembly app. Editors can use this schema for inline validation and autocomplete, while SDKs and tooling can validate the same manifest at build time or runtime.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional schema path used by editors and tooling for inline validation."
+    },
+    "terminal_games_manifest_version": {
+      "const": 1,
+      "description": "Manifest format version. This schema defines version 1.",
+      "examples": [
+        1
+      ]
+    },
+    "shortname": {
+      "type": "string",
+      "description": "Stable app identifier used in URLs, app switching, uploads, and runtime routing.",
+      "minLength": 1,
+      "maxLength": 32,
+      "pattern": "^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$",
+      "examples": [
+        "my-app-name"
+      ]
+    },
+    "details": {
+      "$ref": "#/$defs/appDetails"
+    }
+  },
+  "required": [
+    "terminal_games_manifest_version",
+    "shortname",
+    "details"
+  ],
+  "examples": [
+    {
+      "$schema": "../../terminal-games.schema.json",
+      "terminal_games_manifest_version": 1,
+      "shortname": "my-app-name",
+      "details": {
+        "author": "My Game Studio",
+        "version": "1.0.0",
+        "name": {
+          "en": "My Game"
+        },
+        "description": {
+          "en": "Fun experience on the terminal!"
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "localeKey": {
+      "type": "string",
+      "description": "Locale code used to look up a localized string or screenshot list.",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "examples": [
+        "en",
+        "en-US",
+        "de"
+      ]
+    },
+    "localizedStringMap": {
+      "type": "object",
+      "description": "Map of locale code to localized text.",
+      "default": {},
+      "propertyNames": {
+        "$ref": "#/$defs/localeKey"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "description": "Localized text payload.",
+        "maxLength": 16384
+      },
+      "examples": [
+        {
+          "en": "Kitchen Sink",
+          "de": "Kuechenbecken"
+        }
+      ]
+    },
+    "screenshot": {
+      "type": "object",
+      "description": "Single terminal screenshot entry. Content is ANSI-capable text that will be sanitized by the host before display.",
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string",
+          "description": "Rendered terminal screenshot content of 80x24. The host sanitizes and crops this when displaying it.",
+          "default": "",
+          "maxLength": 131072,
+          "examples": [
+            "┌───────────────────────────────────────────────────────────────────────────────\n│ Hello from Terminal Games\n└───────────────────────────────────────────────────────────────────────────────"
+          ]
+        },
+        "caption": {
+          "type": "string",
+          "description": "Localized caption for the screenshot entry.",
+          "default": "",
+          "maxLength": 16384,
+          "examples": [
+            "Should be an actual screenshot of the game"
+          ]
+        }
+      }
+    },
+    "localizedScreenshots": {
+      "type": "object",
+      "description": "Map of locale code to a list of screenshots for that locale.",
+      "default": {},
+      "propertyNames": {
+        "$ref": "#/$defs/localeKey"
+      },
+      "additionalProperties": {
+        "type": "array",
+        "description": "Screenshots for a single locale.",
+        "default": [],
+        "maxItems": 8,
+        "items": {
+          "$ref": "#/$defs/screenshot"
+        }
+      }
+    },
+    "appDetails": {
+      "type": "object",
+      "description": "Human-facing app metadata shown in menus, upload flows, and discovery surfaces.",
+      "additionalProperties": false,
+      "properties": {
+        "author": {
+          "type": "string",
+          "description": "Display name of the app author or studio.",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": ".*\\S.*",
+          "examples": [
+            "My Game Studio"
+          ]
+        },
+        "version": {
+          "type": "string",
+          "description": "Author-defined app version string.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": ".*\\S.*",
+          "examples": [
+            "1.0.0",
+            "2026-03-29",
+            "v1",
+            "$CARGO_PKG_VERSION"
+          ]
+        },
+        "name": {
+          "$ref": "#/$defs/localizedStringMap",
+          "description": "Localized display names for the app."
+        },
+        "description": {
+          "$ref": "#/$defs/localizedStringMap",
+          "description": "Localized short description shown in app listings."
+        },
+        "details": {
+          "$ref": "#/$defs/localizedStringMap",
+          "description": "Localized long-form details shown in richer UI surfaces."
+        },
+        "screenshots": {
+          "$ref": "#/$defs/localizedScreenshots",
+          "description": "Localized terminal screenshots for previews."
+        }
+      },
+      "required": [
+        "author",
+        "version"
+      ],
+      "examples": [
+        {
+          "author": "My Game Studio",
+          "version": "1.0.0",
+          "name": {
+            "en": "My Game"
+          },
+          "description": {
+            "en": "Fun experience on the terminal!"
+          },
+          "details": {
+            "en": "A significantly longer and detailed description.\n\nCan include multiple paragraphs."
+          },
+          "screenshots": {
+            "en": [
+              {
+                "content": "┌───────────────────────────────────────────────────────────────────────────────\n│ Hello from Terminal Games\n└───────────────────────────────────────────────────────────────────────────────",
+                "caption": "Should be an actual screenshot of the game"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

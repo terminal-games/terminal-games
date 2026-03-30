@@ -19,9 +19,9 @@ use clap::Args;
 use clap_complete::{ArgValueCompleter, PathCompleter};
 use flate2::{Compression, write::DeflateEncoder};
 use rand::Rng;
+use terminput::{Event as TerminputEvent, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
-use terminput::{Event as TerminputEvent, KeyCode, KeyEventKind, KeyModifiers};
 use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, layer::SubscriberExt};
 
 use terminal_games::{
@@ -30,6 +30,7 @@ use terminal_games::{
     control::{AppEnvVar, StatusBarState},
     input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker},
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
+    manifest::{extract_manifest_from_wasm, sanitize_manifest},
     mesh::AppRuntimeUpdateMessage,
     mesh::{BuildId, LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
@@ -324,19 +325,33 @@ fn restore_terminal(stdout: &mut std::io::Stdout) -> Result<()> {
 async fn upsert_game(
     conn: &libsql::Connection,
     app_env_secret_key: &str,
-    shortname: &str,
     path: &str,
-    details: &str,
+    expected_shortname: Option<&str>,
     envs: &[AppEnvVar],
-) -> Result<Option<AppRuntimeUpdateMessage>> {
-    let wasm = fs::read(path).with_context(|| format!("Failed to read wasm for {shortname}"))?;
+) -> Result<(String, Option<AppRuntimeUpdateMessage>)> {
+    let wasm = fs::read(path).with_context(|| format!("Failed to read wasm from {path}"))?;
+    let manifest = extract_manifest_from_wasm(&wasm)
+        .with_context(|| format!("Failed to extract manifest from {path}"))?
+        .ok_or_else(|| anyhow::anyhow!("missing embedded terminal-games manifest in {path}"))?;
+    let manifest = sanitize_manifest(&manifest)?;
+    if let Some(expected_shortname) = expected_shortname {
+        anyhow::ensure!(
+            manifest.shortname == expected_shortname,
+            "manifest shortname '{}' does not match requested shortname '{}'",
+            manifest.shortname,
+            expected_shortname
+        );
+    }
+    let shortname = manifest.shortname.clone();
+    let details = serde_json::to_string(&manifest.details)
+        .with_context(|| format!("Failed to serialize manifest details for {shortname}"))?;
     let build_id = BuildId::from_wasm_and_envs(&wasm, envs);
     let encrypted_env = encrypt_app_env_blob(app_env_secret_key, envs)?;
     let tx = conn.transaction().await?;
     let mut rows = tx
         .query(
             "SELECT id, wasm_hash, env_hash FROM apps WHERE shortname = ?1 LIMIT 1",
-            libsql::params!(shortname),
+            libsql::params!(shortname.as_str()),
         )
         .await
         .with_context(|| format!("Failed to query existing app {shortname}"))?;
@@ -356,7 +371,7 @@ async fn upsert_game(
                  WHERE id = ?1",
                 libsql::params!(
                     app_id,
-                    details,
+                    details.as_str(),
                     wasm,
                     build_id.wasm_hash.to_vec(),
                     build_id.env_hash.to_vec(),
@@ -382,7 +397,7 @@ async fn upsert_game(
                 libsql::params!(
                     app_id,
                     wasm,
-                    details,
+                    details.as_str(),
                     build_id.wasm_hash.to_vec(),
                     build_id.env_hash.to_vec(),
                     encrypted_env.salt,
@@ -404,9 +419,9 @@ async fn upsert_game(
             "INSERT INTO apps (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
              VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)",
             libsql::params!(
-                shortname,
+                shortname.as_str(),
                 wasm,
-                details,
+                details.as_str(),
                 build_id.wasm_hash.to_vec(),
                 build_id.env_hash.to_vec(),
                 encrypted_env.salt,
@@ -429,7 +444,7 @@ async fn upsert_game(
         ))
     };
     tx.commit().await?;
-    Ok(update)
+    Ok((shortname, update))
 }
 
 async fn load_local_app_build_snapshot(
@@ -533,28 +548,17 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         .context("Failed to resolve wasm file path")?
         .display()
         .to_string();
-    let first_app_shortname = Path::new(&wasm_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("app")
-        .to_string();
-    let default_details = |shortname: &str| {
-        format!(
-            r#"{{"author":"Local","version":"dev","name":{{"en":"{shortname}"}},"description":{{"en":""}},"details":{{"en":""}},"screenshots":{{}}}}"#
-        )
-    };
 
     let mut local_app_updates = Vec::new();
-    if let Some(update) = upsert_game(
+    let (first_app_shortname, update) = upsert_game(
         &conn,
         &app_env_secret_key,
-        first_app_shortname.as_str(),
         wasm_path.as_str(),
-        default_details(first_app_shortname.as_str()).as_str(),
+        None,
         &primary_envs,
     )
-    .await?
-    {
+    .await?;
+    if let Some(update) = update {
         local_app_updates.push(update);
     }
 
@@ -565,16 +569,15 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                 .context("Failed to resolve app path")?
                 .display()
                 .to_string();
-            if let Some(update) = upsert_game(
+            let (_, update) = upsert_game(
                 &conn,
                 &app_env_secret_key,
-                shortname,
                 path.as_str(),
-                default_details(shortname).as_str(),
+                Some(shortname),
                 &[],
             )
-            .await?
-            {
+            .await?;
+            if let Some(update) = update {
                 local_app_updates.push(update);
             }
         }
@@ -810,8 +813,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     let mut sigwinch =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigquit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::quit())?;
 
     enum DelayedData {
