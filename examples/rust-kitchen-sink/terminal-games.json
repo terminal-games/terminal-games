@@ -4,7 +4,7 @@
   "shortname": "rust-kitchen-sink",
   "details": {
     "author": "Terminal Games",
-    "version": "1.0.0",
+    "version": "$CARGO_PKG_VERSION",
     "name": {
       "en": "Rust Kitchen Sink"
     },

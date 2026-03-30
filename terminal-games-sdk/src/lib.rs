@@ -19,11 +19,8 @@ pub use terminput;
 macro_rules! embed_manifest {
     () => {
         #[used]
-        static TERMINAL_GAMES_MANIFEST: &[u8] = include_bytes!("../terminal-games.json");
-    };
-    ($path:literal) => {
-        #[used]
-        static TERMINAL_GAMES_MANIFEST: &[u8] = include_bytes!($path);
+        static TERMINAL_GAMES_MANIFEST: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/terminal-games.embed.json"));
     };
 }
 
