@@ -4,6 +4,7 @@
 
 mod admission;
 mod cluster_detection;
+mod cluster_kicked_ips;
 mod control;
 mod idle;
 mod metrics;
@@ -297,7 +298,8 @@ async fn main() -> Result<()> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(Arc::<str>::from);
-    let session_registry = sessions::SessionRegistry::new(region_id);
+    let session_registry = sessions::SessionRegistry::new(region_id, metrics.clone());
+    metrics.set_session_registry(&session_registry);
     let initial_status_bar_state = control::load_status_bar_state(&conn, None).await?;
     session_registry.set_status_bar_state(initial_status_bar_state);
     let control_plane = control::ControlPlane::new(

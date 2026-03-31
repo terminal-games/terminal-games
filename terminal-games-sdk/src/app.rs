@@ -8,16 +8,26 @@
 pub fn change_app(shortname: impl AsRef<str>) -> Result<(), std::io::Error> {
     let shortname = shortname.as_ref();
     let result = unsafe { crate::internal::change_app(shortname.as_ptr(), shortname.len() as u32) };
-    if result < 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("failed to change app, got {}", result),
-        ));
+    match result {
+        CHANGE_APP_ERR_RATE_LIMITED => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "please wait 10 seconds between app changes",
+            ));
+        }
+        r if r < 0 => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to change app, got {}", r),
+            ));
+        }
+        _ => {}
     }
 
     Ok(())
 }
 
+const CHANGE_APP_ERR_RATE_LIMITED: i32 = -2;
 const NEXT_APP_READY_ERR_UNKNOWN_SHORTNAME: i32 = -1;
 const NEXT_APP_READY_ERR_OTHER: i32 = -2;
 

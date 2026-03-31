@@ -2,18 +2,24 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+use std::net::IpAddr;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use prometheus::{
-    Encoder, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder, core::Collector,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
+    TextEncoder, core::Collector,
 };
 use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use terminal_games::app::{SessionAppState, SessionEndReason};
+use terminal_games::control::ClusterKickedIpEntry;
+
+use crate::cluster_kicked_ips;
+use crate::sessions::SessionRegistry;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Transport {
@@ -221,13 +227,16 @@ pub struct ServerMetrics {
     region: String,
     db: libsql::Connection,
     duration_writer: tokio::sync::mpsc::UnboundedSender<DurationRecord>,
+    cluster_kicked_ip_writer: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 
     admission_waiting_sessions: IntGaugeVec,
     admission_queue_exits_total: IntCounterVec,
     ip_ban_events_total: IntCounterVec,
     ip_bans_active: IntGaugeVec,
     cluster_enforcement_total: IntCounterVec,
+    cluster_kicked_ip_count_distribution: HistogramVec,
     active_sessions: IntGaugeVec,
+    live_session_duration_seconds: GaugeVec,
     sessions_total: IntCounterVec,
     session_ends_total: IntCounterVec,
     session_duration_seconds: GaugeVec,
@@ -239,6 +248,7 @@ pub struct ServerMetrics {
     system_memory_available_bytes: IntGaugeVec,
     system_memory_used_bytes: IntGaugeVec,
     system_load_average: GaugeVec,
+    session_registry: Mutex<Option<Weak<SessionRegistry>>>,
 }
 
 impl ServerMetrics {
@@ -326,6 +336,20 @@ impl ServerMetrics {
                 &["region", "transport"],
             )?,
         )?;
+        let cluster_kicked_ip_count_distribution = register(
+            &registry,
+            HistogramVec::new(
+                HistogramOpts::new(
+                    "terminal_games_cluster_kicked_ip_count_distribution",
+                    "Current distribution of cluster-kicked counts per normalized IP",
+                )
+                .buckets(vec![
+                    1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0, 144.0, 233.0, 377.0,
+                    610.0, 987.0,
+                ]),
+                &["region"],
+            )?,
+        )?;
         let active_sessions = register(
             &registry,
             IntGaugeVec::new(
@@ -340,6 +364,16 @@ impl ServerMetrics {
                     "authenticated",
                     "has_audio",
                 ],
+            )?,
+        )?;
+        let live_session_duration_seconds = register(
+            &registry,
+            GaugeVec::new(
+                Opts::new(
+                    "terminal_games_live_session_duration_seconds",
+                    "Current duration of each live session grouped by stable session identifiers",
+                ),
+                &["region", "session_id", "transport", "shortname"],
             )?,
         )?;
         let sessions_total = register(
@@ -475,18 +509,24 @@ impl ServerMetrics {
 
         let (duration_writer, duration_rx) = tokio::sync::mpsc::unbounded_channel();
         spawn_duration_writer(db.clone(), duration_rx);
+        let (cluster_kicked_ip_writer, cluster_kicked_ip_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        spawn_cluster_kicked_ip_writer(db.clone(), cluster_kicked_ip_rx);
 
         Ok(Arc::new(Self {
             registry,
             region,
             db,
             duration_writer,
+            cluster_kicked_ip_writer,
             admission_waiting_sessions,
             admission_queue_exits_total,
             ip_ban_events_total,
             ip_bans_active,
             cluster_enforcement_total,
+            cluster_kicked_ip_count_distribution,
             active_sessions,
+            live_session_duration_seconds,
             sessions_total,
             session_ends_total,
             session_duration_seconds,
@@ -498,12 +538,19 @@ impl ServerMetrics {
             system_memory_available_bytes,
             system_memory_used_bytes,
             system_load_average,
+            session_registry: Mutex::new(None),
         }))
+    }
+
+    pub fn set_session_registry(&self, session_registry: &Arc<SessionRegistry>) {
+        *self.session_registry.lock().unwrap() = Some(Arc::downgrade(session_registry));
     }
 
     pub async fn render(&self) -> Result<String> {
         self.update_system_metrics();
         self.refresh_persisted_shortname_durations().await?;
+        self.refresh_cluster_kicked_ip_metrics().await?;
+        self.refresh_live_session_metrics();
 
         let families = self.registry.gather();
         let encoder = TextEncoder::new();
@@ -566,6 +613,15 @@ impl ServerMetrics {
         self.cluster_enforcement_total
             .with_label_values(&[self.region.as_str(), transport.as_str()])
             .inc();
+    }
+
+    pub fn record_cluster_kicked_ip(&self, ip: IpAddr) {
+        let ip = cluster_kicked_ips::normalize(ip);
+        let display_ip =
+            cluster_kicked_ips::display(&ip).unwrap_or_else(|_| format!("{:02x?}", ip.as_slice()));
+        if let Err(error) = self.cluster_kicked_ip_writer.send(ip) {
+            tracing::error!(?error, ip = %display_ip, "failed to queue cluster-kicked ip persistence");
+        }
     }
 
     pub fn record_bytes(&self, direction: Direction, transport: Transport, bytes: usize) {
@@ -672,6 +728,41 @@ impl ServerMetrics {
         }
         Ok(())
     }
+
+    async fn refresh_cluster_kicked_ip_metrics(&self) -> Result<()> {
+        self.cluster_kicked_ip_count_distribution.reset();
+        let histogram = self
+            .cluster_kicked_ip_count_distribution
+            .with_label_values(&[self.region.as_str()]);
+        for ClusterKickedIpEntry { count, .. } in cluster_kicked_ips::load_entries(&self.db).await?
+        {
+            histogram.observe(count as f64);
+        }
+        Ok(())
+    }
+
+    fn refresh_live_session_metrics(&self) {
+        self.live_session_duration_seconds.reset();
+        let session_registry = self
+            .session_registry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade);
+        let Some(session_registry) = session_registry else {
+            return;
+        };
+        for session in session_registry.summaries() {
+            self.live_session_duration_seconds
+                .with_label_values(&[
+                    self.region.as_str(),
+                    session.session_id.as_str(),
+                    session.transport.as_str(),
+                    session.shortname.as_str(),
+                ])
+                .set(session.duration_seconds as f64);
+        }
+    }
 }
 
 fn spawn_duration_writer(
@@ -689,6 +780,28 @@ fn spawn_duration_writer(
                         seconds = record.seconds,
                         user_id = record.user_id,
                         "failed to persist duration record"
+                    );
+                }
+            }
+        }
+    });
+}
+
+fn spawn_cluster_kicked_ip_writer(
+    db: libsql::Connection,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        while let Some(ip) = rx.recv().await {
+            let display_ip = cluster_kicked_ips::display(&ip)
+                .unwrap_or_else(|_| format!("{:02x?}", ip.as_slice()));
+            match cluster_kicked_ips::increment(&db, &ip).await {
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::error!(
+                        error = ?error,
+                        ip = %display_ip,
+                        "failed to persist cluster-kicked ip record"
                     );
                 }
             }

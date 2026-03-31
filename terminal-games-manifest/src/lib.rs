@@ -75,7 +75,7 @@ fn validate_manifest_json_value(instance: &serde_json::Value) -> Result<(), Stri
 fn process_manifest_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut instance =
         serde_json::from_slice::<serde_json::Value>(bytes).map_err(|error| error.to_string())?;
-    
+
     if let Some(value) = instance.pointer_mut("/details/version") {
         if value.as_str() == Some("$CARGO_PKG_VERSION") {
             *value = serde_json::Value::String(std::env::var("CARGO_PKG_VERSION").unwrap());

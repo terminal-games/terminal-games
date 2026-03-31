@@ -40,9 +40,9 @@ use terminal_games::{
     control::{
         AdminControlRpc, AppControlRpc, AppEnvDeleteRequest, AppEnvListResponse, AppEnvSetRequest,
         AppSelfResponse, AppSummary, AppTokenClaims, BanEntry, BanIpAddRequest, BanIpAddResponse,
-        BanIpRemoveRequest, BanIpRequest, BroadcastRequest, CreateAppRequest, CreateAppResponse,
-        DeleteAppRequest, DeleteShortnameRequest, DeleteShortnameResponse, KickSessionRequest,
-        RegionDiscoveryResponse, RegionRuntimeStatus, RotateAppTokenRequest,
+        BanIpRemoveRequest, BanIpRequest, BroadcastRequest, ClusterKickedIpEntry, CreateAppRequest,
+        CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest, DeleteShortnameResponse,
+        KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus, RotateAppTokenRequest,
         RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage, SpyControlMessage,
         StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest,
         TickerReorderRequest, UploadAppRequest, UploadAppResponse, expiry_from_duration,
@@ -55,6 +55,7 @@ use time::OffsetDateTime;
 
 use crate::{
     admission::{AdmissionController, decode_cidr_blob, encode_cidr_blob, parse_ban_cidr},
+    cluster_kicked_ips,
     sessions::SessionRegistry,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -480,33 +481,14 @@ impl AdminControlRpc for AdminRpcServer {
     }
 
     async fn ban_ip_list(self, _: context::Context) -> Result<Vec<BanEntry>, RpcError> {
-        let mut rows = self
-            .control
-            .app_server
-            .db
-            .query(
-                "SELECT cidr, COALESCE(reason, ''), expires_at, inserted_at
-                 FROM ip_bans
-                 ORDER BY inserted_at DESC, cidr ASC",
-                (),
-            )
-            .await?;
-        let now = current_unix_seconds();
-        let mut entries = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let cidr = decode_cidr_blob(&row.get::<Vec<u8>>(0)?)?;
-            let expires_at = row.get::<Option<i64>>(2)?;
-            if !is_ban_active(expires_at, now) {
-                continue;
-            }
-            entries.push(BanEntry {
-                ip: cidr.to_string(),
-                reason: row.get::<String>(1)?.trim().to_string(),
-                expires_at,
-                inserted_at: row.get::<i64>(3)?,
-            });
-        }
-        Ok(entries)
+        Ok(load_ban_entries(&self.control.app_server.db).await?)
+    }
+
+    async fn cluster_kicked_ip_list(
+        self,
+        _: context::Context,
+    ) -> Result<Vec<ClusterKickedIpEntry>, RpcError> {
+        Ok(cluster_kicked_ips::load_entries(&self.control.app_server.db).await?)
     }
 
     async fn ban_ip_remove(
@@ -1578,6 +1560,33 @@ async fn load_ticker_entries(db: &libsql::Connection) -> anyhow::Result<Vec<Tick
             expires_at,
             sort_order: row.get::<i64>(3)?,
             created_at: row.get::<i64>(4)?,
+        });
+    }
+    Ok(entries)
+}
+
+async fn load_ban_entries(db: &libsql::Connection) -> anyhow::Result<Vec<BanEntry>> {
+    let mut rows = db
+        .query(
+            "SELECT cidr, COALESCE(reason, ''), expires_at, inserted_at
+             FROM ip_bans
+             ORDER BY inserted_at DESC, cidr ASC",
+            (),
+        )
+        .await?;
+    let now = current_unix_seconds();
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let cidr = decode_cidr_blob(&row.get::<Vec<u8>>(0)?).map_err(anyhow::Error::msg)?;
+        let expires_at = row.get::<Option<i64>>(2)?;
+        if !is_ban_active(expires_at, now) {
+            continue;
+        }
+        entries.push(BanEntry {
+            ip: cidr.to_string(),
+            reason: row.get::<String>(1)?.trim().to_string(),
+            expires_at,
+            inserted_at: row.get::<i64>(3)?,
         });
     }
     Ok(entries)

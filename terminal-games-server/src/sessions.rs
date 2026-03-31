@@ -7,7 +7,7 @@ use std::{
     net::IpAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -25,7 +25,7 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::idle::INITIAL_FUEL_SECS;
-use crate::metrics::Transport;
+use crate::metrics::{ServerMetrics, Transport};
 
 #[derive(Clone, Debug)]
 pub enum SpyEvent {
@@ -99,6 +99,7 @@ struct RuntimeSession {
     spy_tx: broadcast::Sender<SpyEvent>,
     snapshot_tx: mpsc::Sender<oneshot::Sender<ReplayTerminalSnapshotCapture>>,
     active_spies: AtomicUsize,
+    finished: AtomicBool,
 }
 
 pub struct SessionCleanupGuard {
@@ -114,15 +115,17 @@ impl Drop for SessionCleanupGuard {
 
 pub struct SessionRegistry {
     region_id: String,
+    metrics: Arc<ServerMetrics>,
     sessions: Mutex<HashMap<u64, Arc<RuntimeSession>>>,
     status_bar_state_tx: watch::Sender<StatusBarState>,
 }
 
 impl SessionRegistry {
-    pub fn new(region_id: String) -> Arc<Self> {
+    pub fn new(region_id: String, metrics: Arc<ServerMetrics>) -> Arc<Self> {
         let (status_bar_state_tx, _) = watch::channel(StatusBarState::default());
         Arc::new(Self {
             region_id,
+            metrics,
             sessions: Mutex::new(HashMap::new()),
             status_bar_state_tx,
         })
@@ -165,6 +168,7 @@ impl SessionRegistry {
             spy_tx,
             snapshot_tx,
             active_spies: AtomicUsize::new(0),
+            finished: AtomicBool::new(false),
         });
         self.sessions
             .lock()
@@ -239,6 +243,12 @@ impl SessionRegistry {
         let Some(session) = self.lookup(local_session_id) else {
             return false;
         };
+        if session.finished.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        if reason == SessionEndReason::ClusterLimited {
+            self.metrics.record_cluster_kicked_ip(session.client_ip);
+        }
         let _ = session.spy_tx.send(SpyEvent::Closed { reason });
         true
     }

@@ -47,6 +47,10 @@ impl IdleMonitor {
         }
     }
 
+    pub fn observe_resize(&mut self) {
+        self.saw_input_this_tick = true;
+    }
+
     pub fn on_tick(&mut self) -> Option<SessionEndReason> {
         if self.paused {
             self.saw_input_this_tick = false;

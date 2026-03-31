@@ -6,6 +6,7 @@ mod app;
 mod auth;
 mod ban_ip;
 mod broadcast;
+mod cluster_ip;
 mod regions;
 mod session;
 mod ticker;
@@ -36,6 +37,8 @@ enum AdminCommand {
     #[command(subcommand)]
     /// Manage status-bar tickers across the fleet.
     Ticker(AdminTickerCommand),
+    /// Inspect repeat offender IPs observed by cluster bot detection.
+    ClusterIpKicks,
     /// Show a temporary broadcast notification to users.
     Broadcast(AdminBroadcastArgs),
     /// Show runtime status for each region.
@@ -219,6 +222,7 @@ pub async fn run(cli: AdminCli, profile: Option<String>) -> Result<()> {
         AdminCommand::Auth(args) => auth::run(args, profile).await,
         AdminCommand::BanIp(command) => ban_ip::run(command, profile).await,
         AdminCommand::Ticker(command) => ticker::run(command, profile).await,
+        AdminCommand::ClusterIpKicks => cluster_ip::run(profile).await,
         AdminCommand::Broadcast(args) => broadcast::run(args, profile).await,
         AdminCommand::Regions => regions::run(profile).await,
         AdminCommand::Session(command) => session::run(command, profile).await,

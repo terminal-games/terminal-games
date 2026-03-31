@@ -288,6 +288,12 @@ pub(crate) struct OutputSample {
     pub(crate) bytes: u32,
 }
 
+pub(crate) fn encode_resize_input(cols: u16, rows: u16) -> SmallVec<[u8; MAX_SAMPLE_BYTES]> {
+    let mut bytes = SmallVec::<[u8; MAX_SAMPLE_BYTES]>::new();
+    bytes.extend_from_slice(format!("\x1b[8;{};{}t", rows, cols).as_bytes());
+    bytes
+}
+
 enum ClusterEvent {
     SessionStarted {
         session: Arc<LiveSessionRecord>,
@@ -567,22 +573,21 @@ impl AdmissionTicket {
 
     pub fn record_input(&mut self, bytes: &[u8]) {
         self.flush_output_batch();
-        let now_ms = monotonic_millis();
-        let sample = InputSample {
-            at_ms: now_ms,
-            bytes: bytes
+        self.record_input_sample(
+            bytes
                 .iter()
                 .copied()
                 .take(MAX_SAMPLE_BYTES)
                 .collect::<SmallVec<[u8; MAX_SAMPLE_BYTES]>>(),
-        };
-        let _ = self
-            .controller
-            .cluster_tx
-            .send(ClusterEvent::InputRecorded {
-                session_id: self.id,
-                sample,
-            });
+        );
+    }
+
+    pub fn record_resize(&mut self, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        self.flush_output_batch();
+        self.record_input_sample(encode_resize_input(cols, rows));
     }
 
     pub fn record_output(&mut self, bytes: usize) {
@@ -612,6 +617,20 @@ impl AdmissionTicket {
             .send(ClusterEvent::OutputRecorded {
                 session_id: self.id,
                 sample: OutputSample { at_ms, bytes },
+            });
+    }
+
+    fn record_input_sample(&mut self, bytes: SmallVec<[u8; MAX_SAMPLE_BYTES]>) {
+        let sample = InputSample {
+            at_ms: monotonic_millis(),
+            bytes,
+        };
+        let _ = self
+            .controller
+            .cluster_tx
+            .send(ClusterEvent::InputRecorded {
+                session_id: self.id,
+                sample,
             });
     }
 }
