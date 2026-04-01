@@ -19,6 +19,7 @@ iptrie = "0.11"
 libsql = "0.9"
 prometheus = "0.14"
 rand_core = "0.6"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 russh = "0.57"
 rustls = "0.23"
 rustls-pemfile = "2"

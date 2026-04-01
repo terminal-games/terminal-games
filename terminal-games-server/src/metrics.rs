@@ -4,7 +4,7 @@
 
 use std::net::IpAddr;
 use std::sync::{
-    Arc, Mutex, Weak,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Instant;
@@ -17,7 +17,6 @@ use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System
 use terminal_games::app::{SessionAppState, SessionEndReason};
 
 use crate::cluster_kicked_ips;
-use crate::sessions::SessionRegistry;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Transport {
@@ -234,7 +233,6 @@ pub struct ServerMetrics {
     cluster_enforcement_total: IntCounterVec,
     cluster_kicked_ip_count: GaugeVec,
     active_sessions: IntGaugeVec,
-    live_session_duration_seconds: GaugeVec,
     sessions_total: IntCounterVec,
     session_ends_total: IntCounterVec,
     session_duration_seconds: GaugeVec,
@@ -246,7 +244,6 @@ pub struct ServerMetrics {
     system_memory_available_bytes: IntGaugeVec,
     system_memory_used_bytes: IntGaugeVec,
     system_load_average: GaugeVec,
-    session_registry: Mutex<Option<Weak<SessionRegistry>>>,
 }
 
 impl ServerMetrics {
@@ -358,16 +355,6 @@ impl ServerMetrics {
                     "authenticated",
                     "has_audio",
                 ],
-            )?,
-        )?;
-        let live_session_duration_seconds = register(
-            &registry,
-            GaugeVec::new(
-                Opts::new(
-                    "terminal_games_live_session_duration_seconds",
-                    "Current duration of each live session grouped by stable session identifiers",
-                ),
-                &["region", "session_id", "transport", "shortname"],
             )?,
         )?;
         let sessions_total = register(
@@ -520,7 +507,6 @@ impl ServerMetrics {
             cluster_enforcement_total,
             cluster_kicked_ip_count,
             active_sessions,
-            live_session_duration_seconds,
             sessions_total,
             session_ends_total,
             session_duration_seconds,
@@ -532,19 +518,13 @@ impl ServerMetrics {
             system_memory_available_bytes,
             system_memory_used_bytes,
             system_load_average,
-            session_registry: Mutex::new(None),
         }))
-    }
-
-    pub fn set_session_registry(&self, session_registry: &Arc<SessionRegistry>) {
-        *self.session_registry.lock().unwrap() = Some(Arc::downgrade(session_registry));
     }
 
     pub async fn render(&self) -> Result<String> {
         self.update_system_metrics();
         self.refresh_persisted_shortname_durations().await?;
         self.refresh_cluster_kicked_ip_metrics().await?;
-        self.refresh_live_session_metrics();
 
         let families = self.registry.gather();
         let encoder = TextEncoder::new();
@@ -632,14 +612,7 @@ impl ServerMetrics {
         has_audio: bool,
         user_id: Option<u64>,
     ) -> SessionHandle {
-        let session = LiveSession::new(
-            self.clone(),
-            app,
-            user_id,
-            transport,
-            authenticated,
-            has_audio,
-        );
+        let session = LiveSession::new(self.clone(), app, user_id, transport, authenticated, has_audio);
         SessionHandle {
             live_session: session,
         }
@@ -734,29 +707,6 @@ impl ServerMetrics {
                 .set(entry.count as f64);
         }
         Ok(())
-    }
-
-    fn refresh_live_session_metrics(&self) {
-        self.live_session_duration_seconds.reset();
-        let session_registry = self
-            .session_registry
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(Weak::upgrade);
-        let Some(session_registry) = session_registry else {
-            return;
-        };
-        for session in session_registry.summaries() {
-            self.live_session_duration_seconds
-                .with_label_values(&[
-                    self.region.as_str(),
-                    session.session_id.as_str(),
-                    session.transport.as_str(),
-                    session.shortname.as_str(),
-                ])
-                .set(session.duration_seconds as f64);
-        }
     }
 }
 

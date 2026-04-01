@@ -6,13 +6,15 @@ use std::{
     collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
+use futures::StreamExt;
+use reqwest::Url;
 use terminal_games::{
     app::{
         SessionAppState, SessionControl, SessionEndReason, SessionIdentity, SessionOutput,
@@ -26,6 +28,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::idle::INITIAL_FUEL_SECS;
 use crate::metrics::{ServerMetrics, Transport};
+
+const LONG_SESSION_WEBHOOK_AFTER: Duration = Duration::from_secs(2 * 60);
 
 #[derive(Clone, Debug)]
 pub enum SpyEvent {
@@ -116,6 +120,7 @@ impl Drop for SessionCleanupGuard {
 pub struct SessionRegistry {
     region_id: String,
     metrics: Arc<ServerMetrics>,
+    long_session_notifier: Option<mpsc::UnboundedSender<Weak<RuntimeSession>>>,
     sessions: Mutex<HashMap<u64, Arc<RuntimeSession>>>,
     status_bar_state_tx: watch::Sender<StatusBarState>,
 }
@@ -123,9 +128,21 @@ pub struct SessionRegistry {
 impl SessionRegistry {
     pub fn new(region_id: String, metrics: Arc<ServerMetrics>) -> Arc<Self> {
         let (status_bar_state_tx, _) = watch::channel(StatusBarState::default());
+        let long_session_notifier = std::env::var("DISCORD_WEBHOOK_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .and_then(|value| match Url::parse(&value) {
+                Ok(url) => Some(spawn_long_session_notifier(url)),
+                Err(error) => {
+                    tracing::warn!(?error, "Ignoring invalid DISCORD_WEBHOOK_URL");
+                    None
+                }
+            });
         Arc::new(Self {
             region_id,
             metrics,
+            long_session_notifier,
             sessions: Mutex::new(HashMap::new()),
             status_bar_state_tx,
         })
@@ -173,7 +190,10 @@ impl SessionRegistry {
         self.sessions
             .lock()
             .unwrap()
-            .insert(local_session_id, session);
+            .insert(local_session_id, session.clone());
+        if let Some(notifier) = &self.long_session_notifier {
+            let _ = notifier.send(Arc::downgrade(&session));
+        }
         SessionRegistration {
             identity,
             session_ui,
@@ -338,6 +358,56 @@ impl SessionRegistry {
             .get(&local_session_id)
             .cloned()
     }
+}
+
+fn spawn_long_session_notifier(url: Url) -> mpsc::UnboundedSender<Weak<RuntimeSession>> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Weak<RuntimeSession>>();
+    tokio::spawn(async move {
+        let mut deadlines = tokio_util::time::DelayQueue::new();
+        loop {
+            tokio::select! {
+                Some(session) = rx.recv() => {
+                    deadlines.insert(session, LONG_SESSION_WEBHOOK_AFTER);
+                }
+                Some(expired) = deadlines.next(), if !deadlines.is_empty() => {
+                    let Some(session) = expired.into_inner().upgrade() else {
+                        continue;
+                    };
+                    if session.finished.load(Ordering::Acquire) {
+                        continue;
+                    }
+
+                    let session_id = format!("{}:{}", session.region_id, session.local_session_id);
+                    let content = format!(
+                        "Long session: id=`{}` transport=`{}` app=`{}`",
+                        session_id,
+                        session.transport.as_str(),
+                        session.identity.app().shortname,
+                    );
+                    match reqwest::Client::new()
+                        .post(url.clone())
+                        .json(&serde_json::json!({ "content": content }))
+                        .send()
+                        .await
+                    {
+                        Ok(response) if response.status().is_success() => {}
+                        Ok(response) => {
+                            tracing::warn!(
+                                status = %response.status(),
+                                session_id,
+                                "discord webhook returned non-success status"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(?error, session_id, "failed to send discord webhook");
+                        }
+                    }
+                }
+                else => break,
+            }
+        }
+    });
+    tx
 }
 
 async fn request_snapshot(session: &RuntimeSession) -> Option<ReplayTerminalSnapshotCapture> {
