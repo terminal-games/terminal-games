@@ -544,7 +544,6 @@ impl AppServer {
                     audio: maybe_mixer,
                     status_bar_input: status_bar_input.clone(),
                     terminal_snapshot: terminal_snapshot.clone(),
-                    notification_tx: notification_tx.clone(),
                     change_app_limiter: change_app_limiter.clone(),
                 };
 
@@ -1412,18 +1411,6 @@ impl AppServer {
             Err(_) => return Ok(-1),
         };
 
-        if !caller
-            .data()
-            .change_app_limiter
-            .try_acquire(Duration::from_secs(CHANGE_APP_RATE_LIMIT_SECS))
-        {
-            caller.data().notification_tx.try_warning(
-                " Please wait 10 seconds between app changes. ",
-                Duration::from_secs(CHANGE_APP_RATE_LIMIT_SECS),
-            );
-            return Ok(CHANGE_APP_ERR_RATE_LIMITED);
-        }
-
         let has_next_app = caller.data().has_next_app.clone();
         let should_prepare = !matches!(
             caller.data().next_app.as_ref(),
@@ -1431,6 +1418,14 @@ impl AppServer {
         );
         if !should_prepare {
             return Ok(0);
+        }
+
+        if !caller
+            .data()
+            .change_app_limiter
+            .try_acquire(Duration::from_secs(CHANGE_APP_RATE_LIMIT_SECS))
+        {
+            return Ok(CHANGE_APP_ERR_RATE_LIMITED);
         }
 
         has_next_app.store(false, Ordering::Release);
@@ -2332,7 +2327,6 @@ pub struct AppState {
     terminal_profile: TerminalProfile,
     audio: Option<Mixer>,
     terminal_snapshot: Arc<TerminalSnapshot>,
-    notification_tx: SessionNotificationSender,
     change_app_limiter: Arc<ChangeAppLimiter>,
 }
 

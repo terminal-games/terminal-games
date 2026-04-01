@@ -612,7 +612,14 @@ impl ServerMetrics {
         has_audio: bool,
         user_id: Option<u64>,
     ) -> SessionHandle {
-        let session = LiveSession::new(self.clone(), app, user_id, transport, authenticated, has_audio);
+        let session = LiveSession::new(
+            self.clone(),
+            app,
+            user_id,
+            transport,
+            authenticated,
+            has_audio,
+        );
         SessionHandle {
             live_session: session,
         }

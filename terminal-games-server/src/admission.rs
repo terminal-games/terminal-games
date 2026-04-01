@@ -214,7 +214,7 @@ impl BanManager {
             let Some((reason, expires_at)) = entry.clone() else {
                 return None;
             };
-            if is_ban_active(expires_at, now) {
+            if is_ban_active(expires_at, now) && matched_prefix.contains(&client_ip) {
                 return Some((matched_prefix, reason));
             }
             self.clear(matched_prefix);

@@ -169,17 +169,15 @@ async fn load_active_ban_cidrs(db: &libsql::Connection) -> Result<Vec<ipnet::IpN
 }
 
 fn cluster_kicked_ip_is_banned(ip: &str, bans: &[ipnet::IpNet]) -> bool {
-    let addr = if let Ok(addr) = ip.parse::<IpAddr>() {
-        addr
-    } else if let Some(prefix) = ip.strip_suffix("/64") {
-        let Ok(addr) = prefix.parse::<Ipv6Addr>() else {
-            return false;
-        };
-        IpAddr::V6(addr)
-    } else {
+    if let Ok(addr) = ip.parse::<IpAddr>() {
+        return bans.iter().any(|ban| ban.contains(&addr));
+    }
+
+    let Ok(prefix) = ip.parse::<ipnet::IpNet>() else {
         return false;
     };
-    bans.iter().any(|ban| ban.contains(&addr))
+    bans.iter()
+        .any(|ban| ban.contains(&prefix) || prefix.contains(ban))
 }
 
 fn current_unix_seconds() -> i64 {

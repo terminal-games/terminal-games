@@ -363,6 +363,7 @@ impl SessionRegistry {
 fn spawn_long_session_notifier(url: Url) -> mpsc::UnboundedSender<Weak<RuntimeSession>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Weak<RuntimeSession>>();
     tokio::spawn(async move {
+        let client = reqwest::Client::new();
         let mut deadlines = tokio_util::time::DelayQueue::new();
         loop {
             tokio::select! {
@@ -384,7 +385,7 @@ fn spawn_long_session_notifier(url: Url) -> mpsc::UnboundedSender<Weak<RuntimeSe
                         session.transport.as_str(),
                         session.identity.app().shortname,
                     );
-                    match reqwest::Client::new()
+                    match client
                         .post(url.clone())
                         .json(&serde_json::json!({ "content": content }))
                         .send()
