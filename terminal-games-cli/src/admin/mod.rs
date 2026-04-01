@@ -38,7 +38,7 @@ enum AdminCommand {
     /// Manage status-bar tickers across the fleet.
     Ticker(AdminTickerCommand),
     /// Inspect repeat offender IPs observed by cluster bot detection.
-    ClusterIpKicks,
+    ClusterIpKicks(AdminClusterIpKicksArgs),
     /// Show a temporary broadcast notification to users.
     Broadcast(AdminBroadcastArgs),
     /// Show runtime status for each region.
@@ -119,6 +119,19 @@ pub(super) struct AdminTickerAddArgs {
     content: String,
     #[command(flatten)]
     expiry: AdminBanIpExpiryArgs,
+}
+
+#[derive(Args)]
+pub(super) struct AdminClusterIpKicksArgs {
+    /// 1-based page number.
+    #[arg(long, default_value_t = 1)]
+    page: u32,
+    /// Number of rows to show per page.
+    #[arg(long = "page-size", default_value_t = 20)]
+    page_size: u32,
+    /// Hide IPs already covered by an active ban.
+    #[arg(long)]
+    exclude_banned: bool,
 }
 
 #[derive(Args)]
@@ -222,7 +235,7 @@ pub async fn run(cli: AdminCli, profile: Option<String>) -> Result<()> {
         AdminCommand::Auth(args) => auth::run(args, profile).await,
         AdminCommand::BanIp(command) => ban_ip::run(command, profile).await,
         AdminCommand::Ticker(command) => ticker::run(command, profile).await,
-        AdminCommand::ClusterIpKicks => cluster_ip::run(profile).await,
+        AdminCommand::ClusterIpKicks(args) => cluster_ip::run(args, profile).await,
         AdminCommand::Broadcast(args) => broadcast::run(args, profile).await,
         AdminCommand::Regions => regions::run(profile).await,
         AdminCommand::Session(command) => session::run(command, profile).await,

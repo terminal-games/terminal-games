@@ -223,6 +223,20 @@ pub struct BanEntry {
 pub struct ClusterKickedIpEntry {
     pub ip: String,
     pub count: u64,
+    pub is_banned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterKickedIpListRequest {
+    pub page: u32,
+    pub page_size: u32,
+    pub exclude_banned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterKickedIpListResponse {
+    pub entries: Vec<ClusterKickedIpEntry>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,7 +440,9 @@ pub trait AdminControlRpc {
     async fn sessions() -> Result<Vec<SessionSummary>, RpcError>;
     async fn ban_ip_add(request: BanIpAddRequest) -> Result<BanIpAddResponse, RpcError>;
     async fn ban_ip_list() -> Result<Vec<BanEntry>, RpcError>;
-    async fn cluster_kicked_ip_list() -> Result<Vec<ClusterKickedIpEntry>, RpcError>;
+    async fn cluster_kicked_ip_list(
+        request: ClusterKickedIpListRequest,
+    ) -> Result<ClusterKickedIpListResponse, RpcError>;
     async fn ban_ip_remove(request: BanIpRemoveRequest) -> Result<(), RpcError>;
     async fn apply_ban(request: BanIpRequest) -> Result<(), RpcError>;
     async fn apply_ban_remove(request: BanIpRemoveRequest) -> Result<(), RpcError>;

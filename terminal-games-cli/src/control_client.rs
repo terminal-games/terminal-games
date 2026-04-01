@@ -16,8 +16,8 @@ use reqwest::header::{AUTHORIZATION, HeaderValue};
 use tarpc::client;
 use terminal_games::control::{
     AdminControlRpcClient, AppControlRpcClient, AppSummary, AppTokenClaims, BanEntry,
-    ClusterKickedIpEntry, RegionDiscoveryResponse, RegionRuntimeStatus, SessionSummary,
-    TickerEntry, rpc_context,
+    ClusterKickedIpListRequest, ClusterKickedIpListResponse, RegionDiscoveryResponse,
+    RegionRuntimeStatus, SessionSummary, TickerEntry, rpc_context,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::{
@@ -332,9 +332,12 @@ impl AdminClient {
         Ok(bans)
     }
 
-    pub async fn cluster_kicked_ip_list(&self) -> Result<Vec<ClusterKickedIpEntry>> {
+    pub async fn cluster_kicked_ip_list(
+        &self,
+        request: ClusterKickedIpListRequest,
+    ) -> Result<ClusterKickedIpListResponse> {
         with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
-            rpc.cluster_kicked_ip_list(rpc_context())
+            rpc.cluster_kicked_ip_list(rpc_context(), request)
                 .await?
                 .map_err(anyhow::Error::msg)
         })

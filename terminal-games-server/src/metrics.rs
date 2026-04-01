@@ -11,12 +11,10 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts, Registry,
-    TextEncoder, core::Collector,
+    Encoder, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder, core::Collector,
 };
 use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use terminal_games::app::{SessionAppState, SessionEndReason};
-use terminal_games::control::ClusterKickedIpEntry;
 
 use crate::cluster_kicked_ips;
 use crate::sessions::SessionRegistry;
@@ -234,7 +232,7 @@ pub struct ServerMetrics {
     ip_ban_events_total: IntCounterVec,
     ip_bans_active: IntGaugeVec,
     cluster_enforcement_total: IntCounterVec,
-    cluster_kicked_ip_count_distribution: HistogramVec,
+    cluster_kicked_ip_count: GaugeVec,
     active_sessions: IntGaugeVec,
     live_session_duration_seconds: GaugeVec,
     sessions_total: IntCounterVec,
@@ -336,18 +334,14 @@ impl ServerMetrics {
                 &["region", "transport"],
             )?,
         )?;
-        let cluster_kicked_ip_count_distribution = register(
+        let cluster_kicked_ip_count = register(
             &registry,
-            HistogramVec::new(
-                HistogramOpts::new(
-                    "terminal_games_cluster_kicked_ip_count_distribution",
-                    "Current distribution of cluster-kicked counts per normalized IP",
-                )
-                .buckets(vec![
-                    1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, 34.0, 55.0, 89.0, 144.0, 233.0, 377.0,
-                    610.0, 987.0,
-                ]),
-                &["region"],
+            GaugeVec::new(
+                Opts::new(
+                    "terminal_games_cluster_kicked_ip_count",
+                    "Current cluster-kicked counts for normalized IPs that are not covered by an active ban",
+                ),
+                &["region", "ip"],
             )?,
         )?;
         let active_sessions = register(
@@ -524,7 +518,7 @@ impl ServerMetrics {
             ip_ban_events_total,
             ip_bans_active,
             cluster_enforcement_total,
-            cluster_kicked_ip_count_distribution,
+            cluster_kicked_ip_count,
             active_sessions,
             live_session_duration_seconds,
             sessions_total,
@@ -730,13 +724,14 @@ impl ServerMetrics {
     }
 
     async fn refresh_cluster_kicked_ip_metrics(&self) -> Result<()> {
-        self.cluster_kicked_ip_count_distribution.reset();
-        let histogram = self
-            .cluster_kicked_ip_count_distribution
-            .with_label_values(&[self.region.as_str()]);
-        for ClusterKickedIpEntry { count, .. } in cluster_kicked_ips::load_entries(&self.db).await?
+        self.cluster_kicked_ip_count.reset();
+        for entry in cluster_kicked_ips::load_visible_page(&self.db, 0, 20, true)
+            .await?
+            .entries
         {
-            histogram.observe(count as f64);
+            self.cluster_kicked_ip_count
+                .with_label_values(&[self.region.as_str(), entry.ip.as_str()])
+                .set(entry.count as f64);
         }
         Ok(())
     }

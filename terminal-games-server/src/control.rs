@@ -40,9 +40,10 @@ use terminal_games::{
     control::{
         AdminControlRpc, AppControlRpc, AppEnvDeleteRequest, AppEnvListResponse, AppEnvSetRequest,
         AppSelfResponse, AppSummary, AppTokenClaims, BanEntry, BanIpAddRequest, BanIpAddResponse,
-        BanIpRemoveRequest, BanIpRequest, BroadcastRequest, ClusterKickedIpEntry, CreateAppRequest,
-        CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest, DeleteShortnameResponse,
-        KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus, RotateAppTokenRequest,
+        BanIpRemoveRequest, BanIpRequest, BroadcastRequest, ClusterKickedIpListRequest,
+        ClusterKickedIpListResponse, CreateAppRequest, CreateAppResponse, DeleteAppRequest,
+        DeleteShortnameRequest, DeleteShortnameResponse, KickSessionRequest,
+        RegionDiscoveryResponse, RegionRuntimeStatus, RotateAppTokenRequest,
         RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage, SpyControlMessage,
         StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest,
         TickerReorderRequest, UploadAppRequest, UploadAppResponse, expiry_from_duration,
@@ -487,8 +488,18 @@ impl AdminControlRpc for AdminRpcServer {
     async fn cluster_kicked_ip_list(
         self,
         _: context::Context,
-    ) -> Result<Vec<ClusterKickedIpEntry>, RpcError> {
-        Ok(cluster_kicked_ips::load_entries(&self.control.app_server.db).await?)
+        request: ClusterKickedIpListRequest,
+    ) -> Result<ClusterKickedIpListResponse, RpcError> {
+        let page = request.page.max(1);
+        let page_size = request.page_size.clamp(1, 100) as usize;
+        let offset = ((page - 1) as usize).saturating_mul(page_size);
+        Ok(cluster_kicked_ips::load_visible_page(
+            &self.control.app_server.db,
+            offset,
+            page_size,
+            request.exclude_banned,
+        )
+        .await?)
     }
 
     async fn ban_ip_remove(

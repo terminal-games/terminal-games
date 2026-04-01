@@ -6,7 +6,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result, bail};
 use libsql::Value;
-use terminal_games::control::ClusterKickedIpEntry;
+use terminal_games::control::{ClusterKickedIpEntry, ClusterKickedIpListResponse};
+
+use crate::admission::decode_cidr_blob;
 
 pub fn normalize(ip: IpAddr) -> Vec<u8> {
     match ip {
@@ -40,14 +42,19 @@ pub async fn increment(db: &libsql::Connection, ip: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub async fn load_entries(db: &libsql::Connection) -> Result<Vec<ClusterKickedIpEntry>> {
+pub async fn load_entries_page(
+    db: &libsql::Connection,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ClusterKickedIpEntry>> {
     let mut rows = db
         .query(
             "SELECT ip, count
              FROM cluster_kicked_ips
              WHERE count > 0
-             ORDER BY count DESC, ip ASC",
-            (),
+             ORDER BY count DESC, ip ASC
+             LIMIT ?1 OFFSET ?2",
+            libsql::params!(limit, offset),
         )
         .await
         .context("failed to load cluster-kicked ip counts")?;
@@ -71,9 +78,55 @@ pub async fn load_entries(db: &libsql::Connection) -> Result<Vec<ClusterKickedIp
             count: row
                 .get::<u64>(1)
                 .context("missing cluster-kicked ip count")?,
+            is_banned: false,
         });
     }
     Ok(entries)
+}
+
+pub async fn load_visible_page(
+    db: &libsql::Connection,
+    offset: usize,
+    limit: usize,
+    exclude_banned: bool,
+) -> Result<ClusterKickedIpListResponse> {
+    const PAGE_SIZE: usize = 64;
+
+    let active_bans = load_active_ban_cidrs(db).await?;
+    let mut entries = Vec::with_capacity(limit);
+    let mut matched_offset = 0_usize;
+    let mut sql_offset = 0_i64;
+    let mut has_more = false;
+
+    loop {
+        let page = load_entries_page(db, PAGE_SIZE as i64, sql_offset).await?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+        for mut entry in page {
+            entry.is_banned = cluster_kicked_ip_is_banned(&entry.ip, &active_bans);
+            if exclude_banned && entry.is_banned {
+                continue;
+            }
+            if matched_offset < offset {
+                matched_offset += 1;
+                continue;
+            }
+            if entries.len() < limit {
+                entries.push(entry);
+            } else {
+                has_more = true;
+                break;
+            }
+        }
+        if has_more || page_len < PAGE_SIZE {
+            break;
+        }
+        sql_offset += PAGE_SIZE as i64;
+    }
+
+    Ok(ClusterKickedIpListResponse { entries, has_more })
 }
 
 fn display_legacy_text(text: &str) -> Result<String> {
@@ -88,4 +141,50 @@ fn display_legacy_text(text: &str) -> Result<String> {
         return Ok(format!("{masked}/64"));
     }
     bail!("invalid legacy cluster-kicked ip value: {text}")
+}
+
+async fn load_active_ban_cidrs(db: &libsql::Connection) -> Result<Vec<ipnet::IpNet>> {
+    let mut rows = db
+        .query(
+            "SELECT cidr, expires_at
+             FROM ip_bans
+             ORDER BY inserted_at DESC, cidr ASC",
+            (),
+        )
+        .await
+        .context("failed to load active ip bans")?;
+    let now = current_unix_seconds();
+    let mut bans = Vec::new();
+    while let Some(row) = rows.next().await.context("failed to read ip ban row")? {
+        let expires_at = row.get::<Option<i64>>(1).context("missing ip ban expiry")?;
+        if expires_at.is_some_and(|expires_at| expires_at <= now) {
+            continue;
+        }
+        bans.push(
+            decode_cidr_blob(&row.get::<Vec<u8>>(0).context("missing ip ban cidr")?)
+                .map_err(anyhow::Error::msg)?,
+        );
+    }
+    Ok(bans)
+}
+
+fn cluster_kicked_ip_is_banned(ip: &str, bans: &[ipnet::IpNet]) -> bool {
+    let addr = if let Ok(addr) = ip.parse::<IpAddr>() {
+        addr
+    } else if let Some(prefix) = ip.strip_suffix("/64") {
+        let Ok(addr) = prefix.parse::<Ipv6Addr>() else {
+            return false;
+        };
+        IpAddr::V6(addr)
+    } else {
+        return false;
+    };
+    bans.iter().any(|ban| ban.contains(&addr))
+}
+
+fn current_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
