@@ -29,7 +29,7 @@ use crate::idle::INITIAL_FUEL_SECS;
 use crate::metrics::Transport;
 use crate::notifications::{LongSessionNotification, Notifications};
 
-const LONG_SESSION_WEBHOOK_AFTER: Duration = Duration::from_secs(2 * 60);
+const LONG_SESSION_WEBHOOK_AFTER: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Debug)]
 pub enum SpyEvent {
