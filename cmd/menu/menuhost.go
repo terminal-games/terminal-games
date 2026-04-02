@@ -41,7 +41,7 @@ func menu_request(typ int32, ptr1 unsafe.Pointer, len1 uint32, ptr2 unsafe.Point
 func menu_poll(requestID int32, dataPtr unsafe.Pointer, dataMaxLen uint32, dataLenPtr unsafe.Pointer) int32
 
 type menuGamesPayload struct {
-	Games []gameData `json:"games"`
+	Apps []gameData `json:"apps"`
 }
 
 type menuProfilePayload struct {
@@ -68,7 +68,7 @@ func menuFetchGames() ([]gameData, error) {
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return nil, err
 	}
-	return payload.Games, nil
+	return payload.Apps, nil
 }
 
 func menuFetchProfile() (string, string, error) {
