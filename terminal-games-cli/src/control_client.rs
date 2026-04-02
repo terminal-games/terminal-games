@@ -9,10 +9,10 @@ use std::{
     task::{Context as TaskContext, Poll},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bytes::BytesMut;
 use futures::{Sink, Stream, future::join_all};
-use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HeaderValue, RETRY_AFTER};
 use tarpc::client;
 use terminal_games::control::{
     AdminControlRpcClient, AppControlRpcClient, AppSummary, AppTokenClaims, BanEntry,
@@ -144,8 +144,36 @@ async fn connect_ws(base_url: &str, path: &str, bearer: &str) -> Result<ClientWs
         }),
         false,
     )
-    .await?;
+    .await
+    .map_err(normalize_ws_connect_error)?;
     Ok(ClientWsTransport::new(socket))
+}
+
+fn normalize_ws_connect_error(error: WsError) -> anyhow::Error {
+    let WsError::Http(response) = &error else {
+        return error.into();
+    };
+    if response.status() != 429 {
+        return error.into();
+    }
+    if let Some(body) = response.body().as_ref()
+        && let Ok(message) = std::str::from_utf8(body)
+    {
+        let message = message.trim();
+        if !message.is_empty() {
+            return anyhow!(message.to_string());
+        }
+    }
+    if let Some(value) = response.headers().get(RETRY_AFTER)
+        && let Ok(value) = value.to_str()
+        && let Ok(retry_after_secs) = value.trim().parse::<f64>()
+    {
+        return anyhow!(format!(
+            "rate limit exceeded; retry in {:.1}s",
+            retry_after_secs
+        ));
+    }
+    anyhow!("rate limit exceeded")
 }
 
 async fn connect_admin_rpc(base_url: &str, bearer: &str) -> Result<AdminControlRpcClient> {

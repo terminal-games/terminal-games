@@ -3,7 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     io,
     pin::Pin,
@@ -39,15 +39,15 @@ use terminal_games::{
     },
     control::{
         AdminControlRpc, AppControlRpc, AppEnvDeleteRequest, AppEnvListResponse, AppEnvSetRequest,
-        AppSelfResponse, AppSummary, AppTokenClaims, BanEntry, BanIpAddRequest, BanIpAddResponse,
-        BanIpRemoveRequest, BanIpRequest, BroadcastRequest, ClusterKickedIpListRequest,
-        ClusterKickedIpListResponse, CreateAppRequest, CreateAppResponse, DeleteAppRequest,
-        DeleteShortnameRequest, DeleteShortnameResponse, KickSessionRequest,
-        RegionDiscoveryResponse, RegionRuntimeStatus, RotateAppTokenRequest,
-        RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage, SpyControlMessage,
-        StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest,
-        TickerReorderRequest, UploadAppRequest, UploadAppResponse, expiry_from_duration,
-        parse_duration_string, parse_optional_expiry,
+        AppSelfInfoRequest, AppSelfInfoResponse, AppSelfResponse, AppSummary, AppTokenClaims,
+        BanEntry, BanIpAddRequest, BanIpAddResponse, BanIpRemoveRequest, BanIpRequest,
+        BroadcastRequest, ClusterKickedIpListRequest, ClusterKickedIpListResponse,
+        CreateAppRequest, CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest,
+        DeleteShortnameResponse, KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus,
+        RotateAppTokenRequest, RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage,
+        SpyControlMessage, StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry,
+        TickerRemoveRequest, TickerReorderRequest, UploadAppRequest, UploadAppResponse,
+        expiry_from_duration, parse_duration_string, parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
     mesh::{AppRuntimeUpdateMessage, BuildId, ContentHash, Mesh, hash_app_envs, hash_bytes},
@@ -75,6 +75,7 @@ pub struct ControlPlane {
     latest_broadcast: Arc<Mutex<Option<StatusBroadcast>>>,
     mesh: Mesh,
     admin_shared_secret: Option<Arc<str>>,
+    rate_limiter: Arc<ApiRateLimiter>,
     bandwidth: Arc<BandwidthTracker>,
     max_capacity: usize,
     region_id: String,
@@ -97,6 +98,7 @@ impl ControlPlane {
             latest_broadcast: Arc::new(Mutex::new(None)),
             mesh,
             admin_shared_secret,
+            rate_limiter: Arc::new(ApiRateLimiter::new()),
             bandwidth: Arc::new(BandwidthTracker::default()),
             max_capacity,
             region_id,
@@ -107,7 +109,7 @@ impl ControlPlane {
         self.bandwidth.record(bytes);
     }
 
-    fn require_admin(&self, headers: &HeaderMap) -> Result<(), Response> {
+    fn require_admin(&self, headers: &HeaderMap) -> Result<AdminGuard, Response> {
         let Some(expected) = self.admin_shared_secret.as_deref() else {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "admin auth disabled").into_response());
         };
@@ -118,7 +120,7 @@ impl ControlPlane {
             sha256_bytes(token).as_slice(),
             sha256_bytes(expected).as_slice(),
         ) {
-            Ok(())
+            Ok(AdminGuard)
         } else {
             Err((StatusCode::UNAUTHORIZED, "invalid bearer token").into_response())
         }
@@ -144,6 +146,37 @@ impl ControlPlane {
             return Err((StatusCode::UNAUTHORIZED, "invalid app token").into_response());
         }
         Ok(AppAuth { record, claims })
+    }
+
+    fn consume_tokens(
+        &self,
+        group: RateLimitGroup,
+        bucket_key: &str,
+        cost: u32,
+    ) -> Result<(), ApiRateLimitExceeded> {
+        match self.rate_limiter.try_consume(group, bucket_key, cost) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::debug!(
+                    ?group,
+                    cost,
+                    retry_after_secs = error.retry_after.as_secs_f64(),
+                    bucket_key,
+                    "API rate limit exceeded"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn consume_tokens_rpc(
+        &self,
+        group: RateLimitGroup,
+        bucket_key: &str,
+        cost: u32,
+    ) -> Result<(), RpcError> {
+        self.consume_tokens(group, bucket_key, cost)
+            .map_err(|error| RpcError::from(error.to_string()))
     }
 
     async fn discover(&self) -> anyhow::Result<RegionDiscoveryResponse> {
@@ -343,6 +376,116 @@ struct AdminRpcServer {
 struct AppRpcServer {
     control: ControlPlane,
     app: AppAuth,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RateLimitGroup {
+    Api,
+    Upload,
+}
+
+impl RateLimitGroup {
+    fn limits(self) -> (f64, u32) {
+        match self {
+            Self::Api => (0.5, 30),
+            Self::Upload => (1.0 / (30.0 * 60.0), 5),
+        }
+    }
+}
+
+struct ApiRateLimiter {
+    state: Mutex<ApiRateLimiterState>,
+}
+
+struct ApiRateLimiterState {
+    buckets: HashMap<(RateLimitGroup, String), ApiTokenBucket>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ApiTokenBucket {
+    available_tokens: f64,
+    last_refill: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ApiRateLimitExceeded {
+    retry_after: Duration,
+}
+
+impl std::fmt::Display for ApiRateLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rate limit exceeded; retry in {:.1}s",
+            self.retry_after.as_secs_f64()
+        )
+    }
+}
+
+impl ApiRateLimiter {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ApiRateLimiterState {
+                buckets: HashMap::new(),
+            }),
+        }
+    }
+
+    fn try_consume(
+        &self,
+        group: RateLimitGroup,
+        bucket_key: &str,
+        cost: u32,
+    ) -> Result<(), ApiRateLimitExceeded> {
+        let (refill_tokens_per_sec, capacity) = group.limits();
+        let now = Instant::now();
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.buckets.retain(|(bucket_group, _), bucket| {
+            let (bucket_refill_tokens_per_sec, bucket_capacity) = bucket_group.limits();
+            bucket.refill(now, bucket_capacity, bucket_refill_tokens_per_sec);
+            !bucket.is_full(bucket_capacity)
+        });
+        let bucket = state
+            .buckets
+            .entry((group, bucket_key.to_string()))
+            .or_insert_with(|| ApiTokenBucket::new(capacity, now));
+        bucket.refill(now, capacity, refill_tokens_per_sec);
+        let cost = cost as f64;
+        if bucket.available_tokens + f64::EPSILON >= cost {
+            bucket.available_tokens = (bucket.available_tokens - cost).max(0.0);
+            Ok(())
+        } else {
+            let missing_tokens = (cost - bucket.available_tokens).max(0.0);
+            Err(ApiRateLimitExceeded {
+                retry_after: Duration::from_secs_f64(missing_tokens / refill_tokens_per_sec),
+            })
+        }
+    }
+}
+
+impl ApiTokenBucket {
+    fn new(capacity: u32, now: Instant) -> Self {
+        Self {
+            available_tokens: capacity as f64,
+            last_refill: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant, capacity: u32, refill_tokens_per_sec: f64) {
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        if elapsed > 0.0 {
+            self.available_tokens =
+                (self.available_tokens + elapsed * refill_tokens_per_sec).min(capacity as f64);
+            self.last_refill = now;
+        }
+    }
+
+    fn is_full(&self, capacity: u32) -> bool {
+        self.available_tokens + f64::EPSILON >= capacity as f64
+    }
 }
 
 #[derive(Default)]
@@ -816,32 +959,52 @@ impl AdminControlRpc for AdminRpcServer {
 }
 
 impl AppControlRpc for AppRpcServer {
-    async fn self_info(self, _: context::Context) -> Result<AppSelfResponse, RpcError> {
-        let mut rows = self
-            .control
-            .app_server
-            .db
-            .query(
-                "SELECT COALESCE(json_extract(details, '$.author'), ''),
-                        COALESCE(duration_seconds, 0.0)
-                 FROM apps WHERE shortname = ?1 LIMIT 1",
-                libsql::params!(self.app.record.shortname.as_str()),
-            )
-            .await?;
-        let (author_name, playtime_seconds) = match rows.next().await? {
-            Some(row) => (row.get::<String>(0).unwrap_or_default(), row.get::<f64>(1)?),
-            None => (String::new(), 0.0),
-        };
-        Ok(AppSelfResponse {
-            app_id: self.app.record.id,
-            author_name,
-            shortname: self.app.record.shortname.clone(),
-            server: self.control.region_id.clone(),
-            playtime_seconds,
+    async fn self_info(
+        self,
+        _: context::Context,
+        request: AppSelfInfoRequest,
+    ) -> Result<AppSelfInfoResponse, RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
+        let mut seen_shortnames = HashSet::new();
+        let mut apps = Vec::new();
+        let mut invalid_shortnames = Vec::new();
+        for claims in request.tokens {
+            if !seen_shortnames.insert(claims.shortname.clone()) {
+                continue;
+            }
+            let Some(record) =
+                load_app_token_record_by_shortname(&self.control.app_server.db, &claims.shortname)
+                    .await?
+            else {
+                invalid_shortnames.push(claims.shortname);
+                continue;
+            };
+            if !constant_time_eq(
+                sha256_hex(&claims.secret).as_bytes(),
+                record.token_hash.as_bytes(),
+            ) {
+                invalid_shortnames.push(claims.shortname);
+                continue;
+            }
+            apps.push(
+                load_app_self_response(
+                    &self.control.app_server.db,
+                    &self.control.region_id,
+                    &record,
+                )
+                .await?,
+            );
+        }
+        Ok(AppSelfInfoResponse {
+            apps,
+            invalid_shortnames,
         })
     }
 
     async fn env_list(self, _: context::Context) -> Result<AppEnvListResponse, RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
         let (_, env_salt, env_blob) =
             load_app_env_blob(&self.control.app_server.db, &self.app.record.shortname)
                 .await?
@@ -858,6 +1021,8 @@ impl AppControlRpc for AppRpcServer {
     }
 
     async fn env_set(self, _: context::Context, request: AppEnvSetRequest) -> Result<(), RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
         validate_app_envs(&request.envs)?;
         let (app_id, env_salt, env_blob) =
             load_app_env_blob(&self.control.app_server.db, &self.app.record.shortname)
@@ -906,6 +1071,8 @@ impl AppControlRpc for AppRpcServer {
         _: context::Context,
         request: AppEnvDeleteRequest,
     ) -> Result<(), RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
         validate_app_env_name(&request.name)?;
         let Some((app_id, env_salt, env_blob)) =
             load_app_env_blob(&self.control.app_server.db, &self.app.record.shortname).await?
@@ -937,6 +1104,8 @@ impl AppControlRpc for AppRpcServer {
     }
 
     async fn rotate_token(self, _: context::Context) -> Result<RotateAppTokenResponse, RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
         Ok(self
             .control
             .rotate_app_token(
@@ -952,6 +1121,8 @@ impl AppControlRpc for AppRpcServer {
         _: context::Context,
         request: UploadAppRequest,
     ) -> Result<UploadAppResponse, RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Upload, &self.app.record.token_hash, 1)?;
         if request.wasm.len() > AUTHOR_UPLOAD_MAX_BYTES {
             return Err(RpcError::from(format!(
                 "wasm upload exceeds {} bytes",
@@ -1103,6 +1274,8 @@ impl AppControlRpc for AppRpcServer {
         _: context::Context,
         request: DeleteShortnameRequest,
     ) -> Result<Option<DeleteShortnameResponse>, RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
         if request.shortname != self.app.record.shortname {
             return Err("shortname mismatch".into());
         }
@@ -1141,8 +1314,7 @@ impl FromRequestParts<ControlPlane> for AdminGuard {
         parts: &mut Parts,
         state: &ControlPlane,
     ) -> Result<Self, Self::Rejection> {
-        state.require_admin(&parts.headers)?;
-        Ok(Self)
+        state.require_admin(&parts.headers)
     }
 }
 
@@ -1414,6 +1586,32 @@ async fn load_app_token_record_by_shortname(
         shortname: row.get::<String>(1)?,
         token_hash: row.get::<String>(2)?,
     }))
+}
+
+async fn load_app_self_response(
+    db: &libsql::Connection,
+    region_id: &str,
+    record: &AppTokenRecord,
+) -> anyhow::Result<AppSelfResponse> {
+    let mut rows = db
+        .query(
+            "SELECT COALESCE(json_extract(details, '$.author'), ''),
+                    COALESCE(duration_seconds, 0.0)
+             FROM apps WHERE shortname = ?1 LIMIT 1",
+            libsql::params!(record.shortname.as_str()),
+        )
+        .await?;
+    let (author_name, playtime_seconds) = match rows.next().await? {
+        Some(row) => (row.get::<String>(0).unwrap_or_default(), row.get::<f64>(1)?),
+        None => (String::new(), 0.0),
+    };
+    Ok(AppSelfResponse {
+        app_id: record.id,
+        author_name,
+        shortname: record.shortname.clone(),
+        server: region_id.to_string(),
+        playtime_seconds,
+    })
 }
 
 async fn load_app_env_blob(

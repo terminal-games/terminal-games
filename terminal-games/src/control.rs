@@ -331,6 +331,17 @@ pub struct AppSelfResponse {
     pub playtime_seconds: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSelfInfoRequest {
+    pub tokens: Vec<AppTokenClaims>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSelfInfoResponse {
+    pub apps: Vec<AppSelfResponse>,
+    pub invalid_shortnames: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BroadcastLevel {
@@ -465,7 +476,7 @@ pub trait AdminControlRpc {
 
 #[tarpc::service]
 pub trait AppControlRpc {
-    async fn self_info() -> Result<AppSelfResponse, RpcError>;
+    async fn self_info(request: AppSelfInfoRequest) -> Result<AppSelfInfoResponse, RpcError>;
     async fn env_list() -> Result<AppEnvListResponse, RpcError>;
     async fn env_set(request: AppEnvSetRequest) -> Result<(), RpcError>;
     async fn env_delete(request: AppEnvDeleteRequest) -> Result<(), RpcError>;
