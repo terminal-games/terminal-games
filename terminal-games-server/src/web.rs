@@ -101,7 +101,7 @@ impl WebServer {
                 let token = token.trim().to_string();
                 if token.is_empty() {
                     tracing::warn!(
-                        "METRICS_BEARER_TOKEN is empty; /metrics will be served without authentication"
+                        "METRICS_BEARER_TOKEN is empty; metrics endpoints will be served without authentication"
                     );
                     None
                 } else {
@@ -110,7 +110,7 @@ impl WebServer {
             }
             Err(std::env::VarError::NotPresent) => {
                 tracing::warn!(
-                    "METRICS_BEARER_TOKEN is not set; /metrics will be served without authentication"
+                    "METRICS_BEARER_TOKEN is not set; metrics endpoints will be served without authentication"
                 );
                 None
             }
@@ -160,6 +160,7 @@ impl WebServer {
                 get(serve_jitter_buffer_processor_js),
             )
             .route("/metrics", get(serve_metrics))
+            .route("/global-metrics", get(serve_global_metrics))
             .route("/pow/challenge", get(pow_challenge_handler))
             .route("/ws", get(websocket_handler))
             .with_state(self.clone())
@@ -308,7 +309,26 @@ async fn serve_metrics(State(server): State<WebServer>, headers: HeaderMap) -> R
             .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response());
     }
 
-    match server.metrics.render().await {
+    match server.metrics.render_local().await {
+        Ok(body) => static_bytes_response("text/plain; version=0.0.4; charset=utf-8", body),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to encode metrics: {err:#}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn serve_global_metrics(State(server): State<WebServer>, headers: HeaderMap) -> Response {
+    if !metrics_request_authorized(&headers, server.metrics_bearer_token.as_deref()) {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(WWW_AUTHENTICATE, "Bearer")
+            .body(Body::from("missing or invalid bearer token"))
+            .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response());
+    }
+
+    match server.metrics.render_global().await {
         Ok(body) => static_bytes_response("text/plain; version=0.0.4; charset=utf-8", body),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,

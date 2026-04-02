@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +16,12 @@ use tokio::sync::{mpsc, watch};
 use crate::cluster_detection::{
     self, ClusterEvaluation, ClusterEvaluationJob, HistoricalSignature, NetworkPrefix,
 };
+use crate::cluster_kicked_ips;
 use crate::metrics::{ServerMetrics, SessionHandle, Transport};
+use crate::notifications::{
+    CapacityThresholdNotification, ClusterEnforcementNotification, ClusterEnforcementSession,
+    Notifications,
+};
 use terminal_games::app::{SessionControl, SessionEndReason};
 
 pub(crate) const INPUT_WINDOW_MS: u64 = 8 * 60_000;
@@ -65,8 +70,10 @@ struct Inner {
     ban_manager: Mutex<BanManager>,
     ban_changes: watch::Sender<()>,
     metrics: Arc<ServerMetrics>,
+    notifications: Arc<Notifications>,
     next_id: AtomicU64,
     state: Mutex<ControllerState>,
+    capacity_threshold_reached: AtomicBool,
     cluster_tx: mpsc::UnboundedSender<ClusterEvent>,
 }
 
@@ -315,6 +322,8 @@ type ClusterSession = (Arc<LiveSessionRecord>, watch::Sender<SessionControl>);
 struct ClusterManager {
     max_running: usize,
     metrics: Arc<ServerMetrics>,
+    db: libsql::Connection,
+    notifications: Arc<Notifications>,
     rx: mpsc::UnboundedReceiver<ClusterEvent>,
     live_sessions: HashMap<u64, ClusterSession>,
     recent_signatures: Arc<[HistoricalSignature]>,
@@ -326,17 +335,26 @@ impl AdmissionController {
         config: AdmissionConfig,
         initial_banned_ips: Vec<(IpNet, Option<String>, Option<i64>)>,
         metrics: Arc<ServerMetrics>,
+        db: libsql::Connection,
+        notifications: Arc<Notifications>,
     ) -> Self {
         let (ban_changes, _) = watch::channel(());
-        let cluster_tx = spawn_cluster_manager(config.max_running, metrics.clone());
+        let cluster_tx = spawn_cluster_manager(
+            config.max_running,
+            metrics.clone(),
+            db,
+            notifications.clone(),
+        );
         let controller = Self {
             inner: Arc::new(Inner {
                 config,
                 ban_manager: Mutex::new(BanManager::new(initial_banned_ips)),
                 ban_changes,
                 metrics,
+                notifications,
                 next_id: AtomicU64::new(1),
                 state: Mutex::new(ControllerState::default()),
+                capacity_threshold_reached: AtomicBool::new(false),
                 cluster_tx,
             }),
         };
@@ -394,6 +412,7 @@ impl AdmissionController {
                 ));
             }
             state.record_metrics(&self.inner.metrics);
+            self.update_capacity_threshold_alert(state.running.len());
         }
 
         AdmissionTicket {
@@ -672,18 +691,26 @@ impl Drop for AdmissionTicket {
             AdmissionState::Rejected(_reason) => {}
         }
         state.record_metrics(&self.controller.metrics);
+        AdmissionController {
+            inner: self.controller.clone(),
+        }
+        .update_capacity_threshold_alert(state.running.len());
     }
 }
 
 fn spawn_cluster_manager(
     max_running: usize,
     metrics: Arc<ServerMetrics>,
+    db: libsql::Connection,
+    notifications: Arc<Notifications>,
 ) -> mpsc::UnboundedSender<ClusterEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(
         ClusterManager {
             max_running,
             metrics,
+            db,
+            notifications,
             rx,
             live_sessions: HashMap::new(),
             recent_signatures: Arc::from([]),
@@ -701,16 +728,16 @@ impl ClusterManager {
         ));
         loop {
             tokio::select! {
-                Some(event) = self.rx.recv() => self.handle(event),
+                Some(event) = self.rx.recv() => self.handle(event).await,
                 _ = tick.tick() => {
-                    self.maybe_evaluate();
+                    self.maybe_evaluate().await;
                 }
                 else => break,
             }
         }
     }
 
-    fn handle(&mut self, event: ClusterEvent) {
+    async fn handle(&mut self, event: ClusterEvent) {
         match event {
             ClusterEvent::SessionStarted {
                 session,
@@ -718,7 +745,7 @@ impl ClusterManager {
             } => {
                 self.live_sessions.insert(session.id, (session, control_tx));
                 self.dirty = true;
-                self.maybe_evaluate();
+                self.maybe_evaluate().await;
             }
             ClusterEvent::InputRecorded { session_id, sample } => {
                 if self.update_session(session_id, |snapshot| {
@@ -758,7 +785,7 @@ impl ClusterManager {
                 self.recent_signatures =
                     Arc::from(recent_signatures.into_iter().collect::<Vec<_>>());
                 self.dirty = true;
-                self.maybe_evaluate();
+                self.maybe_evaluate().await;
             }
         }
     }
@@ -780,7 +807,7 @@ impl ClusterManager {
         true
     }
 
-    fn maybe_evaluate(&mut self) {
+    async fn maybe_evaluate(&mut self) {
         if !self.dirty {
             return;
         }
@@ -803,7 +830,7 @@ impl ClusterManager {
         };
         let pressure = job.pressure;
         let evaluation = cluster_detection::evaluate_job(&job);
-        self.apply_evaluation(evaluation, pressure);
+        self.apply_evaluation(evaluation, pressure).await;
     }
 
     fn should_skip_evaluation(&self) -> bool {
@@ -820,7 +847,8 @@ impl ClusterManager {
         }
     }
 
-    fn apply_evaluation(&mut self, evaluation: ClusterEvaluation, pressure: f64) {
+    async fn apply_evaluation(&mut self, evaluation: ClusterEvaluation, pressure: f64) {
+        let mut newly_evicted = Vec::new();
         for (session, control_tx) in self.live_sessions.values_mut() {
             let next = if evaluation.evicted_session_ids.contains(&session.id) {
                 SessionControl::Close(SessionEndReason::ClusterLimited)
@@ -873,9 +901,76 @@ impl ClusterManager {
                         "Evicting session due to suspected bot cluster"
                     );
                     self.metrics.record_cluster_enforcement(session.transport);
+                    newly_evicted.push((session.id, session.transport, session.client_ip));
                 }
             }
         }
+        if newly_evicted.is_empty() {
+            return;
+        }
+
+        let ip_counts = match cluster_kicked_ips::increment_for_enforcement(
+            &self.db,
+            newly_evicted.iter().map(|(_, _, client_ip)| *client_ip),
+        )
+        .await
+        {
+            Ok(counts) => counts,
+            Err(error) => {
+                tracing::error!(error = ?error, "failed to persist cluster-kicked ip counts");
+                Vec::new()
+            }
+        };
+        self.notifications
+            .notify_cluster_enforcement(ClusterEnforcementNotification {
+                region_id: self.metrics.region().to_string(),
+                current_sessions: self.live_sessions.len(),
+                max_capacity: self.max_running,
+                suspicious_cluster_count: evaluation.suspicious_cluster_count,
+                max_cluster_score: evaluation.max_cluster_score,
+                sessions: newly_evicted
+                    .into_iter()
+                    .map(
+                        |(session_id, transport, client_ip)| ClusterEnforcementSession {
+                            session_id: format!("{}:{session_id}", self.metrics.region()),
+                            transport: transport.as_str().to_string(),
+                            client_ip: client_ip.to_string(),
+                        },
+                    )
+                    .collect(),
+                ip_counts,
+            });
+    }
+}
+
+impl AdmissionController {
+    fn update_capacity_threshold_alert(&self, running_sessions: usize) {
+        if self.inner.config.max_running == 0 || self.inner.config.max_running == usize::MAX {
+            return;
+        }
+        let threshold_reached =
+            running_sessions.saturating_mul(5) >= self.inner.config.max_running.saturating_mul(4);
+        if threshold_reached {
+            if self
+                .inner
+                .capacity_threshold_reached
+                .swap(true, Ordering::AcqRel)
+            {
+                return;
+            }
+            self.inner
+                .notifications
+                .notify_capacity_threshold(CapacityThresholdNotification {
+                    region_id: self.inner.metrics.region().to_string(),
+                    current_sessions: running_sessions,
+                    max_capacity: self.inner.config.max_running,
+                    threshold_percent: 80,
+                });
+            return;
+        }
+        self.inner
+            .capacity_threshold_reached
+            .store(false, Ordering::Release);
     }
 }
 

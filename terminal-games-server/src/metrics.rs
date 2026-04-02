@@ -2,7 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::net::IpAddr;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -15,8 +14,6 @@ use prometheus::{
 };
 use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use terminal_games::app::{SessionAppState, SessionEndReason};
-
-use crate::cluster_kicked_ips;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Transport {
@@ -220,18 +217,17 @@ impl Drop for LiveSession {
 }
 
 pub struct ServerMetrics {
-    registry: Registry,
+    local_registry: Registry,
+    global_registry: Registry,
     region: String,
     db: libsql::Connection,
     duration_writer: tokio::sync::mpsc::UnboundedSender<DurationRecord>,
-    cluster_kicked_ip_writer: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 
     admission_waiting_sessions: IntGaugeVec,
     admission_queue_exits_total: IntCounterVec,
     ip_ban_events_total: IntCounterVec,
     ip_bans_active: IntGaugeVec,
     cluster_enforcement_total: IntCounterVec,
-    cluster_kicked_ip_count: GaugeVec,
     active_sessions: IntGaugeVec,
     sessions_total: IntCounterVec,
     session_ends_total: IntCounterVec,
@@ -247,16 +243,16 @@ pub struct ServerMetrics {
 }
 
 impl ServerMetrics {
-    pub async fn new(admission_max_running: usize, db: libsql::Connection) -> Result<Arc<Self>> {
-        let registry = Registry::new();
-        let region = std::env::var("REGION_ID")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "loca".to_string());
+    pub async fn new(
+        region: String,
+        admission_max_running: usize,
+        db: libsql::Connection,
+    ) -> Result<Arc<Self>> {
+        let local_registry = Registry::new();
+        let global_registry = Registry::new();
 
         let build_info = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new("terminal_games_build_info", "Static build metadata"),
                 &["service", "version", "region"],
@@ -267,7 +263,7 @@ impl ServerMetrics {
             .set(1);
 
         let admission_max_running_metric = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_admission_max_running",
@@ -285,7 +281,7 @@ impl ServerMetrics {
             });
 
         let admission_waiting_sessions = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_admission_waiting_sessions",
@@ -295,7 +291,7 @@ impl ServerMetrics {
             )?,
         )?;
         let admission_queue_exits_total = register(
-            &registry,
+            &local_registry,
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_admission_queue_exits_total",
@@ -305,7 +301,7 @@ impl ServerMetrics {
             )?,
         )?;
         let ip_ban_events_total = register(
-            &registry,
+            &local_registry,
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_ip_ban_events_total",
@@ -315,14 +311,14 @@ impl ServerMetrics {
             )?,
         )?;
         let ip_bans_active = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new("terminal_games_ip_bans_active", "Currently active IP bans"),
                 &["region"],
             )?,
         )?;
         let cluster_enforcement_total = register(
-            &registry,
+            &local_registry,
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_cluster_enforcement_total",
@@ -331,18 +327,8 @@ impl ServerMetrics {
                 &["region", "transport"],
             )?,
         )?;
-        let cluster_kicked_ip_count = register(
-            &registry,
-            GaugeVec::new(
-                Opts::new(
-                    "terminal_games_cluster_kicked_ip_count",
-                    "Current cluster-kicked counts for normalized IPs that are not covered by an active ban",
-                ),
-                &["region", "ip"],
-            )?,
-        )?;
         let active_sessions = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_active_sessions",
@@ -358,7 +344,7 @@ impl ServerMetrics {
             )?,
         )?;
         let sessions_total = register(
-            &registry,
+            &local_registry,
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_sessions_total",
@@ -374,7 +360,7 @@ impl ServerMetrics {
             )?,
         )?;
         let session_ends_total = register(
-            &registry,
+            &local_registry,
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_session_ends_total",
@@ -390,18 +376,18 @@ impl ServerMetrics {
             )?,
         )?;
         let session_duration_seconds = register(
-            &registry,
+            &global_registry,
             GaugeVec::new(
                 Opts::new(
                     "terminal_games_session_duration_seconds",
                     "Total persisted time spent across all users for each shortname",
                 ),
-                &["region", "shortname"],
+                &["shortname"],
             )?,
         )?;
 
         let bytes_total = register(
-            &registry,
+            &local_registry,
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_bytes_total",
@@ -412,7 +398,7 @@ impl ServerMetrics {
         )?;
 
         let process_resident_memory_bytes = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_process_resident_memory_bytes",
@@ -423,7 +409,7 @@ impl ServerMetrics {
         )?;
 
         let process_virtual_memory_bytes = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_process_virtual_memory_bytes",
@@ -434,7 +420,7 @@ impl ServerMetrics {
         )?;
 
         let system_cpu_count = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_system_cpu_count",
@@ -445,7 +431,7 @@ impl ServerMetrics {
         )?;
 
         let system_memory_total_bytes = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_system_memory_total_bytes",
@@ -456,7 +442,7 @@ impl ServerMetrics {
         )?;
 
         let system_memory_available_bytes = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_system_memory_available_bytes",
@@ -467,7 +453,7 @@ impl ServerMetrics {
         )?;
 
         let system_memory_used_bytes = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_system_memory_used_bytes",
@@ -478,7 +464,7 @@ impl ServerMetrics {
         )?;
 
         let system_load_average = register(
-            &registry,
+            &local_registry,
             GaugeVec::new(
                 Opts::new(
                     "terminal_games_system_load_average",
@@ -490,22 +476,18 @@ impl ServerMetrics {
 
         let (duration_writer, duration_rx) = tokio::sync::mpsc::unbounded_channel();
         spawn_duration_writer(db.clone(), duration_rx);
-        let (cluster_kicked_ip_writer, cluster_kicked_ip_rx) =
-            tokio::sync::mpsc::unbounded_channel();
-        spawn_cluster_kicked_ip_writer(db.clone(), cluster_kicked_ip_rx);
 
         Ok(Arc::new(Self {
-            registry,
+            local_registry,
+            global_registry,
             region,
             db,
             duration_writer,
-            cluster_kicked_ip_writer,
             admission_waiting_sessions,
             admission_queue_exits_total,
             ip_ban_events_total,
             ip_bans_active,
             cluster_enforcement_total,
-            cluster_kicked_ip_count,
             active_sessions,
             sessions_total,
             session_ends_total,
@@ -521,18 +503,18 @@ impl ServerMetrics {
         }))
     }
 
-    pub async fn render(&self) -> Result<String> {
-        self.update_system_metrics();
-        self.refresh_persisted_shortname_durations().await?;
-        self.refresh_cluster_kicked_ip_metrics().await?;
+    pub fn region(&self) -> &str {
+        &self.region
+    }
 
-        let families = self.registry.gather();
-        let encoder = TextEncoder::new();
-        let mut buffer = Vec::new();
-        encoder
-            .encode(&families, &mut buffer)
-            .context("failed to encode prometheus metrics")?;
-        String::from_utf8(buffer).context("prometheus metrics were not valid UTF-8")
+    pub async fn render_local(&self) -> Result<String> {
+        self.update_system_metrics();
+        encode_metric_families(&self.local_registry.gather())
+    }
+
+    pub async fn render_global(&self) -> Result<String> {
+        self.refresh_persisted_shortname_durations().await?;
+        encode_metric_families(&self.global_registry.gather())
     }
 
     pub fn record_admission_state(&self, queued_ssh: usize, queued_web: usize) {
@@ -587,15 +569,6 @@ impl ServerMetrics {
         self.cluster_enforcement_total
             .with_label_values(&[self.region.as_str(), transport.as_str()])
             .inc();
-    }
-
-    pub fn record_cluster_kicked_ip(&self, ip: IpAddr) {
-        let ip = cluster_kicked_ips::normalize(ip);
-        let display_ip =
-            cluster_kicked_ips::display(&ip).unwrap_or_else(|_| format!("{:02x?}", ip.as_slice()));
-        if let Err(error) = self.cluster_kicked_ip_writer.send(ip) {
-            tracing::error!(?error, ip = %display_ip, "failed to queue cluster-kicked ip persistence");
-        }
     }
 
     pub fn record_bytes(&self, direction: Direction, transport: Transport, bytes: usize) {
@@ -697,21 +670,8 @@ impl ServerMetrics {
         self.session_duration_seconds.reset();
         for (shortname, seconds) in load_persisted_shortname_durations(&self.db).await? {
             self.session_duration_seconds
-                .with_label_values(&[self.region.as_str(), shortname.as_str()])
+                .with_label_values(&[shortname.as_str()])
                 .set(seconds);
-        }
-        Ok(())
-    }
-
-    async fn refresh_cluster_kicked_ip_metrics(&self) -> Result<()> {
-        self.cluster_kicked_ip_count.reset();
-        for entry in cluster_kicked_ips::load_visible_page(&self.db, 0, 20, true)
-            .await?
-            .entries
-        {
-            self.cluster_kicked_ip_count
-                .with_label_values(&[self.region.as_str(), entry.ip.as_str()])
-                .set(entry.count as f64);
         }
         Ok(())
     }
@@ -732,28 +692,6 @@ fn spawn_duration_writer(
                         seconds = record.seconds,
                         user_id = record.user_id,
                         "failed to persist duration record"
-                    );
-                }
-            }
-        }
-    });
-}
-
-fn spawn_cluster_kicked_ip_writer(
-    db: libsql::Connection,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-) {
-    tokio::spawn(async move {
-        while let Some(ip) = rx.recv().await {
-            let display_ip = cluster_kicked_ips::display(&ip)
-                .unwrap_or_else(|_| format!("{:02x?}", ip.as_slice()));
-            match cluster_kicked_ips::increment(&db, &ip).await {
-                Ok(()) => {}
-                Err(error) => {
-                    tracing::error!(
-                        error = ?error,
-                        ip = %display_ip,
-                        "failed to persist cluster-kicked ip record"
                     );
                 }
             }
@@ -833,6 +771,15 @@ async fn load_persisted_shortname_durations(db: &libsql::Connection) -> Result<V
 
 fn bool_label(value: bool) -> &'static str {
     if value { "true" } else { "false" }
+}
+
+fn encode_metric_families(families: &[prometheus::proto::MetricFamily]) -> Result<String> {
+    let encoder = TextEncoder::new();
+    let mut buffer = Vec::new();
+    encoder
+        .encode(families, &mut buffer)
+        .context("failed to encode prometheus metrics")?;
+    String::from_utf8(buffer).context("prometheus metrics were not valid UTF-8")
 }
 
 fn register<T>(registry: &Registry, metric: T) -> Result<T>

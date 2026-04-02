@@ -8,6 +8,7 @@ mod cluster_kicked_ips;
 mod control;
 mod idle;
 mod metrics;
+mod notifications;
 mod sessions;
 mod ssh;
 mod web;
@@ -207,6 +208,12 @@ async fn main() -> Result<()> {
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
     mesh.start_discovery().await?;
     mesh.serve().await?;
+    let region_id = std::env::var("REGION_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| mesh.region().to_string());
+    let notifications = Arc::new(notifications::Notifications::from_env());
 
     let app_server = Arc::new(AppServer::new(
         mesh.clone(),
@@ -263,7 +270,8 @@ async fn main() -> Result<()> {
         last_inserted_at = last_ban_inserted_at,
         "Loaded initial IP ban snapshot"
     );
-    let metrics = metrics::ServerMetrics::new(max_active_apps, conn.clone()).await?;
+    let metrics =
+        metrics::ServerMetrics::new(region_id.clone(), max_active_apps, conn.clone()).await?;
     let admission_controller = Arc::new(admission::AdmissionController::new(
         AdmissionConfig {
             max_running: max_active_apps,
@@ -273,6 +281,8 @@ async fn main() -> Result<()> {
         },
         banned_ips,
         metrics.clone(),
+        conn.clone(),
+        notifications.clone(),
     ));
     spawn_ip_ban_sync_task(
         conn.clone(),
@@ -288,17 +298,12 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "disabled".to_string()),
         "Configured admission limits"
     );
-    let region_id = std::env::var("REGION_ID")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| mesh.region().to_string());
     let admin_shared_secret = std::env::var("ADMIN_SHARED_SECRET")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(Arc::<str>::from);
-    let session_registry = sessions::SessionRegistry::new(region_id, metrics.clone());
+    let session_registry = sessions::SessionRegistry::new(region_id, notifications.clone());
     let initial_status_bar_state = control::load_status_bar_state(&conn, None).await?;
     session_registry.set_status_bar_state(initial_status_bar_state);
     let control_plane = control::ControlPlane::new(

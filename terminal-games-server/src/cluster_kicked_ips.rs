@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result, bail};
@@ -9,6 +10,7 @@ use libsql::Value;
 use terminal_games::control::{ClusterKickedIpEntry, ClusterKickedIpListResponse};
 
 use crate::admission::decode_cidr_blob;
+use crate::notifications::ClusterKickedIpCount;
 
 pub fn normalize(ip: IpAddr) -> Vec<u8> {
     match ip {
@@ -29,17 +31,68 @@ pub fn display(ip: &[u8]) -> Result<String> {
     }
 }
 
-pub async fn increment(db: &libsql::Connection, ip: &[u8]) -> Result<()> {
-    db.execute(
-        "INSERT INTO cluster_kicked_ips (ip, count)
-         VALUES (?1, 1)
-         ON CONFLICT(ip) DO UPDATE
-         SET count = cluster_kicked_ips.count + 1",
-        libsql::params!(ip),
-    )
-    .await
-    .context("failed to upsert cluster-kicked ip count")?;
-    Ok(())
+pub async fn increment_for_enforcement(
+    db: &libsql::Connection,
+    ips: impl IntoIterator<Item = IpAddr>,
+) -> Result<Vec<ClusterKickedIpCount>> {
+    let mut increments = HashMap::<Vec<u8>, u64>::new();
+    for ip in ips {
+        *increments.entry(normalize(ip)).or_default() += 1;
+    }
+    if increments.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let tx = db
+        .transaction()
+        .await
+        .context("failed to start cluster-kicked ip transaction")?;
+    let mut counts = Vec::with_capacity(increments.len());
+
+    for (ip, incremented_by) in increments {
+        let display_ip = display(&ip)?;
+        tx.execute(
+            "INSERT INTO cluster_kicked_ips (ip, count)
+             VALUES (?1, ?2)
+             ON CONFLICT(ip) DO UPDATE
+             SET count = cluster_kicked_ips.count + excluded.count",
+            libsql::params!(ip.clone(), incremented_by as i64),
+        )
+        .await
+        .with_context(|| format!("failed to upsert cluster-kicked ip count for {display_ip}"))?;
+
+        let mut rows = tx
+            .query(
+                "SELECT count
+                 FROM cluster_kicked_ips
+                 WHERE ip = ?1",
+                libsql::params!(ip.clone()),
+            )
+            .await
+            .with_context(|| {
+                format!("failed to load updated cluster-kicked ip count for {display_ip}")
+            })?;
+        let row = rows
+            .next()
+            .await
+            .with_context(|| {
+                format!("failed to read updated cluster-kicked ip row for {display_ip}")
+            })?
+            .with_context(|| format!("missing updated cluster-kicked ip row for {display_ip}"))?;
+        counts.push(ClusterKickedIpCount {
+            ip: display_ip,
+            incremented_by,
+            total_count: row
+                .get::<u64>(0)
+                .context("missing updated cluster-kicked ip count")?,
+        });
+    }
+
+    tx.commit()
+        .await
+        .context("failed to commit cluster-kicked ip transaction")?;
+    counts.sort_by(|a, b| a.ip.cmp(&b.ip));
+    Ok(counts)
 }
 
 pub async fn load_entries_page(
