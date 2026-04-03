@@ -72,6 +72,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 const BANDWIDTH_WINDOW: Duration = Duration::from_secs(5);
 const AUTHOR_UPLOAD_MAX_BYTES: usize = 50 * 1024 * 1024;
 const CONTROL_RPC_MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+const APP_SELF_INFO_MAX_TOKENS: usize = 100;
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -743,25 +744,14 @@ impl AdminControlRpc for AdminRpcServer {
         }
         let expires_at =
             parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref())?;
-        let mut rows = self
-            .control
-            .app_server
-            .db
-            .query(
-                "SELECT COALESCE(MAX(sort_order), 0) FROM status_tickers",
-                (),
-            )
-            .await?;
-        let next_order = match rows.next().await? {
-            Some(row) => row.get::<i64>(0)?,
-            None => 0,
-        } + 1;
         self.control
             .app_server
             .db
             .execute(
-                "INSERT INTO status_tickers (sort_order, content, expires_at) VALUES (?1, ?2, ?3)",
-                libsql::params!(next_order, content, expires_at),
+                "INSERT INTO status_tickers (sort_order, content, expires_at)
+                 SELECT COALESCE(MAX(sort_order), 0) + 1, ?1, ?2
+                 FROM status_tickers",
+                libsql::params!(content, expires_at),
             )
             .await?;
         self.control.refresh_status_bar_state().await?;
@@ -794,13 +784,27 @@ impl AdminControlRpc for AdminRpcServer {
         if provided_ids != expected_ids {
             return Err("ticker reorder must provide each ticker id exactly once".into());
         }
+        let mut query = String::from("UPDATE status_tickers SET sort_order = CASE id");
+        let mut params = Vec::with_capacity(request.ticker_ids.len() * 3);
         for (index, id) in request.ticker_ids.iter().copied().enumerate() {
-            tx.execute(
-                "UPDATE status_tickers SET sort_order = ?2 WHERE id = ?1",
-                libsql::params!(id, (index as i64) + 1),
-            )
-            .await?;
+            let id = i64::try_from(id).map_err(|_| RpcError::from("ticker id out of range"))?;
+            query.push_str(" WHEN ? THEN ?");
+            params.push(libsql::Value::Integer(id));
+            params.push(libsql::Value::Integer((index as i64) + 1));
         }
+        query.push_str(" END WHERE id IN (");
+        for index in 0..request.ticker_ids.len() {
+            if index > 0 {
+                query.push_str(", ");
+            }
+            query.push('?');
+        }
+        query.push(')');
+        for id in request.ticker_ids.iter().copied() {
+            let id = i64::try_from(id).map_err(|_| RpcError::from("ticker id out of range"))?;
+            params.push(libsql::Value::Integer(id));
+        }
+        tx.execute(&query, libsql::params_from_iter(params)).await?;
         tx.commit().await?;
         self.control.refresh_status_bar_state().await?;
         Ok(())
@@ -864,43 +868,23 @@ impl AdminControlRpc for AdminRpcServer {
         request: CreateAppRequest,
     ) -> Result<CreateAppResponse, RpcError> {
         validate_shortname(&request.shortname)?;
-        let mut existing = self
-            .control
-            .app_server
-            .db
-            .query(
-                "SELECT 1 FROM app_tokens WHERE shortname = ?1 LIMIT 1",
-                libsql::params!(request.shortname.clone()),
-            )
-            .await?;
-        if existing.next().await?.is_some() {
-            return Err(format!("shortname '{}' already exists", request.shortname).into());
-        }
         let secret = random_token_secret();
         let token_hash = sha256_hex(&secret);
-        match self
-            .control
-            .app_server
-            .db
-            .execute(
-                "INSERT INTO app_tokens (shortname, token_hash)
-             VALUES (?1, ?2)",
-                libsql::params!(request.shortname.clone(), token_hash),
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(error) => return Err(error.into()),
-        }
         let mut rows = self
             .control
             .app_server
             .db
             .query(
-                "SELECT id, shortname FROM app_tokens WHERE shortname = ?1 LIMIT 1",
-                libsql::params!(request.shortname),
+                "INSERT INTO app_tokens (shortname, token_hash)
+                 VALUES (?1, ?2)
+                 RETURNING id, shortname",
+                libsql::params!(request.shortname.clone(), token_hash),
             )
-            .await?;
+            .await
+            .map_err(|error| match shortname_exists_error(&error) {
+                true => RpcError::from(format!("shortname '{}' already exists", request.shortname)),
+                false => RpcError::from(error),
+            })?;
         let Some(row) = rows.next().await? else {
             return Err("app row missing after insert".into());
         };
@@ -950,24 +934,33 @@ impl AdminControlRpc for AdminRpcServer {
         _: context::Context,
         request: RotateAppTokenRequest,
     ) -> Result<RotateAppTokenResponse, RpcError> {
+        let secret = random_token_secret();
+        let token_hash = sha256_hex(&secret);
         let mut rows = self
             .control
             .app_server
             .db
             .query(
-                "SELECT id, shortname FROM app_tokens WHERE id = ?1 LIMIT 1",
-                libsql::params!(request.app_id),
+                "UPDATE app_tokens
+                 SET token_hash = ?2
+                 WHERE id = ?1
+                 RETURNING shortname",
+                libsql::params!(request.app_id, token_hash),
             )
             .await?;
         let Some(row) = rows.next().await? else {
             return Err("app not found".into());
         };
-        let app_id = row.get::<u64>(0)?;
-        let shortname = row.get::<String>(1)?;
-        Ok(self
-            .control
-            .rotate_app_token(app_id, &shortname, request.base_url)
-            .await?)
+        let shortname = row.get::<String>(0)?;
+        Ok(RotateAppTokenResponse {
+            app: AppSummary {
+                app_id: request.app_id,
+                author_name: String::new(),
+                shortname: shortname.clone(),
+                playtime_seconds: 0.0,
+            },
+            token: AppTokenClaims::new(request.base_url, shortname, secret).encode()?,
+        })
     }
 
     async fn app_delete(
@@ -993,37 +986,40 @@ impl AppControlRpc for AppRpcServer {
         _: context::Context,
         request: AppSelfInfoRequest,
     ) -> Result<AppSelfInfoResponse, RpcError> {
+        if request.tokens.len() > APP_SELF_INFO_MAX_TOKENS {
+            return Err(RpcError::from(format!(
+                "too many app tokens: max {}",
+                APP_SELF_INFO_MAX_TOKENS
+            )));
+        }
         self.control
             .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
         let mut seen_shortnames = HashSet::new();
+        let unique_claims = request
+            .tokens
+            .into_iter()
+            .filter(|claims| seen_shortnames.insert(claims.shortname.clone()))
+            .collect::<Vec<_>>();
+        let records_by_shortname = load_app_self_info_records_by_shortnames(
+            &self.control.app_server.db,
+            unique_claims.iter().map(|claims| claims.shortname.as_str()),
+        )
+        .await?;
         let mut apps = Vec::new();
         let mut invalid_shortnames = Vec::new();
-        for claims in request.tokens {
-            if !seen_shortnames.insert(claims.shortname.clone()) {
-                continue;
-            }
-            let Some(record) =
-                load_app_token_record_by_shortname(&self.control.app_server.db, &claims.shortname)
-                    .await?
-            else {
+        for claims in unique_claims {
+            let Some(record) = records_by_shortname.get(&claims.shortname) else {
                 invalid_shortnames.push(claims.shortname);
                 continue;
             };
             if !constant_time_eq(
                 sha256_hex(&claims.secret).as_bytes(),
-                record.token_hash.as_bytes(),
+                record.app_token.token_hash.as_bytes(),
             ) {
                 invalid_shortnames.push(claims.shortname);
                 continue;
             }
-            apps.push(
-                load_app_self_response(
-                    &self.control.app_server.db,
-                    &self.control.region_id,
-                    &record,
-                )
-                .await?,
-            );
+            apps.push(record.to_response(&self.control.region_id));
         }
         Ok(AppSelfInfoResponse {
             apps,
@@ -1251,32 +1247,33 @@ impl AppControlRpc for AppRpcServer {
                     .unwrap_or(empty_env_hash),
             };
             let updated_at_ns = current_unix_nanos();
-            tx.execute(
-                "INSERT INTO apps (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
-                     VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)",
-                libsql::params!(
-                    self.app.record.shortname.as_str(),
-                    request.wasm.clone(),
-                    details_json.as_str(),
-                    build_id.wasm_hash.to_vec(),
-                    build_id.env_hash.to_vec(),
-                    env_blob
-                        .as_ref()
-                        .map(|(blob, _)| blob.salt.clone())
-                        .unwrap_or_else(|| empty_env_blob.salt.clone()),
-                    env_blob
-                        .as_ref()
-                        .map(|(blob, _)| blob.ciphertext.clone())
-                        .unwrap_or_else(|| empty_env_blob.ciphertext.clone()),
-                    updated_at_ns
-                ),
-            )
-            .await?;
-            let mut id_rows = tx.query("SELECT last_insert_rowid()", ()).await?;
+            let mut id_rows = tx
+                .query(
+                    "INSERT INTO apps (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
+                     VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)
+                     RETURNING id",
+                    libsql::params!(
+                        self.app.record.shortname.as_str(),
+                        request.wasm.clone(),
+                        details_json.as_str(),
+                        build_id.wasm_hash.to_vec(),
+                        build_id.env_hash.to_vec(),
+                        env_blob
+                            .as_ref()
+                            .map(|(blob, _)| blob.salt.clone())
+                            .unwrap_or_else(|| empty_env_blob.salt.clone()),
+                        env_blob
+                            .as_ref()
+                            .map(|(blob, _)| blob.ciphertext.clone())
+                            .unwrap_or_else(|| empty_env_blob.ciphertext.clone()),
+                        updated_at_ns
+                    ),
+                )
+                .await?;
             let app_id = id_rows
                 .next()
                 .await?
-                .ok_or_else(|| RpcError::from("missing last_insert_rowid"))?
+                .ok_or_else(|| RpcError::from("missing inserted app row"))?
                 .get::<u64>(0)?;
             (app_id, build_id, updated_at_ns, true)
         };
@@ -1622,30 +1619,71 @@ async fn load_app_token_record_by_shortname(
     }))
 }
 
-async fn load_app_self_response(
+#[derive(Debug, Clone)]
+struct AppSelfInfoRecord {
+    app_token: AppTokenRecord,
+    author_name: String,
+    playtime_seconds: f64,
+}
+
+impl AppSelfInfoRecord {
+    fn to_response(&self, region_id: &str) -> AppSelfResponse {
+        AppSelfResponse {
+            app_id: self.app_token.id,
+            author_name: self.author_name.clone(),
+            shortname: self.app_token.shortname.clone(),
+            server: region_id.to_string(),
+            playtime_seconds: self.playtime_seconds,
+        }
+    }
+}
+
+async fn load_app_self_info_records_by_shortnames<'a>(
     db: &libsql::Connection,
-    region_id: &str,
-    record: &AppTokenRecord,
-) -> anyhow::Result<AppSelfResponse> {
+    shortnames: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<HashMap<String, AppSelfInfoRecord>> {
+    let shortnames = shortnames
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if shortnames.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", shortnames.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT app_tokens.id,
+                app_tokens.shortname,
+                app_tokens.token_hash,
+                COALESCE(json_extract(apps.details, '$.author'), ''),
+                COALESCE(apps.duration_seconds, 0.0)
+         FROM app_tokens
+         LEFT JOIN apps ON apps.shortname = app_tokens.shortname
+         WHERE app_tokens.shortname IN ({placeholders})"
+    );
+
     let mut rows = db
-        .query(
-            "SELECT COALESCE(json_extract(details, '$.author'), ''),
-                    COALESCE(duration_seconds, 0.0)
-             FROM apps WHERE shortname = ?1 LIMIT 1",
-            libsql::params!(record.shortname.as_str()),
-        )
+        .query(&query, libsql::params_from_iter(shortnames))
         .await?;
-    let (author_name, playtime_seconds) = match rows.next().await? {
-        Some(row) => (row.get::<String>(0).unwrap_or_default(), row.get::<f64>(1)?),
-        None => (String::new(), 0.0),
-    };
-    Ok(AppSelfResponse {
-        app_id: record.id,
-        author_name,
-        shortname: record.shortname.clone(),
-        server: region_id.to_string(),
-        playtime_seconds,
-    })
+    let mut records = HashMap::new();
+    while let Some(row) = rows.next().await? {
+        let shortname = row.get::<String>(1)?;
+        records.insert(
+            shortname.clone(),
+            AppSelfInfoRecord {
+                app_token: AppTokenRecord {
+                    id: row.get::<u64>(0)?,
+                    shortname,
+                    token_hash: row.get::<String>(2)?,
+                },
+                author_name: row.get::<String>(3).unwrap_or_default(),
+                playtime_seconds: row.get::<f64>(4)?,
+            },
+        );
+    }
+    Ok(records)
 }
 
 async fn load_app_env_blob(
@@ -1933,6 +1971,16 @@ fn require_control_api_compatibility(headers: &HeaderMap) -> Result<(), Response
         ),
     )
         .into_response())
+}
+
+fn shortname_exists_error(error: &libsql::Error) -> bool {
+    match error {
+        libsql::Error::SqliteFailure(_, detail)
+        | libsql::Error::RemoteSqliteFailure(_, _, detail) => {
+            detail.contains("UNIQUE constraint failed: app_tokens.shortname")
+        }
+        _ => false,
+    }
 }
 
 fn internal_error(error: impl std::fmt::Display) -> Response {
