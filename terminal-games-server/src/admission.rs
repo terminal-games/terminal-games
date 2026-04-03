@@ -145,6 +145,31 @@ impl ControllerState {
     }
 }
 
+impl Inner {
+    fn update_capacity_threshold_alert(&self, running_sessions: usize) {
+        if self.config.max_running == 0 || self.config.max_running == usize::MAX {
+            return;
+        }
+        let threshold_reached =
+            running_sessions.saturating_mul(5) >= self.config.max_running.saturating_mul(4);
+        if threshold_reached {
+            if self.capacity_threshold_reached.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            self.notifications
+                .notify_capacity_threshold(CapacityThresholdNotification {
+                    region_id: self.metrics.region().to_string(),
+                    current_sessions: running_sessions,
+                    max_capacity: self.config.max_running,
+                    threshold_percent: 80,
+                });
+            return;
+        }
+        self.capacity_threshold_reached
+            .store(false, Ordering::Release);
+    }
+}
+
 struct QueuedTicket {
     id: u64,
     client_ip: IpAddr,
@@ -373,8 +398,7 @@ impl AdmissionController {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = watch::channel(AdmissionState::Queued(1));
         let matched_ban = self.check_ip_ban(client_ip);
-
-        {
+        let running_sessions = {
             let mut state = self.inner.state.lock().unwrap();
             if let Some((ban_rule, ban_reason)) = matched_ban {
                 tracing::debug!(
@@ -412,8 +436,9 @@ impl AdmissionController {
                 ));
             }
             state.record_metrics(&self.inner.metrics);
-            self.update_capacity_threshold_alert(state.running.len());
-        }
+            state.running.len()
+        };
+        self.inner.update_capacity_threshold_alert(running_sessions);
 
         AdmissionTicket {
             id,
@@ -691,10 +716,10 @@ impl Drop for AdmissionTicket {
             AdmissionState::Rejected(_reason) => {}
         }
         state.record_metrics(&self.controller.metrics);
-        AdmissionController {
-            inner: self.controller.clone(),
-        }
-        .update_capacity_threshold_alert(state.running.len());
+        let running_sessions = state.running.len();
+        drop(state);
+        self.controller
+            .update_capacity_threshold_alert(running_sessions);
     }
 }
 
@@ -949,37 +974,6 @@ impl ClusterManager {
                 ip_counts,
             });
         });
-    }
-}
-
-impl AdmissionController {
-    fn update_capacity_threshold_alert(&self, running_sessions: usize) {
-        if self.inner.config.max_running == 0 || self.inner.config.max_running == usize::MAX {
-            return;
-        }
-        let threshold_reached =
-            running_sessions.saturating_mul(5) >= self.inner.config.max_running.saturating_mul(4);
-        if threshold_reached {
-            if self
-                .inner
-                .capacity_threshold_reached
-                .swap(true, Ordering::AcqRel)
-            {
-                return;
-            }
-            self.inner
-                .notifications
-                .notify_capacity_threshold(CapacityThresholdNotification {
-                    region_id: self.inner.metrics.region().to_string(),
-                    current_sessions: running_sessions,
-                    max_capacity: self.inner.config.max_running,
-                    threshold_percent: 80,
-                });
-            return;
-        }
-        self.inner
-            .capacity_threshold_reached
-            .store(false, Ordering::Release);
     }
 }
 
