@@ -1948,13 +1948,45 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn require_control_api_compatibility(headers: &HeaderMap) -> Result<(), Response> {
-    let Some(expected_version) = headers
-        .get(CONTROL_API_EXPECTED_VERSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(());
+    let expected_version = match headers.get(CONTROL_API_EXPECTED_VERSION_HEADER) {
+        Some(value) => match value.to_str() {
+            Ok(value) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "client must send a non-empty {} header with the control API version it expects.",
+                            CONTROL_API_EXPECTED_VERSION_HEADER,
+                        ),
+                    )
+                        .into_response());
+                }
+                value
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "client sent an invalid {} header; it must be a valid UTF-8 control API version string.",
+                        CONTROL_API_EXPECTED_VERSION_HEADER,
+                    ),
+                )
+                    .into_response());
+            }
+        },
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "client must send the {} header. This terminal-games-server {} provides control API {}.",
+                    CONTROL_API_EXPECTED_VERSION_HEADER,
+                    env!("CARGO_PKG_VERSION"),
+                    CONTROL_API_VERSION,
+                ),
+            )
+                .into_response());
+        }
     };
 
     if expected_version == CONTROL_API_VERSION {

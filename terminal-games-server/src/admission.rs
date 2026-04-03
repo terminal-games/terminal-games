@@ -728,16 +728,16 @@ impl ClusterManager {
         ));
         loop {
             tokio::select! {
-                Some(event) = self.rx.recv() => self.handle(event).await,
+                Some(event) = self.rx.recv() => self.handle(event),
                 _ = tick.tick() => {
-                    self.maybe_evaluate().await;
+                    self.maybe_evaluate();
                 }
                 else => break,
             }
         }
     }
 
-    async fn handle(&mut self, event: ClusterEvent) {
+    fn handle(&mut self, event: ClusterEvent) {
         match event {
             ClusterEvent::SessionStarted {
                 session,
@@ -745,7 +745,7 @@ impl ClusterManager {
             } => {
                 self.live_sessions.insert(session.id, (session, control_tx));
                 self.dirty = true;
-                self.maybe_evaluate().await;
+                self.maybe_evaluate();
             }
             ClusterEvent::InputRecorded { session_id, sample } => {
                 if self.update_session(session_id, |snapshot| {
@@ -785,7 +785,7 @@ impl ClusterManager {
                 self.recent_signatures =
                     Arc::from(recent_signatures.into_iter().collect::<Vec<_>>());
                 self.dirty = true;
-                self.maybe_evaluate().await;
+                self.maybe_evaluate();
             }
         }
     }
@@ -807,7 +807,7 @@ impl ClusterManager {
         true
     }
 
-    async fn maybe_evaluate(&mut self) {
+    fn maybe_evaluate(&mut self) {
         if !self.dirty {
             return;
         }
@@ -830,7 +830,7 @@ impl ClusterManager {
         };
         let pressure = job.pressure;
         let evaluation = cluster_detection::evaluate_job(&job);
-        self.apply_evaluation(evaluation, pressure).await;
+        self.apply_evaluation(evaluation, pressure);
     }
 
     fn should_skip_evaluation(&self) -> bool {
@@ -847,7 +847,7 @@ impl ClusterManager {
         }
     }
 
-    async fn apply_evaluation(&mut self, evaluation: ClusterEvaluation, pressure: f64) {
+    fn apply_evaluation(&mut self, evaluation: ClusterEvaluation, pressure: f64) {
         let mut newly_evicted = Vec::new();
         for (session, control_tx) in self.live_sessions.values_mut() {
             let next = if evaluation.evicted_session_ids.contains(&session.id) {
@@ -909,30 +909,38 @@ impl ClusterManager {
             return;
         }
 
-        let ip_counts = match cluster_kicked_ips::increment_for_enforcement(
-            &self.db,
-            newly_evicted.iter().map(|(_, _, client_ip)| *client_ip),
-        )
-        .await
-        {
-            Ok(counts) => counts,
-            Err(error) => {
-                tracing::error!(error = ?error, "failed to persist cluster-kicked ip counts");
-                Vec::new()
-            }
-        };
-        self.notifications
-            .notify_cluster_enforcement(ClusterEnforcementNotification {
-                region_id: self.metrics.region().to_string(),
-                current_sessions: self.live_sessions.len(),
-                max_capacity: self.max_running,
-                suspicious_cluster_count: evaluation.suspicious_cluster_count,
-                max_cluster_score: evaluation.max_cluster_score,
+        let db = self.db.clone();
+        let notifications = Arc::clone(&self.notifications);
+        let region_id = self.metrics.region().to_string();
+        let current_sessions = self.live_sessions.len();
+        let max_capacity = self.max_running;
+        let suspicious_cluster_count = evaluation.suspicious_cluster_count;
+        let max_cluster_score = evaluation.max_cluster_score;
+
+        tokio::spawn(async move {
+            let ip_counts = match cluster_kicked_ips::increment_for_enforcement(
+                &db,
+                newly_evicted.iter().map(|(_, _, client_ip)| *client_ip),
+            )
+            .await
+            {
+                Ok(counts) => counts,
+                Err(error) => {
+                    tracing::error!(error = ?error, "failed to persist cluster-kicked ip counts");
+                    Vec::new()
+                }
+            };
+            notifications.notify_cluster_enforcement(ClusterEnforcementNotification {
+                region_id: region_id.clone(),
+                current_sessions,
+                max_capacity,
+                suspicious_cluster_count,
+                max_cluster_score,
                 sessions: newly_evicted
                     .into_iter()
                     .map(
                         |(session_id, transport, client_ip)| ClusterEnforcementSession {
-                            session_id: format!("{}:{session_id}", self.metrics.region()),
+                            session_id: format!("{region_id}:{session_id}"),
                             transport: transport.as_str().to_string(),
                             client_ip: client_ip.to_string(),
                         },
@@ -940,6 +948,7 @@ impl ClusterManager {
                     .collect(),
                 ip_counts,
             });
+        });
     }
 }
 
