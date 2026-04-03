@@ -442,7 +442,8 @@ impl SshServer {
                 has_audio,
                 user_id,
             );
-            let mut admitted_session = admission_ticket.start_session(session_metrics.clone());
+            let mut admitted_session = admission_ticket
+                .start_session(session_metrics.clone(), session_identity.app_receiver());
             let mut cluster_control = admitted_session.subscribe_control();
             let mut app_metrics_rx = session_identity.app_receiver();
             let mut resize_events_rx = resize_rx.clone();

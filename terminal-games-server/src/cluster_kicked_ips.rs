@@ -6,11 +6,39 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result, bail};
-use libsql::Value;
 use terminal_games::control::{ClusterKickedIpEntry, ClusterKickedIpListResponse};
 
 use crate::admission::decode_cidr_blob;
-use crate::notifications::ClusterKickedIpCount;
+
+const DEFAULT_RETENTION_DAYS: u64 = 30;
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClusterKickedIpReview {
+    pub(crate) entries: Vec<ClusterKickedIpReviewEntry>,
+    pub(crate) retention_days: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ClusterKickedIpReviewEntry {
+    pub(crate) total_count: u64,
+    pub(crate) incremented_by: u64,
+}
+
+pub(crate) fn empty_review() -> ClusterKickedIpReview {
+    ClusterKickedIpReview {
+        entries: Vec::new(),
+        retention_days: retention_days(),
+    }
+}
+
+pub(crate) fn retention_days() -> u64 {
+    std::env::var("CLUSTER_KICKED_IP_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(DEFAULT_RETENTION_DAYS)
+}
 
 pub fn normalize(ip: IpAddr) -> Vec<u8> {
     match ip {
@@ -34,39 +62,41 @@ pub fn display(ip: &[u8]) -> Result<String> {
 pub async fn increment_for_enforcement(
     db: &libsql::Connection,
     ips: impl IntoIterator<Item = IpAddr>,
-) -> Result<Vec<ClusterKickedIpCount>> {
+) -> Result<ClusterKickedIpReview> {
     let mut increments = HashMap::<Vec<u8>, u64>::new();
     for ip in ips {
         *increments.entry(normalize(ip)).or_default() += 1;
     }
     if increments.is_empty() {
-        return Ok(Vec::new());
+        return Ok(empty_review());
     }
 
-    let tx = db
-        .transaction()
-        .await
-        .context("failed to start cluster-kicked ip transaction")?;
-    let mut counts = Vec::with_capacity(increments.len());
+    let retention_days = retention_days();
+    let bucket_start = current_bucket_start();
+    let cutoff_bucket_start = retained_bucket_cutoff(bucket_start, retention_days);
+    purge_expired_before(db, cutoff_bucket_start).await?;
+
+    let mut entries = Vec::with_capacity(increments.len());
 
     for (ip, incremented_by) in increments {
         let display_ip = display(&ip)?;
-        tx.execute(
-            "INSERT INTO cluster_kicked_ips (ip, count)
-             VALUES (?1, ?2)
-             ON CONFLICT(ip) DO UPDATE
-             SET count = cluster_kicked_ips.count + excluded.count",
-            libsql::params!(ip.clone(), incremented_by as i64),
+        db.execute(
+            "INSERT INTO cluster_kicked_ip_buckets (ip, bucket_start, count)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(ip, bucket_start) DO UPDATE
+             SET count = cluster_kicked_ip_buckets.count + excluded.count",
+            libsql::params!(ip.clone(), bucket_start, incremented_by as i64),
         )
         .await
         .with_context(|| format!("failed to upsert cluster-kicked ip count for {display_ip}"))?;
 
-        let mut rows = tx
+        let mut rows = db
             .query(
-                "SELECT count
-                 FROM cluster_kicked_ips
-                 WHERE ip = ?1",
-                libsql::params!(ip.clone()),
+                "SELECT COALESCE(SUM(count), 0)
+                 FROM cluster_kicked_ip_buckets
+                 WHERE ip = ?1
+                   AND bucket_start >= ?2",
+                libsql::params!(ip, cutoff_bucket_start),
             )
             .await
             .with_context(|| {
@@ -79,20 +109,25 @@ pub async fn increment_for_enforcement(
                 format!("failed to read updated cluster-kicked ip row for {display_ip}")
             })?
             .with_context(|| format!("missing updated cluster-kicked ip row for {display_ip}"))?;
-        counts.push(ClusterKickedIpCount {
-            ip: display_ip,
+        let total_count = row
+            .get::<u64>(0)
+            .context("missing updated cluster-kicked ip count")?;
+        entries.push(ClusterKickedIpReviewEntry {
+            total_count,
             incremented_by,
-            total_count: row
-                .get::<u64>(0)
-                .context("missing updated cluster-kicked ip count")?,
         });
     }
 
-    tx.commit()
-        .await
-        .context("failed to commit cluster-kicked ip transaction")?;
-    counts.sort_by(|a, b| a.ip.cmp(&b.ip));
-    Ok(counts)
+    entries.sort_by(|left, right| {
+        right
+            .total_count
+            .cmp(&left.total_count)
+            .then_with(|| right.incremented_by.cmp(&left.incremented_by))
+    });
+    Ok(ClusterKickedIpReview {
+        entries,
+        retention_days,
+    })
 }
 
 pub async fn load_entries_page(
@@ -100,14 +135,17 @@ pub async fn load_entries_page(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<ClusterKickedIpEntry>> {
+    let cutoff_bucket_start = retained_bucket_cutoff(current_bucket_start(), retention_days());
     let mut rows = db
         .query(
-            "SELECT ip, count
-             FROM cluster_kicked_ips
-             WHERE count > 0
-             ORDER BY count DESC, ip ASC
-             LIMIT ?1 OFFSET ?2",
-            libsql::params!(limit, offset),
+            "SELECT ip, SUM(count) AS total_count
+             FROM cluster_kicked_ip_buckets
+             WHERE bucket_start >= ?1
+             GROUP BY ip
+             HAVING SUM(count) > 0
+             ORDER BY total_count DESC, ip ASC
+             LIMIT ?2 OFFSET ?3",
+            libsql::params!(cutoff_bucket_start, limit, offset),
         )
         .await
         .context("failed to load cluster-kicked ip counts")?;
@@ -118,14 +156,10 @@ pub async fn load_entries_page(
         .await
         .context("failed to read cluster-kicked ip row")?
     {
-        let ip = match row
-            .get_value(0)
-            .context("missing cluster-kicked ip value")?
-        {
-            Value::Blob(bytes) => display(&bytes)?,
-            Value::Text(text) => display_legacy_text(&text)?,
-            other => bail!("unexpected cluster-kicked ip value type: {other:?}"),
-        };
+        let ip = display(
+            &row.get::<Vec<u8>>(0)
+                .context("missing cluster-kicked ip value")?,
+        )?;
         entries.push(ClusterKickedIpEntry {
             ip,
             count: row
@@ -145,6 +179,7 @@ pub async fn load_visible_page(
 ) -> Result<ClusterKickedIpListResponse> {
     const PAGE_SIZE: usize = 64;
 
+    purge_expired(db).await?;
     let active_bans = load_active_ban_cidrs(db).await?;
     let mut entries = Vec::with_capacity(limit);
     let mut matched_offset = 0_usize;
@@ -182,18 +217,20 @@ pub async fn load_visible_page(
     Ok(ClusterKickedIpListResponse { entries, has_more })
 }
 
-fn display_legacy_text(text: &str) -> Result<String> {
-    if let Ok(addr) = text.parse::<Ipv4Addr>() {
-        return Ok(addr.to_string());
-    }
-    if let Some(prefix) = text.strip_suffix("/64") {
-        let addr = prefix
-            .parse::<Ipv6Addr>()
-            .with_context(|| format!("invalid legacy ipv6 cluster-kicked ip: {text}"))?;
-        let masked = Ipv6Addr::from(u128::from(addr) & (!0_u128 << 64));
-        return Ok(format!("{masked}/64"));
-    }
-    bail!("invalid legacy cluster-kicked ip value: {text}")
+pub(crate) async fn purge_expired(db: &libsql::Connection) -> Result<()> {
+    let cutoff_bucket_start = retained_bucket_cutoff(current_bucket_start(), retention_days());
+    purge_expired_before(db, cutoff_bucket_start).await
+}
+
+async fn purge_expired_before(db: &libsql::Connection, cutoff_bucket_start: i64) -> Result<()> {
+    db.execute(
+        "DELETE FROM cluster_kicked_ip_buckets
+         WHERE bucket_start < ?1",
+        libsql::params!(cutoff_bucket_start),
+    )
+    .await
+    .context("failed to purge expired cluster-kicked ip buckets")?;
+    Ok(())
 }
 
 async fn load_active_ban_cidrs(db: &libsql::Connection) -> Result<Vec<ipnet::IpNet>> {
@@ -238,4 +275,13 @@ fn current_unix_seconds() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn current_bucket_start() -> i64 {
+    let now = current_unix_seconds();
+    now - now.rem_euclid(SECONDS_PER_DAY)
+}
+
+fn retained_bucket_cutoff(current_bucket_start: i64, retention_days: u64) -> i64 {
+    current_bucket_start - (retention_days.saturating_sub(1) as i64).saturating_mul(SECONDS_PER_DAY)
 }

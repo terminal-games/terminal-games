@@ -162,6 +162,30 @@ fn spawn_ip_ban_sync_task(
     });
 }
 
+fn spawn_cluster_kicked_ip_retention_task(conn: libsql::Connection) {
+    tokio::spawn(async move {
+        let retention_days = cluster_kicked_ips::retention_days();
+        if let Err(error) = cluster_kicked_ips::purge_expired(&conn).await {
+            tracing::warn!(error = ?error, "failed to purge expired cluster-kicked ip data");
+        }
+
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        tracing::debug!(
+            retention_days,
+            interval_seconds = 24 * 60 * 60,
+            "Started cluster-kicked IP retention task"
+        );
+        loop {
+            interval.tick().await;
+            if let Err(error) = cluster_kicked_ips::purge_expired(&conn).await {
+                tracing::warn!(error = ?error, "failed to purge expired cluster-kicked ip data");
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = aws_lc_rs::default_provider().install_default();
@@ -202,6 +226,9 @@ async fn main() -> Result<()> {
     tx.commit()
         .await
         .context("Failed to commit migration transaction")?;
+    cluster_kicked_ips::purge_expired(&conn)
+        .await
+        .context("Failed to enforce cluster-kicked ip retention")?;
 
     let app_env_secret_key = load_app_env_secret_key();
 
@@ -289,6 +316,7 @@ async fn main() -> Result<()> {
         admission_controller.clone(),
         last_ban_inserted_at,
     );
+    spawn_cluster_kicked_ip_retention_task(conn.clone());
     tracing::info!(
         max_active_apps,
         max_active_apps_per_ip,

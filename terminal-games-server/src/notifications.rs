@@ -8,6 +8,8 @@ use anyhow::{Context, Result, bail};
 use reqwest::Url;
 use tokio::sync::mpsc;
 
+use crate::cluster_kicked_ips::ClusterKickedIpReview;
+
 #[derive(Clone)]
 pub(crate) struct Notifications {
     tx: Option<mpsc::UnboundedSender<NotificationEvent>>,
@@ -28,21 +30,14 @@ pub(crate) struct ClusterEnforcementNotification {
     pub(crate) suspicious_cluster_count: usize,
     pub(crate) max_cluster_score: f64,
     pub(crate) sessions: Vec<ClusterEnforcementSession>,
-    pub(crate) ip_counts: Vec<ClusterKickedIpCount>,
+    pub(crate) ip_review: ClusterKickedIpReview,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ClusterEnforcementSession {
     pub(crate) session_id: String,
     pub(crate) transport: String,
-    pub(crate) client_ip: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ClusterKickedIpCount {
-    pub(crate) ip: String,
-    pub(crate) incremented_by: u64,
-    pub(crate) total_count: u64,
+    pub(crate) app_shortname: String,
 }
 
 #[derive(Clone, Debug)]
@@ -215,28 +210,8 @@ impl DiscordWebhookBackend {
         &self,
         notification: &ClusterEnforcementNotification,
     ) -> serde_json::Value {
-        let sessions = notification
-            .sessions
-            .iter()
-            .map(|session| {
-                format!(
-                    "{} | {} | {}",
-                    session.session_id, session.transport, session.client_ip
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let ip_counts = notification
-            .ip_counts
-            .iter()
-            .map(|ip| format!("{} = {} (+{})", ip.ip, ip.total_count, ip.incremented_by))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let ip_counts = if ip_counts.is_empty() {
-            "<unavailable>".to_string()
-        } else {
-            ip_counts
-        };
+        let sessions = format_session_table(&notification.sessions);
+        let ip_review = format_cluster_kicked_ip_review(&notification.ip_review);
 
         self.embed_payload(
             ":warning: Bot Cluster Enforcement",
@@ -266,7 +241,7 @@ impl DiscordWebhookBackend {
                     true,
                 ),
                 embed_field(":busts_in_silhouette: Sessions", &sessions, false),
-                embed_field(":shield: IP Totals", &ip_counts, false),
+                embed_field(":shield: IP Review", &ip_review, false),
             ],
         )
     }
@@ -355,6 +330,87 @@ fn utilization_percent(current_sessions: usize, max_capacity: usize) -> f64 {
         return 0.0;
     }
     (current_sessions as f64 / max_capacity as f64) * 100.0
+}
+
+fn format_cluster_kicked_ip_review(review: &ClusterKickedIpReview) -> String {
+    if review.entries.is_empty() {
+        return format!(
+            "no retained IP counts updated\nretention window: {}d",
+            review.retention_days
+        );
+    }
+
+    let mut rows = Vec::with_capacity(review.entries.len() + 1);
+    rows.push(vec![
+        "#".to_string(),
+        format!("Total {}d", review.retention_days),
+        "Delta".to_string(),
+    ]);
+    for (index, entry) in review.entries.iter().enumerate() {
+        rows.push(vec![
+            (index + 1).to_string(),
+            entry.total_count.to_string(),
+            format!("+{}", entry.incremented_by),
+        ]);
+    }
+    format_table(&rows)
+}
+
+fn format_session_table(sessions: &[ClusterEnforcementSession]) -> String {
+    if sessions.is_empty() {
+        return "<none>".to_string();
+    }
+    let mut rows = Vec::with_capacity(sessions.len() + 1);
+    rows.push(vec![
+        "Session ID".to_string(),
+        "Transport".to_string(),
+        "App".to_string(),
+    ]);
+    for session in sessions {
+        rows.push(vec![
+            session.session_id.clone(),
+            session.transport.clone(),
+            session.app_shortname.clone(),
+        ]);
+    }
+    format_table(&rows)
+}
+
+fn format_table(rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return "<none>".to_string();
+    }
+    let column_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if column_count == 0 {
+        return "<none>".to_string();
+    }
+
+    let mut widths = vec![0_usize; column_count];
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.len());
+        }
+    }
+
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    for (row_index, row) in rows.iter().enumerate() {
+        let mut padded = Vec::with_capacity(column_count);
+        for (index, width) in widths.iter().enumerate() {
+            let value = row.get(index).map(String::as_str).unwrap_or("");
+            padded.push(format!("{value:<width$}", width = *width));
+        }
+        lines.push(padded.join(" | "));
+        if row_index == 0 {
+            lines.push(
+                widths
+                    .iter()
+                    .map(|width| "-".repeat(*width))
+                    .collect::<Vec<_>>()
+                    .join("-+-"),
+            );
+        }
+    }
+    lines.join("\n")
 }
 
 fn embed_field(name: &str, value: &str, inline: bool) -> serde_json::Value {

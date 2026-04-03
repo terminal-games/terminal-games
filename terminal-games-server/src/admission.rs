@@ -22,7 +22,7 @@ use crate::notifications::{
     CapacityThresholdNotification, ClusterEnforcementNotification, ClusterEnforcementSession,
     Notifications,
 };
-use terminal_games::app::{SessionControl, SessionEndReason};
+use terminal_games::app::{SessionAppState, SessionControl, SessionEndReason};
 
 pub(crate) const INPUT_WINDOW_MS: u64 = 8 * 60_000;
 pub(crate) const MAX_INPUT_SAMPLES: usize = 96;
@@ -330,6 +330,7 @@ enum ClusterEvent {
     SessionStarted {
         session: Arc<LiveSessionRecord>,
         control_tx: watch::Sender<SessionControl>,
+        app_rx: watch::Receiver<SessionAppState>,
     },
     InputRecorded {
         session_id: u64,
@@ -342,7 +343,11 @@ enum ClusterEvent {
     SessionEnded(u64),
 }
 
-type ClusterSession = (Arc<LiveSessionRecord>, watch::Sender<SessionControl>);
+struct ClusterSession {
+    session: Arc<LiveSessionRecord>,
+    control_tx: watch::Sender<SessionControl>,
+    app_rx: watch::Receiver<SessionAppState>,
+}
 
 struct ClusterManager {
     max_running: usize,
@@ -586,7 +591,11 @@ impl AdmissionTicket {
         self.rx.clone()
     }
 
-    pub fn start_session(mut self, session_guard: SessionHandle) -> Self {
+    pub fn start_session(
+        mut self,
+        session_guard: SessionHandle,
+        app_rx: watch::Receiver<SessionAppState>,
+    ) -> Self {
         let now_ms = monotonic_millis();
         let (control_tx, control_rx) = watch::channel(SessionControl::Active);
         let _ = self
@@ -603,6 +612,7 @@ impl AdmissionTicket {
                     outputs: VecDeque::new(),
                 }),
                 control_tx,
+                app_rx,
             });
         self.control_rx = control_rx;
         self.pending_output_bytes = 0;
@@ -767,8 +777,17 @@ impl ClusterManager {
             ClusterEvent::SessionStarted {
                 session,
                 control_tx,
+                app_rx,
             } => {
-                self.live_sessions.insert(session.id, (session, control_tx));
+                self.live_sessions
+                    .insert(
+                        session.id,
+                        ClusterSession {
+                            session,
+                            control_tx,
+                            app_rx,
+                        },
+                    );
                 self.dirty = true;
                 self.maybe_evaluate();
             }
@@ -794,9 +813,10 @@ impl ClusterManager {
             }
             ClusterEvent::SessionEnded(session_id) => {
                 let now_ms = monotonic_millis();
-                let Some((session, _)) = self.live_sessions.remove(&session_id) else {
+                let Some(cluster_session) = self.live_sessions.remove(&session_id) else {
                     return;
                 };
+                let session = cluster_session.session;
                 let mut recent_signatures = self
                     .recent_signatures
                     .iter()
@@ -820,15 +840,15 @@ impl ClusterManager {
         session_id: u64,
         update: impl FnOnce(&mut LiveSessionRecord),
     ) -> bool {
-        let Some((session, _)) = self.live_sessions.get_mut(&session_id) else {
+        let Some(cluster_session) = self.live_sessions.get_mut(&session_id) else {
             return false;
         };
-        let mut snapshot = session.as_ref().clone();
+        let mut snapshot = cluster_session.session.as_ref().clone();
         update(&mut snapshot);
         let now_ms = monotonic_millis();
         cluster_detection::trim_old_inputs(&mut snapshot.inputs, now_ms);
         cluster_detection::trim_old_outputs(&mut snapshot.outputs, now_ms);
-        *session = Arc::new(snapshot);
+        cluster_session.session = Arc::new(snapshot);
         true
     }
 
@@ -848,7 +868,7 @@ impl ClusterManager {
             live_sessions: Arc::from(
                 self.live_sessions
                     .values()
-                    .map(|(session, _)| session.clone())
+                    .map(|cluster_session| cluster_session.session.clone())
                     .collect::<Vec<_>>(),
             ),
             recent_signatures: self.recent_signatures.clone(),
@@ -867,30 +887,32 @@ impl ClusterManager {
     }
 
     fn clear_controls(&mut self) {
-        for (_, control_tx) in self.live_sessions.values_mut() {
-            let _ = update_session_control(control_tx, SessionControl::Active);
+        for cluster_session in self.live_sessions.values_mut() {
+            let _ = update_session_control(&cluster_session.control_tx, SessionControl::Active);
         }
     }
 
     fn apply_evaluation(&mut self, evaluation: ClusterEvaluation, pressure: f64) {
         let mut newly_evicted = Vec::new();
-        for (session, control_tx) in self.live_sessions.values_mut() {
-            let next = if evaluation.evicted_session_ids.contains(&session.id) {
+        for cluster_session in self.live_sessions.values_mut() {
+            let next = if evaluation
+                .evicted_session_ids
+                .contains(&cluster_session.session.id)
+            {
                 SessionControl::Close(SessionEndReason::ClusterLimited)
             } else {
                 SessionControl::Active
             };
-            if update_session_control(control_tx, next) {
+            if update_session_control(&cluster_session.control_tx, next) {
                 if matches!(next, SessionControl::Close(_)) {
                     let summary = evaluation
                         .eviction_summaries
-                        .get(&session.id)
+                        .get(&cluster_session.session.id)
                         .copied()
                         .expect("evicted session missing cluster summary");
                     tracing::warn!(
-                        session_id = session.id,
-                        client_ip = %session.client_ip,
-                        transport = session.transport.as_str(),
+                        session_id = cluster_session.session.id,
+                        transport = cluster_session.session.transport.as_str(),
                         pressure,
                         suspicious_cluster_count = evaluation.suspicious_cluster_count,
                         max_cluster_score = evaluation.max_cluster_score,
@@ -910,14 +932,11 @@ impl ClusterManager {
                             summary.factors.edge_low_engagement_interaction,
                         avg_edge_contribution = summary.contributions.avg_edge,
                         avg_replay_contribution = summary.contributions.avg_replay,
-                        avg_replay_density_contribution =
-                            summary.contributions.avg_replay_density,
-                        avg_low_engagement_contribution =
-                            summary.contributions.avg_low_engagement,
+                        avg_replay_density_contribution = summary.contributions.avg_replay_density,
+                        avg_low_engagement_contribution = summary.contributions.avg_low_engagement,
                         avg_coupling_deficit_contribution =
                             summary.contributions.avg_coupling_deficit,
-                        network_cohesion_contribution =
-                            summary.contributions.network_cohesion,
+                        network_cohesion_contribution = summary.contributions.network_cohesion,
                         start_sync_contribution = summary.contributions.start_sync,
                         size_factor_contribution = summary.contributions.size_factor,
                         pressure_contribution = summary.contributions.pressure,
@@ -925,8 +944,14 @@ impl ClusterManager {
                             summary.contributions.edge_low_engagement_interaction,
                         "Evicting session due to suspected bot cluster"
                     );
-                    self.metrics.record_cluster_enforcement(session.transport);
-                    newly_evicted.push((session.id, session.transport, session.client_ip));
+                    self.metrics
+                        .record_cluster_enforcement(cluster_session.session.transport);
+                    newly_evicted.push((
+                        cluster_session.session.id,
+                        cluster_session.session.transport,
+                        cluster_session.app_rx.borrow().shortname.clone(),
+                        cluster_session.session.client_ip,
+                    ));
                 }
             }
         }
@@ -943,16 +968,16 @@ impl ClusterManager {
         let max_cluster_score = evaluation.max_cluster_score;
 
         tokio::spawn(async move {
-            let ip_counts = match cluster_kicked_ips::increment_for_enforcement(
+            let ip_review = match cluster_kicked_ips::increment_for_enforcement(
                 &db,
-                newly_evicted.iter().map(|(_, _, client_ip)| *client_ip),
+                newly_evicted.iter().map(|(_, _, _, client_ip)| *client_ip),
             )
             .await
             {
                 Ok(counts) => counts,
                 Err(error) => {
                     tracing::error!(error = ?error, "failed to persist cluster-kicked ip counts");
-                    Vec::new()
+                    cluster_kicked_ips::empty_review()
                 }
             };
             notifications.notify_cluster_enforcement(ClusterEnforcementNotification {
@@ -964,14 +989,14 @@ impl ClusterManager {
                 sessions: newly_evicted
                     .into_iter()
                     .map(
-                        |(session_id, transport, client_ip)| ClusterEnforcementSession {
+                        |(session_id, transport, app_shortname, _)| ClusterEnforcementSession {
                             session_id: format!("{region_id}:{session_id}"),
                             transport: transport.as_str().to_string(),
-                            client_ip: client_ip.to_string(),
+                            app_shortname,
                         },
                     )
                     .collect(),
-                ip_counts,
+                ip_review,
             });
         });
     }

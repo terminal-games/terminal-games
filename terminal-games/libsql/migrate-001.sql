@@ -79,10 +79,12 @@ CREATE TABLE IF NOT EXISTS status_tickers (
 CREATE INDEX IF NOT EXISTS idx_status_tickers_sort_order
 ON status_tickers(sort_order, id);
 
-CREATE TABLE IF NOT EXISTS cluster_kicked_ips (
-    ip BLOB PRIMARY KEY,
-    count INTEGER NOT NULL DEFAULT(0)
+CREATE TABLE IF NOT EXISTS cluster_kicked_ip_buckets (
+    ip BLOB NOT NULL,
+    bucket_start INTEGER NOT NULL,
+    count INTEGER NOT NULL DEFAULT(0),
+    PRIMARY KEY(ip, bucket_start)
 );
 
-CREATE INDEX IF NOT EXISTS idx_cluster_kicked_ips_count
-ON cluster_kicked_ips(count, ip);
+CREATE INDEX IF NOT EXISTS idx_cluster_kicked_ip_buckets_bucket_start
+ON cluster_kicked_ip_buckets(bucket_start, ip);
