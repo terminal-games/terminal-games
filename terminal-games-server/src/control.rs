@@ -18,7 +18,12 @@ use axum::{
         FromRequestParts, Path, Query, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION, request::Parts},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, HeaderName, HeaderValue},
+        request::Parts,
+    },
+    middleware,
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -41,13 +46,14 @@ use terminal_games::{
         AdminControlRpc, AppControlRpc, AppEnvDeleteRequest, AppEnvListResponse, AppEnvSetRequest,
         AppSelfInfoRequest, AppSelfInfoResponse, AppSelfResponse, AppSummary, AppTokenClaims,
         BanEntry, BanIpAddRequest, BanIpAddResponse, BanIpRemoveRequest, BanIpRequest,
-        BroadcastRequest, ClusterKickedIpListRequest, ClusterKickedIpListResponse,
-        CreateAppRequest, CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest,
-        DeleteShortnameResponse, KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus,
-        RotateAppTokenRequest, RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage,
-        SpyControlMessage, StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry,
-        TickerRemoveRequest, TickerReorderRequest, UploadAppRequest, UploadAppResponse,
-        expiry_from_duration, parse_duration_string, parse_optional_expiry,
+        BroadcastRequest, CONTROL_API_EXPECTED_VERSION_HEADER, CONTROL_API_VERSION,
+        ClusterKickedIpListRequest, ClusterKickedIpListResponse, CreateAppRequest,
+        CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest, DeleteShortnameResponse,
+        KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus, RotateAppTokenRequest,
+        RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage, SpyControlMessage,
+        StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest,
+        TickerReorderRequest, UploadAppRequest, UploadAppResponse, expiry_from_duration,
+        parse_duration_string, parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
     mesh::{AppRuntimeUpdateMessage, BuildId, ContentHash, Mesh, hash_app_envs, hash_bytes},
@@ -272,7 +278,20 @@ pub fn router(control: ControlPlane) -> Router {
             get(admin_session_spy),
         )
         .route("/app/rpc", get(app_rpc))
+        .layer(middleware::map_response(with_control_api_version))
         .with_state(control)
+}
+
+async fn with_control_api_version<B>(mut response: Response<B>) -> Response<B> {
+    response.headers_mut().insert(
+        HeaderName::from_static(terminal_games::control::CONTROL_API_VERSION_HEADER),
+        HeaderValue::from_static(terminal_games::control::CONTROL_API_VERSION),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static(terminal_games::control::CONTROL_SERVER_VERSION_HEADER),
+        HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+    );
+    response
 }
 
 struct ServerWsTransport {
@@ -524,22 +543,32 @@ impl BandwidthTracker {
 
 pub async fn admin_rpc(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(control): State<ControlPlane>,
     _: AdminGuard,
 ) -> Response {
+    if let Err(response) = require_control_api_compatibility(&headers) {
+        return response;
+    }
     ws.max_message_size(CONTROL_RPC_MAX_FRAME_LEN)
         .max_frame_size(CONTROL_RPC_MAX_FRAME_LEN)
         .on_upgrade(move |socket| run_admin_rpc_socket(socket, control))
+        .into_response()
 }
 
 pub async fn app_rpc(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(control): State<ControlPlane>,
     app: AppAuth,
 ) -> Response {
+    if let Err(response) = require_control_api_compatibility(&headers) {
+        return response;
+    }
     ws.max_message_size(CONTROL_RPC_MAX_FRAME_LEN)
         .max_frame_size(CONTROL_RPC_MAX_FRAME_LEN)
         .on_upgrade(move |socket| run_app_rpc_socket(socket, control, app))
+        .into_response()
 }
 
 async fn run_admin_rpc_socket(socket: WebSocket, control: ControlPlane) {
@@ -1339,11 +1368,15 @@ pub struct SpyQuery {
 
 pub async fn admin_session_spy(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     Path(local_session_id): Path<u64>,
     Query(query): Query<SpyQuery>,
     State(control): State<ControlPlane>,
     _: AdminGuard,
 ) -> Response {
+    if let Err(response) = require_control_api_compatibility(&headers) {
+        return response;
+    }
     let Some(spy) = control
         .session_registry
         .spy(local_session_id, query.rw)
@@ -1362,6 +1395,7 @@ pub async fn admin_session_spy(
             query.show_input,
         )
     })
+    .into_response()
 }
 
 async fn run_spy_socket(
@@ -1873,6 +1907,32 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn require_control_api_compatibility(headers: &HeaderMap) -> Result<(), Response> {
+    let Some(expected_version) = headers
+        .get(CONTROL_API_EXPECTED_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    if expected_version == CONTROL_API_VERSION {
+        return Ok(());
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        format!(
+            "server API version mismatch: this terminal-games-server {} provides control API {}, but the client expects {}. Upgrade or downgrade the CLI/server so the API versions match.",
+            env!("CARGO_PKG_VERSION"),
+            CONTROL_API_VERSION,
+            expected_version,
+        ),
+    )
+        .into_response())
 }
 
 fn internal_error(error: impl std::fmt::Display) -> Response {

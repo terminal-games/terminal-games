@@ -16,13 +16,23 @@ use clap::{
 };
 use clap_complete::CompleteEnv;
 use rustls::crypto::aws_lc_rs;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::OnceLock};
+use terminal_games::control::CONTROL_API_VERSION;
 
 use crate::config::{list_admin_urls, list_app_urls};
+
+const MAIN_HELP_TEMPLATE: &str = "\
+{before-help}{name} {version}
+
+{usage-heading} {usage}
+
+{all-args}{after-help}";
 
 #[derive(Parser)]
 #[command(
     about = "Terminal Games CLI",
+    version = cli_version_display(),
+    help_template = MAIN_HELP_TEMPLATE,
     arg_required_else_help = true,
     subcommand_negates_reqs = true
 )]
@@ -44,6 +54,8 @@ enum Command {
     Admin(admin::AdminCli),
     /// Upload and manage apps.
     App(app::AppCli),
+    /// Print the CLI version.
+    Version,
     #[command(hide = true, name = "completion-refresh")]
     CompletionRefresh(completion_cache::RefreshCli),
     #[command(hide = true, name = "readme-help")]
@@ -66,6 +78,10 @@ async fn async_main() -> Result<()> {
         return match command {
             Command::Admin(cli) => admin::run(cli, profile).await,
             Command::App(cli) => app::run(cli, profile).await,
+            Command::Version => {
+                print_version();
+                Ok(())
+            }
             Command::CompletionRefresh(cli) => completion_cache::run_refresh(cli, profile).await,
             Command::ReadmeHelp => {
                 print_readme_help();
@@ -106,6 +122,29 @@ fn print_readme_help() {
             println!("{left:<width$}  {right}");
         }
     }
+}
+
+fn print_version() {
+    println!("{}", cli_version_line());
+}
+
+fn cli_version_display() -> &'static str {
+    static DISPLAY: OnceLock<String> = OnceLock::new();
+    DISPLAY
+        .get_or_init(|| {
+            format!(
+                "{} (server API {})",
+                env!("CARGO_PKG_VERSION"),
+                CONTROL_API_VERSION
+            )
+        })
+        .as_str()
+}
+
+fn cli_version_line() -> &'static str {
+    static LINE: OnceLock<String> = OnceLock::new();
+    LINE.get_or_init(|| format!("{} {}", env!("CARGO_PKG_NAME"), cli_version_display()))
+        .as_str()
 }
 
 fn collect_readme_help(prefix: &str, command: &ClapCommand, rows: &mut Vec<(String, String)>) {

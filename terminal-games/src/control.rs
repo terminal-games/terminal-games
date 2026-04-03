@@ -12,6 +12,10 @@ pub use crate::app_env::AppEnvVar;
 
 const APP_TOKEN_PREFIX: &str = "tga1.";
 const APP_TOKEN_VERSION: u32 = 1;
+pub const CONTROL_API_VERSION: &str = "1";
+pub const CONTROL_API_EXPECTED_VERSION_HEADER: &str = "x-terminal-games-expected-api-version";
+pub const CONTROL_API_VERSION_HEADER: &str = "x-terminal-games-api-version";
+pub const CONTROL_SERVER_VERSION_HEADER: &str = "x-terminal-games-server-version";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RpcError {
