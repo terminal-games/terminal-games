@@ -13,11 +13,10 @@ const PEER_SEND_ERR_INVALID_PEER_ID: i32 = -5;
 
 const PEER_RECV_ERR_CHANNEL_DISCONNECTED: i32 = -1;
 
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId([u8; 4]);
 
-const NODE_ID_ERROR: &str = "node id must be exactly 4 UTF-8 bytes";
+const NODE_ID_ERROR: &str = "node id must be valid UTF-8 and occupy exactly 4 bytes";
 
 impl NodeId {
     pub const BYTE_LEN: usize = 4;
@@ -33,8 +32,6 @@ impl NodeId {
         if ret < 0 { None } else { Some(ret as u32) }
     }
 }
-
-const _: [(); NodeId::BYTE_LEN] = [(); std::mem::size_of::<NodeId>()];
 
 impl std::fmt::Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -63,40 +60,52 @@ impl FromStr for NodeId {
     }
 }
 
-#[repr(transparent)]
+impl From<NodeId> for [u8; 4] {
+    fn from(node_id: NodeId) -> Self {
+        node_id.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PeerId([u8; 16]);
+pub struct PeerId {
+    node: NodeId,
+    timestamp: u64,
+    randomness: u32,
+}
 
 const PEER_ID_ERROR: &str = "peer ID contains invalid node bytes";
 
 impl PeerId {
-    pub const BYTE_LEN: usize = 16;
+    pub const BYTE_LEN: usize =
+        NodeId::BYTE_LEN + std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
+
+    pub fn to_bytes(&self) -> [u8; Self::BYTE_LEN] {
+        let mut bytes = [0u8; Self::BYTE_LEN];
+        bytes[0..NodeId::BYTE_LEN].copy_from_slice(&<[u8; NodeId::BYTE_LEN]>::from(self.node));
+        bytes[NodeId::BYTE_LEN..12].copy_from_slice(&self.timestamp.to_be_bytes());
+        bytes[12..Self::BYTE_LEN].copy_from_slice(&self.randomness.to_be_bytes());
+        bytes
+    }
 
     /// Returns the time the peer ID was created
     pub fn timestamp(&self) -> SystemTime {
-        let ms = u64::from_be_bytes(self.0[NodeId::BYTE_LEN..12].try_into().unwrap());
+        let ms = self.timestamp;
         UNIX_EPOCH + std::time::Duration::from_millis(ms)
     }
 
     /// Returns the randomness component of the peer ID
     pub fn randomness(&self) -> u32 {
-        u32::from_be_bytes(self.0[12..16].try_into().unwrap())
+        self.randomness
     }
 
     /// Returns the node component of the peer ID
     pub fn node(&self) -> NodeId {
-        NodeId::try_from(self.0[0..NodeId::BYTE_LEN].try_into().unwrap())
-            .expect("peer ID contains invalid node bytes")
+        self.node
     }
 
     /// Sends data to this peer
     pub fn send(&self, data: &[u8]) -> Result<(), PeerError> {
         send(data, &[*self])
-    }
-
-    /// Returns the raw bytes of the ID
-    pub fn as_bytes(&self) -> &[u8; 16] {
-        &self.0
     }
 
     /// Returns the current latency to the peer in milliseconds.
@@ -110,20 +119,22 @@ impl TryFrom<[u8; 16]> for PeerId {
     type Error = PeerError;
 
     fn try_from(bytes: [u8; 16]) -> Result<Self, Self::Error> {
-        NodeId::try_from(bytes[0..NodeId::BYTE_LEN].try_into().unwrap())
+        let node_bytes: [u8; NodeId::BYTE_LEN] = bytes[0..NodeId::BYTE_LEN].try_into().unwrap();
+        let node = NodeId::try_from(node_bytes)
             .map_err(|_| PeerError::InvalidId(PEER_ID_ERROR))?;
-        Ok(Self(bytes))
+        let timestamp = u64::from_be_bytes(bytes[NodeId::BYTE_LEN..12].try_into().unwrap());
+        let randomness = u32::from_be_bytes(bytes[12..Self::BYTE_LEN].try_into().unwrap());
+        Ok(Self {
+            node,
+            timestamp,
+            randomness,
+        })
     }
 }
 
-const _: [(); PeerId::BYTE_LEN] = [(); std::mem::size_of::<PeerId>()];
-
 impl std::fmt::Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for b in &self.0 {
-            write!(f, "{:02x}", b)?;
-        }
-        Ok(())
+        write!(f, "{}-{}-{}", self.node, self.timestamp, self.randomness)
     }
 }
 
@@ -197,7 +208,10 @@ fn list_n(length: u32) -> Result<(Vec<PeerId>, u32), PeerError> {
 
     let peers_vec = buf[..ret as usize * PeerId::BYTE_LEN]
         .chunks_exact(PeerId::BYTE_LEN)
-        .map(|chunk| PeerId::try_from(chunk.try_into().unwrap()))
+        .map(|chunk| {
+            let peer_bytes: [u8; PeerId::BYTE_LEN] = chunk.try_into().unwrap();
+            PeerId::try_from(peer_bytes)
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok((peers_vec, total_count))
@@ -278,7 +292,7 @@ pub fn send(data: &[u8], peer_ids: &[PeerId]) -> Result<(), PeerError> {
 
     let mut peer_ids_buf = Vec::with_capacity(peer_ids.len() * PeerId::BYTE_LEN);
     for id in peer_ids {
-        peer_ids_buf.extend_from_slice(&id.0);
+        peer_ids_buf.extend_from_slice(&id.to_bytes());
     }
 
     let data_ptr = if data.is_empty() {

@@ -45,30 +45,32 @@ func node_latency(node_ptr unsafe.Pointer) int32
 func peer_list(peer_ids_ptr unsafe.Pointer, max_length uint32, total_count_ptr unsafe.Pointer) int32
 
 // ID represents a peer identifier
-type ID [16]byte
+type ID struct {
+	node       NodeID
+	timestamp  uint64
+	randomness uint32
+}
 
 type NodeID [4]byte
 
-func (r NodeID) String() string {
-	if utf8.Valid(r[:]) {
-		return string(r[:])
-	}
-	return hex.EncodeToString(r[:])
-}
+const (
+	nodeIDByteLen = 4
+	idByteLen     = 16
+)
 
-func (r NodeID) Valid() bool {
-	return utf8.Valid(r[:])
+func (r NodeID) String() string {
+	return string(r[:])
 }
 
 var (
-	ErrLatencyUnknown       = errors.New("latency unknown")
-	ErrInvalidPeerCount     = errors.New("invalid peer count (must be 1-1024)")
-	ErrDataTooLarge         = errors.New("data too large: maximum 64KB")
-	ErrChannelFull          = errors.New("send channel full, message dropped")
-	ErrChannelClosed        = errors.New("send channel closed")
-	ErrInvalidPeerID        = errors.New("invalid peer ID: peer ID contains invalid node bytes")
-	ErrChannelDisconnected  = errors.New("receive channel disconnected")
-	ErrListFailed           = errors.New("peer_list failed")
+	ErrLatencyUnknown      = errors.New("latency unknown")
+	ErrInvalidPeerCount    = errors.New("invalid peer count (must be 1-1024)")
+	ErrDataTooLarge        = errors.New("data too large: maximum 64KB")
+	ErrChannelFull         = errors.New("send channel full, message dropped")
+	ErrChannelClosed       = errors.New("send channel closed")
+	ErrInvalidPeerID       = errors.New("invalid peer ID: peer ID contains invalid node bytes")
+	ErrChannelDisconnected = errors.New("receive channel disconnected")
+	ErrListFailed          = errors.New("peer_list failed")
 )
 
 // Latency returns the current latency to this node in milliseconds.
@@ -80,9 +82,9 @@ func (r NodeID) Latency() (uint32, error) {
 	return uint32(ms), nil
 }
 
-// String returns a hex-encoded string representation of the ID
+// String returns the human-readable node-timestamp-randomness representation of the ID.
 func (id ID) String() string {
-	return hex.EncodeToString(id[:])
+	return fmt.Sprintf("%s-%d-%d", id.node, id.timestamp, id.randomness)
 }
 
 // ParseID parses a hex-encoded string into an ID
@@ -92,29 +94,32 @@ func ParseID(s string) (ID, error) {
 	if err != nil {
 		return id, fmt.Errorf("failed to decode hex: %w", err)
 	}
-	if len(decoded) != 16 {
-		return id, fmt.Errorf("invalid ID length: expected 16 bytes, got %d", len(decoded))
+	if len(decoded) != idByteLen {
+		return id, fmt.Errorf("invalid ID length: expected %d bytes, got %d", idByteLen, len(decoded))
 	}
-	copy(id[:], decoded)
+	var bytes [idByteLen]byte
+	copy(bytes[:], decoded)
+	id = idFromBytes(bytes)
+	if !utf8.Valid(id.node[:]) {
+		return ID{}, ErrInvalidPeerID
+	}
 	return id, nil
 }
 
 // Timestamp returns the time the peer ID was created
 func (id ID) Timestamp() time.Time {
-	ms := binary.BigEndian.Uint64(id[4:12])
+	ms := id.timestamp
 	return time.Unix(int64(ms/1000), int64(ms%1000)*int64(time.Millisecond))
 }
 
 // Randomness returns the randomness component of the peer ID
 func (id ID) Randomness() uint32 {
-	return binary.BigEndian.Uint32(id[12:16])
+	return id.randomness
 }
 
 // Node returns the node component of the peer ID
 func (id ID) Node() NodeID {
-	var node [4]byte
-	copy(node[:], id[0:4])
-	return node
+	return id.node
 }
 
 // Latency returns the current latency to this peer in milliseconds
@@ -163,14 +168,20 @@ func listN(length uint32) ([]ID, uint32, error) {
 		return nil, totalCount, nil
 	}
 
-	buf := make([]byte, length*16)
+	buf := make([]byte, length*idByteLen)
 	ret := peer_list(unsafe.Pointer(&buf[0]), length, unsafe.Pointer(&totalCount))
 	if ret < 0 {
 		return nil, totalCount, ErrListFailed
 	}
 
 	count := int(ret)
-	peers := unsafe.Slice((*ID)(unsafe.Pointer(&buf[0])), count)
+	peers := make([]ID, count)
+	for i := range peers {
+		offset := i * idByteLen
+		var peerBytes [idByteLen]byte
+		copy(peerBytes[:], buf[offset:offset+idByteLen])
+		peers[i] = idFromBytes(peerBytes)
+	}
 
 	return peers, totalCount, nil
 }
@@ -204,9 +215,10 @@ func SendTo(data []byte, peerIDs []ID) error {
 		return ErrDataTooLarge
 	}
 
-	peerIDsBuf := make([]byte, len(peerIDs)*16)
+	peerIDsBuf := make([]byte, len(peerIDs)*idByteLen)
 	for i, id := range peerIDs {
-		copy(peerIDsBuf[i*16:(i+1)*16], id[:])
+		peerBytes := id.toBytes()
+		copy(peerIDsBuf[i*idByteLen:(i+1)*idByteLen], peerBytes[:])
 	}
 
 	var dataPtr unsafe.Pointer
@@ -246,7 +258,7 @@ func sendErrorFromCode(code int32) error {
 
 // Recv waits for a message from any peer
 func Recv() (Message, error) {
-	fromPeerBuf := make([]byte, 16)
+	fromPeerBuf := make([]byte, idByteLen)
 	dataBuf := make([]byte, 64*1024)
 
 	for {
@@ -257,10 +269,10 @@ func Recv() (Message, error) {
 		)
 
 		if ret > 0 {
-			var fromPeer ID
-			copy(fromPeer[:], fromPeerBuf)
+			var fromPeerBytes [idByteLen]byte
+			copy(fromPeerBytes[:], fromPeerBuf)
 			return Message{
-				From: fromPeer,
+				From: idFromBytes(fromPeerBytes),
 				Data: dataBuf[:ret],
 			}, nil
 		} else if ret == 0 {
@@ -285,6 +297,38 @@ type ByPeerId []ID
 
 var _ sort.Interface = ByPeerId(nil)
 
-func (p ByPeerId) Len() int           { return len(p) }
-func (p ByPeerId) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
-func (p ByPeerId) Less(i, j int) bool { return bytes.Compare(p[i][:], p[j][:]) < 0 }
+func (p ByPeerId) Len() int      { return len(p) }
+func (p ByPeerId) Swap(i, j int) { p[i], p[j] = p[j], p[i] }
+func (p ByPeerId) Less(i, j int) bool {
+	leftNode := p[i].node
+	rightNode := p[j].node
+	if leftNode != rightNode {
+		return bytes.Compare(leftNode[:], rightNode[:]) < 0
+	}
+
+	leftTimestamp := p[i].timestamp
+	rightTimestamp := p[j].timestamp
+	if leftTimestamp != rightTimestamp {
+		return leftTimestamp < rightTimestamp
+	}
+
+	return p[i].randomness < p[j].randomness
+}
+
+func idFromBytes(bytes [idByteLen]byte) ID {
+	var node NodeID
+	copy(node[:], bytes[:nodeIDByteLen])
+	return ID{
+		node:       node,
+		timestamp:  binary.BigEndian.Uint64(bytes[nodeIDByteLen:12]),
+		randomness: binary.BigEndian.Uint32(bytes[12:idByteLen]),
+	}
+}
+
+func (id ID) toBytes() [idByteLen]byte {
+	var bytes [idByteLen]byte
+	copy(bytes[:nodeIDByteLen], id.node[:])
+	binary.BigEndian.PutUint64(bytes[nodeIDByteLen:12], id.timestamp)
+	binary.BigEndian.PutUint32(bytes[12:idByteLen], id.randomness)
+	return bytes
+}

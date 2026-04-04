@@ -165,7 +165,6 @@ impl AppRuntimeUpdateMessage {
     }
 }
 
-#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(try_from = "[u8; 4]", into = "[u8; 4]")]
 pub struct NodeId([u8; 4]);
@@ -180,8 +179,6 @@ impl NodeId {
         std::str::from_utf8(&self.0).expect("NodeId invariant violated")
     }
 }
-
-const _: [(); NodeId::BYTE_LEN] = [(); std::mem::size_of::<NodeId>()];
 
 impl TryFrom<[u8; 4]> for NodeId {
     type Error = &'static str;
@@ -213,7 +210,6 @@ impl Display for NodeId {
     }
 }
 
-#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct PeerId {
     node: NodeId,
@@ -245,17 +241,15 @@ impl PeerId {
         let randomness = u32::from_be_bytes(randomness_bytes);
         Ok(Self {
             node,
-            randomness,
             timestamp,
+            randomness,
         })
     }
 }
 
-const _: [(); PeerId::BYTE_LEN] = [(); std::mem::size_of::<PeerId>()];
-
 impl Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-{}-{}", self.timestamp, self.randomness, self.node)
+        write!(f, "{}-{}-{}", self.node, self.timestamp, self.randomness)
     }
 }
 
