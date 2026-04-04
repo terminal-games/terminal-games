@@ -779,15 +779,14 @@ impl ClusterManager {
                 control_tx,
                 app_rx,
             } => {
-                self.live_sessions
-                    .insert(
-                        session.id,
-                        ClusterSession {
-                            session,
-                            control_tx,
-                            app_rx,
-                        },
-                    );
+                self.live_sessions.insert(
+                    session.id,
+                    ClusterSession {
+                        session,
+                        control_tx,
+                        app_rx,
+                    },
+                );
                 self.dirty = true;
                 self.maybe_evaluate();
             }
