@@ -217,8 +217,8 @@ impl Display for NodeId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct PeerId {
     node: NodeId,
-    randomness: u32,
     timestamp: u64,
+    randomness: u32,
 }
 
 impl PeerId {
