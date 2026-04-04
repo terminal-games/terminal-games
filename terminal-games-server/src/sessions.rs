@@ -89,7 +89,7 @@ impl Default for SessionIdleState {
 }
 
 struct RuntimeSession {
-    region_id: String,
+    node_id: String,
     local_session_id: u64,
     user_id: Option<u64>,
     client_ip: IpAddr,
@@ -118,28 +118,28 @@ impl Drop for SessionCleanupGuard {
 }
 
 pub struct SessionRegistry {
-    region_id: String,
+    node_id: String,
     long_session_notifier: Option<mpsc::UnboundedSender<Weak<RuntimeSession>>>,
     sessions: Mutex<HashMap<u64, Arc<RuntimeSession>>>,
     status_bar_state_tx: watch::Sender<StatusBarState>,
 }
 
 impl SessionRegistry {
-    pub fn new(region_id: String, notifications: Arc<Notifications>) -> Arc<Self> {
+    pub fn new(node_id: String, notifications: Arc<Notifications>) -> Arc<Self> {
         let (status_bar_state_tx, _) = watch::channel(StatusBarState::default());
         let long_session_notifier = notifications
             .enabled()
             .then(|| spawn_long_session_notifier(notifications));
         Arc::new(Self {
-            region_id,
+            node_id,
             long_session_notifier,
             sessions: Mutex::new(HashMap::new()),
             status_bar_state_tx,
         })
     }
 
-    pub fn region_id(&self) -> &str {
-        &self.region_id
+    pub fn node_id(&self) -> &str {
+        &self.node_id
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -161,7 +161,7 @@ impl SessionRegistry {
         let (snapshot_tx, snapshot_rx) = mpsc::channel(8);
         let (spy_tx, _) = broadcast::channel(64);
         let session = Arc::new(RuntimeSession {
-            region_id: self.region_id.clone(),
+            node_id: self.node_id.clone(),
             local_session_id,
             user_id,
             client_ip,
@@ -217,10 +217,10 @@ impl SessionRegistry {
             .unwrap()
             .values()
             .map(|session| SessionSummary {
-                session_id: format!("{}:{}", session.region_id, session.local_session_id),
+                session_id: format!("{}:{}", session.node_id, session.local_session_id),
                 local_session_id: session.local_session_id,
                 user_id: session.user_id,
-                region_id: session.region_id.clone(),
+                node_id: session.node_id.clone(),
                 transport: session.transport.as_str().to_string(),
                 shortname: session.identity.app().shortname,
                 duration_seconds: session.started_at.elapsed().as_secs(),
@@ -369,7 +369,7 @@ fn spawn_long_session_notifier(
 
                     let session_id = format!(
                         "{}:{}",
-                        strong_session.region_id,
+                        strong_session.node_id,
                         strong_session.local_session_id
                     );
                     notifications.notify_long_session(LongSessionNotification {

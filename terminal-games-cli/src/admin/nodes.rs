@@ -10,12 +10,12 @@ use crate::config::{format_bytes_per_second, print_table};
 pub(super) async fn run(profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
     let mut rows = api
-        .region_statuses()
+        .node_statuses()
         .await?
         .into_iter()
         .map(|status| {
             vec![
-                status.region_id,
+                status.node_id,
                 status.current_sessions.to_string(),
                 status.max_capacity.to_string(),
                 format!("{:.1}%", status.cpu_usage_percent),
@@ -31,7 +31,7 @@ pub(super) async fn run(profile: Option<String>) -> Result<()> {
     rows.sort_by(|left, right| left[0].cmp(&right[0]));
     print_table(
         &[
-            "Region",
+            "Node",
             "Sessions",
             "Capacity",
             "CPU",

@@ -124,7 +124,7 @@ impl LiveSession {
 
     fn segment_labels<'a>(&'a self, shortname: &'a str) -> [&'a str; 5] {
         [
-            self.metrics.region.as_str(),
+            self.metrics.node.as_str(),
             shortname,
             self.transport.as_str(),
             self.authenticated.as_str(),
@@ -183,7 +183,7 @@ impl LiveSession {
             .bytes_total
             .with_label_values(&[
                 direction.as_str(),
-                self.metrics.region.as_str(),
+                self.metrics.node.as_str(),
                 self.transport.as_str(),
             ])
             .inc_by(bytes as u64);
@@ -196,7 +196,7 @@ impl LiveSession {
         self.metrics
             .session_ends_total
             .with_label_values(&[
-                self.metrics.region.as_str(),
+                self.metrics.node.as_str(),
                 self.transport.as_str(),
                 self.authenticated.as_str(),
                 bool_label(self.has_audio),
@@ -219,7 +219,7 @@ impl Drop for LiveSession {
 pub struct ServerMetrics {
     local_registry: Registry,
     global_registry: Registry,
-    region: String,
+    node: String,
     db: libsql::Connection,
     duration_writer: tokio::sync::mpsc::UnboundedSender<DurationRecord>,
 
@@ -244,7 +244,7 @@ pub struct ServerMetrics {
 
 impl ServerMetrics {
     pub async fn new(
-        region: String,
+        node: String,
         admission_max_running: usize,
         db: libsql::Connection,
     ) -> Result<Arc<Self>> {
@@ -255,11 +255,11 @@ impl ServerMetrics {
             &local_registry,
             IntGaugeVec::new(
                 Opts::new("terminal_games_build_info", "Static build metadata"),
-                &["service", "version", "region"],
+                &["service", "version", "node"],
             )?,
         )?;
         build_info
-            .with_label_values(&["terminal-games-server", env!("CARGO_PKG_VERSION"), &region])
+            .with_label_values(&["terminal-games-server", env!("CARGO_PKG_VERSION"), &node])
             .set(1);
 
         let admission_max_running_metric = register(
@@ -269,11 +269,11 @@ impl ServerMetrics {
                     "terminal_games_admission_max_running",
                     "Configured concurrent session limit",
                 ),
-                &["region"],
+                &["node"],
             )?,
         )?;
         admission_max_running_metric
-            .with_label_values(&[&region])
+            .with_label_values(&[&node])
             .set(if admission_max_running == usize::MAX {
                 0
             } else {
@@ -285,9 +285,9 @@ impl ServerMetrics {
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_admission_waiting_sessions",
-                    "Sessions waiting for admission grouped by region and transport",
+                    "Sessions waiting for admission grouped by node and transport",
                 ),
-                &["region", "transport"],
+                &["node", "transport"],
             )?,
         )?;
         let admission_queue_exits_total = register(
@@ -297,7 +297,7 @@ impl ServerMetrics {
                     "terminal_games_admission_queue_exits_total",
                     "Queued sessions that left the queue, grouped by outcome",
                 ),
-                &["region", "transport", "outcome"],
+                &["node", "transport", "outcome"],
             )?,
         )?;
         let ip_ban_events_total = register(
@@ -307,14 +307,14 @@ impl ServerMetrics {
                     "terminal_games_ip_ban_events_total",
                     "IP ban lifecycle events grouped by outcome",
                 ),
-                &["region", "outcome"],
+                &["node", "outcome"],
             )?,
         )?;
         let ip_bans_active = register(
             &local_registry,
             IntGaugeVec::new(
                 Opts::new("terminal_games_ip_bans_active", "Currently active IP bans"),
-                &["region"],
+                &["node"],
             )?,
         )?;
         let cluster_enforcement_total = register(
@@ -324,7 +324,7 @@ impl ServerMetrics {
                     "terminal_games_cluster_enforcement_total",
                     "Cluster-defense enforcement actions grouped by transport and action",
                 ),
-                &["region", "transport"],
+                &["node", "transport"],
             )?,
         )?;
         let active_sessions = register(
@@ -335,7 +335,7 @@ impl ServerMetrics {
                     "Currently active shortname session segments grouped by session attributes",
                 ),
                 &[
-                    "region",
+                    "node",
                     "shortname",
                     "transport",
                     "authenticated",
@@ -351,7 +351,7 @@ impl ServerMetrics {
                     "Total shortname session segments started, grouped by session attributes",
                 ),
                 &[
-                    "region",
+                    "node",
                     "shortname",
                     "transport",
                     "authenticated",
@@ -367,7 +367,7 @@ impl ServerMetrics {
                     "Completed sessions grouped by session attributes and close reason",
                 ),
                 &[
-                    "region",
+                    "node",
                     "transport",
                     "authenticated",
                     "has_audio",
@@ -391,9 +391,9 @@ impl ServerMetrics {
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_bytes_total",
-                    "Network bytes grouped by direction, region, and transport",
+                    "Network bytes grouped by direction, node, and transport",
                 ),
-                &["direction", "region", "transport"],
+                &["direction", "node", "transport"],
             )?,
         )?;
 
@@ -404,7 +404,7 @@ impl ServerMetrics {
                     "terminal_games_process_resident_memory_bytes",
                     "Resident set size used by the terminal-games-server process",
                 ),
-                &["region"],
+                &["node"],
             )?,
         )?;
 
@@ -415,7 +415,7 @@ impl ServerMetrics {
                     "terminal_games_process_virtual_memory_bytes",
                     "Virtual memory size used by the terminal-games-server process",
                 ),
-                &["region"],
+                &["node"],
             )?,
         )?;
 
@@ -426,7 +426,7 @@ impl ServerMetrics {
                     "terminal_games_system_cpu_count",
                     "Logical CPU count visible to the node",
                 ),
-                &["region"],
+                &["node"],
             )?,
         )?;
 
@@ -437,7 +437,7 @@ impl ServerMetrics {
                     "terminal_games_system_memory_total_bytes",
                     "Total system memory visible to the node",
                 ),
-                &["region"],
+                &["node"],
             )?,
         )?;
 
@@ -448,7 +448,7 @@ impl ServerMetrics {
                     "terminal_games_system_memory_available_bytes",
                     "Available system memory visible to the node",
                 ),
-                &["region"],
+                &["node"],
             )?,
         )?;
 
@@ -459,7 +459,7 @@ impl ServerMetrics {
                     "terminal_games_system_memory_used_bytes",
                     "Used system memory derived from total minus available memory",
                 ),
-                &["region"],
+                &["node"],
             )?,
         )?;
 
@@ -470,7 +470,7 @@ impl ServerMetrics {
                     "terminal_games_system_load_average",
                     "System load average across the node",
                 ),
-                &["region", "window"],
+                &["node", "window"],
             )?,
         )?;
 
@@ -480,7 +480,7 @@ impl ServerMetrics {
         Ok(Arc::new(Self {
             local_registry,
             global_registry,
-            region,
+            node,
             db,
             duration_writer,
             admission_waiting_sessions,
@@ -503,8 +503,8 @@ impl ServerMetrics {
         }))
     }
 
-    pub fn region(&self) -> &str {
-        &self.region
+    pub fn node(&self) -> &str {
+        &self.node
     }
 
     pub async fn render_local(&self) -> Result<String> {
@@ -519,22 +519,22 @@ impl ServerMetrics {
 
     pub fn record_admission_state(&self, queued_ssh: usize, queued_web: usize) {
         self.admission_waiting_sessions
-            .with_label_values(&[self.region.as_str(), Transport::Ssh.as_str()])
+            .with_label_values(&[self.node.as_str(), Transport::Ssh.as_str()])
             .set(queued_ssh as i64);
         self.admission_waiting_sessions
-            .with_label_values(&[self.region.as_str(), Transport::Web.as_str()])
+            .with_label_values(&[self.node.as_str(), Transport::Web.as_str()])
             .set(queued_web as i64);
     }
 
     pub fn record_admission_joined_from_queue(&self, transport: Transport) {
         self.admission_queue_exits_total
-            .with_label_values(&[self.region.as_str(), transport.as_str(), "joined"])
+            .with_label_values(&[self.node.as_str(), transport.as_str(), "joined"])
             .inc();
     }
 
     pub fn record_admission_abandoned_queue(&self, transport: Transport) {
         self.admission_queue_exits_total
-            .with_label_values(&[self.region.as_str(), transport.as_str(), "abandoned"])
+            .with_label_values(&[self.node.as_str(), transport.as_str(), "abandoned"])
             .inc();
     }
 
@@ -547,33 +547,33 @@ impl ServerMetrics {
     ) {
         if activated > 0 {
             self.ip_ban_events_total
-                .with_label_values(&[self.region.as_str(), "activated"])
+                .with_label_values(&[self.node.as_str(), "activated"])
                 .inc_by(activated as u64);
         }
         if deactivated > 0 {
             self.ip_ban_events_total
-                .with_label_values(&[self.region.as_str(), "deactivated"])
+                .with_label_values(&[self.node.as_str(), "deactivated"])
                 .inc_by(deactivated as u64);
         }
         if evicted_from_queue > 0 {
             self.ip_ban_events_total
-                .with_label_values(&[self.region.as_str(), "queue_evicted"])
+                .with_label_values(&[self.node.as_str(), "queue_evicted"])
                 .inc_by(evicted_from_queue as u64);
         }
         self.ip_bans_active
-            .with_label_values(&[self.region.as_str()])
+            .with_label_values(&[self.node.as_str()])
             .set(active_ban_count as i64);
     }
 
     pub fn record_cluster_enforcement(&self, transport: Transport) {
         self.cluster_enforcement_total
-            .with_label_values(&[self.region.as_str(), transport.as_str()])
+            .with_label_values(&[self.node.as_str(), transport.as_str()])
             .inc();
     }
 
     pub fn record_bytes(&self, direction: Direction, transport: Transport, bytes: usize) {
         self.bytes_total
-            .with_label_values(&[direction.as_str(), self.region.as_str(), transport.as_str()])
+            .with_label_values(&[direction.as_str(), self.node.as_str(), transport.as_str()])
             .inc_by(bytes as u64);
     }
 
@@ -636,33 +636,33 @@ impl ServerMetrics {
         let available_memory = system.available_memory();
 
         self.process_resident_memory_bytes
-            .with_label_values(&[self.region.as_str()])
+            .with_label_values(&[self.node.as_str()])
             .set(process_resident_memory_bytes as i64);
         self.process_virtual_memory_bytes
-            .with_label_values(&[self.region.as_str()])
+            .with_label_values(&[self.node.as_str()])
             .set(process_virtual_memory_bytes as i64);
         self.system_cpu_count
-            .with_label_values(&[self.region.as_str()])
+            .with_label_values(&[self.node.as_str()])
             .set(system.cpus().len() as i64);
         self.system_memory_total_bytes
-            .with_label_values(&[self.region.as_str()])
+            .with_label_values(&[self.node.as_str()])
             .set(total_memory as i64);
         self.system_memory_available_bytes
-            .with_label_values(&[self.region.as_str()])
+            .with_label_values(&[self.node.as_str()])
             .set(available_memory as i64);
         self.system_memory_used_bytes
-            .with_label_values(&[self.region.as_str()])
+            .with_label_values(&[self.node.as_str()])
             .set(total_memory.saturating_sub(available_memory) as i64);
 
         let loads = System::load_average();
         self.system_load_average
-            .with_label_values(&[self.region.as_str(), "1m"])
+            .with_label_values(&[self.node.as_str(), "1m"])
             .set(loads.one);
         self.system_load_average
-            .with_label_values(&[self.region.as_str(), "5m"])
+            .with_label_values(&[self.node.as_str(), "5m"])
             .set(loads.five);
         self.system_load_average
-            .with_label_values(&[self.region.as_str(), "15m"])
+            .with_label_values(&[self.node.as_str(), "15m"])
             .set(loads.fifteen);
     }
 

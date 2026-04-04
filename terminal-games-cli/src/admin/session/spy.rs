@@ -30,10 +30,10 @@ use crate::{
 
 pub(super) async fn session_spy(args: AdminSessionSpyArgs, profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
-    let (region, local_id) = parse_session_ref(&args.session_id)?;
-    let base_url = api.region_url(&region).await?;
+    let (node, local_id) = parse_session_ref(&args.session_id)?;
+    let base_url = api.node_url(&node).await?;
     let session = api
-        .session_summary(&region, local_id)
+        .session_summary(&node, local_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("unknown session '{}'", args.session_id))?;
     let show_input = !args.hide_input;
@@ -777,7 +777,7 @@ impl SpyStatusBar {
                 &format!("{}x{}", app_size.0, app_size.1),
             ),
             status_field(theme.muted, theme.text, "user", &self.session.username),
-            status_field(theme.muted, theme.text, "region", &self.session.region_id),
+            status_field(theme.muted, theme.text, "node", &self.session.node_id),
             status_field(theme.muted, theme.text, "ip", &self.session.ip_address),
         ];
         let mut left = String::new();

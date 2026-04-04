@@ -30,7 +30,7 @@ use crate::{
     audio::{CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
     control::StatusBarState,
     log_backend::{GuestLogBackend, LogLevel, parse_guest_log_object},
-    mesh::{AppId, BuildId, Mesh, PeerId, PeerMessageApp, RegionId},
+    mesh::{AppId, BuildId, Mesh, PeerId, PeerMessageApp, NodeId},
     rate_limiting::{NetworkInfo, TokenBucket},
     replay::ReplayBuffer,
     status_bar::{StatusBar, StatusBarInput, StatusNotification},
@@ -348,7 +348,7 @@ impl AppServer {
         linker.func_wrap("terminal_games", "next_app_ready", Self::next_app_ready)?;
         linker.func_wrap("terminal_games", "peer_send", Self::peer_send)?;
         linker.func_wrap("terminal_games", "peer_recv", Self::peer_recv)?;
-        linker.func_wrap_async("terminal_games", "region_latency", Self::region_latency)?;
+        linker.func_wrap_async("terminal_games", "node_latency", Self::node_latency)?;
         linker.func_wrap_async("terminal_games", "peer_list", Self::peer_list)?;
         linker.func_wrap(
             "terminal_games",
@@ -1526,7 +1526,10 @@ impl AppServer {
             let offset = i * PEER_ID_SIZE;
             let mut peer_id_bytes = [0u8; PEER_ID_SIZE];
             mem.read(&caller, peer_ids_offset + offset, &mut peer_id_bytes)?;
-            peer_ids.push(crate::mesh::PeerId::from_bytes(peer_id_bytes));
+            peer_ids.push(
+                crate::mesh::PeerId::from_bytes(peer_id_bytes)
+                    .map_err(|error| wasmtime::Error::msg(format!("peer_send: {error}")))?,
+            );
         }
 
         let data_offset = data_ptr as usize;
@@ -1582,23 +1585,24 @@ impl AppServer {
         Ok(data_to_write as i32)
     }
 
-    fn region_latency(
+    fn node_latency(
         mut caller: wasmtime::Caller<'_, AppState>,
-        (region_ptr,): (i32,),
+        (node_ptr,): (i32,),
     ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
         Box::new(async move {
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                wasmtime::bail!("region_latency: failed to find host memory");
+                wasmtime::bail!("node_latency: failed to find host memory");
             };
 
-            let region_offset = region_ptr as usize;
-            let mut region_bytes = [0u8; 4];
-            mem.read(&caller, region_offset, &mut region_bytes)?;
+            let node_offset = node_ptr as usize;
+            let mut node_bytes = [0u8; 4];
+            mem.read(&caller, node_offset, &mut node_bytes)?;
 
-            let region_id = RegionId::from_bytes(region_bytes);
+            let node_id = NodeId::try_from(node_bytes)
+                .map_err(|error| wasmtime::Error::msg(format!("node_latency: {error}")))?;
 
             let mesh = &caller.data().ctx.mesh;
-            match mesh.get_region_latency(region_id).await {
+            match mesh.get_node_latency(node_id).await {
                 Some(latency) => Ok(latency.as_millis() as i32),
                 None => Ok(-1), // Unknown latency is a valid semantic response
             }

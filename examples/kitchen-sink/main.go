@@ -307,7 +307,7 @@ func (m model) View() tea.View {
 			if err == nil && latency > 0 {
 				latencyStr = fmt.Sprintf("%dms", latency)
 			}
-			peerListText += fmt.Sprintf("%s%s [%s] %s%s", cursor, p.String(), p.Region(), latencyStr, selfMarker)
+			peerListText += fmt.Sprintf("%s%s [%s] %s%s", cursor, p.String(), p.Node(), latencyStr, selfMarker)
 		}
 	}
 

@@ -69,7 +69,7 @@ mod internal {
             length: u32,
             total_count_ptr: *mut u32,
         ) -> i32;
-        pub(crate) fn region_latency(region_ptr: *const u8) -> i32;
+        pub(crate) fn node_latency(node_ptr: *const u8) -> i32;
         pub(crate) fn network_info(
             bytes_per_sec_in_ptr: *mut f64,
             bytes_per_sec_out_ptr: *mut f64,

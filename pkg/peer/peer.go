@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"sort"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -34,9 +35,9 @@ func peer_send(peer_ids_ptr unsafe.Pointer, peer_ids_count uint32, data_ptr unsa
 //go:noescape
 func peer_recv(from_peer_ptr unsafe.Pointer, data_ptr unsafe.Pointer, data_max_len uint32) int32
 
-//go:wasmimport terminal_games region_latency
+//go:wasmimport terminal_games node_latency
 //go:noescape
-func region_latency(region_ptr unsafe.Pointer) int32
+func node_latency(node_ptr unsafe.Pointer) int32
 
 //go:wasmimport terminal_games peer_list
 //go:noescape
@@ -45,18 +46,17 @@ func peer_list(peer_ids_ptr unsafe.Pointer, max_length uint32, total_count_ptr u
 // ID represents a peer identifier
 type ID [16]byte
 
-type RegionID [4]byte
+type NodeID [4]byte
 
-func (r RegionID) String() string {
-	// Filter out null bytes and return as string
-	end := 4
-	for i := 0; i < 4; i++ {
-		if r[i] == 0 {
-			end = i
-			break
-		}
+func (r NodeID) String() string {
+	if utf8.Valid(r[:]) {
+		return string(r[:])
 	}
-	return string(r[:end])
+	return hex.EncodeToString(r[:])
+}
+
+func (r NodeID) Valid() bool {
+	return utf8.Valid(r[:])
 }
 
 var (
@@ -69,9 +69,9 @@ var (
 	ErrListFailed           = errors.New("peer_list failed")
 )
 
-// Latency returns the current latency to this region in milliseconds.
-func (r RegionID) Latency() (uint32, error) {
-	ms := region_latency(unsafe.Pointer(&r[0]))
+// Latency returns the current latency to this node in milliseconds.
+func (r NodeID) Latency() (uint32, error) {
+	ms := node_latency(unsafe.Pointer(&r[0]))
 	if ms < 0 {
 		return 0, ErrLatencyUnknown
 	}
@@ -108,16 +108,16 @@ func (id ID) Randomness() uint32 {
 	return binary.BigEndian.Uint32(id[12:16])
 }
 
-// Region returns the region component of the peer ID
-func (id ID) Region() RegionID {
-	var region [4]byte
-	copy(region[:], id[0:4])
-	return region
+// Node returns the node component of the peer ID
+func (id ID) Node() NodeID {
+	var node [4]byte
+	copy(node[:], id[0:4])
+	return node
 }
 
 // Latency returns the current latency to this peer in milliseconds
 func (id ID) Latency() (uint32, error) {
-	return id.Region().Latency()
+	return id.Node().Latency()
 }
 
 // Send is shorthand for `peer.Send(data, id)`
@@ -131,7 +131,7 @@ func CurrentID() ID {
 	return id
 }
 
-// List returns all peers currently connected to this app across all regions.
+// List returns all peers currently connected to this app across all nodes.
 // This includes the current peer.
 func List() ([]ID, error) {
 	for {

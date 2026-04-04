@@ -161,14 +161,14 @@ pub fn parse_utc_timestamp(raw: &str) -> anyhow::Result<i64> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RegionDiscoveryResponse {
-    pub current_region: String,
-    pub regions: Vec<String>,
+pub struct NodeDiscoveryResponse {
+    pub current_node: String,
+    pub nodes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegionRuntimeStatus {
-    pub region_id: String,
+pub struct NodeRuntimeStatus {
+    pub node_id: String,
     pub current_sessions: usize,
     pub max_capacity: usize,
     pub cpu_usage_percent: f32,
@@ -182,7 +182,7 @@ pub struct SessionSummary {
     pub session_id: String,
     pub local_session_id: u64,
     pub user_id: Option<u64>,
-    pub region_id: String,
+    pub node_id: String,
     pub transport: String,
     pub shortname: String,
     pub duration_seconds: u64,
@@ -384,7 +384,7 @@ pub struct TickerEntry {
 pub struct BroadcastRequest {
     pub level: BroadcastLevel,
     #[serde(default)]
-    pub regions: Vec<String>,
+    pub nodes: Vec<String>,
     pub message: String,
     pub duration: String,
 }
@@ -397,7 +397,7 @@ pub struct StatusBroadcast {
     pub expires_at: i64,
     pub created_at: i64,
     #[serde(default)]
-    pub regions: Vec<String>,
+    pub nodes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -450,8 +450,8 @@ pub enum SpyClientMessage {
 
 #[tarpc::service]
 pub trait AdminControlRpc {
-    async fn discover() -> Result<RegionDiscoveryResponse, RpcError>;
-    async fn local_region_status() -> Result<RegionRuntimeStatus, RpcError>;
+    async fn discover() -> Result<NodeDiscoveryResponse, RpcError>;
+    async fn local_node_status() -> Result<NodeRuntimeStatus, RpcError>;
     async fn sessions() -> Result<Vec<SessionSummary>, RpcError>;
     async fn ban_ip_add(request: BanIpAddRequest) -> Result<BanIpAddResponse, RpcError>;
     async fn ban_ip_list() -> Result<Vec<BanEntry>, RpcError>;

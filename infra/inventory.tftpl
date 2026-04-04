@@ -1,4 +1,4 @@
 [all]
-%{ for region, server in servers ~}
-${region} ansible_host=${server.main_ip} ansible_user=root ansible_port=2222 max_active_apps=${server.max_active_apps} region_id=${server.region_id}
+%{ for node, server in servers ~}
+${node} ansible_host=${server.main_ip} ansible_user=root ansible_port=2222 max_active_apps=${server.max_active_apps} node_id=${server.node_id}
 %{ endfor ~}

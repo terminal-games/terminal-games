@@ -13,32 +13,47 @@ const PEER_SEND_ERR_CHANNEL_CLOSED: i32 = -4;
 const PEER_RECV_ERR_CHANNEL_DISCONNECTED: i32 = -1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RegionId([u8; 4]);
+pub struct NodeId([u8; 4]);
 
-impl RegionId {
-    pub fn from_bytes(bytes: [u8; 4]) -> Self {
-        Self(bytes)
+const NODE_ID_ERROR: &str = "node id must be exactly 4 UTF-8 bytes";
+
+impl NodeId {
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).expect("NodeId invariant violated")
     }
 
-    /// Returns the current latency to this region in milliseconds.
-    /// Returns `None` if the latency is unknown or the region is not connected.
+    /// Returns the current latency to this node in milliseconds.
+    /// Returns `None` if the latency is unknown or the node is not connected.
     pub fn latency(&self) -> Option<u32> {
-        let ret = unsafe { crate::internal::region_latency(self.0.as_ptr()) };
+        let ret = unsafe { crate::internal::node_latency(self.0.as_ptr()) };
         if ret < 0 { None } else { Some(ret as u32) }
     }
 }
 
-impl std::fmt::Display for RegionId {
+impl std::fmt::Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let end = self.0.iter().position(|&b| b == 0).unwrap_or(4);
-        if let Ok(s) = std::str::from_utf8(&self.0[..end]) {
-            write!(f, "{}", s)
-        } else {
-            for b in &self.0 {
-                write!(f, "{:02x}", b)?;
-            }
-            Ok(())
-        }
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<[u8; 4]> for NodeId {
+    type Error = PeerError;
+
+    fn try_from(bytes: [u8; 4]) -> Result<Self, Self::Error> {
+        std::str::from_utf8(&bytes).map_err(|_| PeerError::InvalidId(NODE_ID_ERROR))?;
+        Ok(Self(bytes))
+    }
+}
+
+impl FromStr for NodeId {
+    type Err = PeerError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let bytes: [u8; 4] = value
+            .as_bytes()
+            .try_into()
+            .map_err(|_| PeerError::InvalidId(NODE_ID_ERROR))?;
+        Self::try_from(bytes)
     }
 }
 
@@ -57,9 +72,10 @@ impl PeerId {
         u32::from_be_bytes(self.0[12..16].try_into().unwrap())
     }
 
-    /// Returns the region component of the peer ID
-    pub fn region(&self) -> RegionId {
-        RegionId::from_bytes(self.0[0..4].try_into().unwrap())
+    /// Returns the node component of the peer ID
+    pub fn node(&self) -> NodeId {
+        NodeId::try_from(self.0[0..4].try_into().unwrap())
+            .expect("peer ID contains invalid node bytes")
     }
 
     /// Sends data to this peer
@@ -75,7 +91,7 @@ impl PeerId {
     /// Returns the current latency to the peer in milliseconds.
     /// Returns `None` if the latency is unknown
     pub fn latency(&self) -> Option<u32> {
-        self.region().latency()
+        self.node().latency()
     }
 }
 
@@ -121,7 +137,7 @@ pub fn current_id() -> PeerId {
     parse_id(&std::env::var("PEER_ID").unwrap()).unwrap()
 }
 
-/// Returns all peers currently connected to this app across all regions,
+/// Returns all peers currently connected to this app across all nodes,
 /// including the current peer.
 ///
 /// Note: this list is _eventually consistent_ and unordered, meaning that each

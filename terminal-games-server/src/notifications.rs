@@ -24,7 +24,7 @@ pub(crate) struct LongSessionNotification {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ClusterEnforcementNotification {
-    pub(crate) region_id: String,
+    pub(crate) node_id: String,
     pub(crate) current_sessions: usize,
     pub(crate) max_capacity: usize,
     pub(crate) suspicious_cluster_count: usize,
@@ -42,7 +42,7 @@ pub(crate) struct ClusterEnforcementSession {
 
 #[derive(Clone, Debug)]
 pub(crate) struct CapacityThresholdNotification {
-    pub(crate) region_id: String,
+    pub(crate) node_id: String,
     pub(crate) current_sessions: usize,
     pub(crate) max_capacity: usize,
     pub(crate) threshold_percent: usize,
@@ -216,7 +216,7 @@ impl DiscordWebhookBackend {
         self.embed_payload(
             ":warning: Bot Cluster Enforcement",
             vec![
-                embed_field(":round_pushpin: Region", &notification.region_id, true),
+                embed_field(":round_pushpin: Node", &notification.node_id, true),
                 embed_field(
                     ":bar_chart: Capacity",
                     &format!(
@@ -253,7 +253,7 @@ impl DiscordWebhookBackend {
         self.embed_payload(
             ":warning: Capacity Alert",
             vec![
-                embed_field(":round_pushpin: Region", &notification.region_id, true),
+                embed_field(":round_pushpin: Node", &notification.node_id, true),
                 embed_field(
                     ":busts_in_silhouette: Current Sessions",
                     &notification.current_sessions.to_string(),
