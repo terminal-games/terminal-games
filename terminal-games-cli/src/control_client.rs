@@ -9,20 +9,23 @@ use std::{
     task::{Context as TaskContext, Poll},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bytes::BytesMut;
 use futures::{Sink, Stream, future::join_all};
-use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HeaderValue, RETRY_AFTER};
 use tarpc::client;
 use terminal_games::control::{
     AdminControlRpcClient, AppControlRpcClient, AppSummary, AppTokenClaims, BanEntry,
+    CONTROL_API_EXPECTED_VERSION_HEADER, CONTROL_API_VERSION, CONTROL_API_VERSION_HEADER,
+    CONTROL_SERVER_VERSION_HEADER, ClusterKickedIpListRequest, ClusterKickedIpListResponse,
     RegionDiscoveryResponse, RegionRuntimeStatus, SessionSummary, TickerEntry, rpc_context,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{
-        Error as WsError, Message, client::IntoClientRequest, protocol::WebSocketConfig,
+        Error as WsError, Message, client::IntoClientRequest, http::HeaderMap,
+        protocol::WebSocketConfig,
     },
 };
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -33,6 +36,7 @@ use crate::config::{
 };
 
 const CONTROL_RPC_MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn completion_runtime() -> Option<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
@@ -134,7 +138,11 @@ async fn connect_ws(base_url: &str, path: &str, bearer: &str) -> Result<ClientWs
         HeaderValue::from_str(&format!("Bearer {bearer}"))
             .context("invalid bearer token for authorization header")?,
     );
-    let (socket, _) = connect_async_with_config(
+    request.headers_mut().insert(
+        CONTROL_API_EXPECTED_VERSION_HEADER,
+        HeaderValue::from_static(CONTROL_API_VERSION),
+    );
+    let (socket, response) = connect_async_with_config(
         request,
         Some(WebSocketConfig {
             max_message_size: Some(CONTROL_RPC_MAX_FRAME_LEN),
@@ -143,8 +151,78 @@ async fn connect_ws(base_url: &str, path: &str, bearer: &str) -> Result<ClientWs
         }),
         false,
     )
-    .await?;
+    .await
+    .map_err(normalize_ws_connect_error)?;
+    ensure_control_api_compatibility(base_url, response.headers())?;
     Ok(ClientWsTransport::new(socket))
+}
+
+pub(crate) fn ensure_control_api_compatibility(base_url: &str, headers: &HeaderMap) -> Result<()> {
+    let Some(server_api_version) =
+        header_str(headers, CONTROL_API_VERSION_HEADER).with_context(|| {
+            format!("server at '{base_url}' returned an invalid API version header")
+        })?
+    else {
+        anyhow::bail!(
+            "server at '{}' does not report a control API version. This terminal-games-cli {} expects control API {}. Upgrade the server or use a matching CLI build.",
+            base_url,
+            CLI_VERSION,
+            CONTROL_API_VERSION
+        );
+    };
+
+    if server_api_version == CONTROL_API_VERSION {
+        return Ok(());
+    }
+
+    let server_version = header_str(headers, CONTROL_SERVER_VERSION_HEADER).with_context(|| {
+        format!("server at '{base_url}' returned an invalid server version header")
+    })?;
+    let server_version = server_version
+        .map(|version| format!(" (terminal-games-server {version})"))
+        .unwrap_or_default();
+    anyhow::bail!(
+        "server API version mismatch for '{}': this terminal-games-cli {} expects control API {}, but the server reports {}{}. Upgrade or downgrade the CLI/server so the API versions match.",
+        base_url,
+        CLI_VERSION,
+        CONTROL_API_VERSION,
+        server_api_version,
+        server_version,
+    );
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &'static str) -> Result<Option<&'a str>> {
+    headers
+        .get(name)
+        .map(|value| value.to_str().map_err(anyhow::Error::new))
+        .transpose()
+}
+
+pub(crate) fn normalize_ws_connect_error(error: WsError) -> anyhow::Error {
+    let WsError::Http(response) = &error else {
+        return error.into();
+    };
+    if let Some(body) = response.body().as_ref()
+        && let Ok(message) = std::str::from_utf8(body)
+    {
+        let message = message.trim();
+        if !message.is_empty() {
+            return anyhow!(message.to_string());
+        }
+    }
+    if response.status() != 429 {
+        return error.into();
+    }
+    if let Some(value) = response.headers().get(RETRY_AFTER)
+        && let Ok(value) = value.to_str()
+        && let Ok(retry_after_secs) = value.trim().parse::<f64>()
+    {
+        return anyhow!(format!(
+            "rate limit exceeded; retry in {:.1}s",
+            retry_after_secs
+        ));
+    }
+    anyhow!("rate limit exceeded")
 }
 
 async fn connect_admin_rpc(base_url: &str, bearer: &str) -> Result<AdminControlRpcClient> {
@@ -329,6 +407,18 @@ impl AdminClient {
         let completion_bans = bans.iter().map(|ban| ban.ip.clone()).collect::<Vec<_>>();
         completion_cache::store_bans(&self.profile.url, &completion_bans)?;
         Ok(bans)
+    }
+
+    pub async fn cluster_kicked_ip_list(
+        &self,
+        request: ClusterKickedIpListRequest,
+    ) -> Result<ClusterKickedIpListResponse> {
+        with_admin_rpc(&self.profile.url, &self.token, |rpc| async move {
+            rpc.cluster_kicked_ip_list(rpc_context(), request)
+                .await?
+                .map_err(anyhow::Error::msg)
+        })
+        .await
     }
 
     async fn fetch_all_sessions(&self) -> Result<Vec<SessionSummary>> {

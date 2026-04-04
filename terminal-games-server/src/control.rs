@@ -3,7 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     io,
     pin::Pin,
@@ -18,7 +18,12 @@ use axum::{
         FromRequestParts, Path, Query, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION, request::Parts},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, HeaderName, HeaderValue},
+        request::Parts,
+    },
+    middleware,
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -39,10 +44,12 @@ use terminal_games::{
     },
     control::{
         AdminControlRpc, AppControlRpc, AppEnvDeleteRequest, AppEnvListResponse, AppEnvSetRequest,
-        AppSelfResponse, AppSummary, AppTokenClaims, BanEntry, BanIpAddRequest, BanIpAddResponse,
-        BanIpRemoveRequest, BanIpRequest, BroadcastRequest, CreateAppRequest, CreateAppResponse,
-        DeleteAppRequest, DeleteShortnameRequest, DeleteShortnameResponse, KickSessionRequest,
-        RegionDiscoveryResponse, RegionRuntimeStatus, RotateAppTokenRequest,
+        AppSelfInfoRequest, AppSelfInfoResponse, AppSelfResponse, AppSummary, AppTokenClaims,
+        BanEntry, BanIpAddRequest, BanIpAddResponse, BanIpRemoveRequest, BanIpRequest,
+        BroadcastRequest, CONTROL_API_EXPECTED_VERSION_HEADER, CONTROL_API_VERSION,
+        ClusterKickedIpListRequest, ClusterKickedIpListResponse, CreateAppRequest,
+        CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest, DeleteShortnameResponse,
+        KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus, RotateAppTokenRequest,
         RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage, SpyControlMessage,
         StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest,
         TickerReorderRequest, UploadAppRequest, UploadAppResponse, expiry_from_duration,
@@ -55,6 +62,7 @@ use time::OffsetDateTime;
 
 use crate::{
     admission::{AdmissionController, decode_cidr_blob, encode_cidr_blob, parse_ban_cidr},
+    cluster_kicked_ips,
     sessions::SessionRegistry,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -64,6 +72,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 const BANDWIDTH_WINDOW: Duration = Duration::from_secs(5);
 const AUTHOR_UPLOAD_MAX_BYTES: usize = 50 * 1024 * 1024;
 const CONTROL_RPC_MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+const APP_SELF_INFO_MAX_TOKENS: usize = 100;
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -73,6 +82,7 @@ pub struct ControlPlane {
     latest_broadcast: Arc<Mutex<Option<StatusBroadcast>>>,
     mesh: Mesh,
     admin_shared_secret: Option<Arc<str>>,
+    rate_limiter: Arc<ApiRateLimiter>,
     bandwidth: Arc<BandwidthTracker>,
     max_capacity: usize,
     region_id: String,
@@ -95,6 +105,7 @@ impl ControlPlane {
             latest_broadcast: Arc::new(Mutex::new(None)),
             mesh,
             admin_shared_secret,
+            rate_limiter: Arc::new(ApiRateLimiter::new()),
             bandwidth: Arc::new(BandwidthTracker::default()),
             max_capacity,
             region_id,
@@ -105,7 +116,7 @@ impl ControlPlane {
         self.bandwidth.record(bytes);
     }
 
-    fn require_admin(&self, headers: &HeaderMap) -> Result<(), Response> {
+    fn require_admin(&self, headers: &HeaderMap) -> Result<AdminGuard, Response> {
         let Some(expected) = self.admin_shared_secret.as_deref() else {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "admin auth disabled").into_response());
         };
@@ -116,7 +127,7 @@ impl ControlPlane {
             sha256_bytes(token).as_slice(),
             sha256_bytes(expected).as_slice(),
         ) {
-            Ok(())
+            Ok(AdminGuard)
         } else {
             Err((StatusCode::UNAUTHORIZED, "invalid bearer token").into_response())
         }
@@ -142,6 +153,37 @@ impl ControlPlane {
             return Err((StatusCode::UNAUTHORIZED, "invalid app token").into_response());
         }
         Ok(AppAuth { record, claims })
+    }
+
+    fn consume_tokens(
+        &self,
+        group: RateLimitGroup,
+        bucket_key: &str,
+        cost: u32,
+    ) -> Result<(), ApiRateLimitExceeded> {
+        match self.rate_limiter.try_consume(group, bucket_key, cost) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::debug!(
+                    ?group,
+                    cost,
+                    retry_after_secs = error.retry_after.as_secs_f64(),
+                    bucket_key,
+                    "API rate limit exceeded"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn consume_tokens_rpc(
+        &self,
+        group: RateLimitGroup,
+        bucket_key: &str,
+        cost: u32,
+    ) -> Result<(), RpcError> {
+        self.consume_tokens(group, bucket_key, cost)
+            .map_err(|error| RpcError::from(error.to_string()))
     }
 
     async fn discover(&self) -> anyhow::Result<RegionDiscoveryResponse> {
@@ -237,7 +279,20 @@ pub fn router(control: ControlPlane) -> Router {
             get(admin_session_spy),
         )
         .route("/app/rpc", get(app_rpc))
+        .layer(middleware::map_response(with_control_api_version))
         .with_state(control)
+}
+
+async fn with_control_api_version<B>(mut response: Response<B>) -> Response<B> {
+    response.headers_mut().insert(
+        HeaderName::from_static(terminal_games::control::CONTROL_API_VERSION_HEADER),
+        HeaderValue::from_static(terminal_games::control::CONTROL_API_VERSION),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static(terminal_games::control::CONTROL_SERVER_VERSION_HEADER),
+        HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+    );
+    response
 }
 
 struct ServerWsTransport {
@@ -343,6 +398,116 @@ struct AppRpcServer {
     app: AppAuth,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RateLimitGroup {
+    Api,
+    Upload,
+}
+
+impl RateLimitGroup {
+    fn limits(self) -> (f64, u32) {
+        match self {
+            Self::Api => (0.5, 30),
+            Self::Upload => (1.0 / (30.0 * 60.0), 5),
+        }
+    }
+}
+
+struct ApiRateLimiter {
+    state: Mutex<ApiRateLimiterState>,
+}
+
+struct ApiRateLimiterState {
+    buckets: HashMap<(RateLimitGroup, String), ApiTokenBucket>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ApiTokenBucket {
+    available_tokens: f64,
+    last_refill: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ApiRateLimitExceeded {
+    retry_after: Duration,
+}
+
+impl std::fmt::Display for ApiRateLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rate limit exceeded; retry in {:.1}s",
+            self.retry_after.as_secs_f64()
+        )
+    }
+}
+
+impl ApiRateLimiter {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ApiRateLimiterState {
+                buckets: HashMap::new(),
+            }),
+        }
+    }
+
+    fn try_consume(
+        &self,
+        group: RateLimitGroup,
+        bucket_key: &str,
+        cost: u32,
+    ) -> Result<(), ApiRateLimitExceeded> {
+        let (refill_tokens_per_sec, capacity) = group.limits();
+        let now = Instant::now();
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.buckets.retain(|(bucket_group, _), bucket| {
+            let (bucket_refill_tokens_per_sec, bucket_capacity) = bucket_group.limits();
+            bucket.refill(now, bucket_capacity, bucket_refill_tokens_per_sec);
+            !bucket.is_full(bucket_capacity)
+        });
+        let bucket = state
+            .buckets
+            .entry((group, bucket_key.to_string()))
+            .or_insert_with(|| ApiTokenBucket::new(capacity, now));
+        bucket.refill(now, capacity, refill_tokens_per_sec);
+        let cost = cost as f64;
+        if bucket.available_tokens + f64::EPSILON >= cost {
+            bucket.available_tokens = (bucket.available_tokens - cost).max(0.0);
+            Ok(())
+        } else {
+            let missing_tokens = (cost - bucket.available_tokens).max(0.0);
+            Err(ApiRateLimitExceeded {
+                retry_after: Duration::from_secs_f64(missing_tokens / refill_tokens_per_sec),
+            })
+        }
+    }
+}
+
+impl ApiTokenBucket {
+    fn new(capacity: u32, now: Instant) -> Self {
+        Self {
+            available_tokens: capacity as f64,
+            last_refill: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant, capacity: u32, refill_tokens_per_sec: f64) {
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        if elapsed > 0.0 {
+            self.available_tokens =
+                (self.available_tokens + elapsed * refill_tokens_per_sec).min(capacity as f64);
+            self.last_refill = now;
+        }
+    }
+
+    fn is_full(&self, capacity: u32) -> bool {
+        self.available_tokens + f64::EPSILON >= capacity as f64
+    }
+}
+
 #[derive(Default)]
 struct BandwidthTracker {
     samples: Mutex<VecDeque<(Instant, usize)>>,
@@ -379,22 +544,32 @@ impl BandwidthTracker {
 
 pub async fn admin_rpc(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(control): State<ControlPlane>,
     _: AdminGuard,
 ) -> Response {
+    if let Err(response) = require_control_api_compatibility(&headers) {
+        return response;
+    }
     ws.max_message_size(CONTROL_RPC_MAX_FRAME_LEN)
         .max_frame_size(CONTROL_RPC_MAX_FRAME_LEN)
         .on_upgrade(move |socket| run_admin_rpc_socket(socket, control))
+        .into_response()
 }
 
 pub async fn app_rpc(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(control): State<ControlPlane>,
     app: AppAuth,
 ) -> Response {
+    if let Err(response) = require_control_api_compatibility(&headers) {
+        return response;
+    }
     ws.max_message_size(CONTROL_RPC_MAX_FRAME_LEN)
         .max_frame_size(CONTROL_RPC_MAX_FRAME_LEN)
         .on_upgrade(move |socket| run_app_rpc_socket(socket, control, app))
+        .into_response()
 }
 
 async fn run_admin_rpc_socket(socket: WebSocket, control: ControlPlane) {
@@ -480,33 +655,24 @@ impl AdminControlRpc for AdminRpcServer {
     }
 
     async fn ban_ip_list(self, _: context::Context) -> Result<Vec<BanEntry>, RpcError> {
-        let mut rows = self
-            .control
-            .app_server
-            .db
-            .query(
-                "SELECT cidr, COALESCE(reason, ''), expires_at, inserted_at
-                 FROM ip_bans
-                 ORDER BY inserted_at DESC, cidr ASC",
-                (),
-            )
-            .await?;
-        let now = current_unix_seconds();
-        let mut entries = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let cidr = decode_cidr_blob(&row.get::<Vec<u8>>(0)?)?;
-            let expires_at = row.get::<Option<i64>>(2)?;
-            if !is_ban_active(expires_at, now) {
-                continue;
-            }
-            entries.push(BanEntry {
-                ip: cidr.to_string(),
-                reason: row.get::<String>(1)?.trim().to_string(),
-                expires_at,
-                inserted_at: row.get::<i64>(3)?,
-            });
-        }
-        Ok(entries)
+        Ok(load_ban_entries(&self.control.app_server.db).await?)
+    }
+
+    async fn cluster_kicked_ip_list(
+        self,
+        _: context::Context,
+        request: ClusterKickedIpListRequest,
+    ) -> Result<ClusterKickedIpListResponse, RpcError> {
+        let page = request.page.max(1);
+        let page_size = request.page_size.clamp(1, 100) as usize;
+        let offset = ((page - 1) as usize).saturating_mul(page_size);
+        Ok(cluster_kicked_ips::load_visible_page(
+            &self.control.app_server.db,
+            offset,
+            page_size,
+            request.exclude_banned,
+        )
+        .await?)
     }
 
     async fn ban_ip_remove(
@@ -578,25 +744,14 @@ impl AdminControlRpc for AdminRpcServer {
         }
         let expires_at =
             parse_optional_expiry(request.duration.as_deref(), request.expires_at.as_deref())?;
-        let mut rows = self
-            .control
-            .app_server
-            .db
-            .query(
-                "SELECT COALESCE(MAX(sort_order), 0) FROM status_tickers",
-                (),
-            )
-            .await?;
-        let next_order = match rows.next().await? {
-            Some(row) => row.get::<i64>(0)?,
-            None => 0,
-        } + 1;
         self.control
             .app_server
             .db
             .execute(
-                "INSERT INTO status_tickers (sort_order, content, expires_at) VALUES (?1, ?2, ?3)",
-                libsql::params!(next_order, content, expires_at),
+                "INSERT INTO status_tickers (sort_order, content, expires_at)
+                 SELECT COALESCE(MAX(sort_order), 0) + 1, ?1, ?2
+                 FROM status_tickers",
+                libsql::params!(content, expires_at),
             )
             .await?;
         self.control.refresh_status_bar_state().await?;
@@ -629,13 +784,27 @@ impl AdminControlRpc for AdminRpcServer {
         if provided_ids != expected_ids {
             return Err("ticker reorder must provide each ticker id exactly once".into());
         }
+        let mut query = String::from("UPDATE status_tickers SET sort_order = CASE id");
+        let mut params = Vec::with_capacity(request.ticker_ids.len() * 3);
         for (index, id) in request.ticker_ids.iter().copied().enumerate() {
-            tx.execute(
-                "UPDATE status_tickers SET sort_order = ?2 WHERE id = ?1",
-                libsql::params!(id, (index as i64) + 1),
-            )
-            .await?;
+            let id = i64::try_from(id).map_err(|_| RpcError::from("ticker id out of range"))?;
+            query.push_str(" WHEN ? THEN ?");
+            params.push(libsql::Value::Integer(id));
+            params.push(libsql::Value::Integer((index as i64) + 1));
         }
+        query.push_str(" END WHERE id IN (");
+        for index in 0..request.ticker_ids.len() {
+            if index > 0 {
+                query.push_str(", ");
+            }
+            query.push('?');
+        }
+        query.push(')');
+        for id in request.ticker_ids.iter().copied() {
+            let id = i64::try_from(id).map_err(|_| RpcError::from("ticker id out of range"))?;
+            params.push(libsql::Value::Integer(id));
+        }
+        tx.execute(&query, libsql::params_from_iter(params)).await?;
         tx.commit().await?;
         self.control.refresh_status_bar_state().await?;
         Ok(())
@@ -699,43 +868,23 @@ impl AdminControlRpc for AdminRpcServer {
         request: CreateAppRequest,
     ) -> Result<CreateAppResponse, RpcError> {
         validate_shortname(&request.shortname)?;
-        let mut existing = self
-            .control
-            .app_server
-            .db
-            .query(
-                "SELECT 1 FROM app_tokens WHERE shortname = ?1 LIMIT 1",
-                libsql::params!(request.shortname.clone()),
-            )
-            .await?;
-        if existing.next().await?.is_some() {
-            return Err(format!("shortname '{}' already exists", request.shortname).into());
-        }
         let secret = random_token_secret();
         let token_hash = sha256_hex(&secret);
-        match self
-            .control
-            .app_server
-            .db
-            .execute(
-                "INSERT INTO app_tokens (shortname, token_hash)
-             VALUES (?1, ?2)",
-                libsql::params!(request.shortname.clone(), token_hash),
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(error) => return Err(error.into()),
-        }
         let mut rows = self
             .control
             .app_server
             .db
             .query(
-                "SELECT id, shortname FROM app_tokens WHERE shortname = ?1 LIMIT 1",
-                libsql::params!(request.shortname),
+                "INSERT INTO app_tokens (shortname, token_hash)
+                 VALUES (?1, ?2)
+                 RETURNING id, shortname",
+                libsql::params!(request.shortname.clone(), token_hash),
             )
-            .await?;
+            .await
+            .map_err(|error| match shortname_exists_error(&error) {
+                true => RpcError::from(format!("shortname '{}' already exists", request.shortname)),
+                false => RpcError::from(error),
+            })?;
         let Some(row) = rows.next().await? else {
             return Err("app row missing after insert".into());
         };
@@ -785,24 +934,33 @@ impl AdminControlRpc for AdminRpcServer {
         _: context::Context,
         request: RotateAppTokenRequest,
     ) -> Result<RotateAppTokenResponse, RpcError> {
+        let secret = random_token_secret();
+        let token_hash = sha256_hex(&secret);
         let mut rows = self
             .control
             .app_server
             .db
             .query(
-                "SELECT id, shortname FROM app_tokens WHERE id = ?1 LIMIT 1",
-                libsql::params!(request.app_id),
+                "UPDATE app_tokens
+                 SET token_hash = ?2
+                 WHERE id = ?1
+                 RETURNING shortname",
+                libsql::params!(request.app_id, token_hash),
             )
             .await?;
         let Some(row) = rows.next().await? else {
             return Err("app not found".into());
         };
-        let app_id = row.get::<u64>(0)?;
-        let shortname = row.get::<String>(1)?;
-        Ok(self
-            .control
-            .rotate_app_token(app_id, &shortname, request.base_url)
-            .await?)
+        let shortname = row.get::<String>(0)?;
+        Ok(RotateAppTokenResponse {
+            app: AppSummary {
+                app_id: request.app_id,
+                author_name: String::new(),
+                shortname: shortname.clone(),
+                playtime_seconds: 0.0,
+            },
+            token: AppTokenClaims::new(request.base_url, shortname, secret).encode()?,
+        })
     }
 
     async fn app_delete(
@@ -823,32 +981,55 @@ impl AdminControlRpc for AdminRpcServer {
 }
 
 impl AppControlRpc for AppRpcServer {
-    async fn self_info(self, _: context::Context) -> Result<AppSelfResponse, RpcError> {
-        let mut rows = self
-            .control
-            .app_server
-            .db
-            .query(
-                "SELECT COALESCE(json_extract(details, '$.author'), ''),
-                        COALESCE(duration_seconds, 0.0)
-                 FROM apps WHERE shortname = ?1 LIMIT 1",
-                libsql::params!(self.app.record.shortname.as_str()),
-            )
-            .await?;
-        let (author_name, playtime_seconds) = match rows.next().await? {
-            Some(row) => (row.get::<String>(0).unwrap_or_default(), row.get::<f64>(1)?),
-            None => (String::new(), 0.0),
-        };
-        Ok(AppSelfResponse {
-            app_id: self.app.record.id,
-            author_name,
-            shortname: self.app.record.shortname.clone(),
-            server: self.control.region_id.clone(),
-            playtime_seconds,
+    async fn self_info(
+        self,
+        _: context::Context,
+        request: AppSelfInfoRequest,
+    ) -> Result<AppSelfInfoResponse, RpcError> {
+        if request.tokens.len() > APP_SELF_INFO_MAX_TOKENS {
+            return Err(RpcError::from(format!(
+                "too many app tokens: max {}",
+                APP_SELF_INFO_MAX_TOKENS
+            )));
+        }
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
+        let mut seen_shortnames = HashSet::new();
+        let unique_claims = request
+            .tokens
+            .into_iter()
+            .filter(|claims| seen_shortnames.insert(claims.shortname.clone()))
+            .collect::<Vec<_>>();
+        let records_by_shortname = load_app_self_info_records_by_shortnames(
+            &self.control.app_server.db,
+            unique_claims.iter().map(|claims| claims.shortname.as_str()),
+        )
+        .await?;
+        let mut apps = Vec::new();
+        let mut invalid_shortnames = Vec::new();
+        for claims in unique_claims {
+            let Some(record) = records_by_shortname.get(&claims.shortname) else {
+                invalid_shortnames.push(claims.shortname);
+                continue;
+            };
+            if !constant_time_eq(
+                sha256_hex(&claims.secret).as_bytes(),
+                record.app_token.token_hash.as_bytes(),
+            ) {
+                invalid_shortnames.push(claims.shortname);
+                continue;
+            }
+            apps.push(record.to_response(&self.control.region_id));
+        }
+        Ok(AppSelfInfoResponse {
+            apps,
+            invalid_shortnames,
         })
     }
 
     async fn env_list(self, _: context::Context) -> Result<AppEnvListResponse, RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
         let (_, env_salt, env_blob) =
             load_app_env_blob(&self.control.app_server.db, &self.app.record.shortname)
                 .await?
@@ -865,6 +1046,8 @@ impl AppControlRpc for AppRpcServer {
     }
 
     async fn env_set(self, _: context::Context, request: AppEnvSetRequest) -> Result<(), RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
         validate_app_envs(&request.envs)?;
         let (app_id, env_salt, env_blob) =
             load_app_env_blob(&self.control.app_server.db, &self.app.record.shortname)
@@ -913,6 +1096,8 @@ impl AppControlRpc for AppRpcServer {
         _: context::Context,
         request: AppEnvDeleteRequest,
     ) -> Result<(), RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
         validate_app_env_name(&request.name)?;
         let Some((app_id, env_salt, env_blob)) =
             load_app_env_blob(&self.control.app_server.db, &self.app.record.shortname).await?
@@ -944,6 +1129,8 @@ impl AppControlRpc for AppRpcServer {
     }
 
     async fn rotate_token(self, _: context::Context) -> Result<RotateAppTokenResponse, RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
         Ok(self
             .control
             .rotate_app_token(
@@ -959,6 +1146,8 @@ impl AppControlRpc for AppRpcServer {
         _: context::Context,
         request: UploadAppRequest,
     ) -> Result<UploadAppResponse, RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Upload, &self.app.record.token_hash, 1)?;
         if request.wasm.len() > AUTHOR_UPLOAD_MAX_BYTES {
             return Err(RpcError::from(format!(
                 "wasm upload exceeds {} bytes",
@@ -1058,32 +1247,33 @@ impl AppControlRpc for AppRpcServer {
                     .unwrap_or(empty_env_hash),
             };
             let updated_at_ns = current_unix_nanos();
-            tx.execute(
-                "INSERT INTO apps (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
-                     VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)",
-                libsql::params!(
-                    self.app.record.shortname.as_str(),
-                    request.wasm.clone(),
-                    details_json.as_str(),
-                    build_id.wasm_hash.to_vec(),
-                    build_id.env_hash.to_vec(),
-                    env_blob
-                        .as_ref()
-                        .map(|(blob, _)| blob.salt.clone())
-                        .unwrap_or_else(|| empty_env_blob.salt.clone()),
-                    env_blob
-                        .as_ref()
-                        .map(|(blob, _)| blob.ciphertext.clone())
-                        .unwrap_or_else(|| empty_env_blob.ciphertext.clone()),
-                    updated_at_ns
-                ),
-            )
-            .await?;
-            let mut id_rows = tx.query("SELECT last_insert_rowid()", ()).await?;
+            let mut id_rows = tx
+                .query(
+                    "INSERT INTO apps (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
+                     VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)
+                     RETURNING id",
+                    libsql::params!(
+                        self.app.record.shortname.as_str(),
+                        request.wasm.clone(),
+                        details_json.as_str(),
+                        build_id.wasm_hash.to_vec(),
+                        build_id.env_hash.to_vec(),
+                        env_blob
+                            .as_ref()
+                            .map(|(blob, _)| blob.salt.clone())
+                            .unwrap_or_else(|| empty_env_blob.salt.clone()),
+                        env_blob
+                            .as_ref()
+                            .map(|(blob, _)| blob.ciphertext.clone())
+                            .unwrap_or_else(|| empty_env_blob.ciphertext.clone()),
+                        updated_at_ns
+                    ),
+                )
+                .await?;
             let app_id = id_rows
                 .next()
                 .await?
-                .ok_or_else(|| RpcError::from("missing last_insert_rowid"))?
+                .ok_or_else(|| RpcError::from("missing inserted app row"))?
                 .get::<u64>(0)?;
             (app_id, build_id, updated_at_ns, true)
         };
@@ -1110,6 +1300,8 @@ impl AppControlRpc for AppRpcServer {
         _: context::Context,
         request: DeleteShortnameRequest,
     ) -> Result<Option<DeleteShortnameResponse>, RpcError> {
+        self.control
+            .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
         if request.shortname != self.app.record.shortname {
             return Err("shortname mismatch".into());
         }
@@ -1148,8 +1340,7 @@ impl FromRequestParts<ControlPlane> for AdminGuard {
         parts: &mut Parts,
         state: &ControlPlane,
     ) -> Result<Self, Self::Rejection> {
-        state.require_admin(&parts.headers)?;
-        Ok(Self)
+        state.require_admin(&parts.headers)
     }
 }
 
@@ -1174,11 +1365,15 @@ pub struct SpyQuery {
 
 pub async fn admin_session_spy(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     Path(local_session_id): Path<u64>,
     Query(query): Query<SpyQuery>,
     State(control): State<ControlPlane>,
     _: AdminGuard,
 ) -> Response {
+    if let Err(response) = require_control_api_compatibility(&headers) {
+        return response;
+    }
     let Some(spy) = control
         .session_registry
         .spy(local_session_id, query.rw)
@@ -1197,6 +1392,7 @@ pub async fn admin_session_spy(
             query.show_input,
         )
     })
+    .into_response()
 }
 
 async fn run_spy_socket(
@@ -1423,6 +1619,73 @@ async fn load_app_token_record_by_shortname(
     }))
 }
 
+#[derive(Debug, Clone)]
+struct AppSelfInfoRecord {
+    app_token: AppTokenRecord,
+    author_name: String,
+    playtime_seconds: f64,
+}
+
+impl AppSelfInfoRecord {
+    fn to_response(&self, region_id: &str) -> AppSelfResponse {
+        AppSelfResponse {
+            app_id: self.app_token.id,
+            author_name: self.author_name.clone(),
+            shortname: self.app_token.shortname.clone(),
+            server: region_id.to_string(),
+            playtime_seconds: self.playtime_seconds,
+        }
+    }
+}
+
+async fn load_app_self_info_records_by_shortnames<'a>(
+    db: &libsql::Connection,
+    shortnames: impl IntoIterator<Item = &'a str>,
+) -> anyhow::Result<HashMap<String, AppSelfInfoRecord>> {
+    let shortnames = shortnames
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if shortnames.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders = std::iter::repeat_n("?", shortnames.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT app_tokens.id,
+                app_tokens.shortname,
+                app_tokens.token_hash,
+                COALESCE(json_extract(apps.details, '$.author'), ''),
+                COALESCE(apps.duration_seconds, 0.0)
+         FROM app_tokens
+         LEFT JOIN apps ON apps.shortname = app_tokens.shortname
+         WHERE app_tokens.shortname IN ({placeholders})"
+    );
+
+    let mut rows = db
+        .query(&query, libsql::params_from_iter(shortnames))
+        .await?;
+    let mut records = HashMap::new();
+    while let Some(row) = rows.next().await? {
+        let shortname = row.get::<String>(1)?;
+        records.insert(
+            shortname.clone(),
+            AppSelfInfoRecord {
+                app_token: AppTokenRecord {
+                    id: row.get::<u64>(0)?,
+                    shortname,
+                    token_hash: row.get::<String>(2)?,
+                },
+                author_name: row.get::<String>(3).unwrap_or_default(),
+                playtime_seconds: row.get::<f64>(4)?,
+            },
+        );
+    }
+    Ok(records)
+}
+
 async fn load_app_env_blob(
     db: &libsql::Connection,
     shortname: &str,
@@ -1583,6 +1846,33 @@ async fn load_ticker_entries(db: &libsql::Connection) -> anyhow::Result<Vec<Tick
     Ok(entries)
 }
 
+async fn load_ban_entries(db: &libsql::Connection) -> anyhow::Result<Vec<BanEntry>> {
+    let mut rows = db
+        .query(
+            "SELECT cidr, COALESCE(reason, ''), expires_at, inserted_at
+             FROM ip_bans
+             ORDER BY inserted_at DESC, cidr ASC",
+            (),
+        )
+        .await?;
+    let now = current_unix_seconds();
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let cidr = decode_cidr_blob(&row.get::<Vec<u8>>(0)?).map_err(anyhow::Error::msg)?;
+        let expires_at = row.get::<Option<i64>>(2)?;
+        if !is_ban_active(expires_at, now) {
+            continue;
+        }
+        entries.push(BanEntry {
+            ip: cidr.to_string(),
+            reason: row.get::<String>(1)?.trim().to_string(),
+            expires_at,
+            inserted_at: row.get::<i64>(3)?,
+        });
+    }
+    Ok(entries)
+}
+
 pub async fn load_status_bar_state(
     db: &libsql::Connection,
     broadcast: Option<StatusBroadcast>,
@@ -1655,6 +1945,74 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn require_control_api_compatibility(headers: &HeaderMap) -> Result<(), Response> {
+    let expected_version = match headers.get(CONTROL_API_EXPECTED_VERSION_HEADER) {
+        Some(value) => match value.to_str() {
+            Ok(value) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "client must send a non-empty {} header with the control API version it expects.",
+                            CONTROL_API_EXPECTED_VERSION_HEADER,
+                        ),
+                    )
+                        .into_response());
+                }
+                value
+            }
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "client sent an invalid {} header; it must be a valid UTF-8 control API version string.",
+                        CONTROL_API_EXPECTED_VERSION_HEADER,
+                    ),
+                )
+                    .into_response());
+            }
+        },
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "client must send the {} header. This terminal-games-server {} provides control API {}.",
+                    CONTROL_API_EXPECTED_VERSION_HEADER,
+                    env!("CARGO_PKG_VERSION"),
+                    CONTROL_API_VERSION,
+                ),
+            )
+                .into_response());
+        }
+    };
+
+    if expected_version == CONTROL_API_VERSION {
+        return Ok(());
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        format!(
+            "server API version mismatch: this terminal-games-server {} provides control API {}, but the client expects {}. Upgrade or downgrade the CLI/server so the API versions match.",
+            env!("CARGO_PKG_VERSION"),
+            CONTROL_API_VERSION,
+            expected_version,
+        ),
+    )
+        .into_response())
+}
+
+fn shortname_exists_error(error: &libsql::Error) -> bool {
+    match error {
+        libsql::Error::SqliteFailure(_, detail)
+        | libsql::Error::RemoteSqliteFailure(_, _, detail) => {
+            detail.contains("UNIQUE constraint failed: app_tokens.shortname")
+        }
+        _ => false,
+    }
 }
 
 fn internal_error(error: impl std::fmt::Display) -> Response {

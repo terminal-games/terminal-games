@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use terminal_games::app::{
     AppInstantiationParams, AppServer, SessionControl, SessionEndReason, SessionOutput,
+    clamp_window_size_u32,
 };
 use terminal_games::input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker};
 use terminal_games::log_backend::NoopLogBackend;
@@ -441,9 +442,11 @@ impl SshServer {
                 has_audio,
                 user_id,
             );
-            let mut admitted_session = admission_ticket.start_session(session_metrics.clone());
+            let mut admitted_session = admission_ticket
+                .start_session(session_metrics.clone(), session_identity.app_receiver());
             let mut cluster_control = admitted_session.subscribe_control();
             let mut app_metrics_rx = session_identity.app_receiver();
+            let mut resize_events_rx = resize_rx.clone();
             let (first_cols, first_rows) = *resize_rx.borrow();
             let terminal_parser = background_tracker.into_terminal_parser(first_rows, first_cols);
 
@@ -552,6 +555,16 @@ impl SshServer {
                         let idle_state = *idle_rx.borrow_and_update();
                         idle_monitor.set_paused(idle_state.paused);
                         session_registry.set_idle_fuel(local_session_id, idle_monitor.idle_state().fuel_seconds);
+                    }
+
+                    changed = resize_events_rx.changed() => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        let (cols, rows) = *resize_events_rx.borrow_and_update();
+                        idle_monitor.observe_resize();
+                        session_registry.set_idle_fuel(local_session_id, idle_monitor.idle_state().fuel_seconds);
+                        admitted_session.record_resize(cols, rows);
                     }
 
                     data = raw_input_rx.recv(), if pending_input.is_none() => {
@@ -1041,7 +1054,9 @@ impl Handler for SshSession {
         _: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let _ = self.resize_tx.send((col_width as u16, row_height as u16));
+        let _ = self
+            .resize_tx
+            .send(clamp_window_size_u32(col_width, row_height));
         session.channel_success(channel)?;
         Ok(())
     }
@@ -1070,7 +1085,9 @@ impl Handler for SshSession {
         _: &[(Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let _ = self.resize_tx.send((col_width as u16, row_height as u16));
+        let _ = self
+            .resize_tx
+            .send(clamp_window_size_u32(col_width, row_height));
         if let Some(term_sender) = self.term.take() {
             let _ = term_sender.send(term.to_string());
         }

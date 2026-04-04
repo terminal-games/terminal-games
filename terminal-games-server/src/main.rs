@@ -4,9 +4,11 @@
 
 mod admission;
 mod cluster_detection;
+mod cluster_kicked_ips;
 mod control;
 mod idle;
 mod metrics;
+mod notifications;
 mod sessions;
 mod ssh;
 mod web;
@@ -160,6 +162,30 @@ fn spawn_ip_ban_sync_task(
     });
 }
 
+fn spawn_cluster_kicked_ip_retention_task(conn: libsql::Connection) {
+    tokio::spawn(async move {
+        let retention_days = cluster_kicked_ips::retention_days();
+        if let Err(error) = cluster_kicked_ips::purge_expired(&conn).await {
+            tracing::warn!(error = ?error, "failed to purge expired cluster-kicked ip data");
+        }
+
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        tracing::debug!(
+            retention_days,
+            interval_seconds = 24 * 60 * 60,
+            "Started cluster-kicked IP retention task"
+        );
+        loop {
+            interval.tick().await;
+            if let Err(error) = cluster_kicked_ips::purge_expired(&conn).await {
+                tracing::warn!(error = ?error, "failed to purge expired cluster-kicked ip data");
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = aws_lc_rs::default_provider().install_default();
@@ -200,12 +226,21 @@ async fn main() -> Result<()> {
     tx.commit()
         .await
         .context("Failed to commit migration transaction")?;
+    cluster_kicked_ips::purge_expired(&conn)
+        .await
+        .context("Failed to enforce cluster-kicked ip retention")?;
 
     let app_env_secret_key = load_app_env_secret_key();
 
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
     mesh.start_discovery().await?;
     mesh.serve().await?;
+    let region_id = std::env::var("REGION_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| mesh.region().to_string());
+    let notifications = Arc::new(notifications::Notifications::from_env());
 
     let app_server = Arc::new(AppServer::new(
         mesh.clone(),
@@ -262,7 +297,8 @@ async fn main() -> Result<()> {
         last_inserted_at = last_ban_inserted_at,
         "Loaded initial IP ban snapshot"
     );
-    let metrics = metrics::ServerMetrics::new(max_active_apps, conn.clone()).await?;
+    let metrics =
+        metrics::ServerMetrics::new(region_id.clone(), max_active_apps, conn.clone()).await?;
     let admission_controller = Arc::new(admission::AdmissionController::new(
         AdmissionConfig {
             max_running: max_active_apps,
@@ -272,12 +308,15 @@ async fn main() -> Result<()> {
         },
         banned_ips,
         metrics.clone(),
+        conn.clone(),
+        notifications.clone(),
     ));
     spawn_ip_ban_sync_task(
         conn.clone(),
         admission_controller.clone(),
         last_ban_inserted_at,
     );
+    spawn_cluster_kicked_ip_retention_task(conn.clone());
     tracing::info!(
         max_active_apps,
         max_active_apps_per_ip,
@@ -287,17 +326,12 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "disabled".to_string()),
         "Configured admission limits"
     );
-    let region_id = std::env::var("REGION_ID")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| mesh.region().to_string());
     let admin_shared_secret = std::env::var("ADMIN_SHARED_SECRET")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(Arc::<str>::from);
-    let session_registry = sessions::SessionRegistry::new(region_id);
+    let session_registry = sessions::SessionRegistry::new(region_id, notifications.clone());
     let initial_status_bar_state = control::load_status_bar_state(&conn, None).await?;
     session_registry.set_status_bar_state(initial_status_bar_state);
     let control_plane = control::ControlPlane::new(

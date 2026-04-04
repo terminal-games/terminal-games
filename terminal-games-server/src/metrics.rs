@@ -217,7 +217,8 @@ impl Drop for LiveSession {
 }
 
 pub struct ServerMetrics {
-    registry: Registry,
+    local_registry: Registry,
+    global_registry: Registry,
     region: String,
     db: libsql::Connection,
     duration_writer: tokio::sync::mpsc::UnboundedSender<DurationRecord>,
@@ -242,16 +243,16 @@ pub struct ServerMetrics {
 }
 
 impl ServerMetrics {
-    pub async fn new(admission_max_running: usize, db: libsql::Connection) -> Result<Arc<Self>> {
-        let registry = Registry::new();
-        let region = std::env::var("REGION_ID")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "loca".to_string());
+    pub async fn new(
+        region: String,
+        admission_max_running: usize,
+        db: libsql::Connection,
+    ) -> Result<Arc<Self>> {
+        let local_registry = Registry::new();
+        let global_registry = Registry::new();
 
         let build_info = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new("terminal_games_build_info", "Static build metadata"),
                 &["service", "version", "region"],
@@ -262,7 +263,7 @@ impl ServerMetrics {
             .set(1);
 
         let admission_max_running_metric = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_admission_max_running",
@@ -280,7 +281,7 @@ impl ServerMetrics {
             });
 
         let admission_waiting_sessions = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_admission_waiting_sessions",
@@ -290,7 +291,7 @@ impl ServerMetrics {
             )?,
         )?;
         let admission_queue_exits_total = register(
-            &registry,
+            &local_registry,
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_admission_queue_exits_total",
@@ -300,7 +301,7 @@ impl ServerMetrics {
             )?,
         )?;
         let ip_ban_events_total = register(
-            &registry,
+            &local_registry,
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_ip_ban_events_total",
@@ -310,14 +311,14 @@ impl ServerMetrics {
             )?,
         )?;
         let ip_bans_active = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new("terminal_games_ip_bans_active", "Currently active IP bans"),
                 &["region"],
             )?,
         )?;
         let cluster_enforcement_total = register(
-            &registry,
+            &local_registry,
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_cluster_enforcement_total",
@@ -327,7 +328,7 @@ impl ServerMetrics {
             )?,
         )?;
         let active_sessions = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_active_sessions",
@@ -343,7 +344,7 @@ impl ServerMetrics {
             )?,
         )?;
         let sessions_total = register(
-            &registry,
+            &local_registry,
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_sessions_total",
@@ -359,7 +360,7 @@ impl ServerMetrics {
             )?,
         )?;
         let session_ends_total = register(
-            &registry,
+            &local_registry,
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_session_ends_total",
@@ -375,18 +376,18 @@ impl ServerMetrics {
             )?,
         )?;
         let session_duration_seconds = register(
-            &registry,
+            &global_registry,
             GaugeVec::new(
                 Opts::new(
                     "terminal_games_session_duration_seconds",
                     "Total persisted time spent across all users for each shortname",
                 ),
-                &["region", "shortname"],
+                &["shortname"],
             )?,
         )?;
 
         let bytes_total = register(
-            &registry,
+            &local_registry,
             IntCounterVec::new(
                 Opts::new(
                     "terminal_games_bytes_total",
@@ -397,7 +398,7 @@ impl ServerMetrics {
         )?;
 
         let process_resident_memory_bytes = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_process_resident_memory_bytes",
@@ -408,7 +409,7 @@ impl ServerMetrics {
         )?;
 
         let process_virtual_memory_bytes = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_process_virtual_memory_bytes",
@@ -419,7 +420,7 @@ impl ServerMetrics {
         )?;
 
         let system_cpu_count = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_system_cpu_count",
@@ -430,7 +431,7 @@ impl ServerMetrics {
         )?;
 
         let system_memory_total_bytes = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_system_memory_total_bytes",
@@ -441,7 +442,7 @@ impl ServerMetrics {
         )?;
 
         let system_memory_available_bytes = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_system_memory_available_bytes",
@@ -452,7 +453,7 @@ impl ServerMetrics {
         )?;
 
         let system_memory_used_bytes = register(
-            &registry,
+            &local_registry,
             IntGaugeVec::new(
                 Opts::new(
                     "terminal_games_system_memory_used_bytes",
@@ -463,7 +464,7 @@ impl ServerMetrics {
         )?;
 
         let system_load_average = register(
-            &registry,
+            &local_registry,
             GaugeVec::new(
                 Opts::new(
                     "terminal_games_system_load_average",
@@ -477,7 +478,8 @@ impl ServerMetrics {
         spawn_duration_writer(db.clone(), duration_rx);
 
         Ok(Arc::new(Self {
-            registry,
+            local_registry,
+            global_registry,
             region,
             db,
             duration_writer,
@@ -501,17 +503,18 @@ impl ServerMetrics {
         }))
     }
 
-    pub async fn render(&self) -> Result<String> {
-        self.update_system_metrics();
-        self.refresh_persisted_shortname_durations().await?;
+    pub fn region(&self) -> &str {
+        &self.region
+    }
 
-        let families = self.registry.gather();
-        let encoder = TextEncoder::new();
-        let mut buffer = Vec::new();
-        encoder
-            .encode(&families, &mut buffer)
-            .context("failed to encode prometheus metrics")?;
-        String::from_utf8(buffer).context("prometheus metrics were not valid UTF-8")
+    pub async fn render_local(&self) -> Result<String> {
+        self.update_system_metrics();
+        encode_metric_families(&self.local_registry.gather())
+    }
+
+    pub async fn render_global(&self) -> Result<String> {
+        self.refresh_persisted_shortname_durations().await?;
+        encode_metric_families(&self.global_registry.gather())
     }
 
     pub fn record_admission_state(&self, queued_ssh: usize, queued_web: usize) {
@@ -667,7 +670,7 @@ impl ServerMetrics {
         self.session_duration_seconds.reset();
         for (shortname, seconds) in load_persisted_shortname_durations(&self.db).await? {
             self.session_duration_seconds
-                .with_label_values(&[self.region.as_str(), shortname.as_str()])
+                .with_label_values(&[shortname.as_str()])
                 .set(seconds);
         }
         Ok(())
@@ -768,6 +771,15 @@ async fn load_persisted_shortname_durations(db: &libsql::Connection) -> Result<V
 
 fn bool_label(value: bool) -> &'static str {
     if value { "true" } else { "false" }
+}
+
+fn encode_metric_families(families: &[prometheus::proto::MetricFamily]) -> Result<String> {
+    let encoder = TextEncoder::new();
+    let mut buffer = Vec::new();
+    encoder
+        .encode(families, &mut buffer)
+        .context("failed to encode prometheus metrics")?;
+    String::from_utf8(buffer).context("prometheus metrics were not valid UTF-8")
 }
 
 fn register<T>(registry: &Registry, metric: T) -> Result<T>

@@ -12,6 +12,10 @@ pub use crate::app_env::AppEnvVar;
 
 const APP_TOKEN_PREFIX: &str = "tga1.";
 const APP_TOKEN_VERSION: u32 = 1;
+pub const CONTROL_API_VERSION: &str = "1";
+pub const CONTROL_API_EXPECTED_VERSION_HEADER: &str = "x-terminal-games-expected-api-version";
+pub const CONTROL_API_VERSION_HEADER: &str = "x-terminal-games-api-version";
+pub const CONTROL_SERVER_VERSION_HEADER: &str = "x-terminal-games-server-version";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RpcError {
@@ -220,6 +224,26 @@ pub struct BanEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterKickedIpEntry {
+    pub ip: String,
+    pub count: u64,
+    pub is_banned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterKickedIpListRequest {
+    pub page: u32,
+    pub page_size: u32,
+    pub exclude_banned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterKickedIpListResponse {
+    pub entries: Vec<ClusterKickedIpEntry>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KickSessionRequest {
     pub local_session_id: u64,
 }
@@ -309,6 +333,17 @@ pub struct AppSelfResponse {
     pub shortname: String,
     pub server: String,
     pub playtime_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSelfInfoRequest {
+    pub tokens: Vec<AppTokenClaims>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSelfInfoResponse {
+    pub apps: Vec<AppSelfResponse>,
+    pub invalid_shortnames: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -420,6 +455,9 @@ pub trait AdminControlRpc {
     async fn sessions() -> Result<Vec<SessionSummary>, RpcError>;
     async fn ban_ip_add(request: BanIpAddRequest) -> Result<BanIpAddResponse, RpcError>;
     async fn ban_ip_list() -> Result<Vec<BanEntry>, RpcError>;
+    async fn cluster_kicked_ip_list(
+        request: ClusterKickedIpListRequest,
+    ) -> Result<ClusterKickedIpListResponse, RpcError>;
     async fn ban_ip_remove(request: BanIpRemoveRequest) -> Result<(), RpcError>;
     async fn apply_ban(request: BanIpRequest) -> Result<(), RpcError>;
     async fn apply_ban_remove(request: BanIpRemoveRequest) -> Result<(), RpcError>;
@@ -442,7 +480,7 @@ pub trait AdminControlRpc {
 
 #[tarpc::service]
 pub trait AppControlRpc {
-    async fn self_info() -> Result<AppSelfResponse, RpcError>;
+    async fn self_info(request: AppSelfInfoRequest) -> Result<AppSelfInfoResponse, RpcError>;
     async fn env_list() -> Result<AppEnvListResponse, RpcError>;
     async fn env_set(request: AppEnvSetRequest) -> Result<(), RpcError>;
     async fn env_delete(request: AppEnvDeleteRequest) -> Result<(), RpcError>;

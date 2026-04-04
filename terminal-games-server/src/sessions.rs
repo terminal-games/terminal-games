@@ -6,13 +6,14 @@ use std::{
     collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
+use futures::StreamExt;
 use terminal_games::{
     app::{
         SessionAppState, SessionControl, SessionEndReason, SessionIdentity, SessionOutput,
@@ -26,6 +27,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::idle::INITIAL_FUEL_SECS;
 use crate::metrics::Transport;
+use crate::notifications::{LongSessionNotification, Notifications};
+
+const LONG_SESSION_WEBHOOK_AFTER: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Debug)]
 pub enum SpyEvent {
@@ -99,6 +103,7 @@ struct RuntimeSession {
     spy_tx: broadcast::Sender<SpyEvent>,
     snapshot_tx: mpsc::Sender<oneshot::Sender<ReplayTerminalSnapshotCapture>>,
     active_spies: AtomicUsize,
+    finished: AtomicBool,
 }
 
 pub struct SessionCleanupGuard {
@@ -114,15 +119,20 @@ impl Drop for SessionCleanupGuard {
 
 pub struct SessionRegistry {
     region_id: String,
+    long_session_notifier: Option<mpsc::UnboundedSender<Weak<RuntimeSession>>>,
     sessions: Mutex<HashMap<u64, Arc<RuntimeSession>>>,
     status_bar_state_tx: watch::Sender<StatusBarState>,
 }
 
 impl SessionRegistry {
-    pub fn new(region_id: String) -> Arc<Self> {
+    pub fn new(region_id: String, notifications: Arc<Notifications>) -> Arc<Self> {
         let (status_bar_state_tx, _) = watch::channel(StatusBarState::default());
+        let long_session_notifier = notifications
+            .enabled()
+            .then(|| spawn_long_session_notifier(notifications));
         Arc::new(Self {
             region_id,
+            long_session_notifier,
             sessions: Mutex::new(HashMap::new()),
             status_bar_state_tx,
         })
@@ -165,11 +175,15 @@ impl SessionRegistry {
             spy_tx,
             snapshot_tx,
             active_spies: AtomicUsize::new(0),
+            finished: AtomicBool::new(false),
         });
         self.sessions
             .lock()
             .unwrap()
-            .insert(local_session_id, session);
+            .insert(local_session_id, session.clone());
+        if let Some(notifier) = &self.long_session_notifier {
+            let _ = notifier.send(Arc::downgrade(&session));
+        }
         SessionRegistration {
             identity,
             session_ui,
@@ -239,6 +253,9 @@ impl SessionRegistry {
         let Some(session) = self.lookup(local_session_id) else {
             return false;
         };
+        if session.finished.swap(true, Ordering::AcqRel) {
+            return false;
+        }
         let _ = session.spy_tx.send(SpyEvent::Closed { reason });
         true
     }
@@ -328,6 +345,45 @@ impl SessionRegistry {
             .get(&local_session_id)
             .cloned()
     }
+}
+
+fn spawn_long_session_notifier(
+    notifications: Arc<Notifications>,
+) -> mpsc::UnboundedSender<Weak<RuntimeSession>> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Weak<RuntimeSession>>();
+    tokio::spawn(async move {
+        let mut deadlines = tokio_util::time::DelayQueue::new();
+        loop {
+            tokio::select! {
+                Some(session) = rx.recv() => {
+                    deadlines.insert(session, LONG_SESSION_WEBHOOK_AFTER);
+                }
+                Some(expired) = deadlines.next(), if !deadlines.is_empty() => {
+                    let session = expired.into_inner();
+                    let Some(strong_session) = session.upgrade() else {
+                        continue;
+                    };
+                    if strong_session.finished.load(Ordering::Acquire) {
+                        continue;
+                    }
+
+                    let session_id = format!(
+                        "{}:{}",
+                        strong_session.region_id,
+                        strong_session.local_session_id
+                    );
+                    notifications.notify_long_session(LongSessionNotification {
+                        session_id,
+                        app_shortname: strong_session.identity.app().shortname,
+                        duration: strong_session.started_at.elapsed(),
+                    });
+                    deadlines.insert(session, LONG_SESSION_WEBHOOK_AFTER);
+                }
+                else => break,
+            }
+        }
+    });
+    tx
 }
 
 async fn request_snapshot(session: &RuntimeSession) -> Option<ReplayTerminalSnapshotCapture> {

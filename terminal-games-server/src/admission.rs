@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,8 +16,13 @@ use tokio::sync::{mpsc, watch};
 use crate::cluster_detection::{
     self, ClusterEvaluation, ClusterEvaluationJob, HistoricalSignature, NetworkPrefix,
 };
+use crate::cluster_kicked_ips;
 use crate::metrics::{ServerMetrics, SessionHandle, Transport};
-use terminal_games::app::{SessionControl, SessionEndReason};
+use crate::notifications::{
+    CapacityThresholdNotification, ClusterEnforcementNotification, ClusterEnforcementSession,
+    Notifications,
+};
+use terminal_games::app::{SessionAppState, SessionControl, SessionEndReason};
 
 pub(crate) const INPUT_WINDOW_MS: u64 = 8 * 60_000;
 pub(crate) const MAX_INPUT_SAMPLES: usize = 96;
@@ -65,8 +70,10 @@ struct Inner {
     ban_manager: Mutex<BanManager>,
     ban_changes: watch::Sender<()>,
     metrics: Arc<ServerMetrics>,
+    notifications: Arc<Notifications>,
     next_id: AtomicU64,
     state: Mutex<ControllerState>,
+    capacity_threshold_reached: AtomicBool,
     cluster_tx: mpsc::UnboundedSender<ClusterEvent>,
 }
 
@@ -135,6 +142,31 @@ impl ControllerState {
             .iter()
             .filter(|ticket| ticket.client_ip == ip)
             .count()
+    }
+}
+
+impl Inner {
+    fn update_capacity_threshold_alert(&self, running_sessions: usize) {
+        if self.config.max_running == 0 || self.config.max_running == usize::MAX {
+            return;
+        }
+        let threshold_reached =
+            running_sessions.saturating_mul(5) >= self.config.max_running.saturating_mul(4);
+        if threshold_reached {
+            if self.capacity_threshold_reached.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            self.notifications
+                .notify_capacity_threshold(CapacityThresholdNotification {
+                    region_id: self.metrics.region().to_string(),
+                    current_sessions: running_sessions,
+                    max_capacity: self.config.max_running,
+                    threshold_percent: 80,
+                });
+            return;
+        }
+        self.capacity_threshold_reached
+            .store(false, Ordering::Release);
     }
 }
 
@@ -288,10 +320,17 @@ pub(crate) struct OutputSample {
     pub(crate) bytes: u32,
 }
 
+pub(crate) fn encode_resize_input(cols: u16, rows: u16) -> SmallVec<[u8; MAX_SAMPLE_BYTES]> {
+    let mut bytes = SmallVec::<[u8; MAX_SAMPLE_BYTES]>::new();
+    bytes.extend_from_slice(format!("\x1b[8;{};{}t", rows, cols).as_bytes());
+    bytes
+}
+
 enum ClusterEvent {
     SessionStarted {
         session: Arc<LiveSessionRecord>,
         control_tx: watch::Sender<SessionControl>,
+        app_rx: watch::Receiver<SessionAppState>,
     },
     InputRecorded {
         session_id: u64,
@@ -304,11 +343,17 @@ enum ClusterEvent {
     SessionEnded(u64),
 }
 
-type ClusterSession = (Arc<LiveSessionRecord>, watch::Sender<SessionControl>);
+struct ClusterSession {
+    session: Arc<LiveSessionRecord>,
+    control_tx: watch::Sender<SessionControl>,
+    app_rx: watch::Receiver<SessionAppState>,
+}
 
 struct ClusterManager {
     max_running: usize,
     metrics: Arc<ServerMetrics>,
+    db: libsql::Connection,
+    notifications: Arc<Notifications>,
     rx: mpsc::UnboundedReceiver<ClusterEvent>,
     live_sessions: HashMap<u64, ClusterSession>,
     recent_signatures: Arc<[HistoricalSignature]>,
@@ -320,17 +365,26 @@ impl AdmissionController {
         config: AdmissionConfig,
         initial_banned_ips: Vec<(IpNet, Option<String>, Option<i64>)>,
         metrics: Arc<ServerMetrics>,
+        db: libsql::Connection,
+        notifications: Arc<Notifications>,
     ) -> Self {
         let (ban_changes, _) = watch::channel(());
-        let cluster_tx = spawn_cluster_manager(config.max_running, metrics.clone());
+        let cluster_tx = spawn_cluster_manager(
+            config.max_running,
+            metrics.clone(),
+            db,
+            notifications.clone(),
+        );
         let controller = Self {
             inner: Arc::new(Inner {
                 config,
                 ban_manager: Mutex::new(BanManager::new(initial_banned_ips)),
                 ban_changes,
                 metrics,
+                notifications,
                 next_id: AtomicU64::new(1),
                 state: Mutex::new(ControllerState::default()),
+                capacity_threshold_reached: AtomicBool::new(false),
                 cluster_tx,
             }),
         };
@@ -349,8 +403,7 @@ impl AdmissionController {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = watch::channel(AdmissionState::Queued(1));
         let matched_ban = self.check_ip_ban(client_ip);
-
-        {
+        let running_sessions = {
             let mut state = self.inner.state.lock().unwrap();
             if let Some((ban_rule, ban_reason)) = matched_ban {
                 tracing::debug!(
@@ -388,7 +441,9 @@ impl AdmissionController {
                 ));
             }
             state.record_metrics(&self.inner.metrics);
-        }
+            state.running.len()
+        };
+        self.inner.update_capacity_threshold_alert(running_sessions);
 
         AdmissionTicket {
             id,
@@ -536,7 +591,11 @@ impl AdmissionTicket {
         self.rx.clone()
     }
 
-    pub fn start_session(mut self, session_guard: SessionHandle) -> Self {
+    pub fn start_session(
+        mut self,
+        session_guard: SessionHandle,
+        app_rx: watch::Receiver<SessionAppState>,
+    ) -> Self {
         let now_ms = monotonic_millis();
         let (control_tx, control_rx) = watch::channel(SessionControl::Active);
         let _ = self
@@ -553,6 +612,7 @@ impl AdmissionTicket {
                     outputs: VecDeque::new(),
                 }),
                 control_tx,
+                app_rx,
             });
         self.control_rx = control_rx;
         self.pending_output_bytes = 0;
@@ -567,22 +627,21 @@ impl AdmissionTicket {
 
     pub fn record_input(&mut self, bytes: &[u8]) {
         self.flush_output_batch();
-        let now_ms = monotonic_millis();
-        let sample = InputSample {
-            at_ms: now_ms,
-            bytes: bytes
+        self.record_input_sample(
+            bytes
                 .iter()
                 .copied()
                 .take(MAX_SAMPLE_BYTES)
                 .collect::<SmallVec<[u8; MAX_SAMPLE_BYTES]>>(),
-        };
-        let _ = self
-            .controller
-            .cluster_tx
-            .send(ClusterEvent::InputRecorded {
-                session_id: self.id,
-                sample,
-            });
+        );
+    }
+
+    pub fn record_resize(&mut self, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        self.flush_output_batch();
+        self.record_input_sample(encode_resize_input(cols, rows));
     }
 
     pub fn record_output(&mut self, bytes: usize) {
@@ -612,6 +671,20 @@ impl AdmissionTicket {
             .send(ClusterEvent::OutputRecorded {
                 session_id: self.id,
                 sample: OutputSample { at_ms, bytes },
+            });
+    }
+
+    fn record_input_sample(&mut self, bytes: SmallVec<[u8; MAX_SAMPLE_BYTES]>) {
+        let sample = InputSample {
+            at_ms: monotonic_millis(),
+            bytes,
+        };
+        let _ = self
+            .controller
+            .cluster_tx
+            .send(ClusterEvent::InputRecorded {
+                session_id: self.id,
+                sample,
             });
     }
 }
@@ -653,18 +726,26 @@ impl Drop for AdmissionTicket {
             AdmissionState::Rejected(_reason) => {}
         }
         state.record_metrics(&self.controller.metrics);
+        let running_sessions = state.running.len();
+        drop(state);
+        self.controller
+            .update_capacity_threshold_alert(running_sessions);
     }
 }
 
 fn spawn_cluster_manager(
     max_running: usize,
     metrics: Arc<ServerMetrics>,
+    db: libsql::Connection,
+    notifications: Arc<Notifications>,
 ) -> mpsc::UnboundedSender<ClusterEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(
         ClusterManager {
             max_running,
             metrics,
+            db,
+            notifications,
             rx,
             live_sessions: HashMap::new(),
             recent_signatures: Arc::from([]),
@@ -696,8 +777,16 @@ impl ClusterManager {
             ClusterEvent::SessionStarted {
                 session,
                 control_tx,
+                app_rx,
             } => {
-                self.live_sessions.insert(session.id, (session, control_tx));
+                self.live_sessions.insert(
+                    session.id,
+                    ClusterSession {
+                        session,
+                        control_tx,
+                        app_rx,
+                    },
+                );
                 self.dirty = true;
                 self.maybe_evaluate();
             }
@@ -723,9 +812,10 @@ impl ClusterManager {
             }
             ClusterEvent::SessionEnded(session_id) => {
                 let now_ms = monotonic_millis();
-                let Some((session, _)) = self.live_sessions.remove(&session_id) else {
+                let Some(cluster_session) = self.live_sessions.remove(&session_id) else {
                     return;
                 };
+                let session = cluster_session.session;
                 let mut recent_signatures = self
                     .recent_signatures
                     .iter()
@@ -749,15 +839,15 @@ impl ClusterManager {
         session_id: u64,
         update: impl FnOnce(&mut LiveSessionRecord),
     ) -> bool {
-        let Some((session, _)) = self.live_sessions.get_mut(&session_id) else {
+        let Some(cluster_session) = self.live_sessions.get_mut(&session_id) else {
             return false;
         };
-        let mut snapshot = session.as_ref().clone();
+        let mut snapshot = cluster_session.session.as_ref().clone();
         update(&mut snapshot);
         let now_ms = monotonic_millis();
         cluster_detection::trim_old_inputs(&mut snapshot.inputs, now_ms);
         cluster_detection::trim_old_outputs(&mut snapshot.outputs, now_ms);
-        *session = Arc::new(snapshot);
+        cluster_session.session = Arc::new(snapshot);
         true
     }
 
@@ -777,7 +867,7 @@ impl ClusterManager {
             live_sessions: Arc::from(
                 self.live_sessions
                     .values()
-                    .map(|(session, _)| session.clone())
+                    .map(|cluster_session| cluster_session.session.clone())
                     .collect::<Vec<_>>(),
             ),
             recent_signatures: self.recent_signatures.clone(),
@@ -796,29 +886,32 @@ impl ClusterManager {
     }
 
     fn clear_controls(&mut self) {
-        for (_, control_tx) in self.live_sessions.values_mut() {
-            let _ = update_session_control(control_tx, SessionControl::Active);
+        for cluster_session in self.live_sessions.values_mut() {
+            let _ = update_session_control(&cluster_session.control_tx, SessionControl::Active);
         }
     }
 
     fn apply_evaluation(&mut self, evaluation: ClusterEvaluation, pressure: f64) {
-        for (session, control_tx) in self.live_sessions.values_mut() {
-            let next = if evaluation.evicted_session_ids.contains(&session.id) {
+        let mut newly_evicted = Vec::new();
+        for cluster_session in self.live_sessions.values_mut() {
+            let next = if evaluation
+                .evicted_session_ids
+                .contains(&cluster_session.session.id)
+            {
                 SessionControl::Close(SessionEndReason::ClusterLimited)
             } else {
                 SessionControl::Active
             };
-            if update_session_control(control_tx, next) {
+            if update_session_control(&cluster_session.control_tx, next) {
                 if matches!(next, SessionControl::Close(_)) {
                     let summary = evaluation
                         .eviction_summaries
-                        .get(&session.id)
+                        .get(&cluster_session.session.id)
                         .copied()
                         .expect("evicted session missing cluster summary");
                     tracing::warn!(
-                        session_id = session.id,
-                        client_ip = %session.client_ip,
-                        transport = session.transport.as_str(),
+                        session_id = cluster_session.session.id,
+                        transport = cluster_session.session.transport.as_str(),
                         pressure,
                         suspicious_cluster_count = evaluation.suspicious_cluster_count,
                         max_cluster_score = evaluation.max_cluster_score,
@@ -838,14 +931,11 @@ impl ClusterManager {
                             summary.factors.edge_low_engagement_interaction,
                         avg_edge_contribution = summary.contributions.avg_edge,
                         avg_replay_contribution = summary.contributions.avg_replay,
-                        avg_replay_density_contribution =
-                            summary.contributions.avg_replay_density,
-                        avg_low_engagement_contribution =
-                            summary.contributions.avg_low_engagement,
+                        avg_replay_density_contribution = summary.contributions.avg_replay_density,
+                        avg_low_engagement_contribution = summary.contributions.avg_low_engagement,
                         avg_coupling_deficit_contribution =
                             summary.contributions.avg_coupling_deficit,
-                        network_cohesion_contribution =
-                            summary.contributions.network_cohesion,
+                        network_cohesion_contribution = summary.contributions.network_cohesion,
                         start_sync_contribution = summary.contributions.start_sync,
                         size_factor_contribution = summary.contributions.size_factor,
                         pressure_contribution = summary.contributions.pressure,
@@ -853,10 +943,61 @@ impl ClusterManager {
                             summary.contributions.edge_low_engagement_interaction,
                         "Evicting session due to suspected bot cluster"
                     );
-                    self.metrics.record_cluster_enforcement(session.transport);
+                    self.metrics
+                        .record_cluster_enforcement(cluster_session.session.transport);
+                    newly_evicted.push((
+                        cluster_session.session.id,
+                        cluster_session.session.transport,
+                        cluster_session.app_rx.borrow().shortname.clone(),
+                        cluster_session.session.client_ip,
+                    ));
                 }
             }
         }
+        if newly_evicted.is_empty() {
+            return;
+        }
+
+        let db = self.db.clone();
+        let notifications = Arc::clone(&self.notifications);
+        let region_id = self.metrics.region().to_string();
+        let current_sessions = self.live_sessions.len();
+        let max_capacity = self.max_running;
+        let suspicious_cluster_count = evaluation.suspicious_cluster_count;
+        let max_cluster_score = evaluation.max_cluster_score;
+
+        tokio::spawn(async move {
+            let ip_review = match cluster_kicked_ips::increment_for_enforcement(
+                &db,
+                newly_evicted.iter().map(|(_, _, _, client_ip)| *client_ip),
+            )
+            .await
+            {
+                Ok(counts) => counts,
+                Err(error) => {
+                    tracing::error!(error = ?error, "failed to persist cluster-kicked ip counts");
+                    cluster_kicked_ips::empty_review()
+                }
+            };
+            notifications.notify_cluster_enforcement(ClusterEnforcementNotification {
+                region_id: region_id.clone(),
+                current_sessions,
+                max_capacity,
+                suspicious_cluster_count,
+                max_cluster_score,
+                sessions: newly_evicted
+                    .into_iter()
+                    .map(
+                        |(session_id, transport, app_shortname, _)| ClusterEnforcementSession {
+                            session_id: format!("{region_id}:{session_id}"),
+                            transport: transport.as_str().to_string(),
+                            app_shortname,
+                        },
+                    )
+                    .collect(),
+                ip_review,
+            });
+        });
     }
 }
 

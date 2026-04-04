@@ -7,11 +7,11 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -96,6 +96,21 @@ const NEXT_APP_READY_READY: i32 = 1;
 const NEXT_APP_READY_NOT_READY: i32 = 0;
 const NEXT_APP_READY_ERR_UNKNOWN_SHORTNAME: i32 = -1;
 const NEXT_APP_READY_ERR_PREPARE_FAILED_OTHER: i32 = -2;
+pub const MAX_SCREEN_COLS: u16 = 80 * 6;
+pub const MAX_SCREEN_ROWS: u16 = 24 * 6;
+const CHANGE_APP_RATE_LIMIT_SECS: u64 = 10;
+const CHANGE_APP_ERR_RATE_LIMITED: i32 = -2;
+
+pub fn clamp_window_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.min(MAX_SCREEN_COLS), rows.min(MAX_SCREEN_ROWS))
+}
+
+pub fn clamp_window_size_u32(cols: u32, rows: u32) -> (u16, u16) {
+    clamp_window_size(
+        cols.min(u16::MAX as u32) as u16,
+        rows.min(u16::MAX as u32) as u16,
+    )
+}
 
 pub type AppExitResult = Result<I32Exit, AppRunError>;
 
@@ -408,7 +423,10 @@ impl AppServer {
             let startup_shortname = session_identity.shortname();
             let (notification_tx, notification_rx, status_bar_state_rx) = session_ui.into_parts();
 
-            let (first_cols, first_rows) = *window_size_receiver.borrow();
+            let (first_cols, first_rows) = {
+                let (cols, rows) = *window_size_receiver.borrow();
+                clamp_window_size(cols, rows)
+            };
             terminal_parser
                 .screen_mut()
                 .set_size(first_rows, first_cols);
@@ -419,6 +437,7 @@ impl AppServer {
             let (app_output_sender, mut app_output_receiver) =
                 tokio::sync::mpsc::channel::<BytesMut>(1);
             let has_next_app_shortname = Arc::new(AtomicBool::new(false));
+            let change_app_limiter = Arc::new(ChangeAppLimiter::default());
 
             let audio_enabled = audio_sender.is_some();
             let mut maybe_mixer = if let Some(audio_tx) = audio_sender {
@@ -525,6 +544,7 @@ impl AppServer {
                     audio: maybe_mixer,
                     status_bar_input: status_bar_input.clone(),
                     terminal_snapshot: terminal_snapshot.clone(),
+                    change_app_limiter: change_app_limiter.clone(),
                 };
 
                 let mut store = wasmtime::Store::new(&engine, state);
@@ -615,7 +635,10 @@ impl AppServer {
                                 if result.is_err() {
                                     break 'block None;
                                 }
-                                let (width, height) = *window_size_receiver.borrow();
+                                let (width, height) = {
+                                    let (cols, rows) = *window_size_receiver.borrow();
+                                    clamp_window_size(cols, rows)
+                                };
                                 replay_buffer.push_resize(width, height);
 
                                 let screen = terminal.screen_mut();
@@ -1393,21 +1416,28 @@ impl AppServer {
             caller.data().next_app.as_ref(),
             Some(NextAppState::Pending(_))
         );
-        if should_prepare {
-            has_next_app.store(false, Ordering::Release);
-            let ctx = caller.data().ctx.clone();
-            let menu_session = caller.data().menu_session.clone();
-            let session_identity = caller.data().session_identity.clone();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            caller.data_mut().next_app = Some(NextAppState::Pending(rx));
-            tokio::task::spawn(async move {
-                let result = match Self::prepare_instantiate(
-                    &ctx,
-                    &menu_session,
-                    &session_identity,
-                    shortname,
-                )
-                .await
+        if !should_prepare {
+            return Ok(0);
+        }
+
+        if !caller
+            .data()
+            .change_app_limiter
+            .try_acquire(Duration::from_secs(CHANGE_APP_RATE_LIMIT_SECS))
+        {
+            return Ok(CHANGE_APP_ERR_RATE_LIMITED);
+        }
+
+        has_next_app.store(false, Ordering::Release);
+        let ctx = caller.data().ctx.clone();
+        let menu_session = caller.data().menu_session.clone();
+        let session_identity = caller.data().session_identity.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        caller.data_mut().next_app = Some(NextAppState::Pending(rx));
+        tokio::task::spawn(async move {
+            let result =
+                match Self::prepare_instantiate(&ctx, &menu_session, &session_identity, shortname)
+                    .await
                 {
                     Ok(next_app) => {
                         has_next_app.store(true, Ordering::Release);
@@ -1420,9 +1450,8 @@ impl AppServer {
                         Err(error)
                     }
                 };
-                let _ = tx.send(result);
-            });
-        }
+            let _ = tx.send(result);
+        });
 
         Ok(0)
     }
@@ -2298,6 +2327,7 @@ pub struct AppState {
     terminal_profile: TerminalProfile,
     audio: Option<Mixer>,
     terminal_snapshot: Arc<TerminalSnapshot>,
+    change_app_limiter: Arc<ChangeAppLimiter>,
 }
 
 enum NextAppState {
@@ -2308,6 +2338,26 @@ enum NextAppState {
 
 type NextAppPrepareResult =
     Result<(PreloadedAppState, wasmtime::InstancePre<AppState>), NextAppPrepareError>;
+
+#[derive(Default)]
+struct ChangeAppLimiter {
+    last_change_app_at: Mutex<Option<Instant>>,
+}
+
+impl ChangeAppLimiter {
+    fn try_acquire(&self, min_interval: Duration) -> bool {
+        let now = Instant::now();
+        let mut last_change_app_at = self.last_change_app_at.lock().unwrap();
+        if last_change_app_at
+            .as_ref()
+            .is_some_and(|last| now.saturating_duration_since(*last) < min_interval)
+        {
+            return false;
+        }
+        *last_change_app_at = Some(now);
+        true
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum NextAppPrepareErrorCode {

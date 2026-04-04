@@ -7,7 +7,10 @@ use std::{collections::VecDeque, io::Read, thread, time::Instant};
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
-use terminal_games::control::{SessionSummary, SpyClientMessage, SpyControlMessage};
+use terminal_games::control::{
+    CONTROL_API_EXPECTED_VERSION_HEADER, CONTROL_API_VERSION, SessionSummary, SpyClientMessage,
+    SpyControlMessage,
+};
 use terminal_games::palette::{self, Color as PaletteColor};
 use terminal_games::terminal_profile::{TerminalColorMode, TerminalProfile};
 use terminput::{
@@ -20,7 +23,10 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use unicode_width::UnicodeWidthStr;
 
 use super::super::{AdminSessionSpyArgs, load_api, parse_session_ref};
-use crate::config::format_duration;
+use crate::{
+    config::format_duration,
+    control_client::{ensure_control_api_compatibility, normalize_ws_connect_error},
+};
 
 pub(super) async fn session_spy(args: AdminSessionSpyArgs, profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
@@ -44,7 +50,14 @@ pub(super) async fn session_spy(args: AdminSessionSpyArgs, profile: Option<Strin
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {}", api.profile.password))?,
     );
-    let (ws_stream, _) = tokio_tungstenite::connect_async(request).await?;
+    request.headers_mut().insert(
+        CONTROL_API_EXPECTED_VERSION_HEADER,
+        HeaderValue::from_static(CONTROL_API_VERSION),
+    );
+    let (ws_stream, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(normalize_ws_connect_error)?;
+    ensure_control_api_compatibility(&base_url, response.headers())?;
     let (mut write, mut read) = ws_stream.split();
 
     let mut stdout = tokio::io::stdout();

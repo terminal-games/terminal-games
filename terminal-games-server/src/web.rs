@@ -50,6 +50,7 @@ use tower::{Service, ServiceExt};
 
 use terminal_games::app::{
     AppInstantiationParams, AppServer, SessionControl, SessionEndReason, SessionOutput,
+    clamp_window_size,
 };
 use terminal_games::input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker};
 use terminal_games::log_backend::NoopLogBackend;
@@ -100,7 +101,7 @@ impl WebServer {
                 let token = token.trim().to_string();
                 if token.is_empty() {
                     tracing::warn!(
-                        "METRICS_BEARER_TOKEN is empty; /metrics will be served without authentication"
+                        "METRICS_BEARER_TOKEN is empty; metrics endpoints will be served without authentication"
                     );
                     None
                 } else {
@@ -109,7 +110,7 @@ impl WebServer {
             }
             Err(std::env::VarError::NotPresent) => {
                 tracing::warn!(
-                    "METRICS_BEARER_TOKEN is not set; /metrics will be served without authentication"
+                    "METRICS_BEARER_TOKEN is not set; metrics endpoints will be served without authentication"
                 );
                 None
             }
@@ -159,6 +160,7 @@ impl WebServer {
                 get(serve_jitter_buffer_processor_js),
             )
             .route("/metrics", get(serve_metrics))
+            .route("/global-metrics", get(serve_global_metrics))
             .route("/pow/challenge", get(pow_challenge_handler))
             .route("/ws", get(websocket_handler))
             .with_state(self.clone())
@@ -307,7 +309,26 @@ async fn serve_metrics(State(server): State<WebServer>, headers: HeaderMap) -> R
             .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response());
     }
 
-    match server.metrics.render().await {
+    match server.metrics.render_local().await {
+        Ok(body) => static_bytes_response("text/plain; version=0.0.4; charset=utf-8", body),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to encode metrics: {err:#}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn serve_global_metrics(State(server): State<WebServer>, headers: HeaderMap) -> Response {
+    if !metrics_request_authorized(&headers, server.metrics_bearer_token.as_deref()) {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(WWW_AUTHENTICATE, "Bearer")
+            .body(Body::from("missing or invalid bearer token"))
+            .unwrap_or_else(|_| StatusCode::UNAUTHORIZED.into_response());
+    }
+
+    match server.metrics.render_global().await {
         Ok(body) => static_bytes_response("text/plain; version=0.0.4; charset=utf-8", body),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -532,9 +553,11 @@ async fn handle_socket(
         true,
         None,
     );
-    let mut admitted_session = admission_ticket.start_session(session_metrics.clone());
+    let mut admitted_session =
+        admission_ticket.start_session(session_metrics.clone(), session_identity.app_receiver());
     let mut cluster_control = admitted_session.subscribe_control();
     let mut app_metrics_rx = session_identity.app_receiver();
+    let mut resize_events_rx = resize_rx.clone();
     let terminal_parser = background_tracker.into_terminal_parser(initial_size.1, initial_size.0);
 
     let mut exit_rx = server.app_server.instantiate_app(AppInstantiationParams {
@@ -658,6 +681,18 @@ async fn handle_socket(
                     .set_idle_fuel(local_session_id, idle_monitor.idle_state().fuel_seconds);
             }
 
+            changed = resize_events_rx.changed() => {
+                if changed.is_err() {
+                    continue;
+                }
+                let (cols, rows) = *resize_events_rx.borrow_and_update();
+                idle_monitor.observe_resize();
+                server
+                    .session_registry
+                    .set_idle_fuel(local_session_id, idle_monitor.idle_state().fuel_seconds);
+                admitted_session.record_resize(cols, rows);
+            }
+
             data = output_rx.recv() => {
                 let Some(data) = data else {
                     break SessionEndReason::NormalExit;
@@ -753,7 +788,7 @@ async fn recv_initial_resize(
 
 fn parse_resize(text: &str) -> Option<(u16, u16)> {
     let (w, h) = text.split_once(':')?;
-    Some((w.parse().ok()?, h.parse().ok()?))
+    Some(clamp_window_size(w.parse().ok()?, h.parse().ok()?))
 }
 
 fn sanitize_user_agent(ua: &str) -> String {
