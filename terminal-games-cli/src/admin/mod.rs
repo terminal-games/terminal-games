@@ -7,6 +7,7 @@ mod auth;
 mod ban_ip;
 mod broadcast;
 mod cluster_ip;
+mod drain;
 mod nodes;
 mod session;
 mod ticker;
@@ -41,8 +42,9 @@ enum AdminCommand {
     ClusterIpKicks(AdminClusterIpKicksArgs),
     /// Show a temporary broadcast notification to users.
     Broadcast(AdminBroadcastArgs),
-    /// Show runtime status for each node.
-    Nodes,
+    #[command(subcommand)]
+    /// Inspect and control node runtime state.
+    Nodes(AdminNodesCommand),
     #[command(subcommand)]
     /// Inspect and control live sessions.
     Session(AdminSessionCommand),
@@ -170,6 +172,56 @@ pub(super) struct AdminBroadcastArgs {
 }
 
 #[derive(Subcommand)]
+pub(super) enum AdminNodesCommand {
+    /// Show runtime status for each node.
+    #[command(visible_alias = "ls")]
+    List,
+    #[command(subcommand)]
+    /// Drain selected nodes for a planned maintenance window.
+    Drain(AdminNodesDrainCommand),
+}
+
+#[derive(Subcommand)]
+pub(super) enum AdminNodesDrainCommand {
+    /// Start a drain countdown across selected nodes.
+    Start(AdminNodesDrainStartArgs),
+    /// Attach to an active drain and show the live node view.
+    Attach(AdminNodesDrainAttachArgs),
+    /// Cancel an active drain before the timer finishes.
+    Cancel(AdminNodesDrainCancelArgs),
+}
+
+#[derive(Args)]
+pub(super) struct AdminNodesDrainStartArgs {
+    /// Relative duration like 5m or 1h. Defaults to 5m when --ends-at is omitted.
+    #[arg(long, conflicts_with = "ends_at")]
+    duration: Option<String>,
+    /// Absolute RFC3339 end time, for example 2026-04-04T18:30:00Z.
+    #[arg(long = "ends-at", conflicts_with = "duration")]
+    ends_at: Option<String>,
+    /// Comma-separated node ids. Defaults to all discovered nodes.
+    #[arg(long)]
+    nodes: Option<String>,
+    /// Exit after scheduling the drain instead of holding the live display open.
+    #[arg(long)]
+    detach: bool,
+}
+
+#[derive(Args)]
+pub(super) struct AdminNodesDrainAttachArgs {
+    /// Comma-separated node ids. Defaults to all currently draining nodes.
+    #[arg(long)]
+    nodes: Option<String>,
+}
+
+#[derive(Args)]
+pub(super) struct AdminNodesDrainCancelArgs {
+    /// Comma-separated node ids. Defaults to all discovered nodes.
+    #[arg(long)]
+    nodes: Option<String>,
+}
+
+#[derive(Subcommand)]
 pub(super) enum AdminSessionCommand {
     /// List all live sessions across all discovered nodes.
     #[command(visible_alias = "ls")]
@@ -237,7 +289,7 @@ pub async fn run(cli: AdminCli, profile: Option<String>) -> Result<()> {
         AdminCommand::Ticker(command) => ticker::run(command, profile).await,
         AdminCommand::ClusterIpKicks(args) => cluster_ip::run(args, profile).await,
         AdminCommand::Broadcast(args) => broadcast::run(args, profile).await,
-        AdminCommand::Nodes => nodes::run(profile).await,
+        AdminCommand::Nodes(command) => nodes::run(command, profile).await,
         AdminCommand::Session(command) => session::run(command, profile).await,
         AdminCommand::App(command) => app::run(command, profile).await,
     }

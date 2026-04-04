@@ -49,11 +49,11 @@ use terminal_games::{
         BroadcastRequest, CONTROL_API_EXPECTED_VERSION_HEADER, CONTROL_API_VERSION,
         ClusterKickedIpListRequest, ClusterKickedIpListResponse, CreateAppRequest,
         CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest, DeleteShortnameResponse,
-        KickSessionRequest, NodeDiscoveryResponse, NodeRuntimeStatus, RotateAppTokenRequest,
-        RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage, SpyControlMessage,
-        StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest,
-        TickerReorderRequest, UploadAppRequest, UploadAppResponse, expiry_from_duration,
-        parse_duration_string, parse_optional_expiry,
+        DrainStartRequest, KickSessionRequest, NodeDiscoveryResponse, NodeRuntimeStatus,
+        RotateAppTokenRequest, RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage,
+        SpyControlMessage, StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry,
+        TickerRemoveRequest, TickerReorderRequest, UploadAppRequest, UploadAppResponse,
+        expiry_from_duration, parse_duration_string, parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
     mesh::{AppRuntimeUpdateMessage, BuildId, ContentHash, Mesh, hash_app_envs, hash_bytes},
@@ -64,6 +64,7 @@ use crate::{
     admission::{AdmissionController, decode_cidr_blob, encode_cidr_blob, parse_ban_cidr},
     cluster_kicked_ips,
     sessions::SessionRegistry,
+    shutdown::ShutdownCoordinator,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::tungstenite::{Error as WsError, error::ProtocolError};
@@ -86,6 +87,7 @@ pub struct ControlPlane {
     bandwidth: Arc<BandwidthTracker>,
     max_capacity: usize,
     node_id: String,
+    shutdown: ShutdownCoordinator,
 }
 
 impl ControlPlane {
@@ -97,6 +99,7 @@ impl ControlPlane {
         max_capacity: usize,
         admin_shared_secret: Option<Arc<str>>,
         node_id: String,
+        shutdown: ShutdownCoordinator,
     ) -> Self {
         Self {
             app_server,
@@ -109,6 +112,7 @@ impl ControlPlane {
             bandwidth: Arc::new(BandwidthTracker::default()),
             max_capacity,
             node_id,
+            shutdown,
         }
     }
 
@@ -267,6 +271,7 @@ impl ControlPlane {
                 .saturating_sub(system.available_memory()),
             memory_total_bytes: system.total_memory(),
             bandwidth_bytes_per_second: self.bandwidth.bytes_per_second(),
+            shutdown: self.shutdown.snapshot(),
         }
     }
 }
@@ -617,11 +622,33 @@ impl AdminControlRpc for AdminRpcServer {
         Ok(self.control.discover().await?)
     }
 
-    async fn local_node_status(
+    async fn local_node_status(self, _: context::Context) -> Result<NodeRuntimeStatus, RpcError> {
+        Ok(self.control.local_node_status())
+    }
+
+    async fn drain_start(
         self,
         _: context::Context,
-    ) -> Result<NodeRuntimeStatus, RpcError> {
-        Ok(self.control.local_node_status())
+        request: DrainStartRequest,
+    ) -> Result<terminal_games::control::NodeShutdownStatus, RpcError> {
+        Ok(self
+            .control
+            .shutdown
+            .start_drain(Duration::from_secs(request.duration_seconds))
+            .await
+            .map_err(RpcError::from)?)
+    }
+
+    async fn drain_cancel(
+        self,
+        _: context::Context,
+    ) -> Result<terminal_games::control::NodeShutdownStatus, RpcError> {
+        Ok(self
+            .control
+            .shutdown
+            .cancel_drain()
+            .await
+            .map_err(RpcError::from)?)
     }
 
     async fn sessions(self, _: context::Context) -> Result<Vec<SessionSummary>, RpcError> {
@@ -1881,6 +1908,7 @@ pub async fn load_status_bar_state(
     Ok(StatusBarState {
         tickers,
         broadcasts: broadcast.into_iter().collect(),
+        drain: None,
     })
 }
 

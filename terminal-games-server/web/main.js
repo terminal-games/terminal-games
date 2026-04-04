@@ -163,7 +163,11 @@ try {
     await startWebSocketSession();
 } catch (error) {
     console.error('Failed to start WebSocket session:', error);
-    showDisconnect('connection_error');
+    if (error instanceof Error && error.message === 'server_shutdown') {
+        showDisconnect('server_shutdown');
+    } else {
+        showDisconnect('connection_error');
+    }
 }
 
 term.onData((data) => {
@@ -245,6 +249,12 @@ function disconnectMessage(reasonKey) {
                 detail: 'This IP address already has too many active sessions.',
                 hint: 'Close another session or wait a few minutes and try again.'
             };
+        case 'server_shutdown':
+            return {
+                heading: 'Maintenance in progress',
+                detail: 'Server is shutting down for maintenance.',
+                hint: 'Please try again after maintenance ends.'
+            };
         case 'connection_error':
             return {
                 heading: 'Connection error',
@@ -325,7 +335,11 @@ async function startWebSocketSession() {
 async function solveProofOfWork() {
     const response = await fetch('/pow/challenge', { cache: 'no-store' });
     if (!response.ok) {
-        throw new Error('failed to fetch POW challenge');
+        const detail = (await response.text()).trim();
+        if (response.status === 503) {
+            throw new Error('server_shutdown');
+        }
+        throw new Error(detail || 'failed to fetch POW challenge');
     }
     const challenge = await response.json();
     let attempts = 0;

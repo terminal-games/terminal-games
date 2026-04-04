@@ -30,7 +30,7 @@ use crate::{
     audio::{CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
     control::StatusBarState,
     log_backend::{GuestLogBackend, LogLevel, parse_guest_log_object},
-    mesh::{AppId, BuildId, Mesh, PeerId, PeerMessageApp, NodeId},
+    mesh::{AppId, BuildId, Mesh, NodeId, PeerId, PeerMessageApp},
     rate_limiting::{NetworkInfo, TokenBucket},
     replay::ReplayBuffer,
     status_bar::{StatusBar, StatusBarInput, StatusNotification},
@@ -132,6 +132,7 @@ pub enum SessionEndReason {
     TooManyConnectionsFromIp,
     ClusterLimited,
     KickedByAdmin,
+    ServerShutdown,
 }
 
 impl SessionEndReason {
@@ -144,6 +145,7 @@ impl SessionEndReason {
             Self::TooManyConnectionsFromIp => "too_many_connections_from_ip",
             Self::ClusterLimited => "cluster_limited",
             Self::KickedByAdmin => "kicked_by_admin",
+            Self::ServerShutdown => "server_shutdown",
         }
     }
 
@@ -156,6 +158,7 @@ impl SessionEndReason {
             Self::TooManyConnectionsFromIp => "Too many active sessions from your IP address",
             Self::ClusterLimited => "Kicked for likely bot activity",
             Self::KickedByAdmin => "Disconnected by an administrator.",
+            Self::ServerShutdown => "Server is shutting down for maintenance.",
         }
     }
 
@@ -1625,7 +1628,11 @@ impl AppServer {
 
             let app_id = caller.data().app.app_id;
             let mesh = &caller.data().ctx.mesh;
-            let mut peers = mesh.get_peers_for_app(app_id).await.into_iter().collect::<Vec<_>>();
+            let mut peers = mesh
+                .get_peers_for_app(app_id)
+                .await
+                .into_iter()
+                .collect::<Vec<_>>();
             peers.sort_unstable();
 
             let total_count = peers.len();

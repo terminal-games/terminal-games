@@ -10,6 +10,7 @@ mod idle;
 mod metrics;
 mod notifications;
 mod sessions;
+mod shutdown;
 mod ssh;
 mod web;
 
@@ -332,6 +333,8 @@ async fn main() -> Result<()> {
         .filter(|value| !value.is_empty())
         .map(Arc::<str>::from);
     let session_registry = sessions::SessionRegistry::new(node_id, notifications.clone());
+    let shutdown =
+        shutdown::ShutdownCoordinator::new(admission_controller.clone(), session_registry.clone());
     let initial_status_bar_state = control::load_status_bar_state(&conn, None).await?;
     session_registry.set_status_bar_state(initial_status_bar_state);
     let control_plane = control::ControlPlane::new(
@@ -342,34 +345,71 @@ async fn main() -> Result<()> {
         max_active_apps,
         admin_shared_secret,
         session_registry.node_id().to_string(),
+        shutdown.clone(),
     );
 
-    tokio::select! {
-        result = async {
-            let mut server = ssh::SshServer::new(
-                app_server.clone(),
-                admission_controller.clone(),
-                metrics.clone(),
-                session_registry.clone(),
-                control_plane.clone(),
-            ).await?;
-            server.run().await
-        } => {
-            result?;
-        }
-        result = async {
-            let server = web::WebServer::new(
-                app_server.clone(),
-                admission_controller.clone(),
-                metrics.clone(),
-                session_registry.clone(),
-                control_plane.clone(),
-            )?;
-            server.run().await
-        } => {
-            result?;
-        }
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let signal = wait_for_shutdown_signal().await;
+            tracing::info!(signal, "Received OS shutdown signal");
+            if let Err(error) = shutdown.begin_immediate_shutdown(signal).await {
+                tracing::warn!(error, "failed to begin graceful shutdown after signal");
+            }
+        });
     }
+
+    let ssh_listener_token = shutdown.listener_token();
+    let web_listener_token = shutdown.listener_token();
+    let shutdown_for_ssh = shutdown.clone();
+    let ssh_app_server = app_server.clone();
+    let ssh_admission_controller = admission_controller.clone();
+    let ssh_metrics = metrics.clone();
+    let ssh_session_registry = session_registry.clone();
+    let ssh_control_plane = control_plane.clone();
+    let ssh_task = tokio::spawn(async move {
+        let mut server = ssh::SshServer::new(
+            ssh_app_server,
+            ssh_admission_controller,
+            ssh_metrics,
+            ssh_session_registry,
+            ssh_control_plane,
+        )
+        .await?;
+        if let Err(error) = server.run(ssh_listener_token).await {
+            let _ = shutdown_for_ssh
+                .begin_immediate_shutdown("ssh server stopped unexpectedly")
+                .await;
+            Err(error)
+        } else {
+            Ok(())
+        }
+    });
+    let shutdown_for_web = shutdown.clone();
+    let web_task = tokio::spawn(async move {
+        let server = web::WebServer::new(
+            app_server,
+            admission_controller,
+            metrics,
+            session_registry,
+            control_plane,
+        )?;
+        if let Err(error) = server.run(web_listener_token).await {
+            let _ = shutdown_for_web
+                .begin_immediate_shutdown("web server stopped unexpectedly")
+                .await;
+            Err(error)
+        } else {
+            Ok(())
+        }
+    });
+
+    shutdown.wait_for_completion().await;
+
+    let ssh_result = ssh_task.await.context("ssh task join failed")?;
+    let web_result = web_task.await.context("web task join failed")?;
+    ssh_result?;
+    web_result?;
 
     mesh.graceful_shutdown().await;
 
@@ -422,4 +462,26 @@ fn parse_ssh_captcha_threshold(raw: Result<String, std::env::VarError>) -> Resul
 
 fn normalize_expires_at(expires_at_raw: i64) -> Option<i64> {
     (expires_at_raw >= 0).then_some(expires_at_raw)
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> String {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+    let mut sigquit = signal(SignalKind::quit()).expect("failed to register SIGQUIT handler");
+    tokio::select! {
+        _ = sigint.recv() => "SIGINT".to_string(),
+        _ = sigterm.recv() => "SIGTERM".to_string(),
+        _ = sigquit.recv() => "SIGQUIT".to_string(),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> String {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to register ctrl-c handler");
+    "CTRL_C".to_string()
 }

@@ -384,8 +384,7 @@ impl LocalDiscovery {
 
     pub fn allocate_node(&self) -> anyhow::Result<NodeId> {
         let entries = self.read_entries();
-        let used: std::collections::HashSet<NodeId> =
-            entries.into_iter().map(|e| e.node).collect();
+        let used: std::collections::HashSet<NodeId> = entries.into_iter().map(|e| e.node).collect();
 
         for i in 0..=9u8 {
             let node = NodeId::try_from([b'l', b'o', b'c', b'0' + i])

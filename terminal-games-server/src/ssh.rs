@@ -77,7 +77,7 @@ impl SshServer {
         })
     }
 
-    pub async fn run(&mut self) -> Result<(), anyhow::Error> {
+    pub async fn run(&mut self, listener_token: CancellationToken) -> Result<(), anyhow::Error> {
         let host_key = match std::env::var("SSH_HOST_KEY_BASE64") {
             Ok(encoded) => {
                 let decoded = base64::engine::general_purpose::STANDARD
@@ -123,7 +123,10 @@ impl SshServer {
         tracing::info!(addr = %listen_addr, "Running SSH server");
         let socket = tokio::net::TcpListener::bind(listen_addr).await?;
         loop {
-            let (stream, remote_addr) = socket.accept().await?;
+            let (stream, remote_addr) = tokio::select! {
+                _ = listener_token.cancelled() => break,
+                result = socket.accept() => result?,
+            };
             if config.nodelay {
                 if let Err(e) = stream.set_nodelay(true) {
                     tracing::warn!("set_nodelay() failed: {e:?}");
@@ -155,6 +158,8 @@ impl SshServer {
                 }
             });
         }
+        tracing::info!("SSH listener stopped");
+        Ok(())
     }
 
     fn new_client(

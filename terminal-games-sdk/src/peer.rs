@@ -120,8 +120,7 @@ impl TryFrom<[u8; 16]> for PeerId {
 
     fn try_from(bytes: [u8; 16]) -> Result<Self, Self::Error> {
         let node_bytes: [u8; NodeId::BYTE_LEN] = bytes[0..NodeId::BYTE_LEN].try_into().unwrap();
-        let node = NodeId::try_from(node_bytes)
-            .map_err(|_| PeerError::InvalidId(PEER_ID_ERROR))?;
+        let node = NodeId::try_from(node_bytes).map_err(|_| PeerError::InvalidId(PEER_ID_ERROR))?;
         let timestamp = u64::from_be_bytes(bytes[NodeId::BYTE_LEN..12].try_into().unwrap());
         let randomness = u32::from_be_bytes(bytes[12..Self::BYTE_LEN].try_into().unwrap());
         Ok(Self {
@@ -352,8 +351,8 @@ impl Iterator for MessageReader {
         };
 
         if ret > 0 {
-            let from_peer = PeerId::try_from(self.from_peer_buf)
-                .expect("host returned invalid peer ID bytes");
+            let from_peer =
+                PeerId::try_from(self.from_peer_buf).expect("host returned invalid peer ID bytes");
             let data = self.data_buf[..ret as usize].to_vec();
             Some(Message {
                 from: from_peer,

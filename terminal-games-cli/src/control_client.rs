@@ -18,7 +18,8 @@ use terminal_games::control::{
     AdminControlRpcClient, AppControlRpcClient, AppSummary, AppTokenClaims, BanEntry,
     CONTROL_API_EXPECTED_VERSION_HEADER, CONTROL_API_VERSION, CONTROL_API_VERSION_HEADER,
     CONTROL_SERVER_VERSION_HEADER, ClusterKickedIpListRequest, ClusterKickedIpListResponse,
-    NodeDiscoveryResponse, NodeRuntimeStatus, SessionSummary, TickerEntry, rpc_context,
+    DrainStartRequest, NodeDiscoveryResponse, NodeRuntimeStatus, NodeShutdownStatus,
+    SessionSummary, TickerEntry, rpc_context,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::{
@@ -457,17 +458,46 @@ impl AdminClient {
 
     pub async fn node_statuses(&self) -> Result<Vec<NodeRuntimeStatus>> {
         let (_, node_urls) = self.discover().await?;
-        let futures = node_urls.values().cloned().map(|base_url| async move {
-            let rpc = connect_admin_rpc(&base_url, &self.token).await?;
-            rpc.local_node_status(rpc_context())
-                .await?
-                .map_err(anyhow::Error::msg)
-        });
+        let futures = node_urls
+            .values()
+            .cloned()
+            .map(|base_url| async move { self.local_node_status_at(&base_url).await });
         let mut statuses = Vec::new();
         for result in join_all(futures).await {
             statuses.push(result?);
         }
         Ok(statuses)
+    }
+
+    pub async fn local_node_status_at(&self, base_url: &str) -> Result<NodeRuntimeStatus> {
+        with_admin_rpc(base_url, &self.token, |rpc| async move {
+            rpc.local_node_status(rpc_context())
+                .await?
+                .map_err(anyhow::Error::msg)
+        })
+        .await
+    }
+
+    pub async fn drain_start_at(
+        &self,
+        base_url: &str,
+        request: DrainStartRequest,
+    ) -> Result<NodeShutdownStatus> {
+        with_admin_rpc(base_url, &self.token, |rpc| async move {
+            rpc.drain_start(rpc_context(), request)
+                .await?
+                .map_err(anyhow::Error::msg)
+        })
+        .await
+    }
+
+    pub async fn drain_cancel_at(&self, base_url: &str) -> Result<NodeShutdownStatus> {
+        with_admin_rpc(base_url, &self.token, |rpc| async move {
+            rpc.drain_cancel(rpc_context())
+                .await?
+                .map_err(anyhow::Error::msg)
+        })
+        .await
     }
 
     pub async fn completion_app_ids(&self) -> Result<Vec<String>> {

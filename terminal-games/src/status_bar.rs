@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, watch};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::SessionAppState;
-use crate::control::{BroadcastLevel, StatusBarState, TickerEntry};
+use crate::control::{BroadcastLevel, ShutdownPhase, StatusBarState, TickerEntry};
 use crate::palette::{self, Color};
 use crate::rate_limiting::NetworkInfo;
 use crate::terminal_profile::TerminalProfile;
@@ -219,15 +219,16 @@ impl StatusBar {
             Some(p.primary),
             true,
         );
+        let drain_badge = self.render_drain(&p).unwrap_or_default();
         let (right, ticker_click_cols) = if let Some(broadcast) = self.render_broadcast(&p) {
-            (broadcast + &ssh_callout, Vec::new())
+            (broadcast + &drain_badge + &ssh_callout, Vec::new())
         } else if let Some(notification) = self.render_notification(&p) {
-            (notification + &ssh_callout, Vec::new())
+            (notification + &drain_badge + &ssh_callout, Vec::new())
         } else if let Some(ticker) = self.render_ticker_content(&p) {
             let click_cols = ticker.click_cols;
-            (ticker.text + &ssh_callout, click_cols)
+            (ticker.text + &drain_badge + &ssh_callout, click_cols)
         } else {
-            (ssh_callout, Vec::new())
+            (drain_badge + &ssh_callout, Vec::new())
         };
         let right_start = (width as usize).saturating_sub(terminal_width(&right));
         self.input.set_ticker_click_targets(
@@ -313,6 +314,33 @@ impl StatusBar {
                 true,
             ),
         })
+    }
+
+    fn render_drain(&self, p: &palette::Palette) -> Option<String> {
+        let drain = self.shared_state.drain.as_ref()?;
+        let text = match drain.phase {
+            ShutdownPhase::Running => return None,
+            ShutdownPhase::Draining => {
+                let remaining = drain
+                    .deadline_unix_ms
+                    .map(|deadline_unix_ms| {
+                        ((deadline_unix_ms / 1000).saturating_sub(unix_now())).max(0)
+                    })
+                    .unwrap_or_default();
+                if remaining == 0 {
+                    "Maintenance drain in progress".to_string()
+                } else {
+                    format!("Maintenance in {}", format_hhmmss(remaining as u64))
+                }
+            }
+            ShutdownPhase::ShuttingDown => "Maintenance shutdown in progress".to_string(),
+        };
+        Some(style_padded_ansi_text(
+            text,
+            Some(p.on_primary),
+            Some(p.warning),
+            true,
+        ))
     }
 
     fn render_ticker_content(&mut self, p: &palette::Palette) -> Option<RenderedTicker> {
@@ -570,4 +598,11 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
+}
+
+fn format_hhmmss(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds / 60) % 60;
+    let secs = seconds % 60;
+    format!("{hours:02}:{minutes:02}:{secs:02}")
 }

@@ -136,7 +136,7 @@ impl WebServer {
         })
     }
 
-    pub async fn run(&self) -> anyhow::Result<()> {
+    pub async fn run(&self, listener_token: CancellationToken) -> anyhow::Result<()> {
         let tls_acceptor = load_tls_acceptor_from_env()?;
         let default_web_listen_addr = if tls_acceptor.is_some() {
             "0.0.0.0:443"
@@ -169,7 +169,10 @@ impl WebServer {
         let mut make_service = app.into_make_service_with_connect_info::<MyConnectInfo>();
         let listener = tokio::net::TcpListener::bind(listen_addr).await?;
         loop {
-            let (stream, remote_addr) = match listener.accept().await {
+            let (stream, remote_addr) = match tokio::select! {
+                _ = listener_token.cancelled() => break,
+                result = listener.accept() => result,
+            } {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("failed to accept web connection: {e}");
@@ -227,6 +230,8 @@ impl WebServer {
                 }
             });
         }
+        tracing::info!("Web listener stopped");
+        Ok(())
     }
 }
 
@@ -374,6 +379,10 @@ async fn websocket_handler(
     State(server): State<WebServer>,
     ConnectInfo(connect_info): ConnectInfo<MyConnectInfo>,
 ) -> Response {
+    if !server.admission_controller.accepting_new_sessions() {
+        return maintenance_unavailable_response();
+    }
+
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -802,11 +811,21 @@ struct PowChallengeResponse {
     difficulty: u8,
 }
 
-async fn pow_challenge_handler(
-    State(server): State<WebServer>,
-) -> axum::Json<PowChallengeResponse> {
+async fn pow_challenge_handler(State(server): State<WebServer>) -> Response {
+    if !server.admission_controller.accepting_new_sessions() {
+        return maintenance_unavailable_response();
+    }
+
     let challenge = server.pow.issue();
-    axum::Json(challenge)
+    axum::Json(challenge).into_response()
+}
+
+fn maintenance_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        SessionEndReason::ServerShutdown.user_message(),
+    )
+        .into_response()
 }
 
 struct PowGate {
