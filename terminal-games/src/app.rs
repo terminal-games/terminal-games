@@ -1519,13 +1519,12 @@ impl AppServer {
         if data_len > 64 * 1024 {
             return Ok(PEER_SEND_ERR_DATA_TOO_LARGE);
         }
-        const PEER_ID_SIZE: usize = std::mem::size_of::<PeerId>();
         let peer_ids_offset = peer_ids_ptr as usize;
         let peer_ids_count = peer_ids_count as usize;
         let mut peer_ids = Vec::with_capacity(peer_ids_count);
         for i in 0..peer_ids_count {
-            let offset = i * PEER_ID_SIZE;
-            let mut peer_id_bytes = [0u8; PEER_ID_SIZE];
+            let offset = i * PeerId::BYTE_LEN;
+            let mut peer_id_bytes = [0u8; PeerId::BYTE_LEN];
             mem.read(&caller, peer_ids_offset + offset, &mut peer_id_bytes)?;
             let peer_id = match crate::mesh::PeerId::from_bytes(peer_id_bytes) {
                 Ok(peer_id) => peer_id,
@@ -1636,11 +1635,10 @@ impl AppServer {
                 &(total_count as u32).to_le_bytes(),
             )?;
 
-            const PEER_ID_SIZE: usize = 16;
             let ptr_offset = peer_ids_ptr as usize;
 
             for (i, peer_id) in peers.iter().take(length).enumerate() {
-                let write_offset = ptr_offset + (i * PEER_ID_SIZE);
+                let write_offset = ptr_offset + (i * PeerId::BYTE_LEN);
                 let peer_id_bytes = peer_id.to_bytes();
                 mem.write(&mut caller, write_offset, &peer_id_bytes)?;
             }

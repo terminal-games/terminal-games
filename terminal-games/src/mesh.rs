@@ -165,6 +165,7 @@ impl AppRuntimeUpdateMessage {
     }
 }
 
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(try_from = "[u8; 4]", into = "[u8; 4]")]
 pub struct NodeId([u8; 4]);
@@ -173,10 +174,14 @@ const NODE_ID_BYTES: usize = 4;
 const NODE_ID_ERROR: &str = "node id must be valid UTF-8 and occupy exactly 4 bytes";
 
 impl NodeId {
+    pub const BYTE_LEN: usize = NODE_ID_BYTES;
+
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.0).expect("NodeId invariant violated")
     }
 }
+
+const _: [(); NodeId::BYTE_LEN] = [(); std::mem::size_of::<NodeId>()];
 
 impl TryFrom<[u8; 4]> for NodeId {
     type Error = &'static str;
@@ -208,39 +213,45 @@ impl Display for NodeId {
     }
 }
 
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct PeerId {
     node: NodeId,
-    timestamp: u64,
     randomness: u32,
+    timestamp: u64,
 }
 
 impl PeerId {
+    pub const BYTE_LEN: usize =
+        NodeId::BYTE_LEN + std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
+
     pub fn to_bytes(&self) -> [u8; 16] {
-        let mut bytes = [0u8; 16];
-        bytes[0..4].copy_from_slice(&self.node.0);
-        bytes[4..12].copy_from_slice(&self.timestamp.to_be_bytes());
-        bytes[12..16].copy_from_slice(&self.randomness.to_be_bytes());
+        let mut bytes = [0u8; Self::BYTE_LEN];
+        bytes[0..NodeId::BYTE_LEN].copy_from_slice(&self.node.0);
+        bytes[NodeId::BYTE_LEN..12].copy_from_slice(&self.timestamp.to_be_bytes());
+        bytes[12..Self::BYTE_LEN].copy_from_slice(&self.randomness.to_be_bytes());
         bytes
     }
 
-    pub fn from_bytes(bytes: [u8; 16]) -> anyhow::Result<Self> {
-        let mut node_bytes = [0u8; 4];
-        node_bytes.copy_from_slice(&bytes[0..4]);
+    pub fn from_bytes(bytes: [u8; Self::BYTE_LEN]) -> anyhow::Result<Self> {
+        let mut node_bytes = [0u8; NodeId::BYTE_LEN];
+        node_bytes.copy_from_slice(&bytes[0..NodeId::BYTE_LEN]);
         let mut timestamp_bytes = [0u8; 8];
-        timestamp_bytes.copy_from_slice(&bytes[4..12]);
+        timestamp_bytes.copy_from_slice(&bytes[NodeId::BYTE_LEN..12]);
         let mut randomness_bytes = [0u8; 4];
-        randomness_bytes.copy_from_slice(&bytes[12..16]);
+        randomness_bytes.copy_from_slice(&bytes[12..Self::BYTE_LEN]);
         let node = NodeId::try_from(node_bytes).map_err(anyhow::Error::msg)?;
         let timestamp = u64::from_be_bytes(timestamp_bytes);
         let randomness = u32::from_be_bytes(randomness_bytes);
         Ok(Self {
-            timestamp,
-            randomness,
             node,
+            randomness,
+            timestamp,
         })
     }
 }
+
+const _: [(); PeerId::BYTE_LEN] = [(); std::mem::size_of::<PeerId>()];
 
 impl Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
