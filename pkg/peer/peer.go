@@ -23,6 +23,7 @@ const (
 	peerSendErrDataTooLarge     = -2
 	peerSendErrChannelFull      = -3
 	peerSendErrChannelClosed    = -4
+	peerSendErrInvalidPeerID    = -5
 
 	peerRecvErrChannelDisconnected = -1
 )
@@ -65,6 +66,7 @@ var (
 	ErrDataTooLarge         = errors.New("data too large: maximum 64KB")
 	ErrChannelFull          = errors.New("send channel full, message dropped")
 	ErrChannelClosed        = errors.New("send channel closed")
+	ErrInvalidPeerID        = errors.New("invalid peer ID: peer ID contains invalid node bytes")
 	ErrChannelDisconnected  = errors.New("receive channel disconnected")
 	ErrListFailed           = errors.New("peer_list failed")
 )
@@ -235,6 +237,8 @@ func sendErrorFromCode(code int32) error {
 		return ErrChannelFull
 	case peerSendErrChannelClosed:
 		return ErrChannelClosed
+	case peerSendErrInvalidPeerID:
+		return ErrInvalidPeerID
 	default:
 		return fmt.Errorf("unknown peer_send error: %d", code)
 	}
