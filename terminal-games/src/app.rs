@@ -74,6 +74,8 @@ const PEER_SEND_ERR_INVALID_PEER_ID: i32 = -5;
 
 const PEER_RECV_ERR_CHANNEL_DISCONNECTED: i32 = -1;
 
+const NODE_LATENCY_ERR_UNKNOWN: i32 = -1;
+
 // Menu request error codes
 const MENU_REQ_ERR_NOT_MENU_APP: i32 = -1;
 const MENU_REQ_ERR_INVALID_INPUT: i32 = -2;
@@ -1601,13 +1603,13 @@ impl AppServer {
 
             let node_id = match NodeId::try_from(node_bytes) {
                 Ok(node_id) => node_id,
-                Err(_) => return Ok(-1),
+                Err(_) => return Ok(NODE_LATENCY_ERR_UNKNOWN),
             };
 
             let mesh = &caller.data().ctx.mesh;
             match mesh.get_node_latency(node_id).await {
                 Some(latency) => Ok(latency.as_millis() as i32),
-                None => Ok(-1), // Unknown latency is a valid semantic response
+                None => Ok(NODE_LATENCY_ERR_UNKNOWN),
             }
         })
     }
@@ -1623,7 +1625,8 @@ impl AppServer {
 
             let app_id = caller.data().app.app_id;
             let mesh = &caller.data().ctx.mesh;
-            let peers = mesh.get_peers_for_app(app_id).await;
+            let mut peers = mesh.get_peers_for_app(app_id).await.into_iter().collect::<Vec<_>>();
+            peers.sort_unstable();
 
             let total_count = peers.len();
             let length = std::cmp::min(length as usize, 65536);

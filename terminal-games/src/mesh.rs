@@ -741,6 +741,10 @@ impl Mesh {
     }
 
     pub async fn get_node_latency(&self, node: NodeId) -> Option<Duration> {
+        if node == self.inner.node {
+            return Some(Duration::ZERO);
+        }
+
         let nodes = self.inner.nodes.lock().await;
         nodes
             .get(&node)
