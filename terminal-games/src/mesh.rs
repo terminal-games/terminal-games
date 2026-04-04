@@ -114,7 +114,7 @@ trait MeshRpc {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PeerListSyncMessage {
-    region: RegionId,
+    node: NodeId,
     peers_by_app: Vec<(AppId, Vec<PeerId>)>,
 }
 
@@ -166,71 +166,90 @@ impl AppRuntimeUpdateMessage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-pub struct RegionId([u8; 4]);
+#[serde(try_from = "[u8; 4]", into = "[u8; 4]")]
+pub struct NodeId([u8; 4]);
 
-impl RegionId {
-    pub fn from_bytes(bytes: [u8; 4]) -> Self {
-        Self(bytes)
-    }
+const NODE_ID_BYTES: usize = 4;
+const NODE_ID_ERROR: &str = "node id must be valid UTF-8 and occupy exactly 4 bytes";
 
-    pub fn as_bytes(&self) -> &[u8; 4] {
-        &self.0
+impl NodeId {
+    pub const BYTE_LEN: usize = NODE_ID_BYTES;
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).expect("NodeId invariant violated")
     }
 }
 
-impl Display for RegionId {
+impl TryFrom<[u8; 4]> for NodeId {
+    type Error = &'static str;
+
+    fn try_from(bytes: [u8; 4]) -> Result<Self, Self::Error> {
+        std::str::from_utf8(&bytes).map_err(|_| NODE_ID_ERROR)?;
+        Ok(Self(bytes))
+    }
+}
+
+impl std::str::FromStr for NodeId {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let bytes: [u8; NODE_ID_BYTES] = value.as_bytes().try_into().map_err(|_| NODE_ID_ERROR)?;
+        Self::try_from(bytes)
+    }
+}
+
+impl From<NodeId> for [u8; 4] {
+    fn from(node_id: NodeId) -> Self {
+        node_id.0
+    }
+}
+
+impl Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let filtered: Vec<u8> = self
-            .as_bytes()
-            .iter()
-            .copied()
-            .filter(|&b| b != 0)
-            .collect();
-        if let Ok(s) = std::str::from_utf8(&filtered) {
-            write!(f, "{}", s)
-        } else {
-            write!(f, "{}", hex::encode(self.as_bytes()))
-        }
+        f.write_str(self.as_str())
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct PeerId {
-    region: RegionId,
+    node: NodeId,
     timestamp: u64,
     randomness: u32,
 }
 
 impl PeerId {
+    pub const BYTE_LEN: usize =
+        NodeId::BYTE_LEN + std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
+
     pub fn to_bytes(&self) -> [u8; 16] {
-        let mut bytes = [0u8; 16];
-        bytes[0..4].copy_from_slice(self.region.as_bytes());
-        bytes[4..12].copy_from_slice(&self.timestamp.to_be_bytes());
-        bytes[12..16].copy_from_slice(&self.randomness.to_be_bytes());
+        let mut bytes = [0u8; Self::BYTE_LEN];
+        bytes[0..NodeId::BYTE_LEN].copy_from_slice(&self.node.0);
+        bytes[NodeId::BYTE_LEN..12].copy_from_slice(&self.timestamp.to_be_bytes());
+        bytes[12..Self::BYTE_LEN].copy_from_slice(&self.randomness.to_be_bytes());
         bytes
     }
 
-    pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        let mut region_bytes = [0u8; 4];
-        region_bytes.copy_from_slice(&bytes[0..4]);
+    pub fn from_bytes(bytes: [u8; Self::BYTE_LEN]) -> anyhow::Result<Self> {
+        let mut node_bytes = [0u8; NodeId::BYTE_LEN];
+        node_bytes.copy_from_slice(&bytes[0..NodeId::BYTE_LEN]);
         let mut timestamp_bytes = [0u8; 8];
-        timestamp_bytes.copy_from_slice(&bytes[4..12]);
+        timestamp_bytes.copy_from_slice(&bytes[NodeId::BYTE_LEN..12]);
         let mut randomness_bytes = [0u8; 4];
-        randomness_bytes.copy_from_slice(&bytes[12..16]);
-        let region = RegionId::from_bytes(region_bytes);
+        randomness_bytes.copy_from_slice(&bytes[12..Self::BYTE_LEN]);
+        let node = NodeId::try_from(node_bytes).map_err(anyhow::Error::msg)?;
         let timestamp = u64::from_be_bytes(timestamp_bytes);
         let randomness = u32::from_be_bytes(randomness_bytes);
-        Self {
+        Ok(Self {
+            node,
             timestamp,
             randomness,
-            region,
-        }
+        })
     }
 }
 
 impl Display for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}-{}-{}", self.timestamp, self.randomness, self.region)
+        write!(f, "{}-{}-{}", self.node, self.timestamp, self.randomness)
     }
 }
 
@@ -278,7 +297,7 @@ impl PeerMessageApp {
 
 #[async_trait::async_trait]
 pub trait Discovery: Send + Sync {
-    async fn discover_peers(&self) -> anyhow::Result<HashSet<(RegionId, SocketAddr)>>;
+    async fn discover_peers(&self) -> anyhow::Result<HashSet<(NodeId, SocketAddr)>>;
 }
 
 pub struct EnvDiscovery;
@@ -287,11 +306,44 @@ impl EnvDiscovery {
     pub fn new() -> Self {
         Self
     }
+
+    fn parse_peer(entry: &str) -> anyhow::Result<(NodeId, SocketAddr)> {
+        let node_str = entry.get(..NODE_ID_BYTES).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid peer node format '{}': expected 'node:address' (e.g., 'loca:127.0.0.1:3001')",
+                entry
+            )
+        })?;
+        let addr_str = entry
+            .get(NODE_ID_BYTES..)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid peer node format '{}': expected 'node:address' (e.g., 'loca:127.0.0.1:3001')",
+                    entry
+                )
+            })?;
+        if addr_str.is_empty() {
+            anyhow::bail!(
+                "Invalid peer node format '{}': socket address cannot be empty",
+                entry
+            );
+        }
+
+        let node = node_str
+            .parse::<NodeId>()
+            .map_err(|error| anyhow::anyhow!("Invalid peer node format '{}': {}", entry, error))?;
+        let addr = addr_str
+            .parse::<SocketAddr>()
+            .map_err(|error| anyhow::anyhow!("Invalid socket address '{}': {}", addr_str, error))?;
+
+        Ok((node, addr))
+    }
 }
 
 #[async_trait::async_trait]
 impl Discovery for EnvDiscovery {
-    async fn discover_peers(&self) -> anyhow::Result<HashSet<(RegionId, SocketAddr)>> {
+    async fn discover_peers(&self) -> anyhow::Result<HashSet<(NodeId, SocketAddr)>> {
         let nodes_env = std::env::var("PEER_NODES").unwrap_or_else(|_| String::new());
 
         if nodes_env.is_empty() {
@@ -300,31 +352,9 @@ impl Discovery for EnvDiscovery {
 
         nodes_env
             .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                let colon_idx = s.find(':').ok_or_else(|| {
-                    anyhow::anyhow!("Invalid peer node format '{}': expected 'region:address' (e.g., 'loca:127.0.0.1:3001')", s)
-                })?;
-
-                let region_str = &s[..colon_idx];
-                let addr_str = &s[colon_idx + 1..];
-
-                if region_str.is_empty() {
-                    return Err(anyhow::anyhow!("Invalid peer node format '{}': region cannot be empty", s));
-                }
-
-                let mut region_bytes = [0u8; 4];
-                let region_id_bytes = region_str.as_bytes();
-                let copy_len = region_id_bytes.len().min(4);
-                region_bytes[..copy_len].copy_from_slice(&region_id_bytes[..copy_len]);
-                let region = RegionId::from_bytes(region_bytes);
-
-                let addr = addr_str.parse::<SocketAddr>()
-                    .map_err(|e| anyhow::anyhow!("Invalid socket address '{}': {}", addr_str, e))?;
-
-                Ok((region, addr))
-            })
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(Self::parse_peer)
             .collect()
     }
 }
@@ -336,7 +366,7 @@ pub struct LocalDiscovery {
 
 #[derive(Clone, Copy)]
 struct LocalRegistryEntry {
-    region: RegionId,
+    node: NodeId,
     port: u16,
     pid: u32,
 }
@@ -352,25 +382,26 @@ impl LocalDiscovery {
         }
     }
 
-    pub fn allocate_region(&self) -> anyhow::Result<RegionId> {
+    pub fn allocate_node(&self) -> anyhow::Result<NodeId> {
         let entries = self.read_entries();
-        let used: std::collections::HashSet<RegionId> =
-            entries.into_iter().map(|e| e.region).collect();
+        let used: std::collections::HashSet<NodeId> =
+            entries.into_iter().map(|e| e.node).collect();
 
         for i in 0..=9u8 {
-            let region = RegionId::from_bytes([b'l', b'o', b'c', b'0' + i]);
-            if !used.contains(&region) {
-                return Ok(region);
+            let node = NodeId::try_from([b'l', b'o', b'c', b'0' + i])
+                .expect("generated local node id must be valid UTF-8");
+            if !used.contains(&node) {
+                return Ok(node);
             }
         }
         Err(anyhow::anyhow!(
-            "No available region slots (loc0-loc9 all in use)"
+            "No available node slots (loc0-loc9 all in use)"
         ))
     }
 
-    pub async fn register(&self, region: RegionId, port: u16) -> anyhow::Result<()> {
+    pub async fn register(&self, node: NodeId, port: u16) -> anyhow::Result<()> {
         let pid = std::process::id();
-        let entry = LocalRegistryEntry { region, port, pid };
+        let entry = LocalRegistryEntry { node, port, pid };
         *self.self_entry.lock().await = Some(entry);
         self.write_entry(&entry).await
     }
@@ -383,42 +414,51 @@ impl LocalDiscovery {
         Ok(())
     }
 
+    fn format_entry(entry: &LocalRegistryEntry) -> anyhow::Result<String> {
+        Ok(format!(
+            "{}\t{}\t{}",
+            serde_json::to_string(entry.node.as_str())?,
+            entry.port,
+            entry.pid
+        ))
+    }
+
+    fn write_entries(&self, entries: &[LocalRegistryEntry]) -> anyhow::Result<()> {
+        let contents = if entries.is_empty() {
+            String::new()
+        } else {
+            entries
+                .iter()
+                .map(Self::format_entry)
+                .collect::<anyhow::Result<Vec<_>>>()?
+                .join("\n")
+                + "\n"
+        };
+        std::fs::write(&self.registry_path, contents)?;
+        Ok(())
+    }
+
     async fn write_entry(&self, entry: &LocalRegistryEntry) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.registry_path)?;
-        writeln!(
-            file,
-            "{}:{}:{}",
-            hex::encode(entry.region.as_bytes()),
-            entry.port,
-            entry.pid
-        )?;
+        writeln!(file, "{}", Self::format_entry(entry)?)?;
         Ok(())
     }
 
     async fn remove_entry(&self, entry: &LocalRegistryEntry) -> anyhow::Result<()> {
-        let contents = match std::fs::read_to_string(&self.registry_path) {
-            Ok(c) => c,
-            Err(_) => return Ok(()),
-        };
-        let filtered: Vec<&str> = contents
-            .lines()
-            .filter(|line| {
-                if let Some((_, rest)) = line.split_once(':') {
-                    if let Some((port_str, pid_str)) = rest.split_once(':') {
-                        let port_match = port_str.parse::<u16>().ok() == Some(entry.port);
-                        let pid_match = pid_str.parse::<u32>().ok() == Some(entry.pid);
-                        return !(port_match && pid_match);
-                    }
-                }
-                true
-            })
+        if !self.registry_path.exists() {
+            return Ok(());
+        }
+
+        let filtered: Vec<LocalRegistryEntry> = self
+            .read_entries()
+            .into_iter()
+            .filter(|existing| !(existing.port == entry.port && existing.pid == entry.pid))
             .collect();
-        std::fs::write(&self.registry_path, filtered.join("\n") + "\n")?;
-        Ok(())
+        self.write_entries(&filtered)
     }
 
     fn read_entries(&self) -> Vec<LocalRegistryEntry> {
@@ -430,41 +470,32 @@ impl LocalDiscovery {
         let entries: Vec<LocalRegistryEntry> = contents
             .lines()
             .filter_map(|line| {
-                let parts: Vec<&str> = line.splitn(3, ':').collect();
-                if parts.len() != 3 {
-                    return None;
-                }
-                let region_hex = parts[0];
-                let port = parts[1].parse::<u16>().ok()?;
-                let pid = parts[2].parse::<u32>().ok()?;
+                let mut parts = line.splitn(3, '\t');
+                let node_str = serde_json::from_str::<String>(parts.next()?).ok()?;
+                let port = parts.next()?.parse::<u16>().ok()?;
+                let pid = parts.next()?.parse::<u32>().ok()?;
 
                 let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
                 if !alive {
                     return None;
                 }
 
-                let region_bytes: [u8; 4] = hex::decode(region_hex).ok()?.try_into().ok()?;
-                let region = RegionId::from_bytes(region_bytes);
+                let node = node_str.parse::<NodeId>().ok()?;
 
-                Some(LocalRegistryEntry { region, port, pid })
+                Some(LocalRegistryEntry { node, port, pid })
             })
             .collect();
 
-        let canonical = if entries.is_empty() {
-            String::new()
+        let canonical = entries
+            .iter()
+            .map(Self::format_entry)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("local registry entries should serialize")
+            .join("\n");
+        let canonical = if canonical.is_empty() {
+            canonical
         } else {
-            let lines: Vec<String> = entries
-                .iter()
-                .map(|entry| {
-                    format!(
-                        "{}:{}:{}",
-                        hex::encode(entry.region.as_bytes()),
-                        entry.port,
-                        entry.pid
-                    )
-                })
-                .collect();
-            lines.join("\n") + "\n"
+            canonical + "\n"
         };
         if canonical != contents {
             let _ = std::fs::write(&self.registry_path, canonical);
@@ -476,7 +507,7 @@ impl LocalDiscovery {
 
 #[async_trait::async_trait]
 impl Discovery for LocalDiscovery {
-    async fn discover_peers(&self) -> anyhow::Result<HashSet<(RegionId, SocketAddr)>> {
+    async fn discover_peers(&self) -> anyhow::Result<HashSet<(NodeId, SocketAddr)>> {
         let self_entry = *self.self_entry.lock().await;
         let entries = self.read_entries();
 
@@ -491,7 +522,7 @@ impl Discovery for LocalDiscovery {
             })
             .map(|e| {
                 let addr: SocketAddr = ([127, 0, 0, 1], e.port).into();
-                (e.region, addr)
+                (e.node, addr)
             })
             .collect();
 
@@ -505,23 +536,23 @@ struct ActiveConnection {
     addr: SocketAddr,
 }
 
-enum RegionState {
+enum NodeState {
     Pending(SocketAddr),
     Active(ActiveConnection),
 }
 
-impl RegionState {
+impl NodeState {
     fn as_active(&self) -> Option<&ActiveConnection> {
         match self {
-            RegionState::Active(conn) => Some(conn),
-            RegionState::Pending(_) => None,
+            NodeState::Active(conn) => Some(conn),
+            NodeState::Pending(_) => None,
         }
     }
 }
 
 struct MeshInner {
-    region: RegionId,
-    regions: Mutex<HashMap<RegionId, RegionState>>,
+    node: NodeId,
+    nodes: Mutex<HashMap<NodeId, NodeState>>,
     peers: Mutex<HashMap<AppId, HashMap<PeerId, tokio::sync::mpsc::Sender<PeerMessageApp>>>>,
     global_peers: Mutex<HashMap<AppId, HashSet<PeerId>>>,
     latest_app_runtime_updates: Mutex<HashMap<u64, AppRuntimeUpdateMessage>>,
@@ -539,20 +570,19 @@ pub struct Mesh {
 
 impl Mesh {
     pub fn new(discovery: Arc<dyn Discovery>) -> Self {
-        let region_id_str = std::env::var("REGION_ID").unwrap_or_else(|_| "loca".to_string());
-        let mut region_bytes = [0u8; 4];
-        let region_id_bytes = region_id_str.as_bytes();
-        let copy_len = region_id_bytes.len().min(4);
-        region_bytes[..copy_len].copy_from_slice(&region_id_bytes[..copy_len]);
-        Self::with_region(discovery, RegionId::from_bytes(region_bytes))
+        let node_id_str = std::env::var("NODE_ID").unwrap_or_else(|_| "loca".to_string());
+        let node = node_id_str
+            .parse::<NodeId>()
+            .unwrap_or_else(|error| panic!("invalid NODE_ID '{}': {}", node_id_str, error));
+        Self::with_node(discovery, node)
     }
 
-    pub fn with_region(discovery: Arc<dyn Discovery>, region: RegionId) -> Self {
+    pub fn with_node(discovery: Arc<dyn Discovery>, node: NodeId) -> Self {
         Self {
             inner: Arc::new(MeshInner {
                 app_runtime_updates: broadcast::channel(64).0,
-                region,
-                regions: Default::default(),
+                node,
+                nodes: Default::default(),
                 peers: Default::default(),
                 global_peers: Default::default(),
                 latest_app_runtime_updates: Default::default(),
@@ -564,8 +594,8 @@ impl Mesh {
         }
     }
 
-    pub fn region(&self) -> RegionId {
-        self.inner.region
+    pub fn node(&self) -> NodeId {
+        self.inner.node
     }
 
     pub async fn new_peer(
@@ -582,7 +612,7 @@ impl Mesh {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or_default(),
             randomness: rand_core::OsRng.next_u32(),
-            region: self.inner.region,
+            node: self.inner.node,
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -710,27 +740,31 @@ impl Mesh {
         Ok(())
     }
 
-    pub async fn get_region_latency(&self, region: RegionId) -> Option<Duration> {
-        let regions = self.inner.regions.lock().await;
-        regions
-            .get(&region)
+    pub async fn get_node_latency(&self, node: NodeId) -> Option<Duration> {
+        if node == self.inner.node {
+            return Some(Duration::ZERO);
+        }
+
+        let nodes = self.inner.nodes.lock().await;
+        nodes
+            .get(&node)
             .and_then(|s| s.as_active())
             .and_then(|conn| get_tcp_rtt_from_fd(conn.conn_fd).ok())
     }
 
-    pub async fn discover_regions(&self) -> anyhow::Result<Vec<RegionId>> {
-        let mut regions = self
+    pub async fn discover_nodes(&self) -> anyhow::Result<Vec<NodeId>> {
+        let mut nodes = self
             .inner
             .discovery
             .discover_peers()
             .await?
             .into_iter()
-            .map(|(region, _)| region)
+            .map(|(node, _)| node)
             .collect::<Vec<_>>();
-        regions.push(self.inner.region);
-        regions.sort_unstable();
-        regions.dedup();
-        Ok(regions)
+        nodes.push(self.inner.node);
+        nodes.sort_unstable();
+        nodes.dedup();
+        Ok(nodes)
     }
 
     pub async fn graceful_shutdown(&self) {
@@ -761,15 +795,15 @@ impl Mesh {
 
 impl MeshInner {
     async fn broadcast(&self, message: Message) {
-        let region_txs: Vec<_> = {
-            let regions = self.regions.lock().await;
-            regions
+        let node_txs: Vec<_> = {
+            let nodes = self.nodes.lock().await;
+            nodes
                 .iter()
                 .filter_map(|(_, state)| state.as_active().map(|conn| conn.tx.clone()))
                 .collect()
         };
 
-        let send_futures: Vec<_> = region_txs
+        let send_futures: Vec<_> = node_txs
             .into_iter()
             .map(|tx| {
                 let msg = message.clone();
@@ -783,11 +817,11 @@ impl MeshInner {
     }
 
     async fn send_peer_message(&self, message: PeerMessage) {
-        let mut region_partitions: HashMap<RegionId, Vec<PeerId>> = Default::default();
+        let mut node_partitions: HashMap<NodeId, Vec<PeerId>> = Default::default();
         let num_peers = message.to_peers.len();
         for peer_id in message.to_peers {
-            region_partitions
-                .entry(peer_id.region)
+            node_partitions
+                .entry(peer_id.node)
                 .or_insert_with(|| Vec::with_capacity(num_peers))
                 .push(peer_id);
         }
@@ -795,9 +829,9 @@ impl MeshInner {
         let data = Arc::new(message.data);
 
         let mut send_futures: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> =
-            Vec::with_capacity(region_partitions.len() - 1 + num_peers);
-        for (region, peer_ids) in region_partitions {
-            if region == self.region {
+            Vec::with_capacity(node_partitions.len() - 1 + num_peers);
+        for (node, peer_ids) in node_partitions {
+            if node == self.node {
                 let local_sends: Vec<_> = {
                     let peers = self.peers.lock().await;
                     let app_peers = peers.get(&message.app_id);
@@ -824,9 +858,9 @@ impl MeshInner {
                 }
             } else {
                 let remote_tx = {
-                    let regions = self.regions.lock().await;
-                    regions
-                        .get(&region)
+                    let nodes = self.nodes.lock().await;
+                    nodes
+                        .get(&node)
                         .and_then(|s| s.as_active())
                         .map(|conn| conn.tx.clone())
                 };
@@ -841,11 +875,11 @@ impl MeshInner {
 
                     send_futures.push(Box::pin(async move {
                         if let Err(error) = tx.send(Message::PeerMessage(batched_message)).await {
-                            tracing::error!(%region, ?error, "failed to send to remote region");
+                            tracing::error!(%node, ?error, "failed to send to remote node");
                         }
                     }));
                 } else {
-                    tracing::error!(%region, "remote region not connected");
+                    tracing::error!(%node, "remote node not connected");
                 }
             }
         }
@@ -855,34 +889,34 @@ impl MeshInner {
 
     async fn connect_to_node(
         self: &Arc<Self>,
-        region: RegionId,
+        node: NodeId,
         addr: SocketAddr,
     ) -> anyhow::Result<()> {
         {
-            let mut regions = self.regions.lock().await;
-            if let Some(existing) = regions.get(&region) {
+            let mut nodes = self.nodes.lock().await;
+            if let Some(existing) = nodes.get(&node) {
                 let existing_addr = match existing {
-                    RegionState::Pending(existing_addr) => *existing_addr,
-                    RegionState::Active(conn) => conn.addr,
+                    NodeState::Pending(existing_addr) => *existing_addr,
+                    NodeState::Active(conn) => conn.addr,
                 };
                 if existing_addr == addr {
-                    tracing::debug!(%region, "Already connected or connecting to region, skipping");
+                    tracing::debug!(%node, "Already connected or connecting to node, skipping");
                     return Ok(());
                 }
             }
-            regions.insert(region, RegionState::Pending(addr));
+            nodes.insert(node, NodeState::Pending(addr));
         }
 
         let stream = match TcpStream::connect(addr).await {
             Ok(stream) => {
-                tracing::info!(%region, peer = %addr, "Connected TCP to mesh node");
+                tracing::info!(%node, peer = %addr, "Connected TCP to mesh node");
                 stream
             }
             Err(e) => {
-                let mut regions = self.regions.lock().await;
-                if matches!(regions.get(&region), Some(RegionState::Pending(pending_addr)) if *pending_addr == addr)
+                let mut nodes = self.nodes.lock().await;
+                if matches!(nodes.get(&node), Some(NodeState::Pending(pending_addr)) if *pending_addr == addr)
                 {
-                    regions.remove(&region);
+                    nodes.remove(&node);
                 }
                 return Err(e.into());
             }
@@ -890,7 +924,7 @@ impl MeshInner {
 
         let inner = self.clone();
         self.tasks.spawn(async move {
-            inner.handle_connection(stream, addr, Some(region)).await;
+            inner.handle_connection(stream, addr, Some(node)).await;
         });
 
         Ok(())
@@ -898,25 +932,25 @@ impl MeshInner {
 
     async fn heal_network(self: &Arc<Self>) -> anyhow::Result<()> {
         let discovered = self.discovery.discover_peers().await?;
-        let discovered_by_region: HashMap<RegionId, SocketAddr> = discovered.into_iter().collect();
-        let current_regions: HashMap<RegionId, SocketAddr> = {
-            let regions = self.regions.lock().await;
-            regions
+        let discovered_by_node: HashMap<NodeId, SocketAddr> = discovered.into_iter().collect();
+        let current_nodes: HashMap<NodeId, SocketAddr> = {
+            let nodes = self.nodes.lock().await;
+            nodes
                 .iter()
-                .map(|(region, state)| {
+                .map(|(node, state)| {
                     let addr = match state {
-                        RegionState::Pending(addr) => *addr,
-                        RegionState::Active(conn) => conn.addr,
+                        NodeState::Pending(addr) => *addr,
+                        NodeState::Active(conn) => conn.addr,
                     };
-                    (*region, addr)
+                    (*node, addr)
                 })
                 .collect()
         };
 
-        let targets: Vec<(RegionId, SocketAddr)> = discovered_by_region
+        let targets: Vec<(NodeId, SocketAddr)> = discovered_by_node
             .into_iter()
-            .filter(|(region, _)| *region != self.region)
-            .filter(|(region, addr)| current_regions.get(region) != Some(addr))
+            .filter(|(node, _)| *node != self.node)
+            .filter(|(node, addr)| current_nodes.get(node) != Some(addr))
             .collect();
 
         if targets.is_empty() {
@@ -927,11 +961,11 @@ impl MeshInner {
 
         let connect_futures: Vec<_> = targets
             .into_iter()
-            .map(|(region, addr)| {
+            .map(|(node, addr)| {
                 let inner = self.clone();
                 async move {
-                    if let Err(e) = inner.connect_to_node(region, addr).await {
-                        tracing::warn!(%region, %addr, ?e, "Failed to connect");
+                    if let Err(e) = inner.connect_to_node(node, addr).await {
+                        tracing::warn!(%node, %addr, ?e, "Failed to connect");
                     }
                 }
             })
@@ -945,39 +979,39 @@ impl MeshInner {
         self: &Arc<Self>,
         stream: TcpStream,
         addr: SocketAddr,
-        expected_region: Option<RegionId>,
+        expected_node: Option<NodeId>,
     ) {
         let fd = stream.as_raw_fd();
         let result = self
-            .handle_connection_inner(stream, addr, expected_region)
+            .handle_connection_inner(stream, addr, expected_node)
             .await;
 
         if let Err(error) = &result {
-            tracing::warn!(%addr, ?expected_region, ?error, "Mesh connection failed");
+            tracing::warn!(%addr, ?expected_node, ?error, "Mesh connection failed");
         }
 
-        if expected_region.is_some() {
-            if let Some(region) = result.as_ref().ok().copied().or(expected_region) {
+        if expected_node.is_some() {
+            if let Some(node) = result.as_ref().ok().copied().or(expected_node) {
                 let removed = {
-                    let mut regions = self.regions.lock().await;
-                    match regions.get(&region) {
-                        Some(RegionState::Pending(pending_addr)) if *pending_addr == addr => {
-                            regions.remove(&region);
+                    let mut nodes = self.nodes.lock().await;
+                    match nodes.get(&node) {
+                        Some(NodeState::Pending(pending_addr)) if *pending_addr == addr => {
+                            nodes.remove(&node);
                             true
                         }
-                        Some(RegionState::Active(conn)) if conn.conn_fd == fd => {
-                            regions.remove(&region);
+                        Some(NodeState::Active(conn)) if conn.conn_fd == fd => {
+                            nodes.remove(&node);
                             true
                         }
                         _ => false,
                     }
                 };
                 if removed {
-                    tracing::info!(region=%region, %addr, "Disconnected");
+                    tracing::info!(node=%node, %addr, "Disconnected");
                 }
             }
-        } else if let Ok(region) = result {
-            tracing::info!(region=%region, %addr, "Disconnected");
+        } else if let Ok(node) = result {
+            tracing::info!(node=%node, %addr, "Disconnected");
         }
     }
 
@@ -985,9 +1019,9 @@ impl MeshInner {
         self: &Arc<Self>,
         stream: TcpStream,
         addr: SocketAddr,
-        expected_region: Option<RegionId>,
-    ) -> anyhow::Result<RegionId> {
-        let role = if expected_region.is_some() {
+        expected_node: Option<NodeId>,
+    ) -> anyhow::Result<NodeId> {
+        let role = if expected_node.is_some() {
             ConnectionRole::Outgoing
         } else {
             ConnectionRole::Incoming
@@ -1007,7 +1041,7 @@ impl MeshInner {
                 _,
             >(framed, tarpc::tokio_serde::formats::Bincode::default());
             let rpc_client = MeshRpcClient::new(client::Config::default(), transport).spawn();
-            let their_region = expected_region.expect("outgoing must have expected_region");
+            let their_node = expected_node.expect("outgoing must have expected_node");
 
             let local_peers_by_app = self
                 .peers
@@ -1027,7 +1061,7 @@ impl MeshInner {
                 .peer_list_sync(
                     context::current(),
                     PeerListSyncMessage {
-                        region: self.region,
+                        node: self.node,
                         peers_by_app: local_peers_by_app,
                     },
                 )
@@ -1059,7 +1093,7 @@ impl MeshInner {
                                 Message::AppRuntimeUpdated(msg) => rpc_client.app_runtime_updated(context::current(), msg).await,
                             };
                             if let Err(error) = send_result {
-                                tracing::warn!(region=%their_region, ?error, "RPC send failed");
+                                tracing::warn!(node=%their_node, ?error, "RPC send failed");
                                 break;
                             }
                         }
@@ -1068,9 +1102,9 @@ impl MeshInner {
                 let _ = done_tx.send(());
             });
 
-            self.regions.lock().await.insert(
-                their_region,
-                RegionState::Active(ActiveConnection {
+            self.nodes.lock().await.insert(
+                their_node,
+                NodeState::Active(ActiveConnection {
                     tx,
                     conn_fd: fd,
                     addr,
@@ -1082,12 +1116,12 @@ impl MeshInner {
                 _ = &mut done_rx => {}
             }
 
-            self.handle_region_disconnect(their_region).await;
-            return Ok(their_region);
+            self.handle_node_disconnect(their_node).await;
+            return Ok(their_node);
         }
 
-        let remote_region = Arc::new(Mutex::new(None));
-        let remote_region_for_server = remote_region.clone();
+        let remote_node = Arc::new(Mutex::new(None));
+        let remote_node_for_server = remote_node.clone();
         let inner = self.clone();
         let mut codec = LengthDelimitedCodec::new();
         codec.set_max_frame_length(MESH_MAX_FRAME_LEN);
@@ -1104,7 +1138,7 @@ impl MeshInner {
                 .execute(
                     MeshRpcServer {
                         inner,
-                        remote_region: remote_region_for_server,
+                        remote_node: remote_node_for_server,
                     }
                     .serve(),
                 )
@@ -1118,10 +1152,10 @@ impl MeshInner {
             _ = serve_fut => {}
         }
 
-        let maybe_region = *remote_region.lock().await;
-        if let Some(region) = maybe_region {
-            self.handle_region_disconnect(region).await;
-            Ok(region)
+        let maybe_node = *remote_node.lock().await;
+        if let Some(node) = maybe_node {
+            self.handle_node_disconnect(node).await;
+            Ok(node)
         } else {
             Err(anyhow::anyhow!("connection closed before authentication"))
         }
@@ -1130,13 +1164,13 @@ impl MeshInner {
     async fn handle_peer_list_sync(&self, msg: PeerListSyncMessage) {
         let mut global_peers = self.global_peers.lock().await;
 
-        // Remove old peers from this region
+        // Remove old peers from this node
         for (_, peers) in global_peers.iter_mut() {
-            peers.retain(|p| p.region != msg.region);
+            peers.retain(|p| p.node != msg.node);
         }
         global_peers.retain(|_, peers| !peers.is_empty());
 
-        // Add new peers from this region
+        // Add new peers from this node
         for (app_id, peer_ids) in msg.peers_by_app {
             global_peers
                 .entry(app_id)
@@ -1145,7 +1179,7 @@ impl MeshInner {
         }
 
         let total_peers: usize = global_peers.values().map(|s| s.len()).sum();
-        tracing::debug!(region=%msg.region, total_peers, "Received peer list sync");
+        tracing::debug!(node=%msg.node, total_peers, "Received peer list sync");
     }
 
     async fn handle_peer_added(&self, msg: PeerChangeMessage) {
@@ -1170,16 +1204,16 @@ impl MeshInner {
         tracing::debug!(peer=%msg.peer_id, app=%msg.app_id, "Remote peer removed");
     }
 
-    async fn handle_region_disconnect(&self, region: RegionId) {
+    async fn handle_node_disconnect(&self, node: NodeId) {
         let mut global_peers = self.global_peers.lock().await;
 
         for (_, peers) in global_peers.iter_mut() {
-            peers.retain(|p| p.region != region);
+            peers.retain(|p| p.node != node);
         }
 
         global_peers.retain(|_, peers| !peers.is_empty());
 
-        tracing::debug!(%region, "Region disconnected, removed all its peers");
+        tracing::debug!(%node, "Node disconnected, removed all its peers");
     }
 
     async fn handle_peer_message(&self, msg: PeerMessage) {
@@ -1529,7 +1563,7 @@ impl rustls::server::danger::ClientCertVerifier for PinnedClientCertVerifier {
 #[derive(Clone)]
 struct MeshRpcServer {
     inner: Arc<MeshInner>,
-    remote_region: Arc<Mutex<Option<RegionId>>>,
+    remote_node: Arc<Mutex<Option<NodeId>>>,
 }
 
 impl MeshRpc for MeshRpcServer {
@@ -1538,7 +1572,7 @@ impl MeshRpc for MeshRpcServer {
     }
 
     async fn peer_list_sync(self, _: context::Context, msg: PeerListSyncMessage) {
-        *self.remote_region.lock().await = Some(msg.region);
+        *self.remote_node.lock().await = Some(msg.node);
         self.inner.handle_peer_list_sync(msg).await;
         self.inner.heal_now.notify_one();
     }

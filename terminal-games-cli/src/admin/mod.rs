@@ -7,7 +7,7 @@ mod auth;
 mod ban_ip;
 mod broadcast;
 mod cluster_ip;
-mod regions;
+mod nodes;
 mod session;
 mod ticker;
 
@@ -41,8 +41,8 @@ enum AdminCommand {
     ClusterIpKicks(AdminClusterIpKicksArgs),
     /// Show a temporary broadcast notification to users.
     Broadcast(AdminBroadcastArgs),
-    /// Show runtime status for each region.
-    Regions,
+    /// Show runtime status for each node.
+    Nodes,
     #[command(subcommand)]
     /// Inspect and control live sessions.
     Session(AdminSessionCommand),
@@ -162,19 +162,19 @@ pub(super) struct AdminBroadcastArgs {
     /// Notification level. Defaults to info.
     #[arg(long, value_enum, default_value = "info")]
     level: BroadcastLevelArg,
-    /// Comma-separated region ids. Defaults to all regions.
+    /// Comma-separated node ids. Defaults to all nodes.
     #[arg(long)]
-    regions: Option<String>,
+    nodes: Option<String>,
     message: String,
     duration: String,
 }
 
 #[derive(Subcommand)]
 pub(super) enum AdminSessionCommand {
-    /// List all live sessions across all discovered regions.
+    /// List all live sessions across all discovered nodes.
     #[command(visible_alias = "ls")]
     List,
-    /// Disconnect a live session by its region-scoped session id.
+    /// Disconnect a live session by its node-scoped session id.
     Kick(AdminSessionKickArgs),
     /// Attach to a live session for monitoring or read-write control.
     Spy(AdminSessionSpyArgs),
@@ -237,7 +237,7 @@ pub async fn run(cli: AdminCli, profile: Option<String>) -> Result<()> {
         AdminCommand::Ticker(command) => ticker::run(command, profile).await,
         AdminCommand::ClusterIpKicks(args) => cluster_ip::run(args, profile).await,
         AdminCommand::Broadcast(args) => broadcast::run(args, profile).await,
-        AdminCommand::Regions => regions::run(profile).await,
+        AdminCommand::Nodes => nodes::run(profile).await,
         AdminCommand::Session(command) => session::run(command, profile).await,
         AdminCommand::App(command) => app::run(command, profile).await,
     }
@@ -372,23 +372,23 @@ pub(super) async fn refresh_status_bar_state(api: &AdminClient) -> Result<()> {
 }
 
 pub(super) fn parse_session_ref(value: &str) -> Result<(String, u64)> {
-    let (region, local_id) = value
+    let (node, local_id) = value
         .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("session id must be in REGION:ID format"))?;
+        .ok_or_else(|| anyhow::anyhow!("session id must be in NODE:ID format"))?;
     Ok((
-        region.to_string(),
+        node.to_string(),
         local_id
             .parse::<u64>()
             .with_context(|| format!("invalid session id '{local_id}'"))?,
     ))
 }
 
-pub(super) fn parse_regions_arg(value: Option<String>) -> Vec<String> {
+pub(super) fn parse_nodes_arg(value: Option<String>) -> Vec<String> {
     value
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
-        .filter(|region| !region.is_empty())
+        .filter(|node| !node.is_empty())
         .map(str::to_string)
         .collect()
 }

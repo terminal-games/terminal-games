@@ -20,7 +20,7 @@ pub(super) async fn run(profile: Option<String>) -> Result<()> {
                     .user_id
                     .map(|id| id.to_string())
                     .unwrap_or_else(|| "-".to_string()),
-                session.region_id,
+                session.node_id,
                 session.transport,
                 session.shortname,
                 format_duration(session.duration_seconds),
@@ -33,7 +33,7 @@ pub(super) async fn run(profile: Option<String>) -> Result<()> {
         &[
             "Session",
             "User ID",
-            "Region",
+            "Node",
             "Transport",
             "Shortname",
             "Duration",

@@ -49,7 +49,7 @@ use terminal_games::{
         BroadcastRequest, CONTROL_API_EXPECTED_VERSION_HEADER, CONTROL_API_VERSION,
         ClusterKickedIpListRequest, ClusterKickedIpListResponse, CreateAppRequest,
         CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest, DeleteShortnameResponse,
-        KickSessionRequest, RegionDiscoveryResponse, RegionRuntimeStatus, RotateAppTokenRequest,
+        KickSessionRequest, NodeDiscoveryResponse, NodeRuntimeStatus, RotateAppTokenRequest,
         RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage, SpyControlMessage,
         StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest,
         TickerReorderRequest, UploadAppRequest, UploadAppResponse, expiry_from_duration,
@@ -85,7 +85,7 @@ pub struct ControlPlane {
     rate_limiter: Arc<ApiRateLimiter>,
     bandwidth: Arc<BandwidthTracker>,
     max_capacity: usize,
-    region_id: String,
+    node_id: String,
 }
 
 impl ControlPlane {
@@ -96,7 +96,7 @@ impl ControlPlane {
         mesh: Mesh,
         max_capacity: usize,
         admin_shared_secret: Option<Arc<str>>,
-        region_id: String,
+        node_id: String,
     ) -> Self {
         Self {
             app_server,
@@ -108,7 +108,7 @@ impl ControlPlane {
             rate_limiter: Arc::new(ApiRateLimiter::new()),
             bandwidth: Arc::new(BandwidthTracker::default()),
             max_capacity,
-            region_id,
+            node_id,
         }
     }
 
@@ -186,18 +186,18 @@ impl ControlPlane {
             .map_err(|error| RpcError::from(error.to_string()))
     }
 
-    async fn discover(&self) -> anyhow::Result<RegionDiscoveryResponse> {
-        let mut regions = self
+    async fn discover(&self) -> anyhow::Result<NodeDiscoveryResponse> {
+        let mut nodes = self
             .mesh
-            .discover_regions()
+            .discover_nodes()
             .await?
             .into_iter()
-            .map(|region| region.to_string())
+            .map(|node| node.to_string())
             .collect::<Vec<_>>();
-        regions.sort();
-        Ok(RegionDiscoveryResponse {
-            current_region: self.region_id.clone(),
-            regions,
+        nodes.sort();
+        Ok(NodeDiscoveryResponse {
+            current_node: self.node_id.clone(),
+            nodes,
         })
     }
 
@@ -253,12 +253,12 @@ impl ControlPlane {
         latest_broadcast.clone()
     }
 
-    fn local_region_status(&self) -> RegionRuntimeStatus {
+    fn local_node_status(&self) -> NodeRuntimeStatus {
         let mut system = System::new();
         system.refresh_memory();
         system.refresh_cpu_usage();
-        RegionRuntimeStatus {
-            region_id: self.region_id.clone(),
+        NodeRuntimeStatus {
+            node_id: self.node_id.clone(),
             current_sessions: self.session_registry.count(),
             max_capacity: self.max_capacity,
             cpu_usage_percent: system.global_cpu_usage(),
@@ -613,15 +613,15 @@ async fn run_app_rpc_socket(socket: WebSocket, control: ControlPlane, app: AppAu
 }
 
 impl AdminControlRpc for AdminRpcServer {
-    async fn discover(self, _: context::Context) -> Result<RegionDiscoveryResponse, RpcError> {
+    async fn discover(self, _: context::Context) -> Result<NodeDiscoveryResponse, RpcError> {
         Ok(self.control.discover().await?)
     }
 
-    async fn local_region_status(
+    async fn local_node_status(
         self,
         _: context::Context,
-    ) -> Result<RegionRuntimeStatus, RpcError> {
-        Ok(self.control.local_region_status())
+    ) -> Result<NodeRuntimeStatus, RpcError> {
+        Ok(self.control.local_node_status())
     }
 
     async fn sessions(self, _: context::Context) -> Result<Vec<SessionSummary>, RpcError> {
@@ -839,15 +839,15 @@ impl AdminControlRpc for AdminRpcServer {
             return Err("broadcast message exceeds 240 bytes".into());
         }
         let expires_at = parse_duration_string(&request.duration).and_then(expiry_from_duration)?;
-        let regions = normalize_regions(&request.regions);
-        let broadcast = if region_matches(&self.control.region_id, &regions) {
+        let nodes = normalize_nodes(&request.nodes);
+        let broadcast = if node_matches(&self.control.node_id, &nodes) {
             Some(StatusBroadcast {
                 broadcast_id: current_unix_nanos().max(0) as u64,
                 level: request.level,
                 message: request.message,
                 expires_at,
                 created_at: current_unix_seconds(),
-                regions,
+                nodes,
             })
         } else {
             None
@@ -1019,7 +1019,7 @@ impl AppControlRpc for AppRpcServer {
                 invalid_shortnames.push(claims.shortname);
                 continue;
             }
-            apps.push(record.to_response(&self.control.region_id));
+            apps.push(record.to_response(&self.control.node_id));
         }
         Ok(AppSelfInfoResponse {
             apps,
@@ -1627,12 +1627,12 @@ struct AppSelfInfoRecord {
 }
 
 impl AppSelfInfoRecord {
-    fn to_response(&self, region_id: &str) -> AppSelfResponse {
+    fn to_response(&self, node_id: &str) -> AppSelfResponse {
         AppSelfResponse {
             app_id: self.app_token.id,
             author_name: self.author_name.clone(),
             shortname: self.app_token.shortname.clone(),
-            server: region_id.to_string(),
+            server: node_id.to_string(),
             playtime_seconds: self.playtime_seconds,
         }
     }
@@ -1911,19 +1911,19 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
-fn normalize_regions(regions: &[String]) -> Vec<String> {
-    let mut regions = regions
+fn normalize_nodes(nodes: &[String]) -> Vec<String> {
+    let mut nodes = nodes
         .iter()
-        .map(|region| region.trim().to_string())
-        .filter(|region| !region.is_empty())
+        .map(|node| node.trim().to_string())
+        .filter(|node| !node.is_empty())
         .collect::<Vec<_>>();
-    regions.sort();
-    regions.dedup();
-    regions
+    nodes.sort();
+    nodes.dedup();
+    nodes
 }
 
-fn region_matches(region_id: &str, regions: &[String]) -> bool {
-    regions.is_empty() || regions.iter().any(|region| region == region_id)
+fn node_matches(node_id: &str, nodes: &[String]) -> bool {
+    nodes.is_empty() || nodes.iter().any(|node| node == node_id)
 }
 
 fn current_unix_seconds() -> i64 {

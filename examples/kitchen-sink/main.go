@@ -303,11 +303,11 @@ func (m model) View() tea.View {
 				selfMarker = " (you)"
 			}
 			latency, err := p.Latency()
-			latencyStr := "local"
-			if err == nil && latency > 0 {
+			latencyStr := ""
+			if err == nil {
 				latencyStr = fmt.Sprintf("%dms", latency)
 			}
-			peerListText += fmt.Sprintf("%s%s [%s] %s%s", cursor, p.String(), p.Region(), latencyStr, selfMarker)
+			peerListText += fmt.Sprintf("%s%s %s%s", cursor, p.String(), latencyStr, selfMarker)
 		}
 	}
 

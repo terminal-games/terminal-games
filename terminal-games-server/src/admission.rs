@@ -158,7 +158,7 @@ impl Inner {
             }
             self.notifications
                 .notify_capacity_threshold(CapacityThresholdNotification {
-                    region_id: self.metrics.region().to_string(),
+                    node_id: self.metrics.node().to_string(),
                     current_sessions: running_sessions,
                     max_capacity: self.config.max_running,
                     threshold_percent: 80,
@@ -960,7 +960,7 @@ impl ClusterManager {
 
         let db = self.db.clone();
         let notifications = Arc::clone(&self.notifications);
-        let region_id = self.metrics.region().to_string();
+        let node_id = self.metrics.node().to_string();
         let current_sessions = self.live_sessions.len();
         let max_capacity = self.max_running;
         let suspicious_cluster_count = evaluation.suspicious_cluster_count;
@@ -980,7 +980,7 @@ impl ClusterManager {
                 }
             };
             notifications.notify_cluster_enforcement(ClusterEnforcementNotification {
-                region_id: region_id.clone(),
+                node_id: node_id.clone(),
                 current_sessions,
                 max_capacity,
                 suspicious_cluster_count,
@@ -989,7 +989,7 @@ impl ClusterManager {
                     .into_iter()
                     .map(
                         |(session_id, transport, app_shortname, _)| ClusterEnforcementSession {
-                            session_id: format!("{region_id}:{session_id}"),
+                            session_id: format!("{node_id}:{session_id}"),
                             transport: transport.as_str().to_string(),
                             app_shortname,
                         },

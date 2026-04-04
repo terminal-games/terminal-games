@@ -235,11 +235,11 @@ async fn main() -> Result<()> {
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
     mesh.start_discovery().await?;
     mesh.serve().await?;
-    let region_id = std::env::var("REGION_ID")
+    let node_id = std::env::var("NODE_ID")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| mesh.region().to_string());
+        .unwrap_or_else(|| mesh.node().to_string());
     let notifications = Arc::new(notifications::Notifications::from_env());
 
     let app_server = Arc::new(AppServer::new(
@@ -298,7 +298,7 @@ async fn main() -> Result<()> {
         "Loaded initial IP ban snapshot"
     );
     let metrics =
-        metrics::ServerMetrics::new(region_id.clone(), max_active_apps, conn.clone()).await?;
+        metrics::ServerMetrics::new(node_id.clone(), max_active_apps, conn.clone()).await?;
     let admission_controller = Arc::new(admission::AdmissionController::new(
         AdmissionConfig {
             max_running: max_active_apps,
@@ -331,7 +331,7 @@ async fn main() -> Result<()> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .map(Arc::<str>::from);
-    let session_registry = sessions::SessionRegistry::new(region_id, notifications.clone());
+    let session_registry = sessions::SessionRegistry::new(node_id, notifications.clone());
     let initial_status_bar_state = control::load_status_bar_state(&conn, None).await?;
     session_registry.set_status_bar_state(initial_status_bar_state);
     let control_plane = control::ControlPlane::new(
@@ -341,7 +341,7 @@ async fn main() -> Result<()> {
         mesh.clone(),
         max_active_apps,
         admin_shared_secret,
-        session_registry.region_id().to_string(),
+        session_registry.node_id().to_string(),
     );
 
     tokio::select! {

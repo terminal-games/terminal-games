@@ -30,7 +30,7 @@ use crate::{
     audio::{CHANNELS, FRAME_SIZE, Mixer, SAMPLE_RATE},
     control::StatusBarState,
     log_backend::{GuestLogBackend, LogLevel, parse_guest_log_object},
-    mesh::{AppId, BuildId, Mesh, PeerId, PeerMessageApp, RegionId},
+    mesh::{AppId, BuildId, Mesh, PeerId, PeerMessageApp, NodeId},
     rate_limiting::{NetworkInfo, TokenBucket},
     replay::ReplayBuffer,
     status_bar::{StatusBar, StatusBarInput, StatusNotification},
@@ -70,8 +70,11 @@ const PEER_SEND_ERR_INVALID_PEER_COUNT: i32 = -1;
 const PEER_SEND_ERR_DATA_TOO_LARGE: i32 = -2;
 const PEER_SEND_ERR_CHANNEL_FULL: i32 = -3;
 const PEER_SEND_ERR_CHANNEL_CLOSED: i32 = -4;
+const PEER_SEND_ERR_INVALID_PEER_ID: i32 = -5;
 
 const PEER_RECV_ERR_CHANNEL_DISCONNECTED: i32 = -1;
+
+const NODE_LATENCY_ERR_UNKNOWN: i32 = -1;
 
 // Menu request error codes
 const MENU_REQ_ERR_NOT_MENU_APP: i32 = -1;
@@ -348,7 +351,7 @@ impl AppServer {
         linker.func_wrap("terminal_games", "next_app_ready", Self::next_app_ready)?;
         linker.func_wrap("terminal_games", "peer_send", Self::peer_send)?;
         linker.func_wrap("terminal_games", "peer_recv", Self::peer_recv)?;
-        linker.func_wrap_async("terminal_games", "region_latency", Self::region_latency)?;
+        linker.func_wrap_async("terminal_games", "node_latency", Self::node_latency)?;
         linker.func_wrap_async("terminal_games", "peer_list", Self::peer_list)?;
         linker.func_wrap(
             "terminal_games",
@@ -1518,15 +1521,18 @@ impl AppServer {
         if data_len > 64 * 1024 {
             return Ok(PEER_SEND_ERR_DATA_TOO_LARGE);
         }
-        const PEER_ID_SIZE: usize = std::mem::size_of::<PeerId>();
         let peer_ids_offset = peer_ids_ptr as usize;
         let peer_ids_count = peer_ids_count as usize;
         let mut peer_ids = Vec::with_capacity(peer_ids_count);
         for i in 0..peer_ids_count {
-            let offset = i * PEER_ID_SIZE;
-            let mut peer_id_bytes = [0u8; PEER_ID_SIZE];
+            let offset = i * PeerId::BYTE_LEN;
+            let mut peer_id_bytes = [0u8; PeerId::BYTE_LEN];
             mem.read(&caller, peer_ids_offset + offset, &mut peer_id_bytes)?;
-            peer_ids.push(crate::mesh::PeerId::from_bytes(peer_id_bytes));
+            let peer_id = match crate::mesh::PeerId::from_bytes(peer_id_bytes) {
+                Ok(peer_id) => peer_id,
+                Err(_) => return Ok(PEER_SEND_ERR_INVALID_PEER_ID),
+            };
+            peer_ids.push(peer_id);
         }
 
         let data_offset = data_ptr as usize;
@@ -1582,25 +1588,28 @@ impl AppServer {
         Ok(data_to_write as i32)
     }
 
-    fn region_latency(
+    fn node_latency(
         mut caller: wasmtime::Caller<'_, AppState>,
-        (region_ptr,): (i32,),
+        (node_ptr,): (i32,),
     ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
         Box::new(async move {
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                wasmtime::bail!("region_latency: failed to find host memory");
+                wasmtime::bail!("node_latency: failed to find host memory");
             };
 
-            let region_offset = region_ptr as usize;
-            let mut region_bytes = [0u8; 4];
-            mem.read(&caller, region_offset, &mut region_bytes)?;
+            let node_offset = node_ptr as usize;
+            let mut node_bytes = [0u8; 4];
+            mem.read(&caller, node_offset, &mut node_bytes)?;
 
-            let region_id = RegionId::from_bytes(region_bytes);
+            let node_id = match NodeId::try_from(node_bytes) {
+                Ok(node_id) => node_id,
+                Err(_) => return Ok(NODE_LATENCY_ERR_UNKNOWN),
+            };
 
             let mesh = &caller.data().ctx.mesh;
-            match mesh.get_region_latency(region_id).await {
+            match mesh.get_node_latency(node_id).await {
                 Some(latency) => Ok(latency.as_millis() as i32),
-                None => Ok(-1), // Unknown latency is a valid semantic response
+                None => Ok(NODE_LATENCY_ERR_UNKNOWN),
             }
         })
     }
@@ -1616,7 +1625,8 @@ impl AppServer {
 
             let app_id = caller.data().app.app_id;
             let mesh = &caller.data().ctx.mesh;
-            let peers = mesh.get_peers_for_app(app_id).await;
+            let mut peers = mesh.get_peers_for_app(app_id).await.into_iter().collect::<Vec<_>>();
+            peers.sort_unstable();
 
             let total_count = peers.len();
             let length = std::cmp::min(length as usize, 65536);
@@ -1628,11 +1638,10 @@ impl AppServer {
                 &(total_count as u32).to_le_bytes(),
             )?;
 
-            const PEER_ID_SIZE: usize = 16;
             let ptr_offset = peer_ids_ptr as usize;
 
             for (i, peer_id) in peers.iter().take(length).enumerate() {
-                let write_offset = ptr_offset + (i * PEER_ID_SIZE);
+                let write_offset = ptr_offset + (i * PeerId::BYTE_LEN);
                 let peer_id_bytes = peer_id.to_bytes();
                 mem.write(&mut caller, write_offset, &peer_id_bytes)?;
             }

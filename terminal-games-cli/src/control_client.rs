@@ -18,7 +18,7 @@ use terminal_games::control::{
     AdminControlRpcClient, AppControlRpcClient, AppSummary, AppTokenClaims, BanEntry,
     CONTROL_API_EXPECTED_VERSION_HEADER, CONTROL_API_VERSION, CONTROL_API_VERSION_HEADER,
     CONTROL_SERVER_VERSION_HEADER, ClusterKickedIpListRequest, ClusterKickedIpListResponse,
-    RegionDiscoveryResponse, RegionRuntimeStatus, SessionSummary, TickerEntry, rpc_context,
+    NodeDiscoveryResponse, NodeRuntimeStatus, SessionSummary, TickerEntry, rpc_context,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_tungstenite::{
@@ -32,7 +32,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::completion_cache;
 use crate::config::{
-    AdminProfile, derive_region_urls, load_app_token_for_shortname, resolve_admin_profile,
+    AdminProfile, derive_node_urls, load_app_token_for_shortname, resolve_admin_profile,
 };
 
 const CONTROL_RPC_MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
@@ -317,7 +317,7 @@ impl AdminClient {
         connect_admin_rpc(base_url, &self.token).await
     }
 
-    pub async fn discover(&self) -> Result<(RegionDiscoveryResponse, BTreeMap<String, String>)> {
+    pub async fn discover(&self) -> Result<(NodeDiscoveryResponse, BTreeMap<String, String>)> {
         let discovery = self
             .rpc()
             .await?
@@ -326,16 +326,16 @@ impl AdminClient {
             .map_err(anyhow::Error::msg)?;
         Ok((
             discovery.clone(),
-            derive_region_urls(&self.profile.url, &discovery)?,
+            derive_node_urls(&self.profile.url, &discovery)?,
         ))
     }
 
-    pub async fn region_url(&self, region: &str) -> Result<String> {
-        let (_, region_urls) = self.discover().await?;
-        region_urls
-            .get(region)
+    pub async fn node_url(&self, node: &str) -> Result<String> {
+        let (_, node_urls) = self.discover().await?;
+        node_urls
+            .get(node)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown region '{region}'"))
+            .ok_or_else(|| anyhow::anyhow!("unknown node '{node}'"))
     }
 
     pub async fn fanout<F, Fut>(&self, mut call: F) -> Result<usize>
@@ -343,8 +343,8 @@ impl AdminClient {
         F: FnMut(AdminControlRpcClient) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        let (_, region_urls) = self.discover().await?;
-        let connect_futures = region_urls
+        let (_, node_urls) = self.discover().await?;
+        let connect_futures = node_urls
             .values()
             .map(|base_url| connect_admin_rpc(base_url, &self.token));
         let mut futures = Vec::new();
@@ -354,7 +354,7 @@ impl AdminClient {
         for result in join_all(futures).await {
             result?;
         }
-        Ok(region_urls.len())
+        Ok(node_urls.len())
     }
 
     pub async fn all_sessions(&self) -> Result<Vec<SessionSummary>> {
@@ -422,8 +422,8 @@ impl AdminClient {
     }
 
     async fn fetch_all_sessions(&self) -> Result<Vec<SessionSummary>> {
-        let (_, region_urls) = self.discover().await?;
-        let futures = region_urls.values().cloned().map(|base_url| async move {
+        let (_, node_urls) = self.discover().await?;
+        let futures = node_urls.values().cloned().map(|base_url| async move {
             let rpc = connect_admin_rpc(&base_url, &self.token).await?;
             rpc.sessions(rpc_context())
                 .await?
@@ -442,10 +442,10 @@ impl AdminClient {
 
     pub async fn session_summary(
         &self,
-        region: &str,
+        node: &str,
         local_id: u64,
     ) -> Result<Option<SessionSummary>> {
-        let base_url = self.region_url(region).await?;
+        let base_url = self.node_url(node).await?;
         let rpc = connect_admin_rpc(&base_url, &self.token).await?;
         Ok(rpc
             .sessions(rpc_context())
@@ -455,11 +455,11 @@ impl AdminClient {
             .find(|session| session.local_session_id == local_id))
     }
 
-    pub async fn region_statuses(&self) -> Result<Vec<RegionRuntimeStatus>> {
-        let (_, region_urls) = self.discover().await?;
-        let futures = region_urls.values().cloned().map(|base_url| async move {
+    pub async fn node_statuses(&self) -> Result<Vec<NodeRuntimeStatus>> {
+        let (_, node_urls) = self.discover().await?;
+        let futures = node_urls.values().cloned().map(|base_url| async move {
             let rpc = connect_admin_rpc(&base_url, &self.token).await?;
-            rpc.local_region_status(rpc_context())
+            rpc.local_node_status(rpc_context())
                 .await?
                 .map_err(anyhow::Error::msg)
         });

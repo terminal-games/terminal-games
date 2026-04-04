@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use terminal_games::control::{AppTokenClaims, RegionDiscoveryResponse};
+use terminal_games::control::{AppTokenClaims, NodeDiscoveryResponse};
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,9 +237,9 @@ pub fn normalize_base_url(input: &str) -> Result<String> {
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
-pub fn derive_region_urls(
+pub fn derive_node_urls(
     base_url: &str,
-    discovery: &RegionDiscoveryResponse,
+    discovery: &NodeDiscoveryResponse,
 ) -> Result<BTreeMap<String, String>> {
     let base = reqwest::Url::parse(base_url)?;
     let scheme = base.scheme().to_string();
@@ -250,30 +250,30 @@ pub fn derive_region_urls(
 
     let mut base_host = host.to_string();
     if let Some((first, rest)) = host.split_once('.')
-        && discovery.regions.iter().any(|region| region == first)
+        && discovery.nodes.iter().any(|node| node == first)
     {
         base_host = rest.to_string();
     }
 
     let mut urls = BTreeMap::new();
-    for region in &discovery.regions {
-        let region_host = if region == &discovery.current_region && host == base_host {
+    for node in &discovery.nodes {
+        let node_host = if node == &discovery.current_node && host == base_host {
             base_host.clone()
-        } else if region == &discovery.current_region
+        } else if node == &discovery.current_node
             && host != base_host
-            && host.starts_with(region)
+            && host.starts_with(node)
         {
             host.to_string()
         } else {
-            format!("{region}.{base_host}")
+            format!("{node}.{base_host}")
         };
-        let mut url = reqwest::Url::parse(&format!("{scheme}://{region_host}"))?;
+        let mut url = reqwest::Url::parse(&format!("{scheme}://{node_host}"))?;
         if let Some(port) = port {
             url.set_port(Some(port))
                 .map_err(|_| anyhow::anyhow!("invalid port {port}"))?;
         }
         urls.insert(
-            region.clone(),
+            node.clone(),
             url.to_string().trim_end_matches('/').to_string(),
         );
     }

@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"sort"
 	"time"
+	"unicode/utf8"
 	"unsafe"
 )
 
@@ -22,6 +23,7 @@ const (
 	peerSendErrDataTooLarge     = -2
 	peerSendErrChannelFull      = -3
 	peerSendErrChannelClosed    = -4
+	peerSendErrInvalidPeerID    = -5
 
 	peerRecvErrChannelDisconnected = -1
 )
@@ -34,53 +36,55 @@ func peer_send(peer_ids_ptr unsafe.Pointer, peer_ids_count uint32, data_ptr unsa
 //go:noescape
 func peer_recv(from_peer_ptr unsafe.Pointer, data_ptr unsafe.Pointer, data_max_len uint32) int32
 
-//go:wasmimport terminal_games region_latency
+//go:wasmimport terminal_games node_latency
 //go:noescape
-func region_latency(region_ptr unsafe.Pointer) int32
+func node_latency(node_ptr unsafe.Pointer) int32
 
 //go:wasmimport terminal_games peer_list
 //go:noescape
 func peer_list(peer_ids_ptr unsafe.Pointer, max_length uint32, total_count_ptr unsafe.Pointer) int32
 
 // ID represents a peer identifier
-type ID [16]byte
+type ID struct {
+	node       NodeID
+	timestamp  uint64
+	randomness uint32
+}
 
-type RegionID [4]byte
+type NodeID [4]byte
 
-func (r RegionID) String() string {
-	// Filter out null bytes and return as string
-	end := 4
-	for i := 0; i < 4; i++ {
-		if r[i] == 0 {
-			end = i
-			break
-		}
-	}
-	return string(r[:end])
+const (
+	nodeIDByteLen = 4
+	idByteLen     = 16
+)
+
+func (r NodeID) String() string {
+	return string(r[:])
 }
 
 var (
-	ErrLatencyUnknown       = errors.New("latency unknown")
-	ErrInvalidPeerCount     = errors.New("invalid peer count (must be 1-1024)")
-	ErrDataTooLarge         = errors.New("data too large: maximum 64KB")
-	ErrChannelFull          = errors.New("send channel full, message dropped")
-	ErrChannelClosed        = errors.New("send channel closed")
-	ErrChannelDisconnected  = errors.New("receive channel disconnected")
-	ErrListFailed           = errors.New("peer_list failed")
+	ErrLatencyUnknown      = errors.New("latency unknown")
+	ErrInvalidPeerCount    = errors.New("invalid peer count (must be 1-1024)")
+	ErrDataTooLarge        = errors.New("data too large: maximum 64KB")
+	ErrChannelFull         = errors.New("send channel full, message dropped")
+	ErrChannelClosed       = errors.New("send channel closed")
+	ErrInvalidPeerID       = errors.New("invalid peer ID: peer ID contains invalid node bytes")
+	ErrChannelDisconnected = errors.New("receive channel disconnected")
+	ErrListFailed          = errors.New("peer_list failed")
 )
 
-// Latency returns the current latency to this region in milliseconds.
-func (r RegionID) Latency() (uint32, error) {
-	ms := region_latency(unsafe.Pointer(&r[0]))
+// Latency returns the current latency to this node in milliseconds.
+func (r NodeID) Latency() (uint32, error) {
+	ms := node_latency(unsafe.Pointer(&r[0]))
 	if ms < 0 {
 		return 0, ErrLatencyUnknown
 	}
 	return uint32(ms), nil
 }
 
-// String returns a hex-encoded string representation of the ID
+// String returns the human-readable node-timestamp-randomness representation of the ID.
 func (id ID) String() string {
-	return hex.EncodeToString(id[:])
+	return fmt.Sprintf("%s-%d-%d", id.node, id.timestamp, id.randomness)
 }
 
 // ParseID parses a hex-encoded string into an ID
@@ -90,34 +94,37 @@ func ParseID(s string) (ID, error) {
 	if err != nil {
 		return id, fmt.Errorf("failed to decode hex: %w", err)
 	}
-	if len(decoded) != 16 {
-		return id, fmt.Errorf("invalid ID length: expected 16 bytes, got %d", len(decoded))
+	if len(decoded) != idByteLen {
+		return id, fmt.Errorf("invalid ID length: expected %d bytes, got %d", idByteLen, len(decoded))
 	}
-	copy(id[:], decoded)
+	var bytes [idByteLen]byte
+	copy(bytes[:], decoded)
+	id = idFromBytes(bytes)
+	if !utf8.Valid(id.node[:]) {
+		return ID{}, ErrInvalidPeerID
+	}
 	return id, nil
 }
 
 // Timestamp returns the time the peer ID was created
 func (id ID) Timestamp() time.Time {
-	ms := binary.BigEndian.Uint64(id[4:12])
+	ms := id.timestamp
 	return time.Unix(int64(ms/1000), int64(ms%1000)*int64(time.Millisecond))
 }
 
 // Randomness returns the randomness component of the peer ID
 func (id ID) Randomness() uint32 {
-	return binary.BigEndian.Uint32(id[12:16])
+	return id.randomness
 }
 
-// Region returns the region component of the peer ID
-func (id ID) Region() RegionID {
-	var region [4]byte
-	copy(region[:], id[0:4])
-	return region
+// Node returns the node component of the peer ID
+func (id ID) Node() NodeID {
+	return id.node
 }
 
 // Latency returns the current latency to this peer in milliseconds
 func (id ID) Latency() (uint32, error) {
-	return id.Region().Latency()
+	return id.Node().Latency()
 }
 
 // Send is shorthand for `peer.Send(data, id)`
@@ -131,7 +138,7 @@ func CurrentID() ID {
 	return id
 }
 
-// List returns all peers currently connected to this app across all regions.
+// List returns all peers currently connected to this app across all nodes.
 // This includes the current peer.
 func List() ([]ID, error) {
 	for {
@@ -161,14 +168,20 @@ func listN(length uint32) ([]ID, uint32, error) {
 		return nil, totalCount, nil
 	}
 
-	buf := make([]byte, length*16)
+	buf := make([]byte, length*idByteLen)
 	ret := peer_list(unsafe.Pointer(&buf[0]), length, unsafe.Pointer(&totalCount))
 	if ret < 0 {
 		return nil, totalCount, ErrListFailed
 	}
 
 	count := int(ret)
-	peers := unsafe.Slice((*ID)(unsafe.Pointer(&buf[0])), count)
+	peers := make([]ID, count)
+	for i := range peers {
+		offset := i * idByteLen
+		var peerBytes [idByteLen]byte
+		copy(peerBytes[:], buf[offset:offset+idByteLen])
+		peers[i] = idFromBytes(peerBytes)
+	}
 
 	return peers, totalCount, nil
 }
@@ -202,9 +215,10 @@ func SendTo(data []byte, peerIDs []ID) error {
 		return ErrDataTooLarge
 	}
 
-	peerIDsBuf := make([]byte, len(peerIDs)*16)
+	peerIDsBuf := make([]byte, len(peerIDs)*idByteLen)
 	for i, id := range peerIDs {
-		copy(peerIDsBuf[i*16:(i+1)*16], id[:])
+		peerBytes := id.toBytes()
+		copy(peerIDsBuf[i*idByteLen:(i+1)*idByteLen], peerBytes[:])
 	}
 
 	var dataPtr unsafe.Pointer
@@ -235,6 +249,8 @@ func sendErrorFromCode(code int32) error {
 		return ErrChannelFull
 	case peerSendErrChannelClosed:
 		return ErrChannelClosed
+	case peerSendErrInvalidPeerID:
+		return ErrInvalidPeerID
 	default:
 		return fmt.Errorf("unknown peer_send error: %d", code)
 	}
@@ -242,7 +258,7 @@ func sendErrorFromCode(code int32) error {
 
 // Recv waits for a message from any peer
 func Recv() (Message, error) {
-	fromPeerBuf := make([]byte, 16)
+	fromPeerBuf := make([]byte, idByteLen)
 	dataBuf := make([]byte, 64*1024)
 
 	for {
@@ -253,10 +269,10 @@ func Recv() (Message, error) {
 		)
 
 		if ret > 0 {
-			var fromPeer ID
-			copy(fromPeer[:], fromPeerBuf)
+			var fromPeerBytes [idByteLen]byte
+			copy(fromPeerBytes[:], fromPeerBuf)
 			return Message{
-				From: fromPeer,
+				From: idFromBytes(fromPeerBytes),
 				Data: dataBuf[:ret],
 			}, nil
 		} else if ret == 0 {
@@ -281,6 +297,38 @@ type ByPeerId []ID
 
 var _ sort.Interface = ByPeerId(nil)
 
-func (p ByPeerId) Len() int           { return len(p) }
-func (p ByPeerId) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
-func (p ByPeerId) Less(i, j int) bool { return bytes.Compare(p[i][:], p[j][:]) < 0 }
+func (p ByPeerId) Len() int      { return len(p) }
+func (p ByPeerId) Swap(i, j int) { p[i], p[j] = p[j], p[i] }
+func (p ByPeerId) Less(i, j int) bool {
+	leftNode := p[i].node
+	rightNode := p[j].node
+	if leftNode != rightNode {
+		return bytes.Compare(leftNode[:], rightNode[:]) < 0
+	}
+
+	leftTimestamp := p[i].timestamp
+	rightTimestamp := p[j].timestamp
+	if leftTimestamp != rightTimestamp {
+		return leftTimestamp < rightTimestamp
+	}
+
+	return p[i].randomness < p[j].randomness
+}
+
+func idFromBytes(bytes [idByteLen]byte) ID {
+	var node NodeID
+	copy(node[:], bytes[:nodeIDByteLen])
+	return ID{
+		node:       node,
+		timestamp:  binary.BigEndian.Uint64(bytes[nodeIDByteLen:12]),
+		randomness: binary.BigEndian.Uint32(bytes[12:idByteLen]),
+	}
+}
+
+func (id ID) toBytes() [idByteLen]byte {
+	var bytes [idByteLen]byte
+	copy(bytes[:nodeIDByteLen], id.node[:])
+	binary.BigEndian.PutUint64(bytes[nodeIDByteLen:12], id.timestamp)
+	binary.BigEndian.PutUint32(bytes[12:idByteLen], id.randomness)
+	return bytes
+}

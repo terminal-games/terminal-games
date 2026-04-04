@@ -50,7 +50,7 @@ variable "servers" {
   description = "All infrastructure servers"
 
   type = list(object({
-    region_id        = string
+    node_id          = string
     max_active_apps  = optional(number, 100)
     geolocation_lat  = number
     geolocation_long = number
@@ -81,7 +81,7 @@ variable "servers" {
 locals {
   server_configs = {
     for s in var.servers :
-    s.region_id => s
+    s.node_id => s
   }
 
   hetzner_servers = {
@@ -175,7 +175,7 @@ resource "bunnynet_dns_record" "servers_ipv4" {
   for_each = local.server_configs
 
   zone  = bunnynet_dns_zone.primary.id
-  name  = each.value.region_id
+  name  = each.value.node_id
   type  = "A"
   value = local.servers[each.key].main_ip
 }
@@ -184,7 +184,7 @@ resource "bunnynet_dns_record" "servers_ipv6" {
   for_each = local.server_configs
 
   zone  = bunnynet_dns_zone.primary.id
-  name  = each.value.region_id
+  name  = each.value.node_id
   type  = "AAAA"
   value = local.servers[each.key].v6_main_ip
 }

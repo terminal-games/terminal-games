@@ -9,8 +9,8 @@ use super::super::{AdminSessionKickArgs, load_api, parse_session_ref};
 
 pub(super) async fn run(args: AdminSessionKickArgs, profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
-    let (region, local_id) = parse_session_ref(&args.session_id)?;
-    let base_url = api.region_url(&region).await?;
+    let (node, local_id) = parse_session_ref(&args.session_id)?;
+    let base_url = api.node_url(&node).await?;
     api.rpc_at(&base_url)
         .await?
         .session_kick(

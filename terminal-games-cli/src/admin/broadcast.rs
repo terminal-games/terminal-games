@@ -5,7 +5,7 @@
 use anyhow::Result;
 use terminal_games::control::{BroadcastLevel, BroadcastRequest};
 
-use super::{AdminBroadcastArgs, BroadcastLevelArg, load_api, parse_regions_arg};
+use super::{AdminBroadcastArgs, BroadcastLevelArg, load_api, parse_nodes_arg};
 
 pub(super) async fn run(args: AdminBroadcastArgs, profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
@@ -15,7 +15,7 @@ pub(super) async fn run(args: AdminBroadcastArgs, profile: Option<String>) -> Re
             BroadcastLevelArg::Warning => BroadcastLevel::Warning,
             BroadcastLevelArg::Error => BroadcastLevel::Error,
         },
-        regions: parse_regions_arg(args.regions),
+        nodes: parse_nodes_arg(args.nodes),
         message: args.message,
         duration: args.duration,
     };

@@ -32,7 +32,7 @@ async fn add(args: AdminBanIpAddArgs, profile: Option<String>) -> Result<()> {
         .ban_ip_add(terminal_games::control::rpc_context(), request.clone())
         .await?
         .map_err(anyhow::Error::msg)?;
-    let region_count = api
+    let node_count = api
         .fanout(|rpc| {
             let apply_request = terminal_games::control::BanIpRequest {
                 ip: request.ip.clone(),
@@ -46,7 +46,7 @@ async fn add(args: AdminBanIpAddArgs, profile: Option<String>) -> Result<()> {
             }
         })
         .await?;
-    println!("Applied ban across {} regions", region_count);
+    println!("Applied ban across {} nodes", node_count);
     Ok(())
 }
 
@@ -79,7 +79,7 @@ async fn remove(args: AdminBanIpRemoveArgs, profile: Option<String>) -> Result<(
         .ban_ip_remove(terminal_games::control::rpc_context(), request.clone())
         .await?
         .map_err(anyhow::Error::msg)?;
-    let region_count = api
+    let node_count = api
         .fanout(|rpc| {
             let apply_request = request.clone();
             async move {
@@ -89,6 +89,6 @@ async fn remove(args: AdminBanIpRemoveArgs, profile: Option<String>) -> Result<(
             }
         })
         .await?;
-    println!("Removed ban across {} regions", region_count);
+    println!("Removed ban across {} nodes", node_count);
     Ok(())
 }

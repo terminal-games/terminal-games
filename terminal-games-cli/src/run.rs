@@ -636,16 +636,16 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     };
 
     let local_discovery = Arc::new(LocalDiscovery::new());
-    let region = local_discovery
-        .allocate_region()
-        .expect("Failed to allocate region");
-    let mesh = Mesh::with_region(local_discovery.clone(), region);
+    let node = local_discovery
+        .allocate_node()
+        .expect("Failed to allocate node");
+    let mesh = Mesh::with_node(local_discovery.clone(), node);
     let local_addr = mesh
         .serve_on(([127, 0, 0, 1], 0).into())
         .await
         .expect("Failed to start mesh server");
     local_discovery
-        .register(region, local_addr.port())
+        .register(node, local_addr.port())
         .await
         .expect("Failed to register with local discovery");
     mesh.start_discovery().await?;
