@@ -70,6 +70,7 @@ const PEER_SEND_ERR_INVALID_PEER_COUNT: i32 = -1;
 const PEER_SEND_ERR_DATA_TOO_LARGE: i32 = -2;
 const PEER_SEND_ERR_CHANNEL_FULL: i32 = -3;
 const PEER_SEND_ERR_CHANNEL_CLOSED: i32 = -4;
+const PEER_SEND_ERR_INVALID_PEER_ID: i32 = -5;
 
 const PEER_RECV_ERR_CHANNEL_DISCONNECTED: i32 = -1;
 
@@ -1526,10 +1527,11 @@ impl AppServer {
             let offset = i * PEER_ID_SIZE;
             let mut peer_id_bytes = [0u8; PEER_ID_SIZE];
             mem.read(&caller, peer_ids_offset + offset, &mut peer_id_bytes)?;
-            peer_ids.push(
-                crate::mesh::PeerId::from_bytes(peer_id_bytes)
-                    .map_err(|error| wasmtime::Error::msg(format!("peer_send: {error}")))?,
-            );
+            let peer_id = match crate::mesh::PeerId::from_bytes(peer_id_bytes) {
+                Ok(peer_id) => peer_id,
+                Err(_) => return Ok(PEER_SEND_ERR_INVALID_PEER_ID),
+            };
+            peer_ids.push(peer_id);
         }
 
         let data_offset = data_ptr as usize;
@@ -1598,8 +1600,10 @@ impl AppServer {
             let mut node_bytes = [0u8; 4];
             mem.read(&caller, node_offset, &mut node_bytes)?;
 
-            let node_id = NodeId::try_from(node_bytes)
-                .map_err(|error| wasmtime::Error::msg(format!("node_latency: {error}")))?;
+            let node_id = match NodeId::try_from(node_bytes) {
+                Ok(node_id) => node_id,
+                Err(_) => return Ok(-1),
+            };
 
             let mesh = &caller.data().ctx.mesh;
             match mesh.get_node_latency(node_id).await {

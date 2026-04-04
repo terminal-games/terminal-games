@@ -9,6 +9,7 @@ const PEER_SEND_ERR_INVALID_PEER_COUNT: i32 = -1;
 const PEER_SEND_ERR_DATA_TOO_LARGE: i32 = -2;
 const PEER_SEND_ERR_CHANNEL_FULL: i32 = -3;
 const PEER_SEND_ERR_CHANNEL_CLOSED: i32 = -4;
+const PEER_SEND_ERR_INVALID_PEER_ID: i32 = -5;
 
 const PEER_RECV_ERR_CHANNEL_DISCONNECTED: i32 = -1;
 
@@ -60,6 +61,8 @@ impl FromStr for NodeId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PeerId([u8; 16]);
 
+const PEER_ID_ERROR: &str = "peer ID contains invalid node bytes";
+
 impl PeerId {
     /// Returns the time the peer ID was created
     pub fn timestamp(&self) -> SystemTime {
@@ -92,6 +95,16 @@ impl PeerId {
     /// Returns `None` if the latency is unknown
     pub fn latency(&self) -> Option<u32> {
         self.node().latency()
+    }
+}
+
+impl TryFrom<[u8; 16]> for PeerId {
+    type Error = PeerError;
+
+    fn try_from(bytes: [u8; 16]) -> Result<Self, Self::Error> {
+        NodeId::try_from(bytes[0..4].try_into().unwrap())
+            .map_err(|_| PeerError::InvalidId(PEER_ID_ERROR))?;
+        Ok(Self(bytes))
     }
 }
 
@@ -129,7 +142,7 @@ pub fn parse_id(s: &str) -> Result<PeerId, PeerError> {
         .map_err(|_| PeerError::InvalidId("failed to decode hex"))?;
         id[i] = byte;
     }
-    Ok(PeerId(id))
+    PeerId::try_from(id)
 }
 
 pub fn current_id() -> PeerId {
@@ -172,14 +185,10 @@ fn list_n(length: u32) -> Result<(Vec<PeerId>, u32), PeerError> {
         return Err(PeerError::ListFailed);
     }
 
-    let count = ret as usize;
-    let peers_vec = unsafe {
-        let ptr = buf.as_mut_ptr() as *mut PeerId;
-        let len = count;
-        let cap = length as usize;
-        std::mem::forget(buf);
-        Vec::from_raw_parts(ptr, len, cap)
-    };
+    let peers_vec = buf[..ret as usize * 16]
+        .chunks_exact(16)
+        .map(|chunk| PeerId::try_from(chunk.try_into().unwrap()))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok((peers_vec, total_count))
 }
@@ -217,6 +226,7 @@ impl PeerError {
             PEER_SEND_ERR_DATA_TOO_LARGE => PeerError::DataTooLarge,
             PEER_SEND_ERR_CHANNEL_FULL => PeerError::ChannelFull,
             PEER_SEND_ERR_CHANNEL_CLOSED => PeerError::ChannelClosed,
+            PEER_SEND_ERR_INVALID_PEER_ID => PeerError::InvalidId(PEER_ID_ERROR),
             _ => PeerError::Unknown(code),
         }
     }
@@ -318,7 +328,8 @@ impl Iterator for MessageReader {
         };
 
         if ret > 0 {
-            let from_peer = PeerId(self.from_peer_buf);
+            let from_peer = PeerId::try_from(self.from_peer_buf)
+                .expect("host returned invalid peer ID bytes");
             let data = self.data_buf[..ret as usize].to_vec();
             Some(Message {
                 from: from_peer,
