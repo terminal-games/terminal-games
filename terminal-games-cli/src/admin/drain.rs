@@ -306,7 +306,6 @@ fn render_drain_view(
             "CPU",
             "Memory",
             "Bandwidth",
-            "Detail",
         ],
         &rows,
     ));
@@ -335,17 +334,15 @@ fn render_row(state: &NodePollState, shutdown_started: bool) -> Vec<String> {
                 status.memory_total_bytes / 1024 / 1024
             ),
             format_bytes_per_second(status.bandwidth_bytes_per_second),
-            shutdown_detail(status, shutdown_started),
         ],
         NodePollState::Error { node_id, detail } => vec![
             node_id.clone(),
-            "error".to_string(),
+            format!("error: {detail}"),
             "-".to_string(),
             "-".to_string(),
             "-".to_string(),
             "-".to_string(),
             "-".to_string(),
-            detail.clone(),
         ],
     }
 }
@@ -355,14 +352,6 @@ fn shutdown_label(status: &NodeRuntimeStatus, shutdown_started: bool) -> String 
         ShutdownPhase::Running => "running".to_string(),
         ShutdownPhase::Draining => "draining".to_string(),
         ShutdownPhase::ShuttingDown => "shutting_down".to_string(),
-    }
-}
-
-fn shutdown_detail(status: &NodeRuntimeStatus, shutdown_started: bool) -> String {
-    match displayed_shutdown_phase(status, shutdown_started) {
-        ShutdownPhase::Running => "accepting new sessions".to_string(),
-        ShutdownPhase::Draining => "new sessions disabled".to_string(),
-        ShutdownPhase::ShuttingDown => "graceful shutdown active".to_string(),
     }
 }
 
