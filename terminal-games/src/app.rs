@@ -259,6 +259,28 @@ pub struct SessionUi {
     shared_state_rx: watch::Receiver<StatusBarState>,
 }
 
+pub struct SessionIo {
+    closed: AtomicBool,
+}
+
+impl Default for SessionIo {
+    fn default() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl SessionIo {
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
 impl SessionUi {
     pub fn new(shared_state_rx: watch::Receiver<StatusBarState>) -> Self {
         let (notification_tx, notification_rx) = mpsc::channel::<StatusNotification>(8);
@@ -307,6 +329,7 @@ pub struct AppInstantiationParams {
     pub audio_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     pub window_size_receiver: tokio::sync::watch::Receiver<(u16, u16)>,
     pub graceful_shutdown_token: CancellationToken,
+    pub session_io: Arc<SessionIo>,
     pub session_identity: SessionIdentity,
     pub session_ui: SessionUi,
     pub remote_sshid: String,
@@ -414,6 +437,7 @@ impl AppServer {
                 audio_sender,
                 mut window_size_receiver,
                 mut graceful_shutdown_token,
+                session_io,
                 session_identity,
                 session_ui,
                 remote_sshid,
@@ -545,6 +569,7 @@ impl AppServer {
                     input_receiver: raw_input_receiver,
                     has_next_app: has_next_app_shortname.clone(),
                     graceful_shutdown_token: graceful_shutdown_token.clone(),
+                    session_io: session_io.clone(),
                     network_info: network_info.clone(),
                     terminal_profile,
                     audio: maybe_mixer,
@@ -583,12 +608,20 @@ impl AppServer {
                                 break 'block None;
                             }
 
+                            _ = graceful_shutdown_token.cancelled(), if graceful_shutdown_timeout.is_none() => {
+                                session_io.close();
+                                graceful_shutdown_timeout = Some(Box::pin(tokio::time::sleep(Duration::from_millis(5000))));
+                            }
+
                             result = &mut call_future => {
                                 break 'block Some(result);
                             }
 
                             data = app_output_receiver.recv() => {
                                 let Some(mut data) = data else { continue };
+                                if session_io.is_closed() {
+                                    continue;
+                                }
                                 if has_next_app_shortname.load(Ordering::Acquire) {
                                     let needle = b"\x1b[?1049l";
                                     let needle2 = b"\x1b[?25h";
@@ -632,12 +665,15 @@ impl AppServer {
                                         .await
                                         .is_err()
                                     {
+                                        if session_io.is_closed() {
+                                            continue;
+                                        }
                                         break 'block None;
                                     }
                                 }
                             }
 
-                            result = window_size_receiver.changed() => {
+                            result = window_size_receiver.changed(), if !session_io.is_closed() => {
                                 if result.is_err() {
                                     break 'block None;
                                 }
@@ -661,13 +697,16 @@ impl AppServer {
                                         .await
                                         .is_err()
                                     {
+                                        if session_io.is_closed() {
+                                            continue;
+                                        }
                                         break 'block None;
                                     }
                                 }
                                 terminal_snapshot.sync_from_screen(screen);
                             }
 
-                            status_bar_render = status_bar.drive() => {
+                            status_bar_render = status_bar.drive(), if !session_io.is_closed() => {
                                 let Some(force) = status_bar_render else {
                                     break 'block None;
                                 };
@@ -683,6 +722,9 @@ impl AppServer {
                                         .await
                                         .is_err()
                                     {
+                                        if session_io.is_closed() {
+                                            continue;
+                                        }
                                         break 'block None;
                                     }
                                 }
@@ -700,6 +742,9 @@ impl AppServer {
                                     if let Some(replays) = update.replays {
                                         menu_session.replays = replays;
                                     }
+                                    if session_io.is_closed() {
+                                        continue;
+                                    }
                                     let mut output = BytesMut::new();
                                     status_bar.maybe_render_into(terminal.screen(), &mut output, true);
                                     if !output.is_empty() {
@@ -712,6 +757,9 @@ impl AppServer {
                                             .await
                                             .is_err()
                                         {
+                                            if session_io.is_closed() {
+                                                continue;
+                                            }
                                             break 'block None;
                                         }
                                     }
@@ -788,10 +836,6 @@ impl AppServer {
                                     snapshot: replay_buffer.terminal_snapshot(),
                                     output_sequence_cutoff: next_output_sequence,
                                 });
-                            }
-
-                            _ = graceful_shutdown_token.cancelled(), if graceful_shutdown_timeout.is_none() => {
-                                graceful_shutdown_timeout = Some(Box::pin(tokio::time::sleep(Duration::from_millis(5000))));
                             }
 
                             _ = async {
@@ -1293,6 +1337,9 @@ impl AppServer {
         ptr: i32,
         _len: u32,
     ) -> wasmtime::Result<i32> {
+        if caller.data().session_io.is_closed() {
+            return Ok(0);
+        }
         loop {
             let buf = match caller.data_mut().input_receiver.try_recv() {
                 Ok(buf) => buf,
@@ -2165,6 +2212,9 @@ impl AppServer {
         if sample_count == 0 {
             return Ok(0);
         }
+        if caller.data().session_io.is_closed() {
+            return Ok(0);
+        }
 
         let sample_count = sample_count.min(SAMPLE_RATE) as usize;
         let float_count = sample_count * CHANNELS;
@@ -2339,6 +2389,7 @@ pub struct AppState {
     input_receiver: tokio::sync::mpsc::Receiver<Bytes>,
     status_bar_input: StatusBarInput,
     graceful_shutdown_token: CancellationToken,
+    session_io: Arc<SessionIo>,
     network_info: Arc<dyn NetworkInfo>,
     terminal_profile: TerminalProfile,
     audio: Option<Mixer>,

@@ -32,6 +32,11 @@ use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 use crate::sessions::SessionRegistry;
 use std::future::Future;
 
+enum SessionLoopExit {
+    Exit(SessionEndReason),
+    Detach(SessionEndReason),
+}
+
 pub struct SshSession {
     raw_input_tx: tokio::sync::mpsc::Sender<Bytes>,
     resize_tx: tokio::sync::watch::Sender<(u16, u16)>,
@@ -424,6 +429,7 @@ impl SshServer {
             let app_input_sender = session_registration.app_input_sender.clone();
             let app_input_receiver = session_registration.app_input_receiver;
             let spy_snapshot_requests = session_registration.spy_snapshot_requests;
+            let session_io = session_registration.session_io;
             let session_ui = session_registration.session_ui;
             let session_identity = session_registration.identity.clone();
             let _session_cleanup_guard = session_registration.cleanup_guard;
@@ -468,6 +474,7 @@ impl SshServer {
                 session_ui,
                 window_size_receiver: resize_rx,
                 graceful_shutdown_token: token,
+                session_io: session_io.clone(),
                 network_info,
                 terminal_profile,
                 terminal_parser,
@@ -478,7 +485,7 @@ impl SshServer {
             let mut pending_input: Option<
                 Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>,
             > = None;
-            let close_reason = loop {
+            let outcome = loop {
                 tokio::select! {
                     biased;
 
@@ -494,7 +501,7 @@ impl SshServer {
                                 tracing::error!(?error, "App exit channel dropped");
                             }
                         }
-                        break SessionEndReason::NormalExit;
+                        break SessionLoopExit::Exit(SessionEndReason::NormalExit);
                     }
 
                     changed = session_control.changed() => {
@@ -504,15 +511,18 @@ impl SshServer {
                         let SessionControl::Close(reason) = *session_control.borrow() else {
                             continue;
                         };
-                        shutdown_token.cancel();
-                        break reason;
+                        break SessionLoopExit::Detach(reason);
+                    }
+
+                    _ = shutdown_token.cancelled() => {
+                        break SessionLoopExit::Detach(SessionEndReason::NormalExit);
                     }
 
                     result = async {
                         pending_input.as_mut().expect("guarded by select").await
                     }, if pending_input.is_some() => {
                         if result.is_err() {
-                            break SessionEndReason::ConnectionLost;
+                            break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                         }
                         pending_input = None;
                     }
@@ -548,6 +558,7 @@ impl SshServer {
                         if let Some(reason) = idle_monitor.on_tick() {
                             session_registry.set_idle_fuel(local_session_id, idle_monitor.idle_state().fuel_seconds);
                             session_registry.request_close(local_session_id, reason);
+                            break SessionLoopExit::Detach(reason);
                         } else {
                             session_registry.set_idle_fuel(local_session_id, idle_monitor.idle_state().fuel_seconds);
                         }
@@ -574,7 +585,7 @@ impl SshServer {
 
                     data = raw_input_rx.recv(), if pending_input.is_none() => {
                         let Some(data) = data else {
-                            break SessionEndReason::ConnectionLost;
+                            break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                         };
                         idle_monitor.observe_input(&data);
                         admitted_session.record_input(&data);
@@ -586,30 +597,35 @@ impl SshServer {
 
                     data = audio_rx.recv(), if has_audio => {
                         let Some(data) = data else {
-                            break SessionEndReason::NormalExit;
+                            break SessionLoopExit::Exit(SessionEndReason::NormalExit);
                         };
                         admitted_session.record_output(data.len());
                         session_metrics.record_bytes(Direction::Out, data.len());
                         control.record_bytes(data.len());
                         if session_handle.extended_data(channel_id, SSH_EXTENDED_DATA_STDERR, russh::CryptoVec::from_slice(&data)).await.is_err() {
-                            break SessionEndReason::ConnectionLost;
+                            break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                         }
                     }
 
                     data = output_rx.recv() => {
                         let Some(data) = data else {
-                            break SessionEndReason::NormalExit;
+                            break SessionLoopExit::Exit(SessionEndReason::NormalExit);
                         };
                         admitted_session.record_output(data.data.len());
                         session_metrics.record_bytes(Direction::Out, data.data.len());
                         control.record_bytes(data.data.len());
                         session_registry.record_output(local_session_id, &data);
                         if session_handle.data(channel_id, russh::CryptoVec::from_slice(&data.data)).await.is_err() {
-                            break SessionEndReason::ConnectionLost;
+                            break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                         }
                     }
                 }
             };
+            let wait_for_app_exit = matches!(outcome, SessionLoopExit::Detach(_));
+            let close_reason = match outcome {
+                SessionLoopExit::Exit(reason) | SessionLoopExit::Detach(reason) => reason,
+            };
+            session_io.close();
             session_metrics.finish(close_reason);
             session_registry.finish(local_session_id, close_reason);
             close_terminal_session(
@@ -624,6 +640,12 @@ impl SshServer {
                 },
             )
             .await;
+            if wait_for_app_exit {
+                shutdown_token.cancel();
+                drop(output_rx);
+                drop(audio_rx);
+                let _ = tokio::time::timeout(Duration::from_millis(5500), &mut exit_rx).await;
+            }
         });
 
         SshSession {
@@ -666,6 +688,13 @@ async fn close_terminal_session(
     tokio::time::sleep(Duration::from_millis(40)).await;
     let _ = session_handle.close(channel_id).await;
     tokio::time::sleep(Duration::from_millis(40)).await;
+    let _ = session_handle
+        .disconnect(
+            russh::Disconnect::ByApplication,
+            reason.unwrap_or("Session closed").to_string(),
+            "en-US".to_string(),
+        )
+        .await;
 }
 
 fn generate_captcha(len: usize) -> String {

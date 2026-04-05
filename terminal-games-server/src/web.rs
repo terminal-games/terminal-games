@@ -63,6 +63,11 @@ use crate::idle::IdleMonitor;
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 use crate::sessions::SessionRegistry;
 
+enum SessionLoopExit {
+    Exit(SessionEndReason),
+    Detach(SessionEndReason),
+}
+
 const DEFAULT_WEB_POW_DIFFICULTY: u8 = 18;
 const MAX_WEB_POW_DIFFICULTY: u8 = 32;
 #[derive(Clone)]
@@ -543,6 +548,7 @@ async fn handle_socket(
     let app_input_sender = session_registration.app_input_sender.clone();
     let app_input_receiver = session_registration.app_input_receiver;
     let spy_snapshot_requests = session_registration.spy_snapshot_requests;
+    let session_io = session_registration.session_io;
     let session_ui = session_registration.session_ui;
     let session_identity = session_registration.identity.clone();
     let _session_cleanup_guard = session_registration.cleanup_guard;
@@ -582,6 +588,7 @@ async fn handle_socket(
         session_ui,
         window_size_receiver: resize_rx,
         graceful_shutdown_token: token,
+        session_io: session_io.clone(),
         network_info: connect_info.network_info,
         terminal_profile: TerminalProfile::web_default(),
         terminal_parser,
@@ -592,7 +599,7 @@ async fn handle_socket(
     let mut pending_input: Option<
         Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>,
     > = None;
-    let close_reason = loop {
+    let outcome = loop {
         tokio::select! {
             biased;
 
@@ -608,7 +615,7 @@ async fn handle_socket(
                         tracing::error!(?error, "App exit channel dropped");
                     }
                 }
-                break SessionEndReason::NormalExit;
+                break SessionLoopExit::Exit(SessionEndReason::NormalExit);
             }
 
             changed = session_control.changed() => {
@@ -618,15 +625,18 @@ async fn handle_socket(
                 let SessionControl::Close(reason) = *session_control.borrow() else {
                     continue;
                 };
-                cancellation_token.cancel();
-                break reason;
+                break SessionLoopExit::Detach(reason);
+            }
+
+            _ = cancellation_token.cancelled() => {
+                break SessionLoopExit::Detach(SessionEndReason::NormalExit);
             }
 
             result = async {
                 pending_input.as_mut().expect("guarded by select").await
             }, if pending_input.is_some() => {
                 if result.is_err() {
-                    break SessionEndReason::ConnectionLost;
+                    break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                 }
                 pending_input = None;
             }
@@ -672,6 +682,7 @@ async fn handle_socket(
                     server
                         .session_registry
                         .request_close(local_session_id, reason);
+                    break SessionLoopExit::Detach(reason);
                 } else {
                     server
                         .session_registry
@@ -704,7 +715,7 @@ async fn handle_socket(
 
             data = output_rx.recv() => {
                 let Some(data) = data else {
-                    break SessionEndReason::NormalExit;
+                    break SessionLoopExit::Exit(SessionEndReason::NormalExit);
                 };
                 admitted_session.record_output(data.data.len());
                 server.session_registry.record_output(local_session_id, &data);
@@ -712,36 +723,33 @@ async fn handle_socket(
                 {
                     let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
                     if encoder.write_all(&data.data).is_err() || encoder.finish().is_err() {
-                        break SessionEndReason::NormalExit;
+                        break SessionLoopExit::Exit(SessionEndReason::NormalExit);
                     }
                 }
                 msg.push(0x00);
                 session_metrics.record_bytes(Direction::Out, msg.len());
                 server.control.record_bytes(msg.len());
                 if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
-                    cancellation_token.cancel();
-                    break SessionEndReason::ConnectionLost;
+                    break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                 }
             }
 
             data = audio_rx.recv() => {
                 let Some(mut data) = data else {
-                    break SessionEndReason::NormalExit;
+                    break SessionLoopExit::Exit(SessionEndReason::NormalExit);
                 };
                 admitted_session.record_output(data.len());
                 data.push(0x01);
                 session_metrics.record_bytes(Direction::Out, data.len());
                 server.control.record_bytes(data.len());
                 if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
-                    cancellation_token.cancel();
-                    break SessionEndReason::ConnectionLost;
+                    break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                 }
             }
 
             msg = receiver.next(), if pending_input.is_none() => {
                 let Some(msg) = msg else {
-                    cancellation_token.cancel();
-                    break SessionEndReason::ConnectionLost;
+                    break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                 };
                 match msg {
                     Ok(Message::Binary(data)) => {
@@ -760,21 +768,23 @@ async fn handle_socket(
                             }
                         } else if let Some(ts) = text_str.strip_prefix("ping:") {
                             if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
-                                cancellation_token.cancel();
-                                break SessionEndReason::ConnectionLost;
+                                break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                             }
                         }
                     }
                     Ok(Message::Close(_)) | Err(_) => {
-                        cancellation_token.cancel();
-                        break SessionEndReason::ConnectionLost;
+                        break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                     }
                     _ => {}
                 }
             }
         }
     };
-
+    let wait_for_app_exit = matches!(outcome, SessionLoopExit::Detach(_));
+    let close_reason = match outcome {
+        SessionLoopExit::Exit(reason) | SessionLoopExit::Detach(reason) => reason,
+    };
+    session_io.close();
     cancellation_token.cancel();
     session_metrics.finish(close_reason);
     server
@@ -782,6 +792,11 @@ async fn handle_socket(
         .finish(local_session_id, close_reason);
     if close_reason.should_notify_web_client() {
         let _ = send_session_closed_and_close(&mut sender, close_reason).await;
+    }
+    if wait_for_app_exit {
+        drop(output_rx);
+        drop(audio_rx);
+        let _ = tokio::time::timeout(Duration::from_millis(5500), &mut exit_rx).await;
     }
 }
 

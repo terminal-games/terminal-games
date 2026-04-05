@@ -21,6 +21,8 @@ use super::{
 };
 use crate::config::{format_bytes_per_second, format_duration};
 
+const DETACHED_SESSION_GRACE_WINDOW_MS: i64 = 5_000;
+
 enum HoldDrainOutcome {
     Completed,
     Detached,
@@ -144,6 +146,7 @@ async fn hold_drain(
     loop {
         let countdown = remaining_until(deadline_unix_ms);
         let shutdown_started = countdown.is_zero();
+        let grace_countdown = detached_session_grace_remaining(deadline_unix_ms);
         let states = fetch_node_states(api, node_urls).await;
         if !shutdown_started && all_nodes_at_zero_sessions(&states) {
             view.finish()?;
@@ -151,9 +154,9 @@ async fn hold_drain(
             println!("All sessions drained.");
             return Ok(HoldDrainOutcome::Completed);
         }
-        render_drain_view(&mut view, countdown, &states, shutdown_started)?;
+        render_drain_view(&mut view, countdown, grace_countdown, &states)?;
 
-        if shutdown_started && all_nodes_at_zero_sessions(&states) {
+        if shutdown_started && grace_countdown.is_zero() && all_nodes_at_zero_sessions(&states) {
             view.finish()?;
             println!();
             println!("Drain completed.");
@@ -189,7 +192,12 @@ async fn select_attached_node_urls(
 
     for state in states {
         match state {
-            NodePollState::Live(status) if status.shutdown.phase == ShutdownPhase::Draining => {
+            NodePollState::Live(status)
+                if matches!(
+                    status.shutdown.phase,
+                    ShutdownPhase::Draining | ShutdownPhase::ShuttingDown
+                ) =>
+            {
                 let base_url = candidate_urls
                     .get(&status.node_id)
                     .expect("selected node must have a URL");
@@ -204,7 +212,7 @@ async fn select_attached_node_urls(
                 anyhow::bail!(
                     "node '{}' is not draining (current state: {})",
                     status.node_id,
-                    shutdown_label(&status)
+                    shutdown_label(&status, false)
                 );
             }
             NodePollState::Error { node_id, detail } if explicit_selection => {
@@ -245,21 +253,29 @@ async fn fetch_node_states(
 fn render_drain_view(
     view: &mut InlineView,
     countdown: Duration,
+    grace_countdown: Duration,
     states: &[NodePollState],
-    shutdown_started: bool,
 ) -> Result<()> {
-    let mut lines = vec![format!(
-        "Drain countdown: {}",
-        format_duration(countdown.as_secs())
-    )];
+    let shutdown_started = countdown.is_zero();
+    let mut lines = vec![if shutdown_started {
+        format!(
+            "Grace window: {}",
+            format_duration(grace_countdown.as_secs())
+        )
+    } else {
+        format!("Drain countdown: {}", format_duration(countdown.as_secs()))
+    }];
     if shutdown_started {
-        if countdown.is_zero() {
-            lines.push(
-                "Deadline reached. Gracefully closing any remaining active sessions.".to_string(),
-            );
+        if grace_countdown.is_zero() {
+            lines.push("Grace window elapsed. Waiting for node status to settle.".to_string());
         } else {
-            lines.push("All sessions drained early.".to_string());
+            lines.push(
+                "Deadline reached. Waiting up to 5 seconds for detached sessions to exit cleanly."
+                    .to_string(),
+            );
         }
+    } else if all_nodes_at_zero_sessions(states) {
+        lines.push("All sessions drained early.".to_string());
     } else {
         lines.push(
             "Ctrl-C detaches. Use `admin nodes drain cancel` to cancel the drain.".to_string(),
@@ -267,7 +283,10 @@ fn render_drain_view(
     }
     lines.push(String::new());
 
-    let rows = states.iter().map(render_row).collect::<Vec<_>>();
+    let rows = states
+        .iter()
+        .map(|state| render_row(state, shutdown_started))
+        .collect::<Vec<_>>();
     lines.extend(render_table_lines(
         &[
             "Node",
@@ -292,11 +311,11 @@ fn all_nodes_at_zero_sessions(states: &[NodePollState]) -> bool {
     })
 }
 
-fn render_row(state: &NodePollState) -> Vec<String> {
+fn render_row(state: &NodePollState, shutdown_started: bool) -> Vec<String> {
     match state {
         NodePollState::Live(status) => vec![
             status.node_id.clone(),
-            shutdown_label(status),
+            shutdown_label(status, shutdown_started),
             status.current_sessions.to_string(),
             status.max_capacity.to_string(),
             format!("{:.1}%", status.cpu_usage_percent),
@@ -306,7 +325,7 @@ fn render_row(state: &NodePollState) -> Vec<String> {
                 status.memory_total_bytes / 1024 / 1024
             ),
             format_bytes_per_second(status.bandwidth_bytes_per_second),
-            shutdown_detail(status),
+            shutdown_detail(status, shutdown_started),
         ],
         NodePollState::Error { node_id, detail } => vec![
             node_id.clone(),
@@ -321,19 +340,27 @@ fn render_row(state: &NodePollState) -> Vec<String> {
     }
 }
 
-fn shutdown_label(status: &NodeRuntimeStatus) -> String {
-    match status.shutdown.phase {
+fn shutdown_label(status: &NodeRuntimeStatus, shutdown_started: bool) -> String {
+    match displayed_shutdown_phase(status, shutdown_started) {
         ShutdownPhase::Running => "running".to_string(),
         ShutdownPhase::Draining => "draining".to_string(),
         ShutdownPhase::ShuttingDown => "shutting_down".to_string(),
     }
 }
 
-fn shutdown_detail(status: &NodeRuntimeStatus) -> String {
-    match status.shutdown.phase {
+fn shutdown_detail(status: &NodeRuntimeStatus, shutdown_started: bool) -> String {
+    match displayed_shutdown_phase(status, shutdown_started) {
         ShutdownPhase::Running => "accepting new sessions".to_string(),
         ShutdownPhase::Draining => "new sessions disabled".to_string(),
         ShutdownPhase::ShuttingDown => "graceful shutdown active".to_string(),
+    }
+}
+
+fn displayed_shutdown_phase(status: &NodeRuntimeStatus, shutdown_started: bool) -> ShutdownPhase {
+    if shutdown_started && status.shutdown.phase == ShutdownPhase::Draining {
+        ShutdownPhase::ShuttingDown
+    } else {
+        status.shutdown.phase
     }
 }
 
@@ -452,6 +479,10 @@ fn remaining_until(deadline_unix_ms: i64) -> Duration {
             .try_into()
             .unwrap_or_default(),
     )
+}
+
+fn detached_session_grace_remaining(deadline_unix_ms: i64) -> Duration {
+    remaining_until(deadline_unix_ms.saturating_add(DETACHED_SESSION_GRACE_WINDOW_MS))
 }
 
 fn current_unix_ms() -> i64 {

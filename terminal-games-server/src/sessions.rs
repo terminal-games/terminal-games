@@ -16,8 +16,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use terminal_games::{
     app::{
-        SessionAppState, SessionControl, SessionEndReason, SessionIdentity, SessionOutput,
-        SessionUi,
+        SessionAppState, SessionControl, SessionEndReason, SessionIdentity, SessionIo,
+        SessionOutput, SessionUi,
     },
     control::{SessionSummary, StatusBarDrain, StatusBarState},
     replay::{ReplayTerminalSnapshot, ReplayTerminalSnapshotCapture},
@@ -70,6 +70,7 @@ pub struct SessionRegistration {
     pub app_input_sender: mpsc::Sender<Bytes>,
     pub app_input_receiver: mpsc::Receiver<Bytes>,
     pub spy_snapshot_requests: mpsc::Receiver<oneshot::Sender<ReplayTerminalSnapshotCapture>>,
+    pub session_io: Arc<SessionIo>,
     pub cleanup_guard: SessionCleanupGuard,
 }
 
@@ -99,6 +100,7 @@ struct RuntimeSession {
     size_rx: watch::Receiver<(u16, u16)>,
     idle_tx: watch::Sender<SessionIdleState>,
     input_tx: mpsc::Sender<Bytes>,
+    io: Arc<SessionIo>,
     control_tx: watch::Sender<SessionControl>,
     spy_tx: broadcast::Sender<SpyEvent>,
     snapshot_tx: mpsc::Sender<oneshot::Sender<ReplayTerminalSnapshotCapture>>,
@@ -167,6 +169,7 @@ impl SessionRegistry {
         let identity = SessionIdentity::new(username, initial_shortname);
         let session_ui = SessionUi::new(self.status_bar_state_tx.subscribe());
         let (input_tx, input_rx) = mpsc::channel(12);
+        let io = Arc::new(SessionIo::default());
         let (control_tx, control_rx) = watch::channel(SessionControl::Active);
         let (idle_tx, idle_rx) = watch::channel(SessionIdleState::default());
         let (snapshot_tx, snapshot_rx) = mpsc::channel(8);
@@ -182,6 +185,7 @@ impl SessionRegistry {
             size_rx,
             idle_tx: idle_tx.clone(),
             input_tx: input_tx.clone(),
+            io: io.clone(),
             control_tx: control_tx.clone(),
             spy_tx,
             snapshot_tx,
@@ -205,6 +209,7 @@ impl SessionRegistry {
             app_input_sender: input_tx,
             app_input_receiver: input_rx,
             spy_snapshot_requests: snapshot_rx,
+            session_io: io,
             cleanup_guard: SessionCleanupGuard {
                 registry: self.clone(),
                 local_session_id,
@@ -284,6 +289,7 @@ impl SessionRegistry {
         let Some(session) = self.lookup(local_session_id) else {
             return false;
         };
+        session.io.close();
         session
             .control_tx
             .send_if_modified(|current| match (*current, reason) {
@@ -369,6 +375,9 @@ impl SessionRegistry {
 
     pub async fn spy(&self, local_session_id: u64, read_write: bool) -> Option<SpySession> {
         let session = self.lookup(local_session_id)?;
+        if session.finished.load(Ordering::Acquire) {
+            return None;
+        }
         let mut event_rx = session.spy_tx.subscribe();
         session.active_spies.fetch_add(1, Ordering::AcqRel);
 
