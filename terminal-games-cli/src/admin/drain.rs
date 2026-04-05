@@ -37,16 +37,26 @@ pub(super) async fn run(command: AdminNodesDrainCommand, profile: Option<String>
 }
 
 async fn start(args: AdminNodesDrainStartArgs, profile: Option<String>) -> Result<()> {
+    let AdminNodesDrainStartArgs {
+        duration,
+        ends_at,
+        nodes,
+        message,
+        detach,
+    } = args;
     let api = load_api(profile.as_deref())?;
     let (_, all_node_urls) = api.discover().await?;
-    let node_urls = select_node_urls(&all_node_urls, parse_nodes_arg(args.nodes.clone()))?;
+    let node_urls = select_node_urls(&all_node_urls, parse_nodes_arg(nodes.as_deref()))?;
     if node_urls.is_empty() {
         anyhow::bail!("no nodes discovered");
     }
 
-    let duration = resolve_drain_duration(&args)?;
+    let duration = resolve_drain_duration(duration.as_deref(), ends_at.as_deref())?;
     let duration_seconds = duration.as_secs();
-    let request = DrainStartRequest { duration_seconds };
+    let request = DrainStartRequest {
+        duration_seconds,
+        maintenance_message: message,
+    };
 
     let started = match start_drain_on_all_nodes(&api, &node_urls, request).await {
         Ok(started) => started,
@@ -55,7 +65,7 @@ async fn start(args: AdminNodesDrainStartArgs, profile: Option<String>) -> Resul
             return Err(error);
         }
     };
-    if args.detach {
+    if detach {
         println!(
             "Scheduled drain on {} node(s) for {} and detached.",
             started.node_urls.len(),
@@ -74,7 +84,7 @@ async fn start(args: AdminNodesDrainStartArgs, profile: Option<String>) -> Resul
 async fn attach(args: AdminNodesDrainAttachArgs, profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
     let (_, all_node_urls) = api.discover().await?;
-    let requested_nodes = parse_nodes_arg(args.nodes);
+    let requested_nodes = parse_nodes_arg(args.nodes.as_deref());
     let attached = select_attached_node_urls(&api, &all_node_urls, requested_nodes).await?;
     hold_drain(&api, &attached.node_urls, attached.deadline_unix_ms)
         .await
@@ -84,7 +94,7 @@ async fn attach(args: AdminNodesDrainAttachArgs, profile: Option<String>) -> Res
 async fn cancel(args: AdminNodesDrainCancelArgs, profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
     let (_, all_node_urls) = api.discover().await?;
-    let node_urls = select_node_urls(&all_node_urls, parse_nodes_arg(args.nodes))?;
+    let node_urls = select_node_urls(&all_node_urls, parse_nodes_arg(args.nodes.as_deref()))?;
     let cancelled = cancel_drain_on_nodes(&api, &node_urls).await?;
     println!("Cancelled drain on {} node(s).", cancelled);
     Ok(())
@@ -445,8 +455,8 @@ fn join_padded<'a>(cells: impl Iterator<Item = &'a str>, widths: &[usize]) -> St
         .join("  ")
 }
 
-fn resolve_drain_duration(args: &AdminNodesDrainStartArgs) -> Result<Duration> {
-    match (args.duration.as_deref(), args.ends_at.as_deref()) {
+fn resolve_drain_duration(duration: Option<&str>, ends_at: Option<&str>) -> Result<Duration> {
+    match (duration, ends_at) {
         (Some(duration), None) => {
             let duration = parse_duration_string(duration)?;
             let seconds = u64::try_from(duration.whole_seconds())

@@ -15,7 +15,7 @@ pub(super) async fn run(args: AdminBroadcastArgs, profile: Option<String>) -> Re
             BroadcastLevelArg::Warning => BroadcastLevel::Warning,
             BroadcastLevelArg::Error => BroadcastLevel::Error,
         },
-        nodes: parse_nodes_arg(args.nodes),
+        nodes: parse_nodes_arg(args.nodes.as_deref()),
         message: args.message,
         duration: args.duration,
     };

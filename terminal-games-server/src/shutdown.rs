@@ -29,6 +29,7 @@ pub struct ShutdownCoordinator {
 enum ShutdownCommand {
     StartDrain {
         duration: Duration,
+        maintenance_message: Option<Arc<str>>,
         response: oneshot::Sender<Result<NodeShutdownStatus, String>>,
     },
     CancelDrain {
@@ -89,11 +90,17 @@ impl ShutdownCoordinator {
         self.status_rx.borrow().clone()
     }
 
-    pub async fn start_drain(&self, duration: Duration) -> Result<NodeShutdownStatus, String> {
+    pub async fn start_drain(
+        &self,
+        duration: Duration,
+        maintenance_message: Option<String>,
+    ) -> Result<NodeShutdownStatus, String> {
+        let maintenance_message = maintenance_message.map(Arc::<str>::from);
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(ShutdownCommand::StartDrain {
                 duration,
+                maintenance_message,
                 response: response_tx,
             })
             .map_err(|_| "shutdown coordinator is unavailable".to_string())?;
@@ -163,7 +170,11 @@ impl ShutdownWorker {
         deadline_sleep: &mut Option<Pin<Box<tokio::time::Sleep>>>,
     ) -> WorkerAction {
         match command {
-            ShutdownCommand::StartDrain { duration, response } => {
+            ShutdownCommand::StartDrain {
+                duration,
+                maintenance_message,
+                response,
+            } => {
                 let current = self.status_tx.borrow().clone();
                 if current.phase == ShutdownPhase::ShuttingDown {
                     let _ = response.send(Err("shutdown is already in progress".to_string()));
@@ -172,7 +183,7 @@ impl ShutdownWorker {
 
                 let rejected = self
                     .admission_controller
-                    .pause_new_sessions(SessionEndReason::ServerShutdown);
+                    .pause_new_sessions(SessionEndReason::ServerShutdown, maintenance_message);
 
                 if duration.is_zero() {
                     let snapshot = NodeShutdownStatus {
@@ -259,6 +270,9 @@ impl ShutdownWorker {
 
     async fn begin_shutdown(&mut self, source: String) {
         let current = self.status_tx.borrow().clone();
+        let rejected = self
+            .admission_controller
+            .pause_new_sessions(SessionEndReason::ServerShutdown, None);
         if current.phase != ShutdownPhase::ShuttingDown {
             let deadline_unix_ms = current.deadline_unix_ms.or(Some(current_unix_ms()));
             self.set_status(NodeShutdownStatus {
@@ -268,9 +282,6 @@ impl ShutdownWorker {
             });
         }
         self.listener_token.cancel();
-        let rejected = self
-            .admission_controller
-            .pause_new_sessions(SessionEndReason::ServerShutdown);
         let requested = self
             .session_registry
             .request_close_all(SessionEndReason::ServerShutdown);

@@ -25,7 +25,9 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, layer::SubscriberExt};
 
 use terminal_games::{
-    app::{AppInstantiationParams, AppServer, SessionIdentity, SessionIo, SessionOutput, SessionUi},
+    app::{
+        AppInstantiationParams, AppServer, SessionIdentity, SessionIo, SessionOutput, SessionUi,
+    },
     app_env::{encrypt_app_env_blob, validate_app_envs},
     control::{AppEnvVar, StatusBarState},
     input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker},

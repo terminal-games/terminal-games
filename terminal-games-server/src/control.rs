@@ -634,7 +634,10 @@ impl AdminControlRpc for AdminRpcServer {
         Ok(self
             .control
             .shutdown
-            .start_drain(Duration::from_secs(request.duration_seconds))
+            .start_drain(
+                Duration::from_secs(request.duration_seconds),
+                request.maintenance_message,
+            )
             .await
             .map_err(RpcError::from)?)
     }

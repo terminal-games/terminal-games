@@ -385,7 +385,7 @@ async fn websocket_handler(
     ConnectInfo(connect_info): ConnectInfo<MyConnectInfo>,
 ) -> Response {
     if !server.admission_controller.accepting_new_sessions() {
-        return maintenance_unavailable_response();
+        return maintenance_unavailable_response(&server);
     }
 
     let user_agent = headers
@@ -530,7 +530,7 @@ async fn handle_socket(
             ban_reason = ban_reason.as_deref().unwrap_or("<none>"),
             "Rejected client from active IP ban after admission"
         );
-        let _ = send_rejection_and_close(&mut sender, SessionEndReason::BannedIp).await;
+        let _ = send_rejection_and_close(&mut sender, SessionEndReason::BannedIp, None).await;
         return;
     }
     let local_session_id = admission_ticket.id();
@@ -828,19 +828,22 @@ struct PowChallengeResponse {
 
 async fn pow_challenge_handler(State(server): State<WebServer>) -> Response {
     if !server.admission_controller.accepting_new_sessions() {
-        return maintenance_unavailable_response();
+        return maintenance_unavailable_response(&server);
     }
 
     let challenge = server.pow.issue();
     axum::Json(challenge).into_response()
 }
 
-fn maintenance_unavailable_response() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        SessionEndReason::ServerShutdown.user_message(),
-    )
-        .into_response()
+fn maintenance_unavailable_response(server: &WebServer) -> Response {
+    match server.admission_controller.maintenance_message() {
+        Some(message) => (StatusCode::SERVICE_UNAVAILABLE, message.to_string()).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            SessionEndReason::ServerShutdown.user_message(),
+        )
+            .into_response(),
+    }
 }
 
 struct PowGate {
@@ -998,7 +1001,7 @@ async fn wait_for_admission(
 ) -> AdmissionWaitResult {
     let mut updates = ticket.subscribe();
     loop {
-        let status = *updates.borrow();
+        let status = updates.borrow().clone();
         match status {
             AdmissionState::Allowed => {
                 return if sender
@@ -1020,9 +1023,11 @@ async fn wait_for_admission(
                     return AdmissionWaitResult::Disconnected;
                 }
             }
-            AdmissionState::Rejected(reason) => {
-                let _ = send_rejection_and_close(sender, reason).await;
-                return AdmissionWaitResult::Rejected(reason);
+            AdmissionState::Rejected(rejection) => {
+                let maintenance_message = ticket.maintenance_message();
+                let _ = send_rejection_and_close(sender, rejection, maintenance_message.as_deref())
+                    .await;
+                return AdmissionWaitResult::Rejected(rejection);
             }
         }
 
@@ -1065,7 +1070,13 @@ async fn wait_for_admission(
 async fn send_rejection_and_close(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     reason: SessionEndReason,
+    maintenance_message: Option<&str>,
 ) -> Result<(), axum::Error> {
+    if let Some(message) = maintenance_message {
+        sender
+            .send(Message::Text(format!("queue:message:{message}").into()))
+            .await?;
+    }
     sender
         .send(Message::Text(
             format!("queue:rejected:{}", reason.slug()).into(),
@@ -1074,7 +1085,7 @@ async fn send_rejection_and_close(
     sender
         .send(Message::Close(Some(CloseFrame {
             code: 1008,
-            reason: format!("rejected:{}", reason.slug()).into(),
+            reason: maintenance_message.unwrap_or(reason.user_message()).into(),
         })))
         .await
 }

@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+use std::borrow::Cow;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -383,10 +384,13 @@ impl SshServer {
                         reason = reason.slug(),
                         "Rejected SSH admission"
                     );
+                    let maintenance_message = admission_controller.maintenance_message();
+                    let user_message =
+                        ssh_rejection_message(reason, maintenance_message.as_deref());
                     close_terminal_session(
                         &session_handle,
                         channel_id,
-                        Some(reason.user_message()),
+                        Some(user_message.as_ref()),
                         1,
                     )
                     .await;
@@ -789,19 +793,23 @@ async fn wait_for_admission(
     let mut updates = admission_ticket.subscribe();
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut frame = 0usize;
-    let mut status = *updates.borrow();
+    let mut status = updates.borrow().clone();
     loop {
-        match status {
+        match &status {
             AdmissionState::Allowed => return AdmissionWaitResult::Allowed,
-            AdmissionState::Rejected(reason) => return AdmissionWaitResult::Rejected(reason),
+            AdmissionState::Rejected(reason) => {
+                return AdmissionWaitResult::Rejected(*reason);
+            }
             AdmissionState::Queued(_) => {}
         }
         let window = *resize_rx.borrow();
+        let maintenance_message = admission_ticket.maintenance_message();
         if render_loading_screen(
             session_handle,
             channel_id,
             window,
-            status,
+            &status,
+            maintenance_message.as_deref(),
             frame,
             background_tracker.terminal_profile(base_terminal_profile),
         )
@@ -817,7 +825,7 @@ async fn wait_for_admission(
                 if changed.is_err() {
                     return AdmissionWaitResult::Disconnected;
                 }
-                status = *updates.borrow();
+                status = updates.borrow().clone();
             }
             changed = resize_rx.changed() => {
                 if changed.is_err() {
@@ -907,7 +915,8 @@ async fn render_loading_screen(
     session_handle: &Handle,
     channel_id: ChannelId,
     (width, height): (u16, u16),
-    status: AdmissionState,
+    status: &AdmissionState,
+    maintenance_message: Option<&str>,
     frame: usize,
     terminal_profile: TerminalProfile,
 ) -> anyhow::Result<()> {
@@ -916,9 +925,9 @@ async fn render_loading_screen(
     let spinner_plain = format!("{} Loading...", SPINNER_FRAMES[frame]);
     let spinner_line = styled_regular_text(terminal_profile, &spinner_plain);
     let queue_plain = match status {
-        AdmissionState::Allowed => "Starting app...".to_string(),
-        AdmissionState::Queued(position) => format!("Position in queue: {}", position),
-        AdmissionState::Rejected(reason) => reason.user_message().to_string(),
+        AdmissionState::Allowed => Cow::Borrowed("Starting app..."),
+        AdmissionState::Queued(position) => Cow::Owned(format!("Position in queue: {}", position)),
+        AdmissionState::Rejected(reason) => ssh_rejection_message(*reason, maintenance_message),
     };
     let queue_line = styled_regular_text(terminal_profile, &queue_plain);
     let center_row = if height == 0 { 1 } else { height.max(2) / 2 };
@@ -941,6 +950,18 @@ async fn render_loading_screen(
         .await
         .map_err(|_| anyhow::anyhow!("failed writing loading frame"))?;
     Ok(())
+}
+
+fn ssh_rejection_message(
+    reason: SessionEndReason,
+    maintenance_message: Option<&str>,
+) -> Cow<'_, str> {
+    match reason {
+        SessionEndReason::ServerShutdown => maintenance_message
+            .map(|message| Cow::Owned(format!("Maintenance in progress: {message}")))
+            .unwrap_or_else(|| Cow::Borrowed("Maintenance in progress.")),
+        _ => Cow::Borrowed(reason.user_message()),
+    }
 }
 
 fn centered_col(width: u16, text_chars: usize) -> u16 {

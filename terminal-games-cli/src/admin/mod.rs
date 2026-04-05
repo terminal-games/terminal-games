@@ -202,6 +202,9 @@ pub(super) struct AdminNodesDrainStartArgs {
     /// Comma-separated node ids. Defaults to all discovered nodes.
     #[arg(long)]
     nodes: Option<String>,
+    /// Maintenance message shown to users while the drain is active.
+    #[arg(long)]
+    message: Option<String>,
     /// Exit after scheduling the drain instead of holding the live display open.
     #[arg(long)]
     detach: bool,
@@ -435,7 +438,7 @@ pub(super) fn parse_session_ref(value: &str) -> Result<(String, u64)> {
     ))
 }
 
-pub(super) fn parse_nodes_arg(value: Option<String>) -> Vec<String> {
+pub(super) fn parse_nodes_arg(value: Option<&str>) -> Vec<String> {
     value
         .unwrap_or_default()
         .split(',')

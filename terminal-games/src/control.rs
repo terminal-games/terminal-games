@@ -202,6 +202,7 @@ pub struct NodeRuntimeStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DrainStartRequest {
     pub duration_seconds: u64,
+    pub maintenance_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
