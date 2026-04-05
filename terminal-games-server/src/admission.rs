@@ -45,7 +45,7 @@ pub(crate) const CLASS_BUCKETS: usize = 6;
 pub(crate) const BURST_BUCKET_MS: u64 = 5_000;
 pub(crate) const MOUSE_MOTION_COALESCE_MS: u64 = 40;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdmissionState {
     Allowed,
     Queued(usize),
@@ -77,10 +77,22 @@ struct Inner {
     cluster_tx: mpsc::UnboundedSender<ClusterEvent>,
 }
 
-#[derive(Default)]
 struct ControllerState {
+    accepting_new_sessions: bool,
+    maintenance_message: Option<Arc<str>>,
     running: Vec<(u64, IpAddr)>,
     queue: VecDeque<QueuedTicket>,
+}
+
+impl Default for ControllerState {
+    fn default() -> Self {
+        Self {
+            accepting_new_sessions: true,
+            maintenance_message: None,
+            running: Vec::new(),
+            queue: VecDeque::new(),
+        }
+    }
 }
 
 impl ControllerState {
@@ -417,6 +429,15 @@ impl AdmissionController {
                     "Rejected client from active IP ban"
                 );
                 let _ = tx.send(AdmissionState::Rejected(SessionEndReason::BannedIp));
+            } else if !state.accepting_new_sessions {
+                tracing::debug!(
+                    client_ip = %client_ip,
+                    transport = transport.as_str(),
+                    running = state.running.len(),
+                    queued = state.queue.len(),
+                    "Rejected client because new sessions are disabled"
+                );
+                let _ = tx.send(AdmissionState::Rejected(SessionEndReason::ServerShutdown));
             } else if state.running.len() < self.inner.config.max_running
                 && state.running_for_ip(client_ip) < self.inner.config.max_running_per_ip
             {
@@ -467,8 +488,47 @@ impl AdmissionController {
             >= threshold
     }
 
+    pub fn accepting_new_sessions(&self) -> bool {
+        self.inner.state.lock().unwrap().accepting_new_sessions
+    }
+
+    pub fn maintenance_message(&self) -> Option<Arc<str>> {
+        self.inner.state.lock().unwrap().maintenance_message.clone()
+    }
+
     pub fn subscribe_ban_changes(&self) -> watch::Receiver<()> {
         self.inner.ban_changes.subscribe()
+    }
+
+    pub fn pause_new_sessions(
+        &self,
+        reason: SessionEndReason,
+        maintenance_message: Option<Arc<str>>,
+    ) -> usize {
+        let mut state = self.inner.state.lock().unwrap();
+        if !state.accepting_new_sessions {
+            return 0;
+        }
+        state.accepting_new_sessions = false;
+        state.maintenance_message = maintenance_message;
+        let mut rejected = 0usize;
+        while let Some(ticket) = state.queue.pop_front() {
+            let _ = ticket.tx.send(AdmissionState::Rejected(reason));
+            rejected += 1;
+        }
+        state.record_metrics(&self.inner.metrics);
+        rejected
+    }
+
+    pub fn resume_new_sessions(&self) -> bool {
+        let mut state = self.inner.state.lock().unwrap();
+        if state.accepting_new_sessions {
+            return false;
+        }
+        state.accepting_new_sessions = true;
+        state.maintenance_message = None;
+        state.record_metrics(&self.inner.metrics);
+        true
     }
 
     pub fn check_ip_ban(&self, client_ip: IpAddr) -> Option<(IpNet, Option<String>)> {
@@ -625,6 +685,15 @@ impl AdmissionTicket {
         self.control_rx.clone()
     }
 
+    pub fn maintenance_message(&self) -> Option<Arc<str>> {
+        self.controller
+            .state
+            .lock()
+            .unwrap()
+            .maintenance_message
+            .clone()
+    }
+
     pub fn record_input(&mut self, bytes: &[u8]) {
         self.flush_output_batch();
         self.record_input_sample(
@@ -699,7 +768,7 @@ impl Drop for AdmissionTicket {
                 .send(ClusterEvent::SessionEnded(self.id));
         }
         let mut state = self.controller.state.lock().unwrap();
-        match *self.rx.borrow() {
+        match self.rx.borrow().clone() {
             AdmissionState::Allowed => {
                 if let Some(idx) = state.running.iter().position(|(id, _)| *id == self.id) {
                     state.running.swap_remove(idx);
@@ -723,7 +792,7 @@ impl Drop for AdmissionTicket {
                     state.refresh_queue_positions();
                 }
             }
-            AdmissionState::Rejected(_reason) => {}
+            AdmissionState::Rejected(_) => {}
         }
         state.record_metrics(&self.controller.metrics);
         let running_sessions = state.running.len();

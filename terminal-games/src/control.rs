@@ -12,7 +12,7 @@ pub use crate::app_env::AppEnvVar;
 
 const APP_TOKEN_PREFIX: &str = "tga1.";
 const APP_TOKEN_VERSION: u32 = 1;
-pub const CONTROL_API_VERSION: &str = "1";
+pub const CONTROL_API_VERSION: &str = "2";
 pub const CONTROL_API_EXPECTED_VERSION_HEADER: &str = "x-terminal-games-expected-api-version";
 pub const CONTROL_API_VERSION_HEADER: &str = "x-terminal-games-api-version";
 pub const CONTROL_SERVER_VERSION_HEADER: &str = "x-terminal-games-server-version";
@@ -166,6 +166,27 @@ pub struct NodeDiscoveryResponse {
     pub nodes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownPhase {
+    Running,
+    Draining,
+    ShuttingDown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeShutdownStatus {
+    pub phase: ShutdownPhase,
+    pub accepting_new_sessions: bool,
+    pub deadline_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusBarDrain {
+    pub phase: ShutdownPhase,
+    pub deadline_unix_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRuntimeStatus {
     pub node_id: String,
@@ -175,6 +196,13 @@ pub struct NodeRuntimeStatus {
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
     pub bandwidth_bytes_per_second: u64,
+    pub shutdown: NodeShutdownStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainStartRequest {
+    pub duration_seconds: u64,
+    pub maintenance_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,6 +434,8 @@ pub struct StatusBarState {
     pub tickers: Vec<TickerEntry>,
     #[serde(default)]
     pub broadcasts: Vec<StatusBroadcast>,
+    #[serde(default)]
+    pub drain: Option<StatusBarDrain>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,6 +482,8 @@ pub enum SpyClientMessage {
 pub trait AdminControlRpc {
     async fn discover() -> Result<NodeDiscoveryResponse, RpcError>;
     async fn local_node_status() -> Result<NodeRuntimeStatus, RpcError>;
+    async fn drain_start(request: DrainStartRequest) -> Result<NodeShutdownStatus, RpcError>;
+    async fn drain_cancel() -> Result<NodeShutdownStatus, RpcError>;
     async fn sessions() -> Result<Vec<SessionSummary>, RpcError>;
     async fn ban_ip_add(request: BanIpAddRequest) -> Result<BanIpAddResponse, RpcError>;
     async fn ban_ip_list() -> Result<Vec<BanEntry>, RpcError>;

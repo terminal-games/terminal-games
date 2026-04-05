@@ -366,13 +366,7 @@ impl ServerMetrics {
                     "terminal_games_session_ends_total",
                     "Completed sessions grouped by session attributes and close reason",
                 ),
-                &[
-                    "node",
-                    "transport",
-                    "authenticated",
-                    "has_audio",
-                    "reason",
-                ],
+                &["node", "transport", "authenticated", "has_audio", "reason"],
             )?,
         )?;
         let session_duration_seconds = register(

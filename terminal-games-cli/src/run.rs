@@ -25,7 +25,9 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, layer::SubscriberExt};
 
 use terminal_games::{
-    app::{AppInstantiationParams, AppServer, SessionIdentity, SessionOutput, SessionUi},
+    app::{
+        AppInstantiationParams, AppServer, SessionIdentity, SessionIo, SessionOutput, SessionUi,
+    },
     app_env::{encrypt_app_env_blob, validate_app_envs},
     control::{AppEnvVar, StatusBarState},
     input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker},
@@ -798,6 +800,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         session_ui,
         window_size_receiver: resize_rx,
         graceful_shutdown_token: graceful_shutdown_token.clone(),
+        session_io: Arc::new(SessionIo::default()),
         network_info: network_info.clone(),
         terminal_profile,
         terminal_parser,

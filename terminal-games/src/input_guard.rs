@@ -163,6 +163,9 @@ impl TerminalBackgroundTracker {
 
 fn is_interrupt(data: &[u8]) -> bool {
     data == b"\x03"
+        || data == b"\x1b[99;5u"
+        || data == b"\x1b[27;5;99~"
+        || (data.starts_with(b"\x1b[99;5") && data.ends_with(b"u"))
 }
 
 fn is_replay_request(data: &[u8]) -> bool {

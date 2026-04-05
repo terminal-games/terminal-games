@@ -45,6 +45,7 @@ const POW_SPINNER_INTERVAL_MS = 120;
 let spinnerInterval = null;
 let spinnerFrame = 0;
 let overlay = null;
+let pendingMaintenanceMessage = null;
 const titleLabel = ' Terminal Games ';
 const styledTitle = '\x1b[38;2;23;23;23m\x1b[48;2;152;195;121m Terminal Games \x1b[0m';
 const restoreTerminalState =
@@ -61,6 +62,7 @@ const onSocketMessage = async (event) => {
         if (event.data.startsWith('queue:')) {
             if (event.data === 'queue:allowed') {
                 overlay = null;
+                pendingMaintenanceMessage = null;
                 stopQueueSpinner();
                 term.write('\x1b[2J\x1b[H');
             } else if (event.data.startsWith('queue:queued:')) {
@@ -70,13 +72,25 @@ const onSocketMessage = async (event) => {
                     startQueueSpinner();
                     renderOverlay();
                 }
+            } else if (event.data.startsWith('queue:message:')) {
+                pendingMaintenanceMessage = event.data.substring('queue:message:'.length);
+                if (overlay?.type === 'disconnect' && overlay.reason === 'server_shutdown') {
+                    overlay.message = pendingMaintenanceMessage;
+                    renderOverlay();
+                }
             } else if (event.data.startsWith('queue:rejected:')) {
-                showDisconnect(event.data.substring('queue:rejected:'.length));
+                showDisconnect({
+                    reason: event.data.substring('queue:rejected:'.length),
+                    message: pendingMaintenanceMessage
+                });
             }
             return;
         }
         if (event.data.startsWith('session:closed:')) {
-            showDisconnect(event.data.substring('session:closed:'.length));
+            showDisconnect({
+                reason: event.data.substring('session:closed:'.length),
+                message: pendingMaintenanceMessage
+            });
             return;
         }
         if (event.data.startsWith('pong:')) {
@@ -148,7 +162,10 @@ const onSocketClose = (event) => {
             ? event.reason.substring('closed:'.length)
             : null;
     if (rejectedReason || closedReason) {
-        showDisconnect(rejectedReason ?? closedReason);
+        showDisconnect({
+            reason: rejectedReason ?? closedReason,
+            message: pendingMaintenanceMessage
+        });
     } else if (overlay?.type !== 'disconnect') {
         showDisconnect('connection_closed');
     }
@@ -163,7 +180,12 @@ try {
     await startWebSocketSession();
 } catch (error) {
     console.error('Failed to start WebSocket session:', error);
-    showDisconnect('connection_error');
+    if (error instanceof Error && error.message.startsWith('server_shutdown')) {
+        const message = error.message.slice('server_shutdown:'.length) || null;
+        showDisconnect({ reason: 'server_shutdown', message });
+    } else {
+        showDisconnect('connection_error');
+    }
 }
 
 term.onData((data) => {
@@ -207,31 +229,41 @@ function renderQueueScreen() {
     ]);
 }
 
-function renderDisconnectScreen(reasonKey) {
-    const { heading, detail, hint } = disconnectMessage(reasonKey);
-    renderCenteredScreen([
+function renderDisconnectScreen(reason) {
+    const { heading, detail, hint } = disconnectMessage(reason);
+    const lines = [
         styledTitle,
         `\x1b[38;2;248;113;113m${heading}\x1b[0m`,
-        detail,
-        `\x1b[2m${hint}\x1b[0m`
-    ], true);
+        detail
+    ];
+    if (hint) {
+        lines.push(`\x1b[2m${hint}\x1b[0m`);
+    }
+    renderCenteredScreen(lines, true);
 }
 
 function renderOverlay() {
     if (overlay?.type === 'queue') {
         renderQueueScreen();
     } else if (overlay?.type === 'disconnect') {
-        renderDisconnectScreen(overlay.reason);
+        renderDisconnectScreen(overlay);
     }
 }
 
 function showDisconnect(reason) {
     stopQueueSpinner();
-    overlay = { type: 'disconnect', reason };
+    if (typeof reason === 'string') {
+        overlay = { type: 'disconnect', reason, message: null };
+    } else {
+        overlay = { type: 'disconnect', reason: reason.reason, message: reason.message ?? null };
+    }
     renderOverlay();
 }
 
-function disconnectMessage(reasonKey) {
+function disconnectMessage(reason) {
+    const reasonKey = typeof reason === 'string' ? reason : reason.reason;
+    const maintenanceMessage =
+        typeof reason === 'string' ? null : reason.message;
     switch (reasonKey) {
         case 'banned_ip':
             return {
@@ -244,6 +276,12 @@ function disconnectMessage(reasonKey) {
                 heading: 'Too many sessions',
                 detail: 'This IP address already has too many active sessions.',
                 hint: 'Close another session or wait a few minutes and try again.'
+            };
+        case 'server_shutdown':
+            return {
+                heading: 'Maintenance in progress',
+                detail: maintenanceMessage || 'Maintenance in progress.',
+                hint: 'Try again later.'
             };
         case 'connection_error':
             return {
@@ -325,7 +363,11 @@ async function startWebSocketSession() {
 async function solveProofOfWork() {
     const response = await fetch('/pow/challenge', { cache: 'no-store' });
     if (!response.ok) {
-        throw new Error('failed to fetch POW challenge');
+        const detail = (await response.text()).trim();
+        if (response.status === 503) {
+            throw new Error(`server_shutdown:${detail}`);
+        }
+        throw new Error(detail || 'failed to fetch POW challenge');
     }
     const challenge = await response.json();
     let attempts = 0;

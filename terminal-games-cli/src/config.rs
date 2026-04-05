@@ -259,10 +259,7 @@ pub fn derive_node_urls(
     for node in &discovery.nodes {
         let node_host = if node == &discovery.current_node && host == base_host {
             base_host.clone()
-        } else if node == &discovery.current_node
-            && host != base_host
-            && host.starts_with(node)
-        {
+        } else if node == &discovery.current_node && host != base_host && host.starts_with(node) {
             host.to_string()
         } else {
             format!("{node}.{base_host}")

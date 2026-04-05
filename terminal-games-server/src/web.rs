@@ -63,6 +63,11 @@ use crate::idle::IdleMonitor;
 use crate::metrics::{AuthKind, Direction, ServerMetrics, Transport};
 use crate::sessions::SessionRegistry;
 
+enum SessionLoopExit {
+    Exit(SessionEndReason),
+    Detach(SessionEndReason),
+}
+
 const DEFAULT_WEB_POW_DIFFICULTY: u8 = 18;
 const MAX_WEB_POW_DIFFICULTY: u8 = 32;
 #[derive(Clone)]
@@ -136,7 +141,7 @@ impl WebServer {
         })
     }
 
-    pub async fn run(&self) -> anyhow::Result<()> {
+    pub async fn run(&self, listener_token: CancellationToken) -> anyhow::Result<()> {
         let tls_acceptor = load_tls_acceptor_from_env()?;
         let default_web_listen_addr = if tls_acceptor.is_some() {
             "0.0.0.0:443"
@@ -169,7 +174,10 @@ impl WebServer {
         let mut make_service = app.into_make_service_with_connect_info::<MyConnectInfo>();
         let listener = tokio::net::TcpListener::bind(listen_addr).await?;
         loop {
-            let (stream, remote_addr) = match listener.accept().await {
+            let (stream, remote_addr) = match tokio::select! {
+                _ = listener_token.cancelled() => break,
+                result = listener.accept() => result,
+            } {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("failed to accept web connection: {e}");
@@ -227,6 +235,8 @@ impl WebServer {
                 }
             });
         }
+        tracing::info!("Web listener stopped");
+        Ok(())
     }
 }
 
@@ -374,6 +384,10 @@ async fn websocket_handler(
     State(server): State<WebServer>,
     ConnectInfo(connect_info): ConnectInfo<MyConnectInfo>,
 ) -> Response {
+    if !server.admission_controller.accepting_new_sessions() {
+        return maintenance_unavailable_response(&server);
+    }
+
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -516,7 +530,7 @@ async fn handle_socket(
             ban_reason = ban_reason.as_deref().unwrap_or("<none>"),
             "Rejected client from active IP ban after admission"
         );
-        let _ = send_rejection_and_close(&mut sender, SessionEndReason::BannedIp).await;
+        let _ = send_rejection_and_close(&mut sender, SessionEndReason::BannedIp, None).await;
         return;
     }
     let local_session_id = admission_ticket.id();
@@ -534,6 +548,7 @@ async fn handle_socket(
     let app_input_sender = session_registration.app_input_sender.clone();
     let app_input_receiver = session_registration.app_input_receiver;
     let spy_snapshot_requests = session_registration.spy_snapshot_requests;
+    let session_io = session_registration.session_io;
     let session_ui = session_registration.session_ui;
     let session_identity = session_registration.identity.clone();
     let _session_cleanup_guard = session_registration.cleanup_guard;
@@ -573,6 +588,7 @@ async fn handle_socket(
         session_ui,
         window_size_receiver: resize_rx,
         graceful_shutdown_token: token,
+        session_io: session_io.clone(),
         network_info: connect_info.network_info,
         terminal_profile: TerminalProfile::web_default(),
         terminal_parser,
@@ -583,7 +599,7 @@ async fn handle_socket(
     let mut pending_input: Option<
         Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>,
     > = None;
-    let close_reason = loop {
+    let outcome = loop {
         tokio::select! {
             biased;
 
@@ -599,7 +615,7 @@ async fn handle_socket(
                         tracing::error!(?error, "App exit channel dropped");
                     }
                 }
-                break SessionEndReason::NormalExit;
+                break SessionLoopExit::Exit(SessionEndReason::NormalExit);
             }
 
             changed = session_control.changed() => {
@@ -609,15 +625,18 @@ async fn handle_socket(
                 let SessionControl::Close(reason) = *session_control.borrow() else {
                     continue;
                 };
-                cancellation_token.cancel();
-                break reason;
+                break SessionLoopExit::Detach(reason);
+            }
+
+            _ = cancellation_token.cancelled() => {
+                break SessionLoopExit::Detach(SessionEndReason::NormalExit);
             }
 
             result = async {
                 pending_input.as_mut().expect("guarded by select").await
             }, if pending_input.is_some() => {
                 if result.is_err() {
-                    break SessionEndReason::ConnectionLost;
+                    break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                 }
                 pending_input = None;
             }
@@ -663,6 +682,7 @@ async fn handle_socket(
                     server
                         .session_registry
                         .request_close(local_session_id, reason);
+                    break SessionLoopExit::Detach(reason);
                 } else {
                     server
                         .session_registry
@@ -695,7 +715,7 @@ async fn handle_socket(
 
             data = output_rx.recv() => {
                 let Some(data) = data else {
-                    break SessionEndReason::NormalExit;
+                    break SessionLoopExit::Exit(SessionEndReason::NormalExit);
                 };
                 admitted_session.record_output(data.data.len());
                 server.session_registry.record_output(local_session_id, &data);
@@ -703,36 +723,33 @@ async fn handle_socket(
                 {
                     let mut encoder = DeflateEncoder::new(&mut msg, Compression::default());
                     if encoder.write_all(&data.data).is_err() || encoder.finish().is_err() {
-                        break SessionEndReason::NormalExit;
+                        break SessionLoopExit::Exit(SessionEndReason::NormalExit);
                     }
                 }
                 msg.push(0x00);
                 session_metrics.record_bytes(Direction::Out, msg.len());
                 server.control.record_bytes(msg.len());
                 if sender.send(Message::Binary(Bytes::from(msg))).await.is_err() {
-                    cancellation_token.cancel();
-                    break SessionEndReason::ConnectionLost;
+                    break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                 }
             }
 
             data = audio_rx.recv() => {
                 let Some(mut data) = data else {
-                    break SessionEndReason::NormalExit;
+                    break SessionLoopExit::Exit(SessionEndReason::NormalExit);
                 };
                 admitted_session.record_output(data.len());
                 data.push(0x01);
                 session_metrics.record_bytes(Direction::Out, data.len());
                 server.control.record_bytes(data.len());
                 if sender.send(Message::Binary(Bytes::from(data))).await.is_err() {
-                    cancellation_token.cancel();
-                    break SessionEndReason::ConnectionLost;
+                    break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                 }
             }
 
             msg = receiver.next(), if pending_input.is_none() => {
                 let Some(msg) = msg else {
-                    cancellation_token.cancel();
-                    break SessionEndReason::ConnectionLost;
+                    break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                 };
                 match msg {
                     Ok(Message::Binary(data)) => {
@@ -751,21 +768,23 @@ async fn handle_socket(
                             }
                         } else if let Some(ts) = text_str.strip_prefix("ping:") {
                             if sender.send(Message::Text(format!("pong:{}", ts).into())).await.is_err() {
-                                cancellation_token.cancel();
-                                break SessionEndReason::ConnectionLost;
+                                break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                             }
                         }
                     }
                     Ok(Message::Close(_)) | Err(_) => {
-                        cancellation_token.cancel();
-                        break SessionEndReason::ConnectionLost;
+                        break SessionLoopExit::Detach(SessionEndReason::ConnectionLost);
                     }
                     _ => {}
                 }
             }
         }
     };
-
+    let wait_for_app_exit = matches!(outcome, SessionLoopExit::Detach(_));
+    let close_reason = match outcome {
+        SessionLoopExit::Exit(reason) | SessionLoopExit::Detach(reason) => reason,
+    };
+    session_io.close();
     cancellation_token.cancel();
     session_metrics.finish(close_reason);
     server
@@ -773,6 +792,11 @@ async fn handle_socket(
         .finish(local_session_id, close_reason);
     if close_reason.should_notify_web_client() {
         let _ = send_session_closed_and_close(&mut sender, close_reason).await;
+    }
+    if wait_for_app_exit {
+        drop(output_rx);
+        drop(audio_rx);
+        let _ = tokio::time::timeout(Duration::from_millis(5500), &mut exit_rx).await;
     }
 }
 
@@ -802,11 +826,24 @@ struct PowChallengeResponse {
     difficulty: u8,
 }
 
-async fn pow_challenge_handler(
-    State(server): State<WebServer>,
-) -> axum::Json<PowChallengeResponse> {
+async fn pow_challenge_handler(State(server): State<WebServer>) -> Response {
+    if !server.admission_controller.accepting_new_sessions() {
+        return maintenance_unavailable_response(&server);
+    }
+
     let challenge = server.pow.issue();
-    axum::Json(challenge)
+    axum::Json(challenge).into_response()
+}
+
+fn maintenance_unavailable_response(server: &WebServer) -> Response {
+    match server.admission_controller.maintenance_message() {
+        Some(message) => (StatusCode::SERVICE_UNAVAILABLE, message.to_string()).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            SessionEndReason::ServerShutdown.user_message(),
+        )
+            .into_response(),
+    }
 }
 
 struct PowGate {
@@ -964,7 +1001,7 @@ async fn wait_for_admission(
 ) -> AdmissionWaitResult {
     let mut updates = ticket.subscribe();
     loop {
-        let status = *updates.borrow();
+        let status = updates.borrow().clone();
         match status {
             AdmissionState::Allowed => {
                 return if sender
@@ -986,9 +1023,11 @@ async fn wait_for_admission(
                     return AdmissionWaitResult::Disconnected;
                 }
             }
-            AdmissionState::Rejected(reason) => {
-                let _ = send_rejection_and_close(sender, reason).await;
-                return AdmissionWaitResult::Rejected(reason);
+            AdmissionState::Rejected(rejection) => {
+                let maintenance_message = ticket.maintenance_message();
+                let _ = send_rejection_and_close(sender, rejection, maintenance_message.as_deref())
+                    .await;
+                return AdmissionWaitResult::Rejected(rejection);
             }
         }
 
@@ -1031,7 +1070,13 @@ async fn wait_for_admission(
 async fn send_rejection_and_close(
     sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     reason: SessionEndReason,
+    maintenance_message: Option<&str>,
 ) -> Result<(), axum::Error> {
+    if let Some(message) = maintenance_message {
+        sender
+            .send(Message::Text(format!("queue:message:{message}").into()))
+            .await?;
+    }
     sender
         .send(Message::Text(
             format!("queue:rejected:{}", reason.slug()).into(),
@@ -1040,7 +1085,7 @@ async fn send_rejection_and_close(
     sender
         .send(Message::Close(Some(CloseFrame {
             code: 1008,
-            reason: format!("rejected:{}", reason.slug()).into(),
+            reason: maintenance_message.unwrap_or(reason.user_message()).into(),
         })))
         .await
 }

@@ -16,10 +16,10 @@ use bytes::Bytes;
 use futures::StreamExt;
 use terminal_games::{
     app::{
-        SessionAppState, SessionControl, SessionEndReason, SessionIdentity, SessionOutput,
-        SessionUi,
+        SessionAppState, SessionControl, SessionEndReason, SessionIdentity, SessionIo,
+        SessionOutput, SessionUi,
     },
-    control::{SessionSummary, StatusBarState},
+    control::{SessionSummary, StatusBarDrain, StatusBarState},
     replay::{ReplayTerminalSnapshot, ReplayTerminalSnapshotCapture},
 };
 use tokio::sync::broadcast::error::TryRecvError;
@@ -70,6 +70,7 @@ pub struct SessionRegistration {
     pub app_input_sender: mpsc::Sender<Bytes>,
     pub app_input_receiver: mpsc::Receiver<Bytes>,
     pub spy_snapshot_requests: mpsc::Receiver<oneshot::Sender<ReplayTerminalSnapshotCapture>>,
+    pub session_io: Arc<SessionIo>,
     pub cleanup_guard: SessionCleanupGuard,
 }
 
@@ -99,6 +100,7 @@ struct RuntimeSession {
     size_rx: watch::Receiver<(u16, u16)>,
     idle_tx: watch::Sender<SessionIdleState>,
     input_tx: mpsc::Sender<Bytes>,
+    io: Arc<SessionIo>,
     control_tx: watch::Sender<SessionControl>,
     spy_tx: broadcast::Sender<SpyEvent>,
     snapshot_tx: mpsc::Sender<oneshot::Sender<ReplayTerminalSnapshotCapture>>,
@@ -121,11 +123,20 @@ pub struct SessionRegistry {
     node_id: String,
     long_session_notifier: Option<mpsc::UnboundedSender<Weak<RuntimeSession>>>,
     sessions: Mutex<HashMap<u64, Arc<RuntimeSession>>>,
+    count_tx: watch::Sender<usize>,
+    status_bar_state: Mutex<SharedStatusBarState>,
     status_bar_state_tx: watch::Sender<StatusBarState>,
+}
+
+#[derive(Default)]
+struct SharedStatusBarState {
+    base: StatusBarState,
+    drain: Option<StatusBarDrain>,
 }
 
 impl SessionRegistry {
     pub fn new(node_id: String, notifications: Arc<Notifications>) -> Arc<Self> {
+        let (count_tx, _) = watch::channel(0usize);
         let (status_bar_state_tx, _) = watch::channel(StatusBarState::default());
         let long_session_notifier = notifications
             .enabled()
@@ -134,6 +145,8 @@ impl SessionRegistry {
             node_id,
             long_session_notifier,
             sessions: Mutex::new(HashMap::new()),
+            count_tx,
+            status_bar_state: Mutex::new(SharedStatusBarState::default()),
             status_bar_state_tx,
         })
     }
@@ -156,6 +169,7 @@ impl SessionRegistry {
         let identity = SessionIdentity::new(username, initial_shortname);
         let session_ui = SessionUi::new(self.status_bar_state_tx.subscribe());
         let (input_tx, input_rx) = mpsc::channel(12);
+        let io = Arc::new(SessionIo::default());
         let (control_tx, control_rx) = watch::channel(SessionControl::Active);
         let (idle_tx, idle_rx) = watch::channel(SessionIdleState::default());
         let (snapshot_tx, snapshot_rx) = mpsc::channel(8);
@@ -171,16 +185,19 @@ impl SessionRegistry {
             size_rx,
             idle_tx: idle_tx.clone(),
             input_tx: input_tx.clone(),
+            io: io.clone(),
             control_tx: control_tx.clone(),
             spy_tx,
             snapshot_tx,
             active_spies: AtomicUsize::new(0),
             finished: AtomicBool::new(false),
         });
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(local_session_id, session.clone());
+        let count = {
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.insert(local_session_id, session.clone());
+            sessions.len()
+        };
+        self.count_tx.send_replace(count);
         if let Some(notifier) = &self.long_session_notifier {
             let _ = notifier.send(Arc::downgrade(&session));
         }
@@ -192,6 +209,7 @@ impl SessionRegistry {
             app_input_sender: input_tx,
             app_input_receiver: input_rx,
             spy_snapshot_requests: snapshot_rx,
+            session_io: io,
             cleanup_guard: SessionCleanupGuard {
                 registry: self.clone(),
                 local_session_id,
@@ -200,11 +218,30 @@ impl SessionRegistry {
     }
 
     pub fn set_status_bar_state(&self, state: StatusBarState) {
-        self.status_bar_state_tx.send_replace(state);
+        let combined = {
+            let mut shared = self.status_bar_state.lock().unwrap();
+            shared.base = state;
+            compose_status_bar_state(&shared)
+        };
+        self.status_bar_state_tx.send_replace(combined);
+    }
+
+    pub fn set_status_bar_drain(&self, drain: Option<StatusBarDrain>) {
+        let combined = {
+            let mut shared = self.status_bar_state.lock().unwrap();
+            shared.drain = drain;
+            compose_status_bar_state(&shared)
+        };
+        self.status_bar_state_tx.send_replace(combined);
     }
 
     pub fn remove(&self, local_session_id: u64) {
-        self.sessions.lock().unwrap().remove(&local_session_id);
+        let count = {
+            let mut sessions = self.sessions.lock().unwrap();
+            sessions.remove(&local_session_id);
+            sessions.len()
+        };
+        self.count_tx.send_replace(count);
     }
 
     pub fn count(&self) -> usize {
@@ -234,10 +271,25 @@ impl SessionRegistry {
         self.request_close(local_session_id, SessionEndReason::KickedByAdmin)
     }
 
+    pub fn request_close_all(&self, reason: SessionEndReason) -> usize {
+        let local_session_ids = self
+            .sessions
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        local_session_ids
+            .into_iter()
+            .filter(|local_session_id| self.request_close(*local_session_id, reason))
+            .count()
+    }
+
     pub fn request_close(&self, local_session_id: u64, reason: SessionEndReason) -> bool {
         let Some(session) = self.lookup(local_session_id) else {
             return false;
         };
+        session.io.close();
         session
             .control_tx
             .send_if_modified(|current| match (*current, reason) {
@@ -258,6 +310,18 @@ impl SessionRegistry {
         }
         let _ = session.spy_tx.send(SpyEvent::Closed { reason });
         true
+    }
+
+    pub async fn wait_for_zero(&self) {
+        let mut count_rx = self.count_tx.subscribe();
+        loop {
+            if *count_rx.borrow_and_update() == 0 {
+                return;
+            }
+            if count_rx.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     pub fn set_idle_paused(&self, local_session_id: u64, paused: bool) -> bool {
@@ -311,6 +375,9 @@ impl SessionRegistry {
 
     pub async fn spy(&self, local_session_id: u64, read_write: bool) -> Option<SpySession> {
         let session = self.lookup(local_session_id)?;
+        if session.finished.load(Ordering::Acquire) {
+            return None;
+        }
         let mut event_rx = session.spy_tx.subscribe();
         session.active_spies.fetch_add(1, Ordering::AcqRel);
 
@@ -345,6 +412,12 @@ impl SessionRegistry {
             .get(&local_session_id)
             .cloned()
     }
+}
+
+fn compose_status_bar_state(shared: &SharedStatusBarState) -> StatusBarState {
+    let mut state = shared.base.clone();
+    state.drain = shared.drain.clone();
+    state
 }
 
 fn spawn_long_session_notifier(
