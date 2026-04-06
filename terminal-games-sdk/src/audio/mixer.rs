@@ -97,15 +97,13 @@ impl Mixer {
     ///
     /// This should be called periodically from the main loop, typically
     /// every 5-10ms for smooth audio.
-    pub fn tick(&self) {
-        let Some(audio_info) = host::info() else {
-            return;
-        };
+    pub fn tick(&self) -> std::io::Result<()> {
+        let audio_info = host::info()?;
 
         let target_buffer = FRAME_SIZE as u32 * 2;
 
         if audio_info.buffer_available >= target_buffer {
-            return;
+            return Ok(());
         }
 
         let needed = (target_buffer - audio_info.buffer_available) as usize;
@@ -113,10 +111,11 @@ impl Mixer {
         let num_frames = frames * FRAME_SIZE;
 
         if num_frames == 0 {
-            return;
+            return Ok(());
         }
 
         let mixed = self.mix(num_frames);
-        host::write(&mixed);
+        host::write(&mixed)?;
+        Ok(())
     }
 }

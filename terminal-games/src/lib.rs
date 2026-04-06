@@ -16,3 +16,4 @@ pub mod rate_limiting;
 pub mod replay;
 mod status_bar;
 pub mod terminal_profile;
+pub mod wasm_abi;

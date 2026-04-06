@@ -6,14 +6,17 @@ package audio
 
 import (
 	"errors"
+	"fmt"
 	"unsafe"
+
+	"github.com/terminal-games/terminal-games/pkg/internal/hosterr"
 )
 
-//go:wasmimport terminal_games audio_write
+//go:wasmimport terminal_games audio_write_v1
 //go:noescape
 func audio_write(ptr unsafe.Pointer, sampleCount uint32) int32
 
-//go:wasmimport terminal_games audio_info
+//go:wasmimport terminal_games audio_info_v1
 //go:noescape
 func audio_info(
 	frameSizePtr unsafe.Pointer,
@@ -47,6 +50,9 @@ func Info() (AudioInfo, error) {
 	)
 
 	if ret < 0 {
+		if err := hosterr.MaybeVersionMismatch("terminal_games.audio_info_v1", ret); err != nil {
+			return AudioInfo{}, err
+		}
 		return AudioInfo{}, ErrAudioInfoFailed
 	}
 
@@ -67,19 +73,25 @@ func Info() (AudioInfo, error) {
 // dropped. Check the return value to see how many frames were actually
 // written.
 //
-// Returns the number of frames written, or a negative value on error.
-func Write(samples []float32) int {
+// Returns the number of frames written.
+func Write(samples []float32) (int, error) {
 	if len(samples) == 0 {
-		return 0
+		return 0, nil
 	}
 
 	frameCount := len(samples) / Channels
 	if frameCount == 0 {
-		return 0
+		return 0, nil
 	}
 
 	ret := audio_write(unsafe.Pointer(&samples[0]), uint32(frameCount))
-	return int(ret)
+	if ret < 0 {
+		if err := hosterr.MaybeVersionMismatch("terminal_games.audio_write_v1", ret); err != nil {
+			return 0, err
+		}
+		return 0, fmt.Errorf("audio_write failed with code %d", ret)
+	}
+	return int(ret), nil
 }
 
 // AudioWriter is a helper for continuously writing audio with automatic
@@ -101,10 +113,10 @@ func NewAudioWriter(targetBuffer uint32) *AudioWriter {
 //
 // Returns the number of samples that should be written, or 0 if the buffer
 // is sufficiently full. This is useful for rate-limiting audio generation.
-func (w *AudioWriter) ShouldWrite() int {
+func (w *AudioWriter) ShouldWrite() (int, error) {
 	info, err := Info()
 	if err != nil {
-		return 0
+		return 0, err
 	}
 
 	if w.NextPTS < info.PTS {
@@ -112,12 +124,12 @@ func (w *AudioWriter) ShouldWrite() int {
 	}
 
 	if info.BufferAvailable >= w.TargetBuffer {
-		return 0
+		return 0, nil
 	}
 
 	needed := int(w.TargetBuffer - info.BufferAvailable)
 	frames := (needed + FrameSize - 1) / FrameSize
-	return frames * FrameSize
+	return frames * FrameSize, nil
 }
 
 // WriteCallback calls the provided function to generate samples when needed.
@@ -127,16 +139,22 @@ func (w *AudioWriter) ShouldWrite() int {
 //
 // This method updates NextPTS automatically based on how many frames were
 // written.
-func (w *AudioWriter) WriteCallback(generate func(pts uint64, numFrames int) []float32) int {
-	needed := w.ShouldWrite()
+func (w *AudioWriter) WriteCallback(generate func(pts uint64, numFrames int) []float32) (int, error) {
+	needed, err := w.ShouldWrite()
+	if err != nil {
+		return 0, err
+	}
 	if needed == 0 {
-		return 0
+		return 0, nil
 	}
 
 	samples := generate(w.NextPTS, needed)
-	written := Write(samples)
+	written, err := Write(samples)
+	if err != nil {
+		return 0, err
+	}
 	if written > 0 {
 		w.NextPTS += uint64(written)
 	}
-	return written
+	return written, nil
 }

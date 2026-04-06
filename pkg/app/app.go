@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"time"
 	"unsafe"
+
+	"github.com/terminal-games/terminal-games/pkg/internal/hosterr"
 )
 
 const (
@@ -21,19 +23,19 @@ var (
 	ErrNextAppPrepareFailed    = errors.New("failed to prepare app switch")
 )
 
-//go:wasmimport terminal_games change_app
+//go:wasmimport terminal_games change_app_v1
 //go:noescape
 func change_app(address_ptr unsafe.Pointer, addressLen uint32) int32
 
-//go:wasmimport terminal_games next_app_ready
+//go:wasmimport terminal_games next_app_ready_v1
 //go:noescape
 func next_app_ready() int32
 
-//go:wasmimport terminal_games graceful_shutdown_poll
+//go:wasmimport terminal_games graceful_shutdown_poll_v1
 //go:noescape
 func graceful_shutdown_poll() int32
 
-//go:wasmimport terminal_games new_version_available_poll
+//go:wasmimport terminal_games new_version_available_poll_v1
 //go:noescape
 func new_version_available_poll() int32
 
@@ -48,6 +50,9 @@ func Change(shortname string) error {
 	b := []byte(shortname)
 	ret := change_app(unsafe.Pointer(&b[0]), uint32(len(b)))
 	if ret < 0 {
+		if err := hosterr.MaybeVersionMismatch("terminal_games.change_app_v1", ret); err != nil {
+			return err
+		}
 		return fmt.Errorf("change_app failed with code %d", ret)
 	}
 
@@ -63,6 +68,8 @@ func Change(shortname string) error {
 func Ready() (bool, error) {
 	ret := next_app_ready()
 	switch ret {
+	case hosterr.VersionMismatch:
+		return false, hosterr.MaybeVersionMismatch("terminal_games.next_app_ready_v1", ret)
 	case nextAppReadyErrUnknownShortname:
 		return false, ErrNextAppUnknownShortname
 	case nextAppReadyErrOther:
@@ -81,16 +88,16 @@ func Ready() (bool, error) {
 // This can be called periodically by the guest to check if it should begin
 // shutting down gracefully (e.g., saving state, closing connections, etc.)
 // before the host forces a hard shutdown.
-func GracefulShutdownPoll() bool {
-	return graceful_shutdown_poll() > 0
+func GracefulShutdownPoll() (bool, error) {
+	return hosterr.Bool("terminal_games.graceful_shutdown_poll_v1", graceful_shutdown_poll())
 }
 
 // IsNewVersionAvailable polls whether a newer uploaded version of the current app is available.
-func IsNewVersionAvailable() bool {
-	return new_version_available_poll() > 0
+func IsNewVersionAvailable() (bool, error) {
+	return hosterr.Bool("terminal_games.new_version_available_poll_v1", new_version_available_poll())
 }
 
-//go:wasmimport terminal_games network_info
+//go:wasmimport terminal_games network_info_v1
 //go:noescape
 func network_info(
 	bytesPerSecInPtr unsafe.Pointer,
@@ -99,7 +106,7 @@ func network_info(
 	latencyMsPtr unsafe.Pointer,
 ) int32
 
-//go:wasmimport terminal_games terminal_info
+//go:wasmimport terminal_games terminal_info_v1
 //go:noescape
 func terminal_info(
 	colorModePtr unsafe.Pointer,
@@ -138,6 +145,9 @@ func GetNetworkInfo() (NetworkInfo, error) {
 		unsafe.Pointer(&latencyMs),
 	)
 	if ret < 0 {
+		if err := hosterr.MaybeVersionMismatch("terminal_games.network_info_v1", ret); err != nil {
+			return NetworkInfo{}, err
+		}
 		return NetworkInfo{}, errors.New("network_info host call failed")
 	}
 	var lastThrottled time.Time
@@ -187,6 +197,9 @@ func GetTerminalInfo() (TerminalInfo, error) {
 		unsafe.Pointer(&dark),
 	)
 	if ret < 0 {
+		if err := hosterr.MaybeVersionMismatch("terminal_games.terminal_info_v1", ret); err != nil {
+			return TerminalInfo{}, err
+		}
 		return TerminalInfo{}, errors.New("terminal_info host call failed")
 	}
 

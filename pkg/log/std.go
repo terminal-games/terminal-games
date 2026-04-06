@@ -37,7 +37,9 @@ func (w *hostWriter) Write(p []byte) (n int, err error) {
 		}
 		msg := string(bytes.TrimRight(line, "\n"))
 		if msg != "" {
-			Log(w.level, msg)
+			if err := Log(w.level, msg); err != nil {
+				return n, err
+			}
 		}
 	}
 }

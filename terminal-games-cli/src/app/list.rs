@@ -45,6 +45,8 @@ pub(super) async fn run() -> Result<()> {
                 url.clone(),
                 response.server,
                 format_seconds(response.playtime_seconds),
+                if response.stale { "yes" } else { "no" }.to_string(),
+                format_imports(&response.imports, &response.stale_imports),
             ]);
         }
         for shortname in response.invalid_shortnames {
@@ -56,7 +58,15 @@ pub(super) async fn run() -> Result<()> {
     }
     rows.sort();
     print_table(
-        &["App", "Shortname", "Profile", "Server", "Playtime"],
+        &[
+            "App",
+            "Shortname",
+            "Profile",
+            "Server",
+            "Playtime",
+            "Stale",
+            "APIs",
+        ],
         &rows,
     );
     if !warnings.is_empty() {
@@ -66,6 +76,26 @@ pub(super) async fn run() -> Result<()> {
         eprintln!("{warning}");
     }
     Ok(())
+}
+
+fn format_imports(imports: &[String], stale_imports: &[String]) -> String {
+    if imports.is_empty() {
+        return "-".to_string();
+    }
+    let stale_imports = stale_imports
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    imports
+        .iter()
+        .map(|import| {
+            if stale_imports.contains(import) {
+                format!("{import} [old]")
+            } else {
+                import.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 async fn fetch_author_infos_for_server(

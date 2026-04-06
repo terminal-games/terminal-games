@@ -6,7 +6,10 @@ package log
 
 import (
 	"encoding/json"
+	"fmt"
 	"unsafe"
+
+	"github.com/terminal-games/terminal-games/pkg/internal/hosterr"
 )
 
 const (
@@ -17,18 +20,18 @@ const (
 	LevelError = 4
 )
 
-//go:wasmimport terminal_games log
+//go:wasmimport terminal_games log_v1
 //go:noescape
 func hostLog(level uint32, msgPtr unsafe.Pointer, msgLen uint32) int32
 
-func Log(level uint32, message string) {
+func Log(level uint32, message string) error {
 	if message == "" {
-		return
+		return nil
 	}
-	writeJSONLog(level, message, nil)
+	return writeJSONLog(level, message, nil)
 }
 
-func writeJSONLog(level uint32, message string, attrs map[string]any) {
+func writeJSONLog(level uint32, message string, attrs map[string]any) error {
 	entry := map[string]any{
 		"level":   levelString(level),
 		"message": message,
@@ -41,17 +44,23 @@ func writeJSONLog(level uint32, message string, attrs map[string]any) {
 	}
 	data, err := json.Marshal(entry)
 	if err != nil {
-		writeJSONLog(LevelError, "failed to marshal log entry", map[string]any{"log_error": err.Error()})
-		return
+		return err
 	}
 	if len(data) == 0 {
-		return
+		return nil
 	}
 	n := len(data)
 	if n > 16384 {
 		n = 16384
 	}
-	hostLog(level, unsafe.Pointer(&data[0]), uint32(n))
+	ret := hostLog(level, unsafe.Pointer(&data[0]), uint32(n))
+	if ret < 0 {
+		if err := hosterr.MaybeVersionMismatch("terminal_games.log_v1", ret); err != nil {
+			return err
+		}
+		return fmt.Errorf("log failed with code %d", ret)
+	}
+	return nil
 }
 
 func levelString(level uint32) string {

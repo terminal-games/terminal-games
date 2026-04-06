@@ -7,25 +7,27 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+
+	"github.com/terminal-games/terminal-games/pkg/internal/hosterr"
 )
 
-//go:wasmimport terminal_games dial
+//go:wasmimport terminal_games dial_v1
 //go:noescape
 func dial(address_ptr unsafe.Pointer, addressLen uint32, mode uint32) int32
 
-//go:wasmimport terminal_games poll_dial
+//go:wasmimport terminal_games poll_dial_v1
 //go:noescape
 func poll_dial(dial_id int32, local_addr_ptr unsafe.Pointer, local_addr_len_ptr unsafe.Pointer, remote_addr_ptr unsafe.Pointer, remote_addr_len_ptr unsafe.Pointer) int32
 
-//go:wasmimport terminal_games conn_close
+//go:wasmimport terminal_games conn_close_v1
 //go:noescape
 func conn_close(conn_id int32) int32
 
-//go:wasmimport terminal_games conn_write
+//go:wasmimport terminal_games conn_write_v1
 //go:noescape
 func conn_write(conn_id int32, address_ptr unsafe.Pointer, addressLen uint32) int32
 
-//go:wasmimport terminal_games conn_read
+//go:wasmimport terminal_games conn_read_v1
 //go:noescape
 func conn_read(conn_id int32, address_ptr unsafe.Pointer, addressLen uint32) int32
 
@@ -91,6 +93,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	addressBytes := []byte(address)
 	dialID := dial(unsafe.Pointer(&addressBytes[0]), uint32(len(addressBytes)), mode)
 	if dialID < 0 {
+		if err := hosterr.MaybeVersionMismatch("terminal_games.dial_v1", dialID); err != nil {
+			return nil, err
+		}
 		return nil, dialErrorFromCode(dialID)
 	}
 
@@ -129,6 +134,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 			time.Sleep(10 * time.Millisecond)
 			continue
 		default:
+			if err := hosterr.MaybeVersionMismatch("terminal_games.poll_dial_v1", result); err != nil {
+				return nil, err
+			}
 			return nil, pollDialErrorFromCode(result)
 		}
 	}
@@ -202,6 +210,9 @@ func (c *WasmHostConn) Read(b []byte) (n int, err error) {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
+		if err := hosterr.MaybeVersionMismatch("terminal_games.conn_read_v1", readN); err != nil {
+			return 0, err
+		}
 		return 0, readErrorFromCode(readN)
 	}
 }
@@ -247,6 +258,9 @@ func (c *WasmHostConn) Write(b []byte) (n int, err error) {
 			continue
 		}
 
+		if err := hosterr.MaybeVersionMismatch("terminal_games.conn_write_v1", written); err != nil {
+			return totalWritten, err
+		}
 		return totalWritten, writeErrorFromCode(written)
 	}
 
@@ -267,6 +281,9 @@ func writeErrorFromCode(code int32) error {
 func (c *WasmHostConn) Close() error {
 	result := conn_close(c.connID)
 	if result < 0 {
+		if err := hosterr.MaybeVersionMismatch("terminal_games.conn_close_v1", result); err != nil {
+			return err
+		}
 		return ErrInvalidConnID
 	}
 	return nil

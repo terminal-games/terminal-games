@@ -37,6 +37,7 @@ use terminal_games::{
     mesh::{BuildId, LocalDiscovery, Mesh},
     rate_limiting::{NetworkInformation, RateLimitedStream},
     terminal_profile::TerminalProfile,
+    wasm_abi,
 };
 
 use crate::app::load_upload_envs;
@@ -332,6 +333,8 @@ async fn upsert_game(
     envs: &[AppEnvVar],
 ) -> Result<(String, Option<AppRuntimeUpdateMessage>)> {
     let wasm = fs::read(path).with_context(|| format!("Failed to read wasm from {path}"))?;
+    let imports = wasm_abi::guest_host_api_inventory(&wasm)
+        .with_context(|| format!("Failed to parse terminal-games imports from {path}"))?;
     let manifest = extract_manifest_from_wasm(&wasm)
         .with_context(|| format!("Failed to extract manifest from {path}"))?
         .ok_or_else(|| anyhow::anyhow!("missing embedded terminal-games manifest in {path}"))?;
@@ -347,6 +350,8 @@ async fn upsert_game(
     let shortname = manifest.shortname.clone();
     let details = serde_json::to_string(&manifest.details)
         .with_context(|| format!("Failed to serialize manifest details for {shortname}"))?;
+    let imports = serde_json::to_string(&imports)
+        .with_context(|| format!("Failed to serialize terminal-games imports for {shortname}"))?;
     let build_id = BuildId::from_wasm_and_envs(&wasm, envs);
     let encrypted_env = encrypt_app_env_blob(app_env_secret_key, envs)?;
     let tx = conn.transaction().await?;
@@ -365,15 +370,17 @@ async fn upsert_game(
             tx.execute(
                 "UPDATE apps
                  SET details = json(?2),
-                     wasm = ?3,
-                     wasm_hash = ?4,
-                     env_hash = ?5,
-                     env_salt = ?6,
-                     env_blob = ?7
+                     imports = json(?3),
+                     wasm = ?4,
+                     wasm_hash = ?5,
+                     env_hash = ?6,
+                     env_salt = ?7,
+                     env_blob = ?8
                  WHERE id = ?1",
                 libsql::params!(
                     app_id,
                     details.as_str(),
+                    imports.as_str(),
                     wasm,
                     build_id.wasm_hash.to_vec(),
                     build_id.env_hash.to_vec(),
@@ -389,16 +396,18 @@ async fn upsert_game(
             tx.execute(
                 "UPDATE apps
                  SET wasm = ?2,
-                     details = json(?3),
-                     wasm_hash = ?4,
-                     env_hash = ?5,
-                     env_salt = ?6,
-                     env_blob = ?7,
-                     build_updated_at = ?8
+                     imports = json(?3),
+                     details = json(?4),
+                     wasm_hash = ?5,
+                     env_hash = ?6,
+                     env_salt = ?7,
+                     env_blob = ?8,
+                     build_updated_at = ?9
                  WHERE id = ?1",
                 libsql::params!(
                     app_id,
                     wasm,
+                    imports.as_str(),
                     details.as_str(),
                     build_id.wasm_hash.to_vec(),
                     build_id.env_hash.to_vec(),
@@ -418,11 +427,12 @@ async fn upsert_game(
     } else {
         let updated_at_ns = current_unix_nanos();
         tx.execute(
-            "INSERT INTO apps (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
-             VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO apps (shortname, wasm, imports, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
+             VALUES (?1, ?2, json(?3), json(?4), ?5, ?6, ?7, ?8, ?9)",
             libsql::params!(
                 shortname.as_str(),
                 wasm,
+                imports.as_str(),
                 details.as_str(),
                 build_id.wasm_hash.to_vec(),
                 build_id.env_hash.to_vec(),

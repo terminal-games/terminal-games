@@ -16,10 +16,7 @@ pub fn change_app(shortname: impl AsRef<str>) -> Result<(), std::io::Error> {
             ));
         }
         r if r < 0 => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to change app, got {}", r),
-            ));
+            return Err(crate::host_call_error("terminal_games.change_app_v1", r));
         }
         _ => {}
     }
@@ -34,6 +31,7 @@ const NEXT_APP_READY_ERR_OTHER: i32 = -2;
 #[derive(Debug)]
 pub enum NextAppReadyError {
     UnknownShortname,
+    VersionMismatch,
     Other(i32),
 }
 
@@ -41,6 +39,12 @@ impl std::fmt::Display for NextAppReadyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownShortname => write!(f, "unknown app shortname"),
+            Self::VersionMismatch => {
+                write!(
+                    f,
+                    "terminal-games host version mismatch for terminal_games.next_app_ready_v1"
+                )
+            }
             Self::Other(code) => write!(f, "next_app_ready failed with code {}", code),
         }
     }
@@ -58,6 +62,7 @@ pub fn next_app_ready() -> Result<bool, NextAppReadyError> {
     let result = unsafe { crate::internal::next_app_ready() };
     match result {
         NEXT_APP_READY_ERR_UNKNOWN_SHORTNAME => Err(NextAppReadyError::UnknownShortname),
+        crate::HOST_API_VERSION_MISMATCH => Err(NextAppReadyError::VersionMismatch),
         NEXT_APP_READY_ERR_OTHER => Err(NextAppReadyError::Other(result)),
         r if r < 0 => Err(NextAppReadyError::Other(r)),
         r => Ok(r > 0),
@@ -70,13 +75,17 @@ pub fn next_app_ready() -> Result<bool, NextAppReadyError> {
 /// This can be called periodically by the guest to check if it should begin
 /// shutting down gracefully (e.g., saving state, closing connections, etc.)
 /// before the host forces a hard shutdown.
-pub fn graceful_shutdown_poll() -> bool {
-    return unsafe { crate::internal::graceful_shutdown_poll() } > 0;
+pub fn graceful_shutdown_poll() -> std::io::Result<bool> {
+    crate::host_call_bool("terminal_games.graceful_shutdown_poll_v1", unsafe {
+        crate::internal::graceful_shutdown_poll()
+    })
 }
 
 /// Polls whether a newer uploaded version of the current app is available.
-pub fn is_new_version_available() -> bool {
-    (unsafe { crate::internal::new_version_available_poll() }) > 0
+pub fn is_new_version_available() -> std::io::Result<bool> {
+    crate::host_call_bool("terminal_games.new_version_available_poll_v1", unsafe {
+        crate::internal::new_version_available_poll()
+    })
 }
 
 /// Information about the current session's network connection to the host.
@@ -109,9 +118,9 @@ pub fn network_info() -> std::io::Result<NetworkInfo> {
         )
     };
     if result < 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "network_info host call failed",
+        return Err(crate::host_call_error(
+            "terminal_games.network_info_v1",
+            result,
         ));
     }
     let last_throttled = (last_throttled_ms > 0).then(|| {
@@ -160,9 +169,9 @@ pub fn terminal_info() -> std::io::Result<TerminalInfo> {
         )
     };
     if result < 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "terminal_info host call failed",
+        return Err(crate::host_call_error(
+            "terminal_games.terminal_info_v1",
+            result,
         ));
     }
 

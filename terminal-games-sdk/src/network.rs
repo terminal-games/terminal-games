@@ -30,6 +30,7 @@ const CONN_ERR_CONNECTION_ERROR: i32 = -2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialError {
+    VersionMismatch,
     AddressTooLong,
     TooManyConnections,
     DialTaskFailed,
@@ -46,6 +47,9 @@ pub enum DialError {
 impl std::fmt::Display for DialError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DialError::VersionMismatch => {
+                write!(f, "terminal-games host version mismatch for terminal_games")
+            }
             DialError::AddressTooLong => write!(f, "address too long"),
             DialError::TooManyConnections => write!(f, "too many connections (max 8)"),
             DialError::DialTaskFailed => write!(f, "dial task failed"),
@@ -66,6 +70,7 @@ impl std::error::Error for DialError {}
 impl DialError {
     fn from_dial_code(code: i32) -> Self {
         match code {
+            crate::HOST_API_VERSION_MISMATCH => DialError::VersionMismatch,
             DIAL_ERR_ADDRESS_TOO_LONG => DialError::AddressTooLong,
             DIAL_ERR_TOO_MANY_CONNECTIONS => DialError::TooManyConnections,
             _ => DialError::Unknown(code),
@@ -74,6 +79,7 @@ impl DialError {
 
     fn from_poll_code(code: i32) -> Self {
         match code {
+            crate::HOST_API_VERSION_MISMATCH => DialError::VersionMismatch,
             POLL_DIAL_ERR_INVALID_DIAL_ID => DialError::InvalidDialId,
             POLL_DIAL_ERR_TASK_FAILED => DialError::DialTaskFailed,
             POLL_DIAL_ERR_TOO_MANY_CONNECTIONS => DialError::TooManyConnections,
@@ -220,10 +226,12 @@ impl Conn {
     pub fn close(&self) -> io::Result<()> {
         let result = unsafe { crate::internal::conn_close(self.fd) };
         if result < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid connection ID",
-            ));
+            return Err(match result {
+                crate::HOST_API_VERSION_MISMATCH => {
+                    crate::host_call_error("terminal_games.conn_close_v1", result)
+                }
+                _ => io::Error::new(io::ErrorKind::InvalidInput, "invalid connection ID"),
+            });
         }
         Ok(())
     }
@@ -272,6 +280,10 @@ impl Conn {
         }
 
         match result {
+            crate::HOST_API_VERSION_MISMATCH => Err(crate::host_call_error(
+                "terminal_games.conn_write_v1",
+                result,
+            )),
             CONN_ERR_INVALID_CONN_ID => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid connection ID",
@@ -304,6 +316,10 @@ impl Conn {
         }
 
         match result {
+            crate::HOST_API_VERSION_MISMATCH => Err(crate::host_call_error(
+                "terminal_games.conn_read_v1",
+                result,
+            )),
             CONN_ERR_INVALID_CONN_ID => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid connection ID",
@@ -386,6 +402,9 @@ impl AsyncRead for Conn {
 
         if result < 0 {
             let err = match result {
+                crate::HOST_API_VERSION_MISMATCH => {
+                    crate::host_call_error("terminal_games.conn_read_v1", result)
+                }
                 CONN_ERR_INVALID_CONN_ID => {
                     io::Error::new(io::ErrorKind::InvalidInput, "invalid connection ID")
                 }

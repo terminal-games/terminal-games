@@ -133,6 +133,7 @@ async fn main() -> std::io::Result<()> {
 
         let mut event_counter = 0;
         for event in &mut terminal_reader {
+            let event = event?;
             event_counter += 1;
             if let Some(key_event) = event.as_key() {
                 match key_event {
@@ -252,11 +253,18 @@ async fn main() -> std::io::Result<()> {
             Err(_) => break,
         }
 
-        if app::graceful_shutdown_poll() {
+        if app::graceful_shutdown_poll()? {
             break;
         }
 
         for msg in &mut peer_messages {
+            let msg = match msg {
+                Ok(msg) => msg,
+                Err(err) => {
+                    tracing::warn!("peer receive error: {}", err);
+                    continue;
+                }
+            };
             let message_str = String::from_utf8_lossy(&msg.data).to_string();
             let peer_msg = PeerMessage {
                 from: msg.from,
@@ -402,9 +410,9 @@ async fn main() -> std::io::Result<()> {
         frame_counter += 1;
 
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        mixer().tick();
+        mixer().tick()?;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        mixer().tick();
+        mixer().tick()?;
     }
     std::io::stdout().write(b"\x1b[?1003l")?;
     Ok(())

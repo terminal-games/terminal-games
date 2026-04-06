@@ -32,11 +32,11 @@ const (
 	menuReqReplayDelete = 4
 )
 
-//go:wasmimport terminal_games menu_request
+//go:wasmimport terminal_games menu_request_v1
 //go:noescape
 func menu_request(typ int32, ptr1 unsafe.Pointer, len1 uint32, ptr2 unsafe.Pointer, len2 uint32, extra int64) int32
 
-//go:wasmimport terminal_games menu_poll
+//go:wasmimport terminal_games menu_poll_v1
 //go:noescape
 func menu_poll(requestID int32, dataPtr unsafe.Pointer, dataMaxLen uint32, dataLenPtr unsafe.Pointer) int32
 

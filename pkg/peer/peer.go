@@ -16,6 +16,8 @@ import (
 	"time"
 	"unicode/utf8"
 	"unsafe"
+
+	"github.com/terminal-games/terminal-games/pkg/internal/hosterr"
 )
 
 const (
@@ -28,19 +30,19 @@ const (
 	peerRecvErrChannelDisconnected = -1
 )
 
-//go:wasmimport terminal_games peer_send
+//go:wasmimport terminal_games peer_send_v1
 //go:noescape
 func peer_send(peer_ids_ptr unsafe.Pointer, peer_ids_count uint32, data_ptr unsafe.Pointer, data_len uint32) int32
 
-//go:wasmimport terminal_games peer_recv
+//go:wasmimport terminal_games peer_recv_v1
 //go:noescape
 func peer_recv(from_peer_ptr unsafe.Pointer, data_ptr unsafe.Pointer, data_max_len uint32) int32
 
-//go:wasmimport terminal_games node_latency
+//go:wasmimport terminal_games node_latency_v1
 //go:noescape
 func node_latency(node_ptr unsafe.Pointer) int32
 
-//go:wasmimport terminal_games peer_list
+//go:wasmimport terminal_games peer_list_v1
 //go:noescape
 func peer_list(peer_ids_ptr unsafe.Pointer, max_length uint32, total_count_ptr unsafe.Pointer) int32
 
@@ -77,6 +79,9 @@ var (
 func (r NodeID) Latency() (uint32, error) {
 	ms := node_latency(unsafe.Pointer(&r[0]))
 	if ms < 0 {
+		if err := hosterr.MaybeVersionMismatch("terminal_games.node_latency_v1", ms); err != nil {
+			return 0, err
+		}
 		return 0, ErrLatencyUnknown
 	}
 	return uint32(ms), nil
@@ -163,6 +168,9 @@ func listN(length uint32) ([]ID, uint32, error) {
 	if length == 0 {
 		ret := peer_list(nil, 0, unsafe.Pointer(&totalCount))
 		if ret < 0 {
+			if err := hosterr.MaybeVersionMismatch("terminal_games.peer_list_v1", ret); err != nil {
+				return nil, 0, err
+			}
 			return nil, 0, ErrListFailed
 		}
 		return nil, totalCount, nil
@@ -171,6 +179,9 @@ func listN(length uint32) ([]ID, uint32, error) {
 	buf := make([]byte, length*idByteLen)
 	ret := peer_list(unsafe.Pointer(&buf[0]), length, unsafe.Pointer(&totalCount))
 	if ret < 0 {
+		if err := hosterr.MaybeVersionMismatch("terminal_games.peer_list_v1", ret); err != nil {
+			return nil, totalCount, err
+		}
 		return nil, totalCount, ErrListFailed
 	}
 
@@ -233,6 +244,9 @@ func SendTo(data []byte, peerIDs []ID) error {
 		uint32(len(data)),
 	)
 	if ret < 0 {
+		if err := hosterr.MaybeVersionMismatch("terminal_games.peer_send_v1", ret); err != nil {
+			return err
+		}
 		return sendErrorFromCode(ret)
 	}
 
@@ -279,6 +293,9 @@ func Recv() (Message, error) {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		} else {
+			if err := hosterr.MaybeVersionMismatch("terminal_games.peer_recv_v1", ret); err != nil {
+				return Message{}, err
+			}
 			return Message{}, recvErrorFromCode(ret)
 		}
 	}

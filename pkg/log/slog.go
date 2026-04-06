@@ -41,8 +41,7 @@ func (h *hostHandler) Handle(_ context.Context, r slog.Record) error {
 			attrs["line"] = frame.Line
 		}
 	}
-	writeJSONLog(level, r.Message, attrs)
-	return nil
+	return writeJSONLog(level, r.Message, attrs)
 }
 
 func (h *hostHandler) WithAttrs(attrs []slog.Attr) slog.Handler {

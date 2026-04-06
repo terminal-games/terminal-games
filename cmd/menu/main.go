@@ -168,7 +168,10 @@ func main() {
 	}
 	menuModel.applyMenuLocalization()
 
-	p := bubblewrap.NewProgram(menuModel)
+	p, err := bubblewrap.NewProgram(menuModel)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)

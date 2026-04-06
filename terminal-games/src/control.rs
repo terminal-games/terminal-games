@@ -288,6 +288,9 @@ pub struct AppSummary {
     pub author_name: String,
     pub shortname: String,
     pub playtime_seconds: f64,
+    pub stale: bool,
+    pub stale_imports: Vec<String>,
+    pub imports: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +364,9 @@ pub struct AppSelfResponse {
     pub shortname: String,
     pub server: String,
     pub playtime_seconds: f64,
+    pub stale: bool,
+    pub stale_imports: Vec<String>,
+    pub imports: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

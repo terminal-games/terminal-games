@@ -23,9 +23,34 @@ pub(super) async fn run(profile: Option<String>) -> Result<()> {
                 },
                 app.shortname,
                 format_seconds(app.playtime_seconds),
+                if app.stale { "yes" } else { "no" }.to_string(),
+                format_imports(&app.imports, &app.stale_imports),
             ]
         })
         .collect::<Vec<_>>();
-    print_table(&["App ID", "App", "Shortname", "Playtime"], &rows);
+    print_table(
+        &["App ID", "App", "Shortname", "Playtime", "Stale", "APIs"],
+        &rows,
+    );
     Ok(())
+}
+
+fn format_imports(imports: &[String], stale_imports: &[String]) -> String {
+    if imports.is_empty() {
+        return "-".to_string();
+    }
+    let stale_imports = stale_imports
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    imports
+        .iter()
+        .map(|import| {
+            if stale_imports.contains(import) {
+                format!("{import} [old]")
+            } else {
+                import.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
