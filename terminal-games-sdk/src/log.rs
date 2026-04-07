@@ -65,6 +65,16 @@ impl tracing::field::Visit for JsonVisitor {
 
 struct HostLayer;
 
+fn host_log(level: u32, bytes: &[u8]) -> std::io::Result<()> {
+    let result =
+        unsafe { crate::internal::log(level, bytes.as_ptr(), bytes.len().min(16384) as u32) };
+    if result < 0 {
+        Err(crate::host_call_error("terminal_games.log_v1", result))
+    } else {
+        Ok(())
+    }
+}
+
 impl<S> Layer<S> for HostLayer
 where
     S: tracing::Subscriber,
@@ -120,14 +130,13 @@ where
             return;
         };
         let bytes = msg.as_bytes();
-        if !bytes.is_empty() {
-            let _ = unsafe {
-                crate::internal::log(
-                    level_to_host(event.metadata().level()),
-                    bytes.as_ptr(),
-                    bytes.len().min(16384) as u32,
-                )
-            };
+        if !bytes.is_empty()
+            && let Err(error) = host_log(level_to_host(event.metadata().level()), bytes)
+        {
+            static LOG_FAILURE: OnceLock<()> = OnceLock::new();
+            let _ = LOG_FAILURE.get_or_init(|| {
+                eprintln!("terminal-games logging disabled: {error}");
+            });
         }
     }
 }

@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use super::super::{
     AppServer, AppState, NODE_LATENCY_ERR_UNKNOWN, PEER_RECV_ERR_CHANNEL_DISCONNECTED,
     PEER_SEND_ERR_CHANNEL_CLOSED, PEER_SEND_ERR_CHANNEL_FULL, PEER_SEND_ERR_DATA_TOO_LARGE,
@@ -5,23 +7,16 @@ use super::super::{
 };
 use crate::{
     mesh::{NodeId, PeerId},
-    wasm_abi,
-    wasm_abi::HOST_API_MODULE,
+    wasm_abi::{HOST_API_MODULE, HostApiRegistration},
 };
 
-impl AppServer {
-    #[rustfmt::skip]
-    pub(super) fn link_peer_host_functions(
-        linker: &mut wasmtime::Linker<AppState>,
-    ) -> anyhow::Result<()> {
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::peer::SEND.current_import(), Self::peer_send)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::peer::RECV.current_import(), Self::peer_recv)?;
-        linker.func_wrap_async(HOST_API_MODULE, wasm_abi::peer::NODE_LATENCY.current_import(), Self::node_latency)?;
-        linker.func_wrap_async(HOST_API_MODULE, wasm_abi::peer::LIST.current_import(), Self::peer_list)?;
-        Ok(())
-    }
+inventory::submit! { HostApiRegistration::new("peer_send", 1, |linker| linker.func_wrap(HOST_API_MODULE, "peer_send_v1", AppServer::peer_send_v1)) }
+inventory::submit! { HostApiRegistration::new("peer_recv", 1, |linker| linker.func_wrap(HOST_API_MODULE, "peer_recv_v1", AppServer::peer_recv_v1)) }
+inventory::submit! { HostApiRegistration::new("node_latency", 1, |linker| linker.func_wrap_async(HOST_API_MODULE, "node_latency_v1", AppServer::node_latency_v1)) }
+inventory::submit! { HostApiRegistration::new("peer_list", 1, |linker| linker.func_wrap_async(HOST_API_MODULE, "peer_list_v1", AppServer::peer_list_v1)) }
 
-    fn peer_send(
+impl AppServer {
+    fn peer_send_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         peer_ids_ptr: i32,
         peer_ids_count: u32,
@@ -75,7 +70,7 @@ impl AppServer {
         }
     }
 
-    fn peer_recv(
+    fn peer_recv_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         from_peer_ptr: i32,
         data_ptr: i32,
@@ -110,7 +105,7 @@ impl AppServer {
         Ok(data_to_write as i32)
     }
 
-    fn node_latency(
+    fn node_latency_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         (node_ptr,): (i32,),
     ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {
@@ -136,7 +131,7 @@ impl AppServer {
         })
     }
 
-    fn peer_list(
+    fn peer_list_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         (peer_ids_ptr, length, total_count_ptr): (i32, u32, i32),
     ) -> Box<dyn Future<Output = wasmtime::Result<i32>> + Send + '_> {

@@ -5,23 +5,17 @@ use super::super::{
     NEXT_APP_READY_ERR_PREPARE_FAILED_OTHER, NEXT_APP_READY_NOT_READY, NEXT_APP_READY_READY,
     NextAppPrepareError, NextAppState,
 };
-use crate::{wasm_abi, wasm_abi::HOST_API_MODULE};
+use crate::wasm_abi::{HOST_API_MODULE, HostApiRegistration};
+
+inventory::submit! { HostApiRegistration::new("change_app", 1, |linker| linker.func_wrap(HOST_API_MODULE, "change_app_v1", AppServer::change_app_v1)) }
+inventory::submit! { HostApiRegistration::new("next_app_ready", 1, |linker| linker.func_wrap(HOST_API_MODULE, "next_app_ready_v1", AppServer::next_app_ready_v1)) }
+inventory::submit! { HostApiRegistration::new("graceful_shutdown_poll", 1, |linker| linker.func_wrap(HOST_API_MODULE, "graceful_shutdown_poll_v1", AppServer::graceful_shutdown_poll_v1)) }
+inventory::submit! { HostApiRegistration::new("new_version_available_poll", 1, |linker| linker.func_wrap(HOST_API_MODULE, "new_version_available_poll_v1", AppServer::new_version_available_poll_v1)) }
+inventory::submit! { HostApiRegistration::new("network_info", 1, |linker| linker.func_wrap(HOST_API_MODULE, "network_info_v1", AppServer::network_info_v1)) }
+inventory::submit! { HostApiRegistration::new("terminal_info", 1, |linker| linker.func_wrap(HOST_API_MODULE, "terminal_info_v1", AppServer::terminal_info_v1)) }
 
 impl AppServer {
-    #[rustfmt::skip]
-    pub(super) fn link_app_host_functions(
-        linker: &mut wasmtime::Linker<AppState>,
-    ) -> anyhow::Result<()> {
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::app::CHANGE_APP.current_import(), Self::change_app)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::app::NEXT_APP_READY.current_import(), Self::next_app_ready)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::app::GRACEFUL_SHUTDOWN_POLL.current_import(), Self::graceful_shutdown_poll)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::app::NEW_VERSION_AVAILABLE_POLL.current_import(), Self::new_version_available_poll)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::app::NETWORK_INFO.current_import(), Self::host_network_info)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::app::TERMINAL_INFO.current_import(), Self::host_terminal_info)?;
-        Ok(())
-    }
-
-    fn change_app(
+    fn change_app_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         ptr: i32,
         len: u32,
@@ -89,7 +83,7 @@ impl AppServer {
         Ok(0)
     }
 
-    fn next_app_ready(mut caller: wasmtime::Caller<'_, AppState>) -> wasmtime::Result<i32> {
+    fn next_app_ready_v1(mut caller: wasmtime::Caller<'_, AppState>) -> wasmtime::Result<i32> {
         let ready = caller.data().has_next_app.load(Ordering::Acquire);
         if ready {
             return Ok(NEXT_APP_READY_READY);
@@ -128,12 +122,14 @@ impl AppServer {
             }
         }
     }
-    fn graceful_shutdown_poll(caller: wasmtime::Caller<'_, AppState>) -> wasmtime::Result<i32> {
+    fn graceful_shutdown_poll_v1(caller: wasmtime::Caller<'_, AppState>) -> wasmtime::Result<i32> {
         let is_cancelled = caller.data().graceful_shutdown_token.is_cancelled();
         Ok(if is_cancelled { 1 } else { 0 })
     }
 
-    fn new_version_available_poll(caller: wasmtime::Caller<'_, AppState>) -> wasmtime::Result<i32> {
+    fn new_version_available_poll_v1(
+        caller: wasmtime::Caller<'_, AppState>,
+    ) -> wasmtime::Result<i32> {
         let has_update = caller
             .data()
             .app
@@ -143,7 +139,7 @@ impl AppServer {
         Ok(if has_update { 1 } else { 0 })
     }
 
-    fn host_network_info(
+    fn network_info_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         bytes_per_sec_in_ptr: i32,
         bytes_per_sec_out_ptr: i32,
@@ -189,7 +185,7 @@ impl AppServer {
         Ok(0)
     }
 
-    fn host_terminal_info(
+    fn terminal_info_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         color_mode_ptr: i32,
         has_bg_ptr: i32,

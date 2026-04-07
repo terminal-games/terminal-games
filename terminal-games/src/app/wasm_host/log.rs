@@ -1,20 +1,13 @@
 use super::super::{AppServer, AppState};
 use crate::{
     log_backend::{LogLevel, parse_guest_log_object},
-    wasm_abi,
-    wasm_abi::HOST_API_MODULE,
+    wasm_abi::{HOST_API_MODULE, HostApiRegistration},
 };
 
-impl AppServer {
-    #[rustfmt::skip]
-    pub(super) fn link_log_host_functions(
-        linker: &mut wasmtime::Linker<AppState>,
-    ) -> anyhow::Result<()> {
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::log::LOG.current_import(), Self::host_log)?;
-        Ok(())
-    }
+inventory::submit! { HostApiRegistration::new("log", 1, |linker| linker.func_wrap(HOST_API_MODULE, "log_v1", AppServer::log_v1)) }
 
-    fn host_log(
+impl AppServer {
+    fn log_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         level: u32,
         ptr: i32,

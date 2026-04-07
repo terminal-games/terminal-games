@@ -6,19 +6,13 @@ use super::super::{
     MENU_REQ_REPLAYS_LIST, MenuRequestJob, MenuRequestKind, MenuRequestState, MenuSessionState,
     MenuUpdate, PendingMenuRequest,
 };
-use crate::{wasm_abi, wasm_abi::HOST_API_MODULE};
+use crate::wasm_abi::{HOST_API_MODULE, HostApiRegistration};
+
+inventory::submit! { HostApiRegistration::new("menu_request", 1, |linker| linker.func_wrap(HOST_API_MODULE, "menu_request_v1", AppServer::menu_request_v1)) }
+inventory::submit! { HostApiRegistration::new("menu_poll", 1, |linker| linker.func_wrap(HOST_API_MODULE, "menu_poll_v1", AppServer::menu_poll_v1)) }
 
 impl AppServer {
-    #[rustfmt::skip]
-    pub(super) fn link_menu_host_functions(
-        linker: &mut wasmtime::Linker<AppState>,
-    ) -> anyhow::Result<()> {
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::menu::REQUEST.current_import(), Self::menu_request)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::menu::POLL.current_import(), Self::menu_poll)?;
-        Ok(())
-    }
-
-    fn menu_request(
+    fn menu_request_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         typ: i32,
         ptr1: i32,
@@ -109,7 +103,7 @@ impl AppServer {
         Ok(request_id)
     }
 
-    fn menu_poll(
+    fn menu_poll_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         request_id: i32,
         data_ptr: i32,

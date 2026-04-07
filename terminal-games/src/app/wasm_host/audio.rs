@@ -1,21 +1,14 @@
 use super::super::{AppServer, AppState};
 use crate::{
     audio::{CHANNELS, FRAME_SIZE, SAMPLE_RATE},
-    wasm_abi,
-    wasm_abi::HOST_API_MODULE,
+    wasm_abi::{HOST_API_MODULE, HostApiRegistration},
 };
 
-impl AppServer {
-    #[rustfmt::skip]
-    pub(super) fn link_audio_host_functions(
-        linker: &mut wasmtime::Linker<AppState>,
-    ) -> anyhow::Result<()> {
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::audio::WRITE.current_import(), Self::audio_write)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::audio::INFO.current_import(), Self::audio_info)?;
-        Ok(())
-    }
+inventory::submit! { HostApiRegistration::new("audio_write", 1, |linker| linker.func_wrap(HOST_API_MODULE, "audio_write_v1", AppServer::audio_write_v1)) }
+inventory::submit! { HostApiRegistration::new("audio_info", 1, |linker| linker.func_wrap(HOST_API_MODULE, "audio_info_v1", AppServer::audio_info_v1)) }
 
-    fn audio_write(
+impl AppServer {
+    fn audio_write_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         ptr: i32,
         sample_count: u32,
@@ -53,7 +46,7 @@ impl AppServer {
         Ok(written as i32)
     }
 
-    fn audio_info(
+    fn audio_info_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         frame_size_ptr: i32,
         sample_rate_ptr: i32,

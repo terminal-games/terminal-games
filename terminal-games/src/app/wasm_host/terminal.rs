@@ -1,18 +1,12 @@
 use super::super::{AppServer, AppState};
-use crate::{wasm_abi, wasm_abi::HOST_API_MODULE};
+use crate::wasm_abi::{HOST_API_MODULE, HostApiRegistration};
+
+inventory::submit! { HostApiRegistration::new("terminal_read", 1, |linker| linker.func_wrap(HOST_API_MODULE, "terminal_read_v1", AppServer::terminal_read_v1)) }
+inventory::submit! { HostApiRegistration::new("terminal_size", 1, |linker| linker.func_wrap(HOST_API_MODULE, "terminal_size_v1", AppServer::terminal_size_v1)) }
+inventory::submit! { HostApiRegistration::new("terminal_cursor", 1, |linker| linker.func_wrap(HOST_API_MODULE, "terminal_cursor_v1", AppServer::terminal_cursor_v1)) }
 
 impl AppServer {
-    #[rustfmt::skip]
-    pub(super) fn link_terminal_host_functions(
-        linker: &mut wasmtime::Linker<AppState>,
-    ) -> anyhow::Result<()> {
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::terminal::READ.current_import(), Self::terminal_read)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::terminal::SIZE.current_import(), Self::terminal_size)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::terminal::CURSOR.current_import(), Self::terminal_cursor)?;
-        Ok(())
-    }
-
-    fn terminal_read(
+    fn terminal_read_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         ptr: i32,
         _len: u32,
@@ -44,7 +38,7 @@ impl AppServer {
         }
     }
 
-    fn terminal_size(
+    fn terminal_size_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         width_ptr: i32,
         height_ptr: i32,
@@ -64,7 +58,7 @@ impl AppServer {
         Ok(0)
     }
 
-    fn terminal_cursor(
+    fn terminal_cursor_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         x_ptr: i32,
         y_ptr: i32,

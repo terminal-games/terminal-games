@@ -10,22 +10,16 @@ use super::super::{
     POLL_DIAL_ERR_TASK_FAILED, POLL_DIAL_ERR_TLS_HANDSHAKE, POLL_DIAL_ERR_TOO_MANY_CONNECTIONS,
     POLL_DIAL_PENDING, PendingDial, Stream, is_globally_reachable,
 };
-use crate::{wasm_abi, wasm_abi::HOST_API_MODULE};
+use crate::wasm_abi::{HOST_API_MODULE, HostApiRegistration};
+
+inventory::submit! { HostApiRegistration::new("dial", 1, |linker| linker.func_wrap(HOST_API_MODULE, "dial_v1", AppServer::dial_v1)) }
+inventory::submit! { HostApiRegistration::new("poll_dial", 1, |linker| linker.func_wrap(HOST_API_MODULE, "poll_dial_v1", AppServer::poll_dial_v1)) }
+inventory::submit! { HostApiRegistration::new("conn_close", 1, |linker| linker.func_wrap(HOST_API_MODULE, "conn_close_v1", AppServer::conn_close_v1)) }
+inventory::submit! { HostApiRegistration::new("conn_write", 1, |linker| linker.func_wrap(HOST_API_MODULE, "conn_write_v1", AppServer::conn_write_v1)) }
+inventory::submit! { HostApiRegistration::new("conn_read", 1, |linker| linker.func_wrap(HOST_API_MODULE, "conn_read_v1", AppServer::conn_read_v1)) }
 
 impl AppServer {
-    #[rustfmt::skip]
-    pub(super) fn link_net_host_functions(
-        linker: &mut wasmtime::Linker<AppState>,
-    ) -> anyhow::Result<()> {
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::net::DIAL.current_import(), Self::host_dial)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::net::POLL_DIAL.current_import(), Self::poll_dial)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::net::CONN_CLOSE.current_import(), Self::conn_close)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::net::CONN_WRITE.current_import(), Self::conn_write)?;
-        linker.func_wrap(HOST_API_MODULE, wasm_abi::net::CONN_READ.current_import(), Self::conn_read)?;
-        Ok(())
-    }
-
-    fn host_dial(
+    fn dial_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         address_ptr: i32,
         address_len: u32,
@@ -142,7 +136,7 @@ impl AppServer {
         Ok((stream, local_addr, remote_addr))
     }
 
-    fn poll_dial(
+    fn poll_dial_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         dial_id: i32,
         local_addr_ptr: i32,
@@ -226,7 +220,7 @@ impl AppServer {
         }
     }
 
-    fn conn_close(
+    fn conn_close_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         conn_id: i32,
     ) -> wasmtime::Result<i32> {
@@ -241,7 +235,7 @@ impl AppServer {
         Ok(0)
     }
 
-    fn conn_write(
+    fn conn_write_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         conn_id: i32,
         data_ptr: i32,
@@ -283,7 +277,7 @@ impl AppServer {
         }
     }
 
-    fn conn_read(
+    fn conn_read_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         conn_id: i32,
         ptr: i32,

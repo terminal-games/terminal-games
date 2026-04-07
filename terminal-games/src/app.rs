@@ -36,7 +36,7 @@ use crate::{
     terminal_profile::TerminalProfile,
 };
 
-mod wasm_host;
+pub(crate) mod wasm_host;
 
 /// Maximum number of concurrent connections per app instance
 const MAX_CONNECTIONS: usize = 8;
@@ -366,7 +366,7 @@ impl AppServer {
         let mut linker = wasmtime::Linker::<AppState>::new(&engine);
         wasmtime_wasi::p1::add_to_linker_async(&mut linker, |t| &mut t.app.wasi_ctx)?;
 
-        wasm_host::link(&mut linker)?;
+        crate::wasm_abi::link(&mut linker)?;
         Ok(Self {
             linker: Arc::new(linker),
             mesh,
@@ -983,8 +983,7 @@ impl AppServer {
         let module = ctx
             .app_registry
             .load_or_compile_module(&wasm_bytes, ctx.linker.engine())?;
-        let mut linker = (*ctx.linker).clone();
-        wasm_host::link_missing_host_api_fallbacks(&mut linker, &module)?;
+        let linker = (*ctx.linker).clone();
         let instance_pre = linker.instantiate_pre(&module)?;
 
         Ok((
@@ -1000,6 +999,7 @@ impl AppServer {
         ))
     }
 }
+
 fn trigger_replay_upload(
     notification_tx: &SessionNotificationSender,
     replay_buffer: &ReplayBuffer,
