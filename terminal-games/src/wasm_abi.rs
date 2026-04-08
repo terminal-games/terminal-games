@@ -9,10 +9,13 @@ pub const HOST_API_VERSION_MISMATCH: i32 = -32_000;
 
 type LinkFn = for<'a> fn(
     &'a mut wasmtime::Linker<AppState>,
+    &'static str,
+    &'static str,
 ) -> wasmtime::Result<&'a mut wasmtime::Linker<AppState>>;
 
 pub struct HostApiRegistration {
-    pub stem: &'static str,
+    pub stable_id: &'static str,
+    pub import: &'static str,
     pub version: u32,
     pub link: LinkFn,
 }
@@ -20,9 +23,15 @@ pub struct HostApiRegistration {
 inventory::collect!(HostApiRegistration);
 
 impl HostApiRegistration {
-    pub const fn new(stem: &'static str, version: u32, link: LinkFn) -> Self {
+    pub const fn new(
+        stable_id: &'static str,
+        import: &'static str,
+        version: u32,
+        link: LinkFn,
+    ) -> Self {
         Self {
-            stem,
+            stable_id,
+            import,
             version,
             link,
         }
@@ -31,7 +40,7 @@ impl HostApiRegistration {
 
 pub(crate) fn link(linker: &mut wasmtime::Linker<AppState>) -> anyhow::Result<()> {
     for registration in inventory::iter::<HostApiRegistration> {
-        (registration.link)(linker)?;
+        (registration.link)(linker, HOST_API_MODULE, registration.import)?;
     }
     Ok(())
 }
@@ -57,18 +66,32 @@ pub fn guest_host_api_inventory(wasm: &[u8]) -> anyhow::Result<Vec<String>> {
 }
 
 pub fn is_host_api_import_out_of_date(import: &str) -> bool {
-    let Some((stem, version)) = parse_import(import) else {
+    let Some(registration) = registration_for_import(import) else {
         return true;
     };
-    let current_version = inventory::iter::<HostApiRegistration>
-        .into_iter()
-        .filter(|api| api.stem == stem)
-        .map(|api| api.version)
-        .max();
-    current_version.is_none_or(|current| version != current)
+    let Some(latest_registration) = latest_host_api_registration(registration.stable_id) else {
+        return true;
+    };
+    registration.version != latest_registration.version
 }
 
-fn parse_import(import: &str) -> Option<(&str, u32)> {
-    let (name, version) = import.rsplit_once("_v")?;
-    Some((name, version.parse().ok()?))
+pub fn latest_host_api_import(import: &str) -> Option<String> {
+    Some(
+        latest_host_api_registration(registration_for_import(import)?.stable_id)?
+            .import
+            .to_string(),
+    )
+}
+
+fn registration_for_import(import: &str) -> Option<&'static HostApiRegistration> {
+    inventory::iter::<HostApiRegistration>
+        .into_iter()
+        .find(|api| api.import == import)
+}
+
+fn latest_host_api_registration(stable_id: &str) -> Option<&'static HostApiRegistration> {
+    inventory::iter::<HostApiRegistration>
+        .into_iter()
+        .filter(|api| api.stable_id == stable_id)
+        .max_by_key(|api| api.version)
 }

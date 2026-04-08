@@ -1,10 +1,10 @@
 use super::super::{AppServer, AppState};
 use crate::{
     log_backend::{LogLevel, parse_guest_log_object},
-    wasm_abi::{HOST_API_MODULE, HostApiRegistration},
+    wasm_abi::HostApiRegistration,
 };
 
-inventory::submit! { HostApiRegistration::new("log", 1, |linker| linker.func_wrap(HOST_API_MODULE, "log_v1", AppServer::log_v1)) }
+inventory::submit! { HostApiRegistration::new("log", "log_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::log_v1)) }
 
 impl AppServer {
     fn log_v1(

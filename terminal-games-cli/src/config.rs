@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use terminal_games::control::{AppTokenClaims, NodeDiscoveryResponse};
+use terminal_games::control::{AppTokenClaims, NodeDiscoveryResponse, StaleImport};
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,16 +202,19 @@ pub fn list_app_urls() -> Result<Vec<String>> {
     Ok(urls)
 }
 
-pub fn format_imports(imports: &[String], stale_imports: &[String]) -> String {
+pub fn format_imports(imports: &[String], stale_imports: &[StaleImport]) -> String {
     if imports.is_empty() {
         return "-".to_string();
     }
-    let stale_imports = stale_imports.iter().collect::<BTreeSet<_>>();
+    let stale_imports = stale_imports
+        .iter()
+        .map(|stale| (stale.import.as_str(), stale.latest_import.as_str()))
+        .collect::<BTreeMap<_, _>>();
     imports
         .iter()
         .map(|import| {
-            if stale_imports.contains(import) {
-                format!("{import} [old]")
+            if let Some(latest) = stale_imports.get(import.as_str()) {
+                format!("{import} [old, latest: {latest}]")
             } else {
                 import.clone()
             }

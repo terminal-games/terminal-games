@@ -7,13 +7,13 @@ use super::super::{
 };
 use crate::{
     mesh::{NodeId, PeerId},
-    wasm_abi::{HOST_API_MODULE, HostApiRegistration},
+    wasm_abi::HostApiRegistration,
 };
 
-inventory::submit! { HostApiRegistration::new("peer_send", 1, |linker| linker.func_wrap(HOST_API_MODULE, "peer_send_v1", AppServer::peer_send_v1)) }
-inventory::submit! { HostApiRegistration::new("peer_recv", 1, |linker| linker.func_wrap(HOST_API_MODULE, "peer_recv_v1", AppServer::peer_recv_v1)) }
-inventory::submit! { HostApiRegistration::new("node_latency", 1, |linker| linker.func_wrap_async(HOST_API_MODULE, "node_latency_v1", AppServer::node_latency_v1)) }
-inventory::submit! { HostApiRegistration::new("peer_list", 1, |linker| linker.func_wrap_async(HOST_API_MODULE, "peer_list_v1", AppServer::peer_list_v1)) }
+inventory::submit! { HostApiRegistration::new("peer_send", "peer_send_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::peer_send_v1)) }
+inventory::submit! { HostApiRegistration::new("peer_recv", "peer_recv_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::peer_recv_v1)) }
+inventory::submit! { HostApiRegistration::new("node_latency", "node_latency_v1", 1, |linker, module, import| linker.func_wrap_async(module, import, AppServer::node_latency_v1)) }
+inventory::submit! { HostApiRegistration::new("peer_list", "peer_list_v1", 1, |linker, module, import| linker.func_wrap_async(module, import, AppServer::peer_list_v1)) }
 
 impl AppServer {
     fn peer_send_v1(

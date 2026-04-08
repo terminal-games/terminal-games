@@ -283,13 +283,19 @@ pub struct CreateAppRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleImport {
+    pub import: String,
+    pub latest_import: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSummary {
     pub app_id: u64,
     pub author_name: String,
     pub shortname: String,
     pub playtime_seconds: f64,
     pub stale: bool,
-    pub stale_imports: Vec<String>,
+    pub stale_imports: Vec<StaleImport>,
     pub imports: Vec<String>,
 }
 
@@ -366,7 +372,7 @@ pub struct AppSelfResponse {
     pub server: String,
     pub playtime_seconds: f64,
     pub stale: bool,
-    pub stale_imports: Vec<String>,
+    pub stale_imports: Vec<StaleImport>,
     pub imports: Vec<String>,
 }
 

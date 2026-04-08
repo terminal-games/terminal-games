@@ -51,9 +51,9 @@ use terminal_games::{
         CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest, DeleteShortnameResponse,
         DrainStartRequest, KickSessionRequest, NodeDiscoveryResponse, NodeRuntimeStatus,
         RotateAppTokenRequest, RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage,
-        SpyControlMessage, StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry,
-        TickerRemoveRequest, TickerReorderRequest, UploadAppRequest, UploadAppResponse,
-        expiry_from_duration, parse_duration_string, parse_optional_expiry,
+        SpyControlMessage, StaleImport, StatusBarState, StatusBroadcast, TickerAddRequest,
+        TickerEntry, TickerRemoveRequest, TickerReorderRequest, UploadAppRequest,
+        UploadAppResponse, expiry_from_duration, parse_duration_string, parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
     mesh::{AppRuntimeUpdateMessage, BuildId, ContentHash, Mesh, hash_app_envs, hash_bytes},
@@ -1680,11 +1680,16 @@ impl AppSelfInfoRecord {
     }
 }
 
-fn app_import_staleness(imports: &[String]) -> (bool, Vec<String>) {
+fn app_import_staleness(imports: &[String]) -> (bool, Vec<StaleImport>) {
     let stale_imports = imports
         .iter()
-        .filter(|import| wasm_abi::is_host_api_import_out_of_date(import))
-        .cloned()
+        .filter_map(|import| {
+            let latest_import = wasm_abi::latest_host_api_import(import)?;
+            (latest_import != *import).then(|| StaleImport {
+                import: import.clone(),
+                latest_import,
+            })
+        })
         .collect::<Vec<_>>();
     (!stale_imports.is_empty(), stale_imports)
 }

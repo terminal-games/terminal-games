@@ -1,9 +1,9 @@
 use super::super::{AppServer, AppState};
-use crate::wasm_abi::{HOST_API_MODULE, HostApiRegistration};
+use crate::wasm_abi::HostApiRegistration;
 
-inventory::submit! { HostApiRegistration::new("terminal_read", 1, |linker| linker.func_wrap(HOST_API_MODULE, "terminal_read_v1", AppServer::terminal_read_v1)) }
-inventory::submit! { HostApiRegistration::new("terminal_size", 1, |linker| linker.func_wrap(HOST_API_MODULE, "terminal_size_v1", AppServer::terminal_size_v1)) }
-inventory::submit! { HostApiRegistration::new("terminal_cursor", 1, |linker| linker.func_wrap(HOST_API_MODULE, "terminal_cursor_v1", AppServer::terminal_cursor_v1)) }
+inventory::submit! { HostApiRegistration::new("terminal_read", "terminal_read_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::terminal_read_v1)) }
+inventory::submit! { HostApiRegistration::new("terminal_size", "terminal_size_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::terminal_size_v1)) }
+inventory::submit! { HostApiRegistration::new("terminal_cursor", "terminal_cursor_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::terminal_cursor_v1)) }
 
 impl AppServer {
     fn terminal_read_v1(

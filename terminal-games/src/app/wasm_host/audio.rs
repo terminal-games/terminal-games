@@ -1,11 +1,11 @@
 use super::super::{AppServer, AppState};
 use crate::{
     audio::{CHANNELS, FRAME_SIZE, SAMPLE_RATE},
-    wasm_abi::{HOST_API_MODULE, HostApiRegistration},
+    wasm_abi::HostApiRegistration,
 };
 
-inventory::submit! { HostApiRegistration::new("audio_write", 1, |linker| linker.func_wrap(HOST_API_MODULE, "audio_write_v1", AppServer::audio_write_v1)) }
-inventory::submit! { HostApiRegistration::new("audio_info", 1, |linker| linker.func_wrap(HOST_API_MODULE, "audio_info_v1", AppServer::audio_info_v1)) }
+inventory::submit! { HostApiRegistration::new("audio_write", "audio_write_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::audio_write_v1)) }
+inventory::submit! { HostApiRegistration::new("audio_info", "audio_info_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::audio_info_v1)) }
 
 impl AppServer {
     fn audio_write_v1(

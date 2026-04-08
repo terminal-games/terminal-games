@@ -5,14 +5,14 @@ use super::super::{
     NEXT_APP_READY_ERR_PREPARE_FAILED_OTHER, NEXT_APP_READY_NOT_READY, NEXT_APP_READY_READY,
     NextAppPrepareError, NextAppState,
 };
-use crate::wasm_abi::{HOST_API_MODULE, HostApiRegistration};
+use crate::wasm_abi::HostApiRegistration;
 
-inventory::submit! { HostApiRegistration::new("change_app", 1, |linker| linker.func_wrap(HOST_API_MODULE, "change_app_v1", AppServer::change_app_v1)) }
-inventory::submit! { HostApiRegistration::new("next_app_ready", 1, |linker| linker.func_wrap(HOST_API_MODULE, "next_app_ready_v1", AppServer::next_app_ready_v1)) }
-inventory::submit! { HostApiRegistration::new("graceful_shutdown_poll", 1, |linker| linker.func_wrap(HOST_API_MODULE, "graceful_shutdown_poll_v1", AppServer::graceful_shutdown_poll_v1)) }
-inventory::submit! { HostApiRegistration::new("new_version_available_poll", 1, |linker| linker.func_wrap(HOST_API_MODULE, "new_version_available_poll_v1", AppServer::new_version_available_poll_v1)) }
-inventory::submit! { HostApiRegistration::new("network_info", 1, |linker| linker.func_wrap(HOST_API_MODULE, "network_info_v1", AppServer::network_info_v1)) }
-inventory::submit! { HostApiRegistration::new("terminal_info", 1, |linker| linker.func_wrap(HOST_API_MODULE, "terminal_info_v1", AppServer::terminal_info_v1)) }
+inventory::submit! { HostApiRegistration::new("change_app", "change_app_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::change_app_v1)) }
+inventory::submit! { HostApiRegistration::new("next_app_ready", "next_app_ready_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::next_app_ready_v1)) }
+inventory::submit! { HostApiRegistration::new("graceful_shutdown_poll", "graceful_shutdown_poll_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::graceful_shutdown_poll_v1)) }
+inventory::submit! { HostApiRegistration::new("new_version_available_poll", "new_version_available_poll_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::new_version_available_poll_v1)) }
+inventory::submit! { HostApiRegistration::new("network_info", "network_info_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::network_info_v1)) }
+inventory::submit! { HostApiRegistration::new("terminal_info", "terminal_info_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::terminal_info_v1)) }
 
 impl AppServer {
     fn change_app_v1(

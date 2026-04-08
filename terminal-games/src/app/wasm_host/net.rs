@@ -10,13 +10,13 @@ use super::super::{
     POLL_DIAL_ERR_TASK_FAILED, POLL_DIAL_ERR_TLS_HANDSHAKE, POLL_DIAL_ERR_TOO_MANY_CONNECTIONS,
     POLL_DIAL_PENDING, PendingDial, Stream, is_globally_reachable,
 };
-use crate::wasm_abi::{HOST_API_MODULE, HostApiRegistration};
+use crate::wasm_abi::HostApiRegistration;
 
-inventory::submit! { HostApiRegistration::new("dial", 1, |linker| linker.func_wrap(HOST_API_MODULE, "dial_v1", AppServer::dial_v1)) }
-inventory::submit! { HostApiRegistration::new("poll_dial", 1, |linker| linker.func_wrap(HOST_API_MODULE, "poll_dial_v1", AppServer::poll_dial_v1)) }
-inventory::submit! { HostApiRegistration::new("conn_close", 1, |linker| linker.func_wrap(HOST_API_MODULE, "conn_close_v1", AppServer::conn_close_v1)) }
-inventory::submit! { HostApiRegistration::new("conn_write", 1, |linker| linker.func_wrap(HOST_API_MODULE, "conn_write_v1", AppServer::conn_write_v1)) }
-inventory::submit! { HostApiRegistration::new("conn_read", 1, |linker| linker.func_wrap(HOST_API_MODULE, "conn_read_v1", AppServer::conn_read_v1)) }
+inventory::submit! { HostApiRegistration::new("dial", "dial_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::dial_v1)) }
+inventory::submit! { HostApiRegistration::new("poll_dial", "poll_dial_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::poll_dial_v1)) }
+inventory::submit! { HostApiRegistration::new("conn_close", "conn_close_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::conn_close_v1)) }
+inventory::submit! { HostApiRegistration::new("conn_write", "conn_write_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::conn_write_v1)) }
+inventory::submit! { HostApiRegistration::new("conn_read", "conn_read_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::conn_read_v1)) }
 
 impl AppServer {
     fn dial_v1(

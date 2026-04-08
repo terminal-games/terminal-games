@@ -6,10 +6,10 @@ use super::super::{
     MENU_REQ_REPLAYS_LIST, MenuRequestJob, MenuRequestKind, MenuRequestState, MenuSessionState,
     MenuUpdate, PendingMenuRequest,
 };
-use crate::wasm_abi::{HOST_API_MODULE, HostApiRegistration};
+use crate::wasm_abi::HostApiRegistration;
 
-inventory::submit! { HostApiRegistration::new("menu_request", 1, |linker| linker.func_wrap(HOST_API_MODULE, "menu_request_v1", AppServer::menu_request_v1)) }
-inventory::submit! { HostApiRegistration::new("menu_poll", 1, |linker| linker.func_wrap(HOST_API_MODULE, "menu_poll_v1", AppServer::menu_poll_v1)) }
+inventory::submit! { HostApiRegistration::new("menu_request", "menu_request_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::menu_request_v1)) }
+inventory::submit! { HostApiRegistration::new("menu_poll", "menu_poll_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::menu_poll_v1)) }
 
 impl AppServer {
     fn menu_request_v1(
