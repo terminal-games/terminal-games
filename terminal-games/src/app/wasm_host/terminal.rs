@@ -9,15 +9,22 @@ impl AppServer {
     fn terminal_read_v1(
         mut caller: wasmtime::Caller<'_, AppState>,
         ptr: i32,
-        _len: u32,
+        len: u32,
     ) -> wasmtime::Result<i32> {
         if caller.data().session_io.is_closed() {
             return Ok(0);
         }
+        if len == 0 {
+            return Ok(0);
+        }
         loop {
-            let buf = match caller.data_mut().input_receiver.try_recv() {
-                Ok(buf) => buf,
-                Err(_) => return Ok(0),
+            let buf = if caller.data().pending_terminal_input.is_empty() {
+                match caller.data_mut().input_receiver.try_recv() {
+                    Ok(buf) => buf,
+                    Err(_) => return Ok(0),
+                }
+            } else {
+                std::mem::take(&mut caller.data_mut().pending_terminal_input)
             };
             if caller
                 .data()
@@ -31,6 +38,13 @@ impl AppServer {
             }
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
                 wasmtime::bail!("terminal_read: failed to find host memory");
+            };
+            let max_len = len as usize;
+            let buf = if buf.len() > max_len {
+                caller.data_mut().pending_terminal_input = buf.slice(max_len..);
+                buf.slice(..max_len)
+            } else {
+                buf
             };
             let offset = ptr as u32 as usize;
             mem.write(&mut caller, offset, buf.as_ref())?;
