@@ -312,7 +312,8 @@ pub struct RotateAppTokenRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotateAppTokenResponse {
-    pub app: AppSummary,
+    pub app_id: u64,
+    pub shortname: String,
     pub token: String,
 }
 

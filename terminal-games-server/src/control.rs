@@ -227,15 +227,8 @@ impl ControlPlane {
             )
             .await?;
         Ok(RotateAppTokenResponse {
-            app: AppSummary {
-                app_id,
-                author_name: String::new(),
-                shortname: shortname.to_string(),
-                playtime_seconds: 0.0,
-                stale: false,
-                stale_imports: Vec::new(),
-                imports: Vec::new(),
-            },
+            app_id,
+            shortname: shortname.to_string(),
             token: AppTokenClaims::new(base_url, shortname.to_string(), secret).encode()?,
         })
     }
@@ -996,15 +989,8 @@ impl AdminControlRpc for AdminRpcServer {
         };
         let shortname = row.get::<String>(0)?;
         Ok(RotateAppTokenResponse {
-            app: AppSummary {
-                app_id: request.app_id,
-                author_name: String::new(),
-                shortname: shortname.clone(),
-                playtime_seconds: 0.0,
-                stale: false,
-                stale_imports: Vec::new(),
-                imports: Vec::new(),
-            },
+            app_id: request.app_id,
+            shortname: shortname.clone(),
             token: AppTokenClaims::new(request.base_url, shortname, secret).encode()?,
         })
     }

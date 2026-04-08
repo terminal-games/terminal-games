@@ -21,8 +21,8 @@ pub(super) async fn run(args: AdminAppRotateTokenArgs, profile: Option<String>) 
         )
         .await?
         .map_err(anyhow::Error::msg)?;
-    println!("App ID: {}", response.app.app_id);
-    println!("Shortname: {}", response.app.shortname);
+    println!("App ID: {}", response.app_id);
+    println!("Shortname: {}", response.shortname);
     println!("Token: {}", response.token);
     Ok(())
 }
