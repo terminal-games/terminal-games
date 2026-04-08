@@ -25,6 +25,9 @@ type dimensions struct {
 }
 
 func Read(buffer []byte) (int, error) {
+	if len(buffer) == 0 {
+		return 0, nil
+	}
 	n := terminal_read(unsafe.Pointer(&buffer[0]), uint32(len(buffer)))
 	if n < 0 {
 		if err := hosterr.MaybeVersionMismatch("terminal_games.terminal_read_v1", n); err != nil {
