@@ -6,7 +6,7 @@ use anyhow::Result;
 use terminal_games::control::AppSummary;
 
 use super::super::load_api;
-use crate::config::{format_seconds, print_table};
+use crate::config::{format_imports, format_seconds, print_table};
 
 pub(super) async fn run(profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
@@ -33,24 +33,4 @@ pub(super) async fn run(profile: Option<String>) -> Result<()> {
         &rows,
     );
     Ok(())
-}
-
-fn format_imports(imports: &[String], stale_imports: &[String]) -> String {
-    if imports.is_empty() {
-        return "-".to_string();
-    }
-    let stale_imports = stale_imports
-        .iter()
-        .collect::<std::collections::HashSet<_>>();
-    imports
-        .iter()
-        .map(|import| {
-            if stale_imports.contains(import) {
-                format!("{import} [old]")
-            } else {
-                import.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }

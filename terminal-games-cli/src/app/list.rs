@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 
 use crate::config::StoredAppTokenEntry;
-use crate::config::{format_seconds, load_app_tokens_for_listing, print_table};
+use crate::config::{format_imports, format_seconds, load_app_tokens_for_listing, print_table};
 use crate::control_client::AppClient;
 
 pub(super) async fn run() -> Result<()> {
@@ -76,26 +76,6 @@ pub(super) async fn run() -> Result<()> {
         eprintln!("{warning}");
     }
     Ok(())
-}
-
-fn format_imports(imports: &[String], stale_imports: &[String]) -> String {
-    if imports.is_empty() {
-        return "-".to_string();
-    }
-    let stale_imports = stale_imports
-        .iter()
-        .collect::<std::collections::HashSet<_>>();
-    imports
-        .iter()
-        .map(|import| {
-            if stale_imports.contains(import) {
-                format!("{import} [old]")
-            } else {
-                import.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 async fn fetch_author_infos_for_server(

@@ -202,6 +202,24 @@ pub fn list_app_urls() -> Result<Vec<String>> {
     Ok(urls)
 }
 
+pub fn format_imports(imports: &[String], stale_imports: &[String]) -> String {
+    if imports.is_empty() {
+        return "-".to_string();
+    }
+    let stale_imports = stale_imports.iter().collect::<BTreeSet<_>>();
+    imports
+        .iter()
+        .map(|import| {
+            if stale_imports.contains(import) {
+                format!("{import} [old]")
+            } else {
+                import.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn save_app_token(claims: &AppTokenClaims) -> Result<()> {
     let normalized = normalize_app_claims(claims.clone())?;
     let mut tokens: AppTokensFile = read_toml(app_tokens_path())?;
