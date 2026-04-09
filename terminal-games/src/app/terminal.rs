@@ -1,4 +1,4 @@
-use super::super::{AppServer, AppState};
+use super::{AppServer, AppState};
 use crate::wasm_abi::HostApiRegistration;
 
 inventory::submit! { HostApiRegistration::new("terminal_read", "terminal_read_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::terminal_read_v1)) }

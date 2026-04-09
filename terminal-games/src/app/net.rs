@@ -2,7 +2,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use rustls_platform_verifier::BuilderVerifierExt;
 
-use super::super::{
+use super::{
     AppServer, AppState, CONN_ERR_CONNECTION_ERROR, CONN_ERR_INVALID_CONN_ID, Connection,
     DIAL_ERR_ADDRESS_TOO_LONG, DIAL_ERR_TOO_MANY_CONNECTIONS, MAX_CONNECTIONS,
     POLL_DIAL_ERR_CONNECTION_FAILED, POLL_DIAL_ERR_DNS_RESOLUTION, POLL_DIAL_ERR_INVALID_DIAL_ID,

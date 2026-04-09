@@ -1,6 +1,6 @@
 use std::{sync::atomic::Ordering, time::Duration, time::UNIX_EPOCH};
 
-use super::super::{
+use super::{
     AppServer, AppState, CHANGE_APP_ERR_RATE_LIMITED, CHANGE_APP_RATE_LIMIT_SECS,
     NEXT_APP_READY_ERR_PREPARE_FAILED_OTHER, NEXT_APP_READY_NOT_READY, NEXT_APP_READY_READY,
     NextAppPrepareError, NextAppState,
@@ -211,7 +211,7 @@ impl AppServer {
             None => (0i32, 0u8, 0u8, 0u8),
         };
         let dark_background = background_rgb
-            .map(super::super::is_rgb_dark)
+            .map(super::is_rgb_dark)
             .or(profile.dark_background);
         let (has_dark, dark) = match dark_background {
             Some(is_dark) => (1i32, if is_dark { 1i32 } else { 0i32 }),

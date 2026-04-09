@@ -1,4 +1,4 @@
-use super::super::{AppServer, AppState};
+use super::{AppServer, AppState};
 use crate::{
     audio::{CHANNELS, FRAME_SIZE, SAMPLE_RATE},
     wasm_abi::HostApiRegistration,

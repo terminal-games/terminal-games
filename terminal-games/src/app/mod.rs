@@ -2,6 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+mod app;
+mod audio;
+mod log;
+mod menu;
+mod net;
+mod peer;
+mod terminal;
+
 use std::{
     collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
@@ -35,8 +43,6 @@ use crate::{
     status_bar::{StatusBar, StatusBarInput, StatusNotification},
     terminal_profile::TerminalProfile,
 };
-
-pub(crate) mod wasm_host;
 
 /// Maximum number of concurrent connections per app instance
 const MAX_CONNECTIONS: usize = 8;

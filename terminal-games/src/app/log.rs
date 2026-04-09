@@ -1,4 +1,4 @@
-use super::super::{AppServer, AppState};
+use super::{AppServer, AppState};
 use crate::{
     log_backend::{LogLevel, parse_guest_log_object},
     wasm_abi::HostApiRegistration,
