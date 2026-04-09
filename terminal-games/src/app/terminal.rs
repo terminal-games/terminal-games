@@ -18,13 +18,9 @@ impl AppServer {
             return Ok(0);
         }
         loop {
-            let buf = if caller.data().pending_terminal_input.is_empty() {
-                match caller.data_mut().input_receiver.try_recv() {
-                    Ok(buf) => buf,
-                    Err(_) => return Ok(0),
-                }
-            } else {
-                std::mem::take(&mut caller.data_mut().pending_terminal_input)
+            let buf = match caller.data_mut().input_receiver.try_recv() {
+                Ok(buf) => buf,
+                Err(_) => return Ok(0),
             };
             if caller
                 .data()
@@ -39,13 +35,8 @@ impl AppServer {
             let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
                 wasmtime::bail!("terminal_read: failed to find host memory");
             };
-            let max_len = len as usize;
-            let buf = if buf.len() > max_len {
-                caller.data_mut().pending_terminal_input = buf.slice(max_len..);
-                buf.slice(..max_len)
-            } else {
-                buf
-            };
+            let max_len = std::cmp::min(len as usize, buf.len());
+            let buf = buf.slice(..max_len);
             let offset = ptr as u32 as usize;
             mem.write(&mut caller, offset, buf.as_ref())?;
             return Ok(buf.len() as i32);
