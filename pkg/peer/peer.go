@@ -28,6 +28,7 @@ const (
 	peerSendErrInvalidPeerID    = -5
 
 	peerRecvErrChannelDisconnected = -1
+	nodeLatencyErrUnavailable      = -1
 )
 
 //go:wasmimport terminal_games peer_send_v1
@@ -65,7 +66,7 @@ func (r NodeID) String() string {
 }
 
 var (
-	ErrLatencyUnknown      = errors.New("latency unknown")
+	ErrLatencyUnavailable  = errors.New("latency unavailable for this node")
 	ErrInvalidPeerCount    = errors.New("invalid peer count (must be 1-1024)")
 	ErrDataTooLarge        = errors.New("data too large: maximum 64KB")
 	ErrChannelFull         = errors.New("send channel full, message dropped")
@@ -76,13 +77,17 @@ var (
 )
 
 // Latency returns the current latency to this node in milliseconds.
+// It returns ErrLatencyUnavailable when the host has no active latency measurement.
 func (r NodeID) Latency() (uint32, error) {
 	ms := node_latency(unsafe.Pointer(&r[0]))
 	if ms < 0 {
 		if err := hosterr.MaybeVersionMismatch("terminal_games.node_latency_v1", ms); err != nil {
 			return 0, err
 		}
-		return 0, ErrLatencyUnknown
+		if ms == nodeLatencyErrUnavailable {
+			return 0, ErrLatencyUnavailable
+		}
+		return 0, fmt.Errorf("node_latency failed with code %d", ms)
 	}
 	return uint32(ms), nil
 }
@@ -127,7 +132,7 @@ func (id ID) Node() NodeID {
 	return id.node
 }
 
-// Latency returns the current latency to this peer in milliseconds
+// Latency returns the current latency to this peer in milliseconds.
 func (id ID) Latency() (uint32, error) {
 	return id.Node().Latency()
 }

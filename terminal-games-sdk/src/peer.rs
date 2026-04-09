@@ -12,6 +12,7 @@ const PEER_SEND_ERR_CHANNEL_CLOSED: i32 = -4;
 const PEER_SEND_ERR_INVALID_PEER_ID: i32 = -5;
 
 const PEER_RECV_ERR_CHANNEL_DISCONNECTED: i32 = -1;
+const NODE_LATENCY_ERR_UNAVAILABLE: i32 = -1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId([u8; 4]);
@@ -26,16 +27,14 @@ impl NodeId {
     }
 
     /// Returns the current latency to this node in milliseconds.
-    /// Returns `None` if the latency is unknown or the node is not connected.
-    pub fn latency(&self) -> Result<Option<u32>, PeerError> {
+    /// Returns an error if latency is unavailable for this node, including
+    /// when the host has no active latency measurement.
+    pub fn latency(&self) -> Result<u32, PeerError> {
         let ret = unsafe { crate::internal::node_latency(self.0.as_ptr()) };
         if ret < 0 {
-            match PeerError::from_recv_code(ret) {
-                PeerError::Unknown(_) => Ok(None),
-                err => Err(err),
-            }
+            Err(PeerError::from_latency_code(ret))
         } else {
-            Ok(Some(ret as u32))
+            Ok(ret as u32)
         }
     }
 }
@@ -116,8 +115,8 @@ impl PeerId {
     }
 
     /// Returns the current latency to the peer in milliseconds.
-    /// Returns `None` if the latency is unknown
-    pub fn latency(&self) -> Result<Option<u32>, PeerError> {
+    /// Returns an error if latency is unavailable for this peer.
+    pub fn latency(&self) -> Result<u32, PeerError> {
         self.node().latency()
     }
 }
@@ -241,6 +240,7 @@ pub struct Message {
 pub enum PeerError {
     InvalidId(&'static str),
     VersionMismatch,
+    LatencyUnavailable,
     InvalidPeerCount,
     DataTooLarge,
     ChannelFull,
@@ -263,11 +263,18 @@ impl PeerError {
         }
     }
 
-    #[allow(unused)]
     fn from_recv_code(code: i32) -> Self {
         match code {
             crate::HOST_API_VERSION_MISMATCH => PeerError::VersionMismatch,
             PEER_RECV_ERR_CHANNEL_DISCONNECTED => PeerError::ChannelDisconnected,
+            _ => PeerError::Unknown(code),
+        }
+    }
+
+    fn from_latency_code(code: i32) -> Self {
+        match code {
+            crate::HOST_API_VERSION_MISMATCH => PeerError::VersionMismatch,
+            NODE_LATENCY_ERR_UNAVAILABLE => PeerError::LatencyUnavailable,
             _ => PeerError::Unknown(code),
         }
     }
@@ -286,6 +293,9 @@ impl std::fmt::Display for PeerError {
             PeerError::InvalidId(msg) => write!(f, "invalid peer ID: {}", msg),
             PeerError::VersionMismatch => {
                 write!(f, "terminal-games host version mismatch for terminal_games")
+            }
+            PeerError::LatencyUnavailable => {
+                write!(f, "latency unavailable for this node")
             }
             PeerError::InvalidPeerCount => write!(f, "invalid peer count (must be 1-1024)"),
             PeerError::DataTooLarge => write!(f, "data too large: maximum 64KB"),
