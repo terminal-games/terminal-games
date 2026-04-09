@@ -283,11 +283,20 @@ pub struct CreateAppRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleImport {
+    pub import: String,
+    pub latest_import: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSummary {
     pub app_id: u64,
     pub author_name: String,
     pub shortname: String,
     pub playtime_seconds: f64,
+    pub stale: bool,
+    pub stale_imports: Vec<StaleImport>,
+    pub imports: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,7 +318,8 @@ pub struct RotateAppTokenRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RotateAppTokenResponse {
-    pub app: AppSummary,
+    pub app_id: u64,
+    pub shortname: String,
     pub token: String,
 }
 
@@ -361,6 +371,9 @@ pub struct AppSelfResponse {
     pub shortname: String,
     pub server: String,
     pub playtime_seconds: f64,
+    pub stale: bool,
+    pub stale_imports: Vec<StaleImport>,
+    pub imports: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,7 +384,14 @@ pub struct AppSelfInfoRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSelfInfoResponse {
     pub apps: Vec<AppSelfResponse>,
-    pub invalid_shortnames: Vec<String>,
+    pub token_statuses: Vec<AppSelfInfoTokenStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSelfInfoTokenStatus {
+    pub shortname: String,
+    pub valid_tokens: u32,
+    pub invalid_tokens: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

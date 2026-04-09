@@ -113,7 +113,7 @@ func main() {
 	slog.Debug("audio started", "volume", initialVolume)
 
 	zone.NewGlobal()
-	p := bubblewrap.NewProgram(model{
+	p, err := bubblewrap.NewProgram(model{
 		timeLeft:        300,
 		mainStyle:       lipgloss.NewStyle().Padding(1).Border(lipgloss.NormalBorder()),
 		httpStyle:       lipgloss.NewStyle().Width(100),
@@ -125,6 +125,9 @@ func main() {
 		audioPlaying:    audioPlaying,
 		audioVolume:     initialVolume,
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
@@ -237,7 +240,7 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tickMsg:
 		m.timeLeft--
-		m.newVersionAvailable = app.IsNewVersionAvailable()
+		m.newVersionAvailable, _ = app.IsNewVersionAvailable()
 		if m.timeLeft <= 0 {
 			return m, tea.Quit
 		}

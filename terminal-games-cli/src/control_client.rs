@@ -33,7 +33,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::completion_cache;
 use crate::config::{
-    AdminProfile, derive_node_urls, load_app_token_for_shortname, resolve_admin_profile,
+    AdminProfile, derive_node_urls, load_app_tokens_for_shortname, resolve_admin_profile,
 };
 
 const CONTROL_RPC_MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
@@ -295,6 +295,22 @@ async fn connect_app_rpc(claims: &AppTokenClaims) -> Result<AppControlRpcClient>
     Ok(AppControlRpcClient::new(client::Config::default(), transport).spawn())
 }
 
+pub(crate) async fn connect_app_rpc_fallback(
+    claims_candidates: &[AppTokenClaims],
+) -> Result<AppControlRpcClient> {
+    let mut last_unauthorized = None;
+    for claims in claims_candidates {
+        match connect_app_rpc(claims).await {
+            Ok(rpc) => return Ok(rpc),
+            Err(error) if is_unauthorized_error(&error) => {
+                last_unauthorized = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_unauthorized.unwrap_or_else(|| anyhow!("no configured app tokens")))
+}
+
 #[derive(Clone)]
 pub struct AdminClient {
     pub profile: AdminProfile,
@@ -544,32 +560,51 @@ impl AdminClient {
 
 #[derive(Clone)]
 pub struct AppClient {
-    pub claims: AppTokenClaims,
+    claims_candidates: Vec<AppTokenClaims>,
 }
 
 impl AppClient {
-    pub fn from_claims(claims: AppTokenClaims) -> Result<Self> {
-        Ok(Self { claims })
+    pub fn from_claims_candidates(claims_candidates: Vec<AppTokenClaims>) -> Result<Self> {
+        anyhow::ensure!(
+            !claims_candidates.is_empty(),
+            "no app token configured for the requested app"
+        );
+        Ok(Self { claims_candidates })
     }
 
     pub fn from_target(shortname: &str, url_override: Option<&str>) -> Result<Self> {
-        Self::from_claims(load_app_claims_for_target(shortname, url_override)?)
+        Self::from_claims_candidates(load_app_claim_candidates_for_target(
+            shortname,
+            url_override,
+        )?)
     }
 
     pub async fn rpc(&self) -> Result<AppControlRpcClient> {
-        connect_app_rpc(&self.claims).await
+        connect_app_rpc_fallback(&self.claims_candidates).await
     }
 }
 
-pub fn load_app_claims_for_target(
+pub fn load_app_claim_candidates_for_target(
     shortname: &str,
     url_override: Option<&str>,
-) -> Result<AppTokenClaims> {
-    load_app_token_for_shortname(shortname, url_override)?.ok_or_else(|| {
-        if let Some(url) = url_override {
-            anyhow::anyhow!("no app token configured for '{}' on '{}'", shortname, url)
-        } else {
-            anyhow::anyhow!("no app token configured for '{}'", shortname)
-        }
+) -> Result<Vec<AppTokenClaims>> {
+    let claims = load_app_tokens_for_shortname(shortname, url_override)?;
+    if !claims.is_empty() {
+        return Ok(claims);
+    }
+    Err(if let Some(url) = url_override {
+        anyhow::anyhow!("no app token configured for '{}' on '{}'", shortname, url)
+    } else {
+        anyhow::anyhow!("no app token configured for '{}'", shortname)
+    })
+}
+
+pub(crate) fn is_unauthorized_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("401 unauthorized")
+            || message.contains("invalid app token")
+            || message.contains("unknown app")
+            || message.contains("missing bearer token")
     })
 }

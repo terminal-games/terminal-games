@@ -23,12 +23,13 @@ fn main() -> std::io::Result<()> {
     let mut fps_window_frames: u32 = 0;
     let mut recent_fps = 0.0f64;
     'outer: loop {
-        if app::graceful_shutdown_poll() {
+        if app::graceful_shutdown_poll()? {
             break;
         }
 
         let mut event_counter = 0;
         for event in &mut terminal_reader {
+            let event = event?;
             event_counter += 1;
             if let Some(key_event) = event.as_key() {
                 match key_event {

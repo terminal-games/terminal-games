@@ -116,10 +116,18 @@ func startMixer() {
 		writer := NewAudioWriter(FrameSize * 4)
 
 		for {
-			neededFrames := writer.ShouldWrite()
+			neededFrames, err := writer.ShouldWrite()
+			if err != nil {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
 			if neededFrames > 0 {
 				mixed := globalMixer.mix(neededFrames)
-				written := Write(mixed)
+				written, err := Write(mixed)
+				if err != nil {
+					time.Sleep(5 * time.Millisecond)
+					continue
+				}
 				if written > 0 {
 					writer.NextPTS += uint64(written)
 				}

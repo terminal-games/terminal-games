@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS apps (
     id INTEGER PRIMARY KEY,
     shortname TEXT NOT NULL UNIQUE,
     wasm BLOB NOT NULL,
+    imports JSON NOT NULL CHECK(json_valid(imports)),
     details JSON NOT NULL CHECK(json_valid(details)),
     wasm_hash BLOB NOT NULL,
     env_hash BLOB NOT NULL,

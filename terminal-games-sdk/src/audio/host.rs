@@ -4,6 +4,7 @@
 
 use super::FRAME_SIZE;
 use crate::internal;
+use std::io;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AudioInfo {
@@ -14,7 +15,7 @@ pub struct AudioInfo {
 }
 
 /// Get audio timing information for synchronization.
-pub fn info() -> Option<AudioInfo> {
+pub fn info() -> io::Result<AudioInfo> {
     let mut frame_size: u32 = 0;
     let mut sample_rate: u32 = 0;
     let mut pts: u64 = 0;
@@ -30,10 +31,10 @@ pub fn info() -> Option<AudioInfo> {
     };
 
     if ret < 0 {
-        return None;
+        return Err(crate::host_call_error("terminal_games.audio_info_v1", ret));
     }
 
-    Some(AudioInfo {
+    Ok(AudioInfo {
         frame_size,
         sample_rate,
         pts,
@@ -50,14 +51,19 @@ pub fn info() -> Option<AudioInfo> {
 /// dropped. Check the return value to see how many frames were actually
 /// written.
 ///
-/// Returns the number of frames written, or a negative value on error.
-pub fn write(samples: &[f32]) -> i32 {
+/// Returns the number of frames written.
+pub fn write(samples: &[f32]) -> io::Result<usize> {
     if samples.is_empty() {
-        return 0;
+        return Ok(0);
     }
 
     let frame_count = samples.len() / super::CHANNELS;
-    unsafe { internal::audio_write(samples.as_ptr(), frame_count as u32) }
+    let ret = unsafe { internal::audio_write(samples.as_ptr(), frame_count as u32) };
+    if ret < 0 {
+        Err(crate::host_call_error("terminal_games.audio_write_v1", ret))
+    } else {
+        Ok(ret as usize)
+    }
 }
 
 /// Helper for continuously writing audio with automatic timing management.
@@ -78,22 +84,20 @@ impl AudioWriter {
     ///
     /// Returns the number of samples that should be written, or 0 if the buffer
     /// is sufficiently full. This is useful for rate-limiting audio generation.
-    pub fn should_write(&mut self) -> usize {
-        let Some(audio_info) = info() else {
-            return 0;
-        };
+    pub fn should_write(&mut self) -> io::Result<usize> {
+        let audio_info = info()?;
 
         if self.next_pts < audio_info.pts {
             self.next_pts = audio_info.pts;
         }
 
         if audio_info.buffer_available >= self.target_buffer {
-            return 0;
+            return Ok(0);
         }
 
         let needed = (self.target_buffer - audio_info.buffer_available) as usize;
         let frames = (needed + FRAME_SIZE - 1) / FRAME_SIZE;
-        frames * FRAME_SIZE
+        Ok(frames * FRAME_SIZE)
     }
 
     /// Calls the provided function to generate samples when needed.
@@ -103,21 +107,21 @@ impl AudioWriter {
     ///
     /// This method updates `next_pts` automatically based on how many frames were
     /// written.
-    pub fn write_callback<F>(&mut self, generate: F) -> i32
+    pub fn write_callback<F>(&mut self, generate: F) -> io::Result<usize>
     where
         F: FnOnce(u64, usize) -> Vec<f32>,
     {
-        let needed = self.should_write();
+        let needed = self.should_write()?;
         if needed == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let samples = generate(self.next_pts, needed);
-        let written = write(&samples);
+        let written = write(&samples)?;
         if written > 0 {
             self.next_pts += written as u64;
         }
-        written
+        Ok(written)
     }
 }
 

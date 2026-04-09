@@ -12,6 +12,7 @@ const PEER_SEND_ERR_CHANNEL_CLOSED: i32 = -4;
 const PEER_SEND_ERR_INVALID_PEER_ID: i32 = -5;
 
 const PEER_RECV_ERR_CHANNEL_DISCONNECTED: i32 = -1;
+const NODE_LATENCY_ERR_UNAVAILABLE: i32 = -1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId([u8; 4]);
@@ -26,10 +27,15 @@ impl NodeId {
     }
 
     /// Returns the current latency to this node in milliseconds.
-    /// Returns `None` if the latency is unknown or the node is not connected.
-    pub fn latency(&self) -> Option<u32> {
+    /// Returns an error if latency is unavailable for this node, including
+    /// when the host has no active latency measurement.
+    pub fn latency(&self) -> Result<u32, PeerError> {
         let ret = unsafe { crate::internal::node_latency(self.0.as_ptr()) };
-        if ret < 0 { None } else { Some(ret as u32) }
+        if ret < 0 {
+            Err(PeerError::from_latency_code(ret))
+        } else {
+            Ok(ret as u32)
+        }
     }
 }
 
@@ -109,8 +115,8 @@ impl PeerId {
     }
 
     /// Returns the current latency to the peer in milliseconds.
-    /// Returns `None` if the latency is unknown
-    pub fn latency(&self) -> Option<u32> {
+    /// Returns an error if latency is unavailable for this peer.
+    pub fn latency(&self) -> Result<u32, PeerError> {
         self.node().latency()
     }
 }
@@ -192,7 +198,7 @@ fn list_n(length: u32) -> Result<(Vec<PeerId>, u32), PeerError> {
     if length == 0 {
         let ret = unsafe { crate::internal::peer_list(std::ptr::null_mut(), 0, &mut total_count) };
         if ret < 0 {
-            return Err(PeerError::ListFailed);
+            return Err(PeerError::from_list_code(ret));
         }
         return Ok((Vec::new(), total_count));
     }
@@ -202,7 +208,7 @@ fn list_n(length: u32) -> Result<(Vec<PeerId>, u32), PeerError> {
     let ret = unsafe { crate::internal::peer_list(buf.as_mut_ptr(), length, &mut total_count) };
 
     if ret < 0 {
-        return Err(PeerError::ListFailed);
+        return Err(PeerError::from_list_code(ret));
     }
 
     let peers_vec = buf[..ret as usize * PeerId::BYTE_LEN]
@@ -233,6 +239,8 @@ pub struct Message {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerError {
     InvalidId(&'static str),
+    VersionMismatch,
+    LatencyUnavailable,
     InvalidPeerCount,
     DataTooLarge,
     ChannelFull,
@@ -245,6 +253,7 @@ pub enum PeerError {
 impl PeerError {
     fn from_send_code(code: i32) -> Self {
         match code {
+            crate::HOST_API_VERSION_MISMATCH => PeerError::VersionMismatch,
             PEER_SEND_ERR_INVALID_PEER_COUNT => PeerError::InvalidPeerCount,
             PEER_SEND_ERR_DATA_TOO_LARGE => PeerError::DataTooLarge,
             PEER_SEND_ERR_CHANNEL_FULL => PeerError::ChannelFull,
@@ -254,11 +263,26 @@ impl PeerError {
         }
     }
 
-    #[allow(unused)]
     fn from_recv_code(code: i32) -> Self {
         match code {
+            crate::HOST_API_VERSION_MISMATCH => PeerError::VersionMismatch,
             PEER_RECV_ERR_CHANNEL_DISCONNECTED => PeerError::ChannelDisconnected,
             _ => PeerError::Unknown(code),
+        }
+    }
+
+    fn from_latency_code(code: i32) -> Self {
+        match code {
+            crate::HOST_API_VERSION_MISMATCH => PeerError::VersionMismatch,
+            NODE_LATENCY_ERR_UNAVAILABLE => PeerError::LatencyUnavailable,
+            _ => PeerError::Unknown(code),
+        }
+    }
+
+    fn from_list_code(code: i32) -> Self {
+        match code {
+            crate::HOST_API_VERSION_MISMATCH => PeerError::VersionMismatch,
+            _ => PeerError::ListFailed,
         }
     }
 }
@@ -267,6 +291,12 @@ impl std::fmt::Display for PeerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PeerError::InvalidId(msg) => write!(f, "invalid peer ID: {}", msg),
+            PeerError::VersionMismatch => {
+                write!(f, "terminal-games host version mismatch for terminal_games")
+            }
+            PeerError::LatencyUnavailable => {
+                write!(f, "latency unavailable for this node")
+            }
             PeerError::InvalidPeerCount => write!(f, "invalid peer count (must be 1-1024)"),
             PeerError::DataTooLarge => write!(f, "data too large: maximum 64KB"),
             PeerError::ChannelFull => write!(f, "send channel full, message dropped"),
@@ -339,7 +369,7 @@ impl Default for MessageReader {
 }
 
 impl Iterator for MessageReader {
-    type Item = Message;
+    type Item = Result<Message, PeerError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let ret = unsafe {
@@ -351,16 +381,18 @@ impl Iterator for MessageReader {
         };
 
         if ret > 0 {
-            let from_peer =
-                PeerId::try_from(self.from_peer_buf).expect("host returned invalid peer ID bytes");
+            let from_peer = match PeerId::try_from(self.from_peer_buf) {
+                Ok(from_peer) => from_peer,
+                Err(err) => return Some(Err(err)),
+            };
             let data = self.data_buf[..ret as usize].to_vec();
-            Some(Message {
+            Some(Ok(Message {
                 from: from_peer,
                 data,
-            })
+            }))
+        } else if ret < 0 {
+            Some(Err(PeerError::from_recv_code(ret)))
         } else {
-            // ret == 0: no data available immediately
-            // ret < 0: error (treat as no data for iterator pattern)
             None
         }
     }

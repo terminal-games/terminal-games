@@ -3,7 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     error::Error,
     io,
     pin::Pin,
@@ -44,19 +44,20 @@ use terminal_games::{
     },
     control::{
         AdminControlRpc, AppControlRpc, AppEnvDeleteRequest, AppEnvListResponse, AppEnvSetRequest,
-        AppSelfInfoRequest, AppSelfInfoResponse, AppSelfResponse, AppSummary, AppTokenClaims,
-        BanEntry, BanIpAddRequest, BanIpAddResponse, BanIpRemoveRequest, BanIpRequest,
-        BroadcastRequest, CONTROL_API_EXPECTED_VERSION_HEADER, CONTROL_API_VERSION,
-        ClusterKickedIpListRequest, ClusterKickedIpListResponse, CreateAppRequest,
-        CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest, DeleteShortnameResponse,
-        DrainStartRequest, KickSessionRequest, NodeDiscoveryResponse, NodeRuntimeStatus,
-        RotateAppTokenRequest, RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage,
-        SpyControlMessage, StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry,
-        TickerRemoveRequest, TickerReorderRequest, UploadAppRequest, UploadAppResponse,
-        expiry_from_duration, parse_duration_string, parse_optional_expiry,
+        AppSelfInfoRequest, AppSelfInfoResponse, AppSelfInfoTokenStatus, AppSelfResponse,
+        AppSummary, AppTokenClaims, BanEntry, BanIpAddRequest, BanIpAddResponse,
+        BanIpRemoveRequest, BanIpRequest, BroadcastRequest, CONTROL_API_EXPECTED_VERSION_HEADER,
+        CONTROL_API_VERSION, ClusterKickedIpListRequest, ClusterKickedIpListResponse,
+        CreateAppRequest, CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest,
+        DeleteShortnameResponse, DrainStartRequest, KickSessionRequest, NodeDiscoveryResponse,
+        NodeRuntimeStatus, RotateAppTokenRequest, RotateAppTokenResponse, RpcError, SessionSummary,
+        SpyClientMessage, SpyControlMessage, StaleImport, StatusBarState, StatusBroadcast,
+        TickerAddRequest, TickerEntry, TickerRemoveRequest, TickerReorderRequest, UploadAppRequest,
+        UploadAppResponse, expiry_from_duration, parse_duration_string, parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
     mesh::{AppRuntimeUpdateMessage, BuildId, ContentHash, Mesh, hash_app_envs, hash_bytes},
+    wasm_abi,
 };
 use time::OffsetDateTime;
 
@@ -226,12 +227,8 @@ impl ControlPlane {
             )
             .await?;
         Ok(RotateAppTokenResponse {
-            app: AppSummary {
-                app_id,
-                author_name: String::new(),
-                shortname: shortname.to_string(),
-                playtime_seconds: 0.0,
-            },
+            app_id,
+            shortname: shortname.to_string(),
             token: AppTokenClaims::new(base_url, shortname.to_string(), secret).encode()?,
         })
     }
@@ -924,6 +921,9 @@ impl AdminControlRpc for AdminRpcServer {
             author_name: String::new(),
             shortname: shortname.clone(),
             playtime_seconds: 0.0,
+            stale: false,
+            stale_imports: Vec::new(),
+            imports: Vec::new(),
         };
         Ok(CreateAppResponse {
             app,
@@ -940,7 +940,8 @@ impl AdminControlRpc for AdminRpcServer {
                 "SELECT a.id,
                         COALESCE(json_extract(g.details, '$.author'), ''),
                         a.shortname,
-                        COALESCE(g.duration_seconds, 0.0)
+                        COALESCE(g.duration_seconds, 0.0),
+                        COALESCE(g.imports, '[]')
                  FROM app_tokens a
                  LEFT JOIN apps g ON g.shortname = a.shortname
                  ORDER BY a.id ASC",
@@ -949,11 +950,16 @@ impl AdminControlRpc for AdminRpcServer {
             .await?;
         let mut app_tokens = Vec::new();
         while let Some(row) = rows.next().await? {
+            let imports = serde_json::from_str::<Vec<String>>(&row.get::<String>(4)?)?;
+            let (stale, stale_imports) = app_import_staleness(&imports);
             app_tokens.push(AppSummary {
                 app_id: row.get::<u64>(0)?,
                 author_name: row.get::<String>(1)?,
                 shortname: row.get::<String>(2)?,
                 playtime_seconds: row.get::<f64>(3)?,
+                stale,
+                stale_imports,
+                imports,
             });
         }
         Ok(app_tokens)
@@ -983,12 +989,8 @@ impl AdminControlRpc for AdminRpcServer {
         };
         let shortname = row.get::<String>(0)?;
         Ok(RotateAppTokenResponse {
-            app: AppSummary {
-                app_id: request.app_id,
-                author_name: String::new(),
-                shortname: shortname.clone(),
-                playtime_seconds: 0.0,
-            },
+            app_id: request.app_id,
+            shortname: shortname.clone(),
             token: AppTokenClaims::new(request.base_url, shortname, secret).encode()?,
         })
     }
@@ -1024,36 +1026,38 @@ impl AppControlRpc for AppRpcServer {
         }
         self.control
             .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
-        let mut seen_shortnames = HashSet::new();
-        let unique_claims = request
-            .tokens
-            .into_iter()
-            .filter(|claims| seen_shortnames.insert(claims.shortname.clone()))
-            .collect::<Vec<_>>();
+        let claims_by_shortname = group_app_self_info_claims(request.tokens);
         let records_by_shortname = load_app_self_info_records_by_shortnames(
             &self.control.app_server.db,
-            unique_claims.iter().map(|claims| claims.shortname.as_str()),
+            claims_by_shortname
+                .iter()
+                .map(|(shortname, _)| shortname.as_str()),
         )
         .await?;
         let mut apps = Vec::new();
-        let mut invalid_shortnames = Vec::new();
-        for claims in unique_claims {
-            let Some(record) = records_by_shortname.get(&claims.shortname) else {
-                invalid_shortnames.push(claims.shortname);
-                continue;
-            };
-            if !constant_time_eq(
-                sha256_hex(&claims.secret).as_bytes(),
-                record.app_token.token_hash.as_bytes(),
-            ) {
-                invalid_shortnames.push(claims.shortname);
+        let mut token_statuses = Vec::new();
+        for (shortname, claims) in claims_by_shortname {
+            let valid_tokens = records_by_shortname
+                .get(&shortname)
+                .map(|record| {
+                    matching_app_token_count(record.app_token.token_hash.as_str(), &claims)
+                })
+                .unwrap_or(0);
+            token_statuses.push(AppSelfInfoTokenStatus {
+                shortname: shortname.clone(),
+                valid_tokens,
+                invalid_tokens: claims.len() as u32 - valid_tokens,
+            });
+            if valid_tokens == 0 {
                 continue;
             }
-            apps.push(record.to_response(&self.control.node_id));
+            if let Some(record) = records_by_shortname.get(&shortname) {
+                apps.push(record.to_response(&self.control.node_id));
+            }
         }
         Ok(AppSelfInfoResponse {
             apps,
-            invalid_shortnames,
+            token_statuses,
         })
     }
 
@@ -1184,6 +1188,8 @@ impl AppControlRpc for AppRpcServer {
                 AUTHOR_UPLOAD_MAX_BYTES
             )));
         }
+        let imports_json =
+            serde_json::to_string(&wasm_abi::guest_host_api_inventory(&request.wasm)?)?;
         let manifest = extract_manifest_from_wasm(&request.wasm).and_then(|manifest| {
             manifest.ok_or_else(|| anyhow::anyhow!("missing embedded terminal-games manifest"))
         })?;
@@ -1248,16 +1254,18 @@ impl AppControlRpc for AppRpcServer {
             tx.execute(
                 "UPDATE apps
                  SET wasm = ?2,
-                     details = json(?3),
-                     wasm_hash = ?4,
-                     env_hash = ?5,
-                     env_salt = ?6,
-                     env_blob = ?7,
-                     build_updated_at = ?8
+                     imports = json(?3),
+                     details = json(?4),
+                     wasm_hash = ?5,
+                     env_hash = ?6,
+                     env_salt = ?7,
+                     env_blob = ?8,
+                     build_updated_at = ?9
                  WHERE id = ?1",
                 libsql::params!(
                     app_id,
                     request.wasm.clone(),
+                    imports_json.as_str(),
                     details_json.as_str(),
                     build_id.wasm_hash.to_vec(),
                     build_id.env_hash.to_vec(),
@@ -1279,12 +1287,13 @@ impl AppControlRpc for AppRpcServer {
             let updated_at_ns = current_unix_nanos();
             let mut id_rows = tx
                 .query(
-                    "INSERT INTO apps (shortname, wasm, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
-                     VALUES (?1, ?2, json(?3), ?4, ?5, ?6, ?7, ?8)
+                    "INSERT INTO apps (shortname, wasm, imports, details, wasm_hash, env_hash, env_salt, env_blob, build_updated_at)
+                     VALUES (?1, ?2, json(?3), json(?4), ?5, ?6, ?7, ?8, ?9)
                      RETURNING id",
                     libsql::params!(
                         self.app.record.shortname.as_str(),
                         request.wasm.clone(),
+                        imports_json.as_str(),
                         details_json.as_str(),
                         build_id.wasm_hash.to_vec(),
                         build_id.env_hash.to_vec(),
@@ -1654,18 +1663,37 @@ struct AppSelfInfoRecord {
     app_token: AppTokenRecord,
     author_name: String,
     playtime_seconds: f64,
+    imports: Vec<String>,
 }
 
 impl AppSelfInfoRecord {
     fn to_response(&self, node_id: &str) -> AppSelfResponse {
+        let (stale, stale_imports) = app_import_staleness(&self.imports);
         AppSelfResponse {
             app_id: self.app_token.id,
             author_name: self.author_name.clone(),
             shortname: self.app_token.shortname.clone(),
             server: node_id.to_string(),
             playtime_seconds: self.playtime_seconds,
+            stale,
+            stale_imports,
+            imports: self.imports.clone(),
         }
     }
+}
+
+fn app_import_staleness(imports: &[String]) -> (bool, Vec<StaleImport>) {
+    let stale_imports = imports
+        .iter()
+        .filter_map(|import| {
+            let latest_import = wasm_abi::latest_host_api_import(import)?;
+            (latest_import != *import).then(|| StaleImport {
+                import: import.clone(),
+                latest_import,
+            })
+        })
+        .collect::<Vec<_>>();
+    (!stale_imports.is_empty(), stale_imports)
 }
 
 async fn load_app_self_info_records_by_shortnames<'a>(
@@ -1688,7 +1716,8 @@ async fn load_app_self_info_records_by_shortnames<'a>(
                 app_tokens.shortname,
                 app_tokens.token_hash,
                 COALESCE(json_extract(apps.details, '$.author'), ''),
-                COALESCE(apps.duration_seconds, 0.0)
+                COALESCE(apps.duration_seconds, 0.0),
+                COALESCE(apps.imports, '[]')
          FROM app_tokens
          LEFT JOIN apps ON apps.shortname = app_tokens.shortname
          WHERE app_tokens.shortname IN ({placeholders})"
@@ -1710,10 +1739,36 @@ async fn load_app_self_info_records_by_shortnames<'a>(
                 },
                 author_name: row.get::<String>(3).unwrap_or_default(),
                 playtime_seconds: row.get::<f64>(4)?,
+                imports: serde_json::from_str(&row.get::<String>(5)?)?,
             },
         );
     }
     Ok(records)
+}
+
+fn group_app_self_info_claims(tokens: Vec<AppTokenClaims>) -> Vec<(String, Vec<AppTokenClaims>)> {
+    let mut grouped = HashMap::<String, Vec<AppTokenClaims>>::new();
+    let mut ordered_shortnames = Vec::new();
+    for claims in tokens {
+        let shortname = claims.shortname.clone();
+        if !grouped.contains_key(&shortname) {
+            ordered_shortnames.push(shortname.clone());
+        }
+        grouped.entry(shortname).or_default().push(claims);
+    }
+    ordered_shortnames
+        .into_iter()
+        .filter_map(|shortname| grouped.remove(&shortname).map(|claims| (shortname, claims)))
+        .collect()
+}
+
+fn matching_app_token_count(token_hash: &str, claims: &[AppTokenClaims]) -> u32 {
+    claims
+        .iter()
+        .filter(|claims| {
+            constant_time_eq(sha256_hex(&claims.secret).as_bytes(), token_hash.as_bytes())
+        })
+        .count() as u32
 }
 
 async fn load_app_env_blob(
