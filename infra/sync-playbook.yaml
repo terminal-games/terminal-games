@@ -17,11 +17,13 @@
           - LIBSQL_URL | length > 0
           - ADMIN_SHARED_SECRET is defined
           - ADMIN_SHARED_SECRET | length > 0
+          - AUTHOR_ENV_SECRET_KEY is defined
+          - AUTHOR_ENV_SECRET_KEY | length > 0
           - METRICS_BEARER_TOKEN is defined
           - METRICS_BEARER_TOKEN | length > 0
           - SSH_HOST_KEY_BASE64 is defined
           - SSH_HOST_KEY_BASE64 | length > 0
-        fail_msg: "Set MESH_PINNED_PEM, LIBSQL_AUTH_TOKEN, LIBSQL_URL, ADMIN_SHARED_SECRET, METRICS_BEARER_TOKEN, and SSH_HOST_KEY_BASE64."
+        fail_msg: "Set MESH_PINNED_PEM, LIBSQL_AUTH_TOKEN, LIBSQL_URL, ADMIN_SHARED_SECRET, AUTHOR_ENV_SECRET_KEY, METRICS_BEARER_TOKEN, and SSH_HOST_KEY_BASE64."
       no_log: true
 
     - name: Verify local server binary exists
