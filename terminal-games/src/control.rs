@@ -384,7 +384,14 @@ pub struct AppSelfInfoRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSelfInfoResponse {
     pub apps: Vec<AppSelfResponse>,
-    pub invalid_shortnames: Vec<String>,
+    pub token_statuses: Vec<AppSelfInfoTokenStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSelfInfoTokenStatus {
+    pub shortname: String,
+    pub valid_tokens: u32,
+    pub invalid_tokens: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

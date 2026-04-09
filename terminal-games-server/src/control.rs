@@ -44,15 +44,15 @@ use terminal_games::{
     },
     control::{
         AdminControlRpc, AppControlRpc, AppEnvDeleteRequest, AppEnvListResponse, AppEnvSetRequest,
-        AppSelfInfoRequest, AppSelfInfoResponse, AppSelfResponse, AppSummary, AppTokenClaims,
-        BanEntry, BanIpAddRequest, BanIpAddResponse, BanIpRemoveRequest, BanIpRequest,
-        BroadcastRequest, CONTROL_API_EXPECTED_VERSION_HEADER, CONTROL_API_VERSION,
-        ClusterKickedIpListRequest, ClusterKickedIpListResponse, CreateAppRequest,
-        CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest, DeleteShortnameResponse,
-        DrainStartRequest, KickSessionRequest, NodeDiscoveryResponse, NodeRuntimeStatus,
-        RotateAppTokenRequest, RotateAppTokenResponse, RpcError, SessionSummary, SpyClientMessage,
-        SpyControlMessage, StaleImport, StatusBarState, StatusBroadcast, TickerAddRequest,
-        TickerEntry, TickerRemoveRequest, TickerReorderRequest, UploadAppRequest,
+        AppSelfInfoRequest, AppSelfInfoResponse, AppSelfInfoTokenStatus, AppSelfResponse,
+        AppSummary, AppTokenClaims, BanEntry, BanIpAddRequest, BanIpAddResponse,
+        BanIpRemoveRequest, BanIpRequest, BroadcastRequest, CONTROL_API_EXPECTED_VERSION_HEADER,
+        CONTROL_API_VERSION, ClusterKickedIpListRequest, ClusterKickedIpListResponse,
+        CreateAppRequest, CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest,
+        DeleteShortnameResponse, DrainStartRequest, KickSessionRequest, NodeDiscoveryResponse,
+        NodeRuntimeStatus, RotateAppTokenRequest, RotateAppTokenResponse, RpcError, SessionSummary,
+        SpyClientMessage, SpyControlMessage, StaleImport, StatusBarState, StatusBroadcast,
+        TickerAddRequest, TickerEntry, TickerRemoveRequest, TickerReorderRequest, UploadAppRequest,
         UploadAppResponse, expiry_from_duration, parse_duration_string, parse_optional_expiry,
     },
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
@@ -1035,21 +1035,29 @@ impl AppControlRpc for AppRpcServer {
         )
         .await?;
         let mut apps = Vec::new();
-        let mut invalid_shortnames = Vec::new();
+        let mut token_statuses = Vec::new();
         for (shortname, claims) in claims_by_shortname {
-            let Some(record) = records_by_shortname.get(&shortname) else {
-                invalid_shortnames.push(shortname);
-                continue;
-            };
-            if !claims_match_app_token_hash(record.app_token.token_hash.as_str(), &claims) {
-                invalid_shortnames.push(shortname);
+            let valid_tokens = records_by_shortname
+                .get(&shortname)
+                .map(|record| {
+                    matching_app_token_count(record.app_token.token_hash.as_str(), &claims)
+                })
+                .unwrap_or(0);
+            token_statuses.push(AppSelfInfoTokenStatus {
+                shortname: shortname.clone(),
+                valid_tokens,
+                invalid_tokens: claims.len() as u32 - valid_tokens,
+            });
+            if valid_tokens == 0 {
                 continue;
             }
-            apps.push(record.to_response(&self.control.node_id));
+            if let Some(record) = records_by_shortname.get(&shortname) {
+                apps.push(record.to_response(&self.control.node_id));
+            }
         }
         Ok(AppSelfInfoResponse {
             apps,
-            invalid_shortnames,
+            token_statuses,
         })
     }
 
@@ -1754,10 +1762,13 @@ fn group_app_self_info_claims(tokens: Vec<AppTokenClaims>) -> Vec<(String, Vec<A
         .collect()
 }
 
-fn claims_match_app_token_hash(token_hash: &str, claims: &[AppTokenClaims]) -> bool {
-    claims.iter().any(|claims| {
-        constant_time_eq(sha256_hex(&claims.secret).as_bytes(), token_hash.as_bytes())
-    })
+fn matching_app_token_count(token_hash: &str, claims: &[AppTokenClaims]) -> u32 {
+    claims
+        .iter()
+        .filter(|claims| {
+            constant_time_eq(sha256_hex(&claims.secret).as_bytes(), token_hash.as_bytes())
+        })
+        .count() as u32
 }
 
 async fn load_app_env_blob(

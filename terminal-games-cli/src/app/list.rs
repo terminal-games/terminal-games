@@ -2,10 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::Result;
-use terminal_games::control::{AppSelfInfoRequest, AppSelfInfoResponse, AppTokenClaims};
+use terminal_games::control::{
+    AppSelfInfoRequest, AppSelfInfoResponse, AppSelfInfoTokenStatus, AppTokenClaims,
+};
 
 use crate::config::{format_imports, format_seconds, load_app_tokens_for_listing, print_table};
 use crate::control_client::{connect_app_rpc_fallback, is_unauthorized_error};
@@ -28,10 +30,11 @@ pub(super) async fn run() -> Result<()> {
     for (url, groups) in groups_by_url {
         match fetch_author_infos_for_server(&groups).await {
             Ok(response) => {
-                let invalid_shortnames = response
-                    .invalid_shortnames
+                let token_statuses = response
+                    .token_statuses
                     .into_iter()
-                    .collect::<BTreeSet<_>>();
+                    .map(|status| (status.shortname.clone(), status))
+                    .collect::<BTreeMap<_, _>>();
                 rows.extend(response.apps.into_iter().map(|app| {
                     vec![
                         if app.author_name.trim().is_empty() {
@@ -47,7 +50,7 @@ pub(super) async fn run() -> Result<()> {
                         format_imports(&app.imports, &app.stale_imports),
                     ]
                 }));
-                warnings.extend(collect_group_warnings(&url, &groups, &invalid_shortnames).await?);
+                warnings.extend(collect_group_warnings(&url, &groups, &token_statuses));
             }
             Err(error) => warnings.extend(groups.iter().map(|(shortname, claims)| {
                 format_group_fetch_warning(shortname, &url, claims.len(), &error)
@@ -92,81 +95,60 @@ async fn fetch_author_infos_for_server(groups: &TokenGroups) -> Result<AppSelfIn
         .map_err(anyhow::Error::msg)
 }
 
-async fn collect_group_warnings(
+fn collect_group_warnings(
     url: &str,
     groups: &TokenGroups,
-    invalid_shortnames: &BTreeSet<String>,
-) -> Result<Vec<String>> {
+    token_statuses: &BTreeMap<String, AppSelfInfoTokenStatus>,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     for (shortname, claims) in groups {
-        let warning = if claims.len() == 1 {
-            invalid_shortnames
-                .contains(shortname)
-                .then(|| format!("Skipping invalid app token '{}' on {}", shortname, url))
+        let fallback_status;
+        let status = if let Some(status) = token_statuses.get(shortname) {
+            status
         } else {
-            validate_group_warning(
-                claims,
-                shortname,
-                url,
-                !invalid_shortnames.contains(shortname),
-            )
-            .await?
+            fallback_status = AppSelfInfoTokenStatus {
+                shortname: shortname.clone(),
+                valid_tokens: 0,
+                invalid_tokens: claims.len() as u32,
+            };
+            &fallback_status
         };
+        let warning = format_group_warning(shortname, url, claims.len(), status);
         if let Some(warning) = warning {
             warnings.push(warning);
         }
     }
-    Ok(warnings)
+    warnings
 }
 
-async fn validate_group_warning(
-    claims: &[AppTokenClaims],
+fn format_group_warning(
     shortname: &str,
     url: &str,
-    has_valid_app: bool,
-) -> Result<Option<String>> {
-    let mut invalid = 0;
-    let mut other_errors = BTreeMap::<String, usize>::new();
-    for claims in claims {
-        match connect_app_rpc_fallback(std::slice::from_ref(claims)).await {
-            Ok(_) => {}
-            Err(error) if is_unauthorized_error(&error) => invalid += 1,
-            Err(error) => {
-                *other_errors
-                    .entry(error.root_cause().to_string())
-                    .or_default() += 1;
-            }
-        }
+    token_count: usize,
+    status: &AppSelfInfoTokenStatus,
+) -> Option<String> {
+    if status.invalid_tokens == 0 {
+        return None;
     }
-    if invalid == 0 && other_errors.is_empty() {
-        return Ok(None);
-    }
-    let mut details = Vec::new();
-    if invalid > 0 {
-        details.push(format!(
-            "{} invalid token{}",
-            invalid,
-            if invalid == 1 { "" } else { "s" }
+    if token_count == 1 {
+        return Some(format!(
+            "Skipping invalid app token '{}' on {}",
+            shortname, url
         ));
     }
-    details.extend(other_errors.into_iter().map(|(error, count)| {
-        format!(
-            "{} token{} failed with {}",
-            count,
-            if count == 1 { "" } else { "s" },
-            error
-        )
-    }));
-    let details = details.join("; ");
-
-    Ok(Some(if has_valid_app {
+    let details = format!(
+        "{} invalid token{}",
+        status.invalid_tokens,
+        if status.invalid_tokens == 1 { "" } else { "s" }
+    );
+    Some(if status.valid_tokens > 0 {
         format!(
             "Ignoring duplicate app tokens for '{}' on {} ({})",
             shortname, url, details
         )
     } else {
         format!("Skipping '{}' on {} ({})", shortname, url, details)
-    }))
+    })
 }
 
 fn format_group_fetch_warning(
