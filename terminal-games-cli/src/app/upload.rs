@@ -11,7 +11,7 @@ use terminal_games::{
 };
 
 use super::{AppUploadArgs, load_upload_envs};
-use crate::control_client::{AppClient, load_app_claims_for_target};
+use crate::control_client::AppClient;
 
 pub(super) async fn run(args: AppUploadArgs, profile: Option<String>) -> Result<()> {
     let wasm = fs::read(&args.path_to_wasm_file)
@@ -20,7 +20,6 @@ pub(super) async fn run(args: AppUploadArgs, profile: Option<String>) -> Result<
         .ok_or_else(|| anyhow::anyhow!("missing embedded terminal-games manifest"))?;
     validate_manifest(&manifest)?;
     let target_shortname = args.shortname.as_deref().unwrap_or(&manifest.shortname);
-    let claims = load_app_claims_for_target(target_shortname, profile.as_deref())?;
     anyhow::ensure!(
         manifest.shortname == target_shortname,
         "manifest shortname '{}' does not match target '{}'",
@@ -28,7 +27,7 @@ pub(super) async fn run(args: AppUploadArgs, profile: Option<String>) -> Result<
         target_shortname
     );
 
-    let client = AppClient::from_claims(claims)?;
+    let client = AppClient::from_target(target_shortname, profile.as_deref())?;
     let envs = load_upload_envs(&args.env, args.env_file.as_deref())?;
     let response: UploadAppResponse = client
         .rpc()

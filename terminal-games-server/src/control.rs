@@ -3,7 +3,7 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     error::Error,
     io,
     pin::Pin,
@@ -1026,29 +1026,23 @@ impl AppControlRpc for AppRpcServer {
         }
         self.control
             .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
-        let mut seen_shortnames = HashSet::new();
-        let unique_claims = request
-            .tokens
-            .into_iter()
-            .filter(|claims| seen_shortnames.insert(claims.shortname.clone()))
-            .collect::<Vec<_>>();
+        let claims_by_shortname = group_app_self_info_claims(request.tokens);
         let records_by_shortname = load_app_self_info_records_by_shortnames(
             &self.control.app_server.db,
-            unique_claims.iter().map(|claims| claims.shortname.as_str()),
+            claims_by_shortname
+                .iter()
+                .map(|(shortname, _)| shortname.as_str()),
         )
         .await?;
         let mut apps = Vec::new();
         let mut invalid_shortnames = Vec::new();
-        for claims in unique_claims {
-            let Some(record) = records_by_shortname.get(&claims.shortname) else {
-                invalid_shortnames.push(claims.shortname);
+        for (shortname, claims) in claims_by_shortname {
+            let Some(record) = records_by_shortname.get(&shortname) else {
+                invalid_shortnames.push(shortname);
                 continue;
             };
-            if !constant_time_eq(
-                sha256_hex(&claims.secret).as_bytes(),
-                record.app_token.token_hash.as_bytes(),
-            ) {
-                invalid_shortnames.push(claims.shortname);
+            if !claims_match_app_token_hash(record.app_token.token_hash.as_str(), &claims) {
+                invalid_shortnames.push(shortname);
                 continue;
             }
             apps.push(record.to_response(&self.control.node_id));
@@ -1742,6 +1736,28 @@ async fn load_app_self_info_records_by_shortnames<'a>(
         );
     }
     Ok(records)
+}
+
+fn group_app_self_info_claims(tokens: Vec<AppTokenClaims>) -> Vec<(String, Vec<AppTokenClaims>)> {
+    let mut grouped = HashMap::<String, Vec<AppTokenClaims>>::new();
+    let mut ordered_shortnames = Vec::new();
+    for claims in tokens {
+        let shortname = claims.shortname.clone();
+        if !grouped.contains_key(&shortname) {
+            ordered_shortnames.push(shortname.clone());
+        }
+        grouped.entry(shortname).or_default().push(claims);
+    }
+    ordered_shortnames
+        .into_iter()
+        .filter_map(|shortname| grouped.remove(&shortname).map(|claims| (shortname, claims)))
+        .collect()
+}
+
+fn claims_match_app_token_hash(token_hash: &str, claims: &[AppTokenClaims]) -> bool {
+    claims.iter().any(|claims| {
+        constant_time_eq(sha256_hex(&claims.secret).as_bytes(), token_hash.as_bytes())
+    })
 }
 
 async fn load_app_env_blob(

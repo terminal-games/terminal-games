@@ -125,33 +125,22 @@ pub fn default_url_value() -> Result<Option<String>> {
 
 pub fn list_stored_app_tokens() -> Result<Vec<StoredAppTokenEntry>> {
     let tokens: AppTokensFile = read_toml(app_tokens_path())?;
-    let mut entries = BTreeMap::new();
-    for stored in tokens.token {
-        let claims = decode_app_token(&stored.token)?;
-        entries.insert(
-            (claims.url.clone(), claims.shortname.clone()),
-            StoredAppTokenEntry { claims },
-        );
-    }
-    Ok(entries.into_values().collect())
+    tokens
+        .token
+        .into_iter()
+        .map(|stored| {
+            let claims = decode_app_token(&stored.token)?;
+            Ok(StoredAppTokenEntry { claims })
+        })
+        .collect()
 }
 
-pub fn load_app_token_for_shortname(
+pub fn load_app_tokens_for_shortname(
     shortname: &str,
     url_override: Option<&str>,
-) -> Result<Option<AppTokenClaims>> {
+) -> Result<Vec<AppTokenClaims>> {
     let requested_url = normalize_optional_url(url_override)?;
-    if let Some(claims) = load_env_app_token()? {
-        if claims.shortname == shortname
-            && requested_url
-                .as_deref()
-                .is_none_or(|requested| requested == claims.url)
-        {
-            return Ok(Some(claims));
-        }
-    }
-
-    let entries = list_stored_app_tokens()?;
+    let entries = load_all_app_token_entries()?;
     select_app_claims(
         &entries,
         shortname,
@@ -162,20 +151,7 @@ pub fn load_app_token_for_shortname(
 
 pub fn load_app_tokens_for_listing(url_filter: Option<&str>) -> Result<Vec<StoredAppTokenEntry>> {
     let filter_url = normalize_optional_url(url_filter)?;
-    let mut entries = BTreeMap::new();
-    for entry in list_stored_app_tokens()? {
-        entries.insert(
-            (entry.claims.url.clone(), entry.claims.shortname.clone()),
-            entry,
-        );
-    }
-    if let Some(claims) = load_env_app_token()? {
-        entries.insert(
-            (claims.url.clone(), claims.shortname.clone()),
-            StoredAppTokenEntry { claims },
-        );
-    }
-    let mut entries = entries.into_values().collect::<Vec<_>>();
+    let mut entries = load_all_app_token_entries()?;
     if let Some(filter_url) = filter_url {
         entries.retain(|entry| entry.claims.url == filter_url);
     }
@@ -395,35 +371,52 @@ fn select_app_claims(
     shortname: &str,
     requested_url: Option<&str>,
     default_url: Option<&str>,
-) -> Result<Option<AppTokenClaims>> {
+) -> Result<Vec<AppTokenClaims>> {
     let matches = entries
         .iter()
         .filter(|entry| entry.claims.shortname == shortname)
         .collect::<Vec<_>>();
     if matches.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     if let Some(requested_url) = requested_url {
-        return matches
-            .iter()
-            .find(|entry| entry.claims.url == requested_url)
+        let matches = matches
+            .into_iter()
+            .filter(|entry| entry.claims.url == requested_url)
             .map(|entry| entry.claims.clone())
-            .map(Some)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no app token configured for '{}' on '{}'; available on: {}",
-                    shortname,
-                    requested_url,
-                    available_app_urls(&matches)
+            .collect::<Vec<_>>();
+        return if matches.is_empty() {
+            Err(anyhow::anyhow!(
+                "no app token configured for '{}' on '{}'; available on: {}",
+                shortname,
+                requested_url,
+                available_app_urls(
+                    &entries
+                        .iter()
+                        .filter(|entry| entry.claims.shortname == shortname)
+                        .collect::<Vec<_>>()
                 )
-            });
+            ))
+        } else {
+            Ok(matches)
+        };
     }
-    if matches.len() == 1 {
-        return Ok(Some(matches[0].claims.clone()));
+
+    let urls = matches
+        .iter()
+        .map(|entry| entry.claims.url.as_str())
+        .collect::<BTreeSet<_>>();
+    if urls.len() == 1 {
+        return Ok(matches.iter().map(|entry| entry.claims.clone()).collect());
     }
     if let Some(default_url) = default_url {
-        if let Some(entry) = matches.iter().find(|entry| entry.claims.url == default_url) {
-            return Ok(Some(entry.claims.clone()));
+        let matches = matches
+            .iter()
+            .filter(|entry| entry.claims.url == default_url)
+            .map(|entry| entry.claims.clone())
+            .collect::<Vec<_>>();
+        if !matches.is_empty() {
+            return Ok(matches);
         }
     }
     Err(anyhow::anyhow!(
@@ -441,6 +434,14 @@ fn available_app_urls(entries: &[&StoredAppTokenEntry]) -> String {
         .into_iter()
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn load_all_app_token_entries() -> Result<Vec<StoredAppTokenEntry>> {
+    let mut entries = list_stored_app_tokens()?;
+    if let Some(claims) = load_env_app_token()? {
+        entries.insert(0, StoredAppTokenEntry { claims });
+    }
+    Ok(entries)
 }
 
 fn load_env_app_token() -> Result<Option<AppTokenClaims>> {
