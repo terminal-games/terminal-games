@@ -262,7 +262,7 @@ async fn main() -> std::io::Result<()> {
                 Ok(msg) => msg,
                 Err(err) => {
                     tracing::warn!("peer receive error: {}", err);
-                    continue;
+                    break;
                 }
             };
             let message_str = String::from_utf8_lossy(&msg.data).to_string();
