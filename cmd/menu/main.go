@@ -58,6 +58,7 @@ type model struct {
 	help        help.Model
 	games       gamesModel
 	profile     profileModel
+	about       aboutModel
 	dirty       bool
 	viewCache   string
 }
@@ -165,6 +166,7 @@ func main() {
 		help:        help.New(),
 		games:       newGamesModel(zoneManager),
 		profile:     newProfileModel(zoneManager),
+		about:       newAboutModel(),
 	}
 	menuModel.applyMenuLocalization()
 
@@ -183,6 +185,7 @@ func (m *model) Init() tea.Cmd {
 		m.tabs.Init(),
 		m.games.Init(),
 		m.profile.Init(),
+		m.about.Init(),
 		startupLoadingDelayCmd(),
 	)
 }
@@ -228,6 +231,8 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 		m.profile, cmd = m.profile.Update(message)
 		cmds = append(cmds, cmd)
+		m.about, cmd = m.about.Update(message)
+		cmds = append(cmds, cmd)
 		if !m.started && m.startupReady() {
 			m.started = true
 		}
@@ -243,6 +248,8 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.games, cmd = m.games.Update(message)
 		cmds = append(cmds, cmd)
 		m.profile, cmd = m.profile.Update(message)
+		cmds = append(cmds, cmd)
+		m.about, cmd = m.about.Update(message)
 		cmds = append(cmds, cmd)
 		m.tabs, cmd = m.tabs.Update(message)
 		cmds = append(cmds, cmd)
@@ -281,6 +288,8 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.games, cmd = m.games.Update(msg)
 	case "profile":
 		m.profile, cmd = m.profile.Update(msg)
+	case "about":
+		m.about, cmd = m.about.Update(msg)
 	}
 	return m, cmd
 }
@@ -300,6 +309,9 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 	case "profile":
 		m.profile, cmd = m.profile.Update(msg)
+		cmds = append(cmds, cmd)
+	case "about":
+		m.about, cmd = m.about.Update(msg)
 		cmds = append(cmds, cmd)
 	}
 	return m, tea.Batch(cmds...)
@@ -324,6 +336,8 @@ func (m *model) handleMouseMotion(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		if m.profile.hovered != oldHover {
 			m.dirty = true
 		}
+	case "about":
+		m.about, cmd = m.about.Update(msg)
 	}
 	if m.tabs.Hovered != oldTabHover {
 		m.dirty = true
@@ -482,6 +496,7 @@ func startupLoadingDelayCmd() tea.Cmd {
 func (m *model) applyMenuLocalization() {
 	activeID := m.tabs.ActiveTab().ID
 	m.keys = newKeyMap(m.localizer)
+	m.about.applyLocalization(m.localizer)
 	m.tabs = tabs.NewWithActive([]tabs.Tab{
 		{ID: "games", Title: m.localizer.Text(textTabGames)},
 		{ID: "profile", Title: m.localizer.Text(textTabProfile)},

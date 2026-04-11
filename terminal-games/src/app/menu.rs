@@ -1,10 +1,11 @@
 use super::{
-    AppServer, AppState, GameDetailsOut, MAX_MENU_REQUESTS, MENU_POLL_ERR_BUFFER_TOO_SMALL,
-    MENU_POLL_ERR_INVALID_REQUEST_ID, MENU_POLL_ERR_REQUEST_FAILED, MENU_POLL_PENDING,
-    MENU_REQ_ERR_INVALID_INPUT, MENU_REQ_ERR_NOT_MENU_APP, MENU_REQ_ERR_TOO_MANY_REQUESTS,
-    MENU_REQ_GAMES_LIST, MENU_REQ_PROFILE_GET, MENU_REQ_PROFILE_SET, MENU_REQ_REPLAY_DELETE,
-    MENU_REQ_REPLAYS_LIST, MenuRequestJob, MenuRequestKind, MenuRequestState, MenuSessionState,
-    MenuUpdate, PendingMenuRequest,
+    AppContext, AppServer, AppState, GameDetailsOut, MAX_MENU_REQUESTS,
+    MENU_POLL_ERR_BUFFER_TOO_SMALL, MENU_POLL_ERR_INVALID_REQUEST_ID, MENU_POLL_ERR_REQUEST_FAILED,
+    MENU_POLL_PENDING, MENU_REQ_ABOUT_STATUS, MENU_REQ_ERR_INVALID_INPUT,
+    MENU_REQ_ERR_NOT_MENU_APP, MENU_REQ_ERR_TOO_MANY_REQUESTS, MENU_REQ_GAMES_LIST,
+    MENU_REQ_PROFILE_GET, MENU_REQ_PROFILE_SET, MENU_REQ_REPLAY_DELETE, MENU_REQ_REPLAYS_LIST,
+    MenuRequestJob, MenuRequestKind, MenuRequestState, MenuSessionState, MenuUpdate,
+    PendingMenuRequest,
 };
 use crate::wasm_abi::HostApiRegistration;
 
@@ -88,6 +89,10 @@ impl AppServer {
             MENU_REQ_REPLAY_DELETE => MenuRequestJob {
                 request_id: request_id_u,
                 kind: MenuRequestKind::ReplayDelete { created_at: extra },
+            },
+            MENU_REQ_ABOUT_STATUS => MenuRequestJob {
+                request_id: request_id_u,
+                kind: MenuRequestKind::AboutStatus,
             },
             _ => {
                 caller.data_mut().menu_requests[request_id_u] = None;
@@ -406,5 +411,74 @@ impl AppServer {
             update.replays = Some(std::mem::take(&mut menu_session.replays));
         }
         (Ok(Vec::new()), update)
+    }
+
+    pub(in crate::app) async fn load_menu_about_status(ctx: AppContext) -> Result<Vec<u8>, String> {
+        #[derive(serde::Serialize)]
+        struct AboutNodeOut {
+            node_id: String,
+            latency_ms: i32,
+            active_sessions: usize,
+            sessions_known: bool,
+            is_current: bool,
+            region_code: Option<String>,
+            region_name: Option<String>,
+            latitude_deg: Option<f64>,
+            longitude_deg: Option<f64>,
+        }
+
+        #[derive(serde::Serialize)]
+        struct AboutOut {
+            host_kind: String,
+            server_version: Option<String>,
+            cli_api_version: String,
+            current_region: String,
+            nodes: Vec<AboutNodeOut>,
+            refreshed_at_unix_ms: i64,
+        }
+
+        let current_node = ctx.mesh.node();
+        let discovered_nodes = ctx
+            .mesh
+            .discover_nodes()
+            .await
+            .unwrap_or_else(|_| vec![current_node]);
+        let mut nodes = Vec::with_capacity(discovered_nodes.len());
+        for node in discovered_nodes {
+            let latency_ms = ctx
+                .mesh
+                .get_node_latency(node)
+                .await
+                .map(|latency| latency.as_millis().min(i32::MAX as u128) as i32)
+                .unwrap_or(-1);
+            let status = ctx.mesh.get_node_status(node).await;
+            nodes.push(AboutNodeOut {
+                node_id: node.to_string(),
+                latency_ms,
+                active_sessions: status.current_sessions,
+                sessions_known: status.status_known,
+                is_current: node == current_node,
+                region_code: status.region_code,
+                region_name: status.region_name,
+                latitude_deg: status.latitude_deg,
+                longitude_deg: status.longitude_deg,
+            });
+        }
+        nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+
+        let payload = AboutOut {
+            host_kind: ctx.about_runtime.host_kind,
+            server_version: ctx.about_runtime.server_version,
+            cli_api_version: ctx.about_runtime.cli_api_version,
+            current_region: current_node.to_string(),
+            nodes,
+            refreshed_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(std::time::Duration::ZERO)
+                .as_millis()
+                .min(i64::MAX as u128) as i64,
+        };
+
+        serde_json::to_vec(&payload).map_err(|e| e.to_string())
     }
 }

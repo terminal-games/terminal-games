@@ -110,6 +110,18 @@ trait MeshRpc {
     async fn peer_added(msg: PeerChangeMessage);
     async fn peer_removed(msg: PeerChangeMessage);
     async fn app_runtime_updated(msg: AppRuntimeUpdateMessage);
+    async fn node_status() -> MeshNodeStatus;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MeshNodeStatus {
+    pub node_id: String,
+    pub current_sessions: usize,
+    pub status_known: bool,
+    pub region_code: Option<String>,
+    pub region_name: Option<String>,
+    pub latitude_deg: Option<f64>,
+    pub longitude_deg: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,7 +373,7 @@ impl Discovery for EnvDiscovery {
 
 pub struct LocalDiscovery {
     registry_path: std::path::PathBuf,
-    self_entry: Mutex<Option<LocalRegistryEntry>>,
+    self_entry: std::sync::Mutex<Option<LocalRegistryEntry>>,
 }
 
 #[derive(Clone, Copy)]
@@ -378,7 +390,7 @@ impl LocalDiscovery {
             std::path::PathBuf::from(format!("/tmp/terminal-games-mesh-{}.registry", uid));
         Self {
             registry_path,
-            self_entry: Mutex::new(None),
+            self_entry: std::sync::Mutex::new(None),
         }
     }
 
@@ -398,17 +410,17 @@ impl LocalDiscovery {
         ))
     }
 
-    pub async fn register(&self, node: NodeId, port: u16) -> anyhow::Result<()> {
+    pub fn register(&self, node: NodeId, port: u16) -> anyhow::Result<()> {
         let pid = std::process::id();
         let entry = LocalRegistryEntry { node, port, pid };
-        *self.self_entry.lock().await = Some(entry);
-        self.write_entry(&entry).await
+        *self.self_entry.lock().unwrap() = Some(entry);
+        self.write_entry(&entry)
     }
 
-    pub async fn unregister(&self) -> anyhow::Result<()> {
-        let entry = self.self_entry.lock().await.take();
+    pub fn unregister(&self) -> anyhow::Result<()> {
+        let entry = self.self_entry.lock().unwrap().take();
         if let Some(entry) = entry {
-            self.remove_entry(&entry).await?;
+            self.remove_entry(&entry)?;
         }
         Ok(())
     }
@@ -437,7 +449,7 @@ impl LocalDiscovery {
         Ok(())
     }
 
-    async fn write_entry(&self, entry: &LocalRegistryEntry) -> anyhow::Result<()> {
+    fn write_entry(&self, entry: &LocalRegistryEntry) -> anyhow::Result<()> {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -447,7 +459,7 @@ impl LocalDiscovery {
         Ok(())
     }
 
-    async fn remove_entry(&self, entry: &LocalRegistryEntry) -> anyhow::Result<()> {
+    fn remove_entry(&self, entry: &LocalRegistryEntry) -> anyhow::Result<()> {
         if !self.registry_path.exists() {
             return Ok(());
         }
@@ -507,7 +519,7 @@ impl LocalDiscovery {
 #[async_trait::async_trait]
 impl Discovery for LocalDiscovery {
     async fn discover_peers(&self) -> anyhow::Result<HashSet<(NodeId, SocketAddr)>> {
-        let self_entry = *self.self_entry.lock().await;
+        let self_entry = *self.self_entry.lock().unwrap();
         let entries = self.read_entries();
 
         let peers = entries
@@ -531,6 +543,7 @@ impl Discovery for LocalDiscovery {
 
 struct ActiveConnection {
     tx: tokio::sync::mpsc::Sender<Message>,
+    rpc_client: MeshRpcClient,
     conn_fd: RawFd,
     addr: SocketAddr,
 }
@@ -551,6 +564,7 @@ impl NodeState {
 
 struct MeshInner {
     node: NodeId,
+    node_location: MeshNodeLocation,
     nodes: Mutex<HashMap<NodeId, NodeState>>,
     peers: Mutex<HashMap<AppId, HashMap<PeerId, tokio::sync::mpsc::Sender<PeerMessageApp>>>>,
     global_peers: Mutex<HashMap<AppId, HashSet<PeerId>>>,
@@ -560,6 +574,57 @@ struct MeshInner {
     tasks: TaskTracker,
     heal_now: Notify,
     app_runtime_updates: broadcast::Sender<AppRuntimeUpdateMessage>,
+}
+
+impl MeshInner {
+    async fn local_node_status(&self) -> MeshNodeStatus {
+        let current_sessions = self
+            .peers
+            .lock()
+            .await
+            .values()
+            .map(|app_peers| app_peers.len())
+            .sum();
+        let location = self.node_location.clone();
+
+        MeshNodeStatus {
+            node_id: self.node.to_string(),
+            current_sessions,
+            status_known: true,
+            region_code: location.region_code,
+            region_name: location.region_name,
+            latitude_deg: location.latitude_deg,
+            longitude_deg: location.longitude_deg,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MeshNodeLocation {
+    pub region_code: Option<String>,
+    pub region_name: Option<String>,
+    pub latitude_deg: Option<f64>,
+    pub longitude_deg: Option<f64>,
+}
+
+fn read_optional_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_optional_env_f64(key: &str) -> Option<f64> {
+    read_optional_env(key).and_then(|value| value.parse::<f64>().ok())
+}
+
+fn node_location_from_env() -> MeshNodeLocation {
+    MeshNodeLocation {
+        region_code: read_optional_env("NODE_REGION"),
+        region_name: read_optional_env("NODE_REGION_NAME"),
+        latitude_deg: read_optional_env_f64("NODE_LATITUDE"),
+        longitude_deg: read_optional_env_f64("NODE_LONGITUDE"),
+    }
 }
 
 #[derive(Clone)]
@@ -581,6 +646,7 @@ impl Mesh {
             inner: Arc::new(MeshInner {
                 app_runtime_updates: broadcast::channel(64).0,
                 node,
+                node_location: node_location_from_env(),
                 nodes: Default::default(),
                 peers: Default::default(),
                 global_peers: Default::default(),
@@ -595,6 +661,10 @@ impl Mesh {
 
     pub fn node(&self) -> NodeId {
         self.inner.node
+    }
+
+    async fn local_node_status(&self) -> MeshNodeStatus {
+        self.inner.local_node_status().await
     }
 
     pub async fn new_peer(
@@ -749,6 +819,48 @@ impl Mesh {
             .get(&node)
             .and_then(|s| s.as_active())
             .and_then(|conn| get_tcp_rtt_from_fd(conn.conn_fd).ok())
+    }
+
+    pub async fn get_node_status(&self, node: NodeId) -> MeshNodeStatus {
+        if node == self.inner.node {
+            return self.local_node_status().await;
+        }
+
+        let rpc_client = {
+            let nodes = self.inner.nodes.lock().await;
+            nodes
+                .get(&node)
+                .and_then(|state| state.as_active())
+                .map(|conn| conn.rpc_client.clone())
+        };
+
+        let Some(rpc_client) = rpc_client else {
+            return MeshNodeStatus {
+                node_id: node.to_string(),
+                current_sessions: 0,
+                status_known: false,
+                region_code: None,
+                region_name: None,
+                latitude_deg: None,
+                longitude_deg: None,
+            };
+        };
+
+        match rpc_client.node_status(context::current()).await {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::debug!(node = %node, ?error, "failed to query mesh node status");
+                MeshNodeStatus {
+                    node_id: node.to_string(),
+                    current_sessions: 0,
+                    status_known: false,
+                    region_code: None,
+                    region_name: None,
+                    latitude_deg: None,
+                    longitude_deg: None,
+                }
+            }
+        }
     }
 
     pub async fn discover_nodes(&self) -> anyhow::Result<Vec<NodeId>> {
@@ -1078,6 +1190,7 @@ impl MeshInner {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(1);
             let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
             let cancel = self.cancel.clone();
+            let rpc_sender = rpc_client.clone();
             self.tasks.spawn(async move {
                 loop {
                     tokio::select! {
@@ -1085,11 +1198,11 @@ impl MeshInner {
                         msg = rx.recv() => {
                             let Some(msg) = msg else { break };
                             let send_result = match msg {
-                                Message::PeerMessage(msg) => rpc_client.peer_message(context::current(), msg).await,
-                                Message::PeerListSync(msg) => rpc_client.peer_list_sync(context::current(), msg).await,
-                                Message::PeerAdded(msg) => rpc_client.peer_added(context::current(), msg).await,
-                                Message::PeerRemoved(msg) => rpc_client.peer_removed(context::current(), msg).await,
-                                Message::AppRuntimeUpdated(msg) => rpc_client.app_runtime_updated(context::current(), msg).await,
+                                Message::PeerMessage(msg) => rpc_sender.peer_message(context::current(), msg).await,
+                                Message::PeerListSync(msg) => rpc_sender.peer_list_sync(context::current(), msg).await,
+                                Message::PeerAdded(msg) => rpc_sender.peer_added(context::current(), msg).await,
+                                Message::PeerRemoved(msg) => rpc_sender.peer_removed(context::current(), msg).await,
+                                Message::AppRuntimeUpdated(msg) => rpc_sender.app_runtime_updated(context::current(), msg).await,
                             };
                             if let Err(error) = send_result {
                                 tracing::warn!(node=%their_node, ?error, "RPC send failed");
@@ -1105,6 +1218,7 @@ impl MeshInner {
                 their_node,
                 NodeState::Active(ActiveConnection {
                     tx,
+                    rpc_client: rpc_client.clone(),
                     conn_fd: fd,
                     addr,
                 }),
@@ -1586,5 +1700,9 @@ impl MeshRpc for MeshRpcServer {
 
     async fn app_runtime_updated(self, _: context::Context, msg: AppRuntimeUpdateMessage) {
         self.inner.handle_app_runtime_updated(msg).await;
+    }
+
+    async fn node_status(self, _: context::Context) -> MeshNodeStatus {
+        self.inner.local_node_status().await
     }
 }

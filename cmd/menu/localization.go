@@ -37,13 +37,22 @@ func sameLanguageTags(a, b []language.Tag) bool {
 type textKey string
 
 const (
-	textHeaderTitle    textKey = "header.title"
-	textTabGames       textKey = "tab.games"
-	textTabProfile     textKey = "tab.profile"
-	textTabAbout       textKey = "tab.about"
-	textWindowTooSmall textKey = "window.tooSmall"
-	textUnknownTab     textKey = "tab.unknown"
-	textAboutBody      textKey = "about.body"
+	textHeaderTitle              textKey = "header.title"
+	textTabGames                 textKey = "tab.games"
+	textTabProfile               textKey = "tab.profile"
+	textTabAbout                 textKey = "tab.about"
+	textWindowTooSmall           textKey = "window.tooSmall"
+	textUnknownTab               textKey = "tab.unknown"
+	textAboutBadge               textKey = "about.badge"
+	textAboutTitle               textKey = "about.title"
+	textAboutBody                textKey = "about.body"
+	textAboutSectionCredits      textKey = "about.section.credits"
+	textAboutSectionSource       textKey = "about.section.source"
+	textAboutSectionDocs         textKey = "about.section.docs"
+	textAboutDevelopedByPrefix   textKey = "about.developedByPrefix"
+	textAboutOpenSourcePrefix    textKey = "about.openSourcePrefix"
+	textAboutDeveloperDocsPrefix textKey = "about.developerDocsPrefix"
+	textAboutSentenceEnd         textKey = "about.sentenceEnd"
 
 	textHelpQuit    textKey = "help.quit"
 	textHelpNextTab textKey = "help.nextTab"
@@ -137,8 +146,26 @@ func (l localizer) Text(key textKey) string {
 			return "Fenster ist zu klein"
 		case textUnknownTab:
 			return "Unbekannter Tab"
+		case textAboutBadge:
+			return "IM TERMINAL GEMACHT"
+		case textAboutTitle:
+			return "Spielen, teilen und direkt im Terminal entwickeln."
 		case textAboutBody:
-			return "Info"
+			return "Terminal Games ist eine Open-Source-Plattform fuer Spiele, die fuer moderne Terminals und ueber SSH entwickelt werden."
+		case textAboutSectionCredits:
+			return "Mitwirkende"
+		case textAboutSectionSource:
+			return "Quellcode"
+		case textAboutSectionDocs:
+			return "Entwickler"
+		case textAboutDevelopedByPrefix:
+			return "Entwickelt von "
+		case textAboutOpenSourcePrefix:
+			return "Open Source auf "
+		case textAboutDeveloperDocsPrefix:
+			return "Werde Spieleentwickler unter "
+		case textAboutSentenceEnd:
+			return ""
 		case textHelpQuit:
 			return "beenden"
 		case textHelpNextTab:
@@ -240,8 +267,26 @@ func (l localizer) Text(key textKey) string {
 		return "Window must be larger"
 	case textUnknownTab:
 		return "Unknown tab"
+	case textAboutBadge:
+		return "BUILT FOR THE TERMINAL"
+	case textAboutTitle:
+		return "Play games from anywhere, in the terminal."
 	case textAboutBody:
-		return "About"
+		return "Terminal Games is an open source platform built for games designed to work on modern terminals and over SSH."
+	case textAboutSectionCredits:
+		return "Credits"
+	case textAboutSectionSource:
+		return "Source"
+	case textAboutSectionDocs:
+		return "Developers"
+	case textAboutDevelopedByPrefix:
+		return "Developed by "
+	case textAboutOpenSourcePrefix:
+		return "Open source at "
+	case textAboutDeveloperDocsPrefix:
+		return "Become a game developer at "
+	case textAboutSentenceEnd:
+		return ""
 	case textHelpQuit:
 		return "quit"
 	case textHelpNextTab:

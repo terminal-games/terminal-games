@@ -5,6 +5,7 @@ provider "registry.opentofu.org/bunnyway/bunnynet" {
   version     = "0.13.0"
   constraints = "0.13.0"
   hashes = [
+    "h1:AAxUZLSrIW8eFIr3Wr1utiVKtld5BBxLuNabsb7u9fQ=",
     "h1:vKiK9vgLgIOfQPfDjYvOgPqeuJNHF1QM2FFda9PIn7c=",
     "zh:0016d8db546b1586f46ca6d824fd45fbb3d3459ae753106c0f12eb9ecbbf719f",
     "zh:013309bf0abb280c20ad49c682a1f4bf8467b67fe683181ed01d8fbd844f052e",
@@ -31,6 +32,7 @@ provider "registry.opentofu.org/bunnyway/bunnynet" {
 provider "registry.opentofu.org/hashicorp/local" {
   version = "2.7.0"
   hashes = [
+    "h1:y4Z2q/vw3DUN+0KOunHUsptXPnO/7rDs9zSLdIdtwMk=",
     "h1:ztAhzyJDidK0Lo0MXxbjlI/0Zkgw4oQvlfZ0ggHi8p4=",
     "zh:39e037a963356e583d90d509d82f6dc19914ef5c66970fb166db414f035468f4",
     "zh:5292e51488d40d6c2b365daa9a406144c3fa3f769f1c03065adb4757d41c6ea0",
@@ -47,6 +49,7 @@ provider "registry.opentofu.org/hashicorp/local" {
 provider "registry.opentofu.org/hetznercloud/hcloud" {
   version = "1.60.1"
   hashes = [
+    "h1:Yn/7M+RswavjNlD0nPMUayi76qyu3jkKf4h1UczNqkc=",
     "h1:aFTtCV6KIyK8QpkQrJZfAyjx+GXNVaBm4qN3Vvqmwlc=",
     "zh:0a746671e3f149b998a2abf730a5401a07305c67f93d5bbfdcf60aa19fdebb4d",
     "zh:156273b900a006253841727387671dd67c7c5c502998d6a9af5a5abbf5717fdf",
@@ -69,6 +72,7 @@ provider "registry.opentofu.org/vultr/vultr" {
   constraints = "2.29.1"
   hashes = [
     "h1:FowrC0SVOCrZczJ19tUFZN06xXuSWeD+eQi4GE3PZiA=",
+    "h1:Ywr+aBHXovLMIwSYWAdIj6o+N0tAG2NVNLF1/aTxKgg=",
     "zh:0c5036dd6274cb2c0dadda0976a45d8c0d54fc47abfa91d89db6a3c13f24e81c",
     "zh:16ad8ccab96d663e3829688d02819d5d6765df5934eaa19a82a94ebe6d1a6889",
     "zh:28f7109691ef3f8233e2144171deb4805c0486520b6e8d9af6115ad8c27b5e4d",

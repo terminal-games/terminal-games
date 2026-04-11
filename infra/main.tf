@@ -52,6 +52,8 @@ variable "servers" {
   type = list(object({
     node_id          = string
     max_active_apps  = optional(number, 100)
+    region_code      = optional(string)
+    region_name      = optional(string)
     geolocation_lat  = number
     geolocation_long = number
 
@@ -81,7 +83,10 @@ variable "servers" {
 locals {
   server_configs = {
     for s in var.servers :
-    s.node_id => s
+    s.node_id => merge(s, {
+      region_code = coalesce(try(s.region_code, null), upper(substr(s.node_id, 0, 3)))
+      region_name = coalesce(try(s.region_name, null), s.node_id)
+    })
   }
 
   hetzner_servers = {
