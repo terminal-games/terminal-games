@@ -26,8 +26,8 @@ const (
 	autoInterval = 10 * time.Second
 	animDuration = 400 * time.Millisecond
 	snapDuration = 150 * time.Millisecond
-	frameZoneID = "carousel-frame"
-	btnZoneID   = "carousel-btn"
+	frameZoneID  = "carousel-frame"
+	btnZoneID    = "carousel-btn"
 )
 
 type Screenshot struct {
@@ -152,11 +152,19 @@ func (m Model) Update(msg tea.Msg) (Model, tea.Cmd) {
 }
 
 func (m *Model) HandleMouse(msg tea.MouseMsg) (Model, tea.Cmd, bool) {
+	return m.handleMouse(msg, m.zone)
+}
+
+func (m *Model) HandleMouseInZone(msg tea.MouseMsg, zoneManager *zone.Manager) (Model, tea.Cmd, bool) {
+	return m.handleMouse(msg, zoneManager)
+}
+
+func (m *Model) handleMouse(msg tea.MouseMsg, zoneManager *zone.Manager) (Model, tea.Cmd, bool) {
 	switch msg := msg.(type) {
 	case tea.MouseReleaseMsg:
-		if m.zone != nil {
+		if zoneManager != nil {
 			n := len(m.Screenshots)
-			fz := m.zone.Get(frameZoneID)
+			fz := zoneManager.Get(frameZoneID)
 			if n > 1 && fz.InBounds(msg) {
 				x, _ := fz.Pos(msg)
 				zoneWidth := fz.EndX - fz.StartX + 1
@@ -169,7 +177,7 @@ func (m *Model) HandleMouse(msg tea.MouseMsg) (Model, tea.Cmd, bool) {
 			}
 			cur := m.currentPage()
 			for i := range m.Screenshots {
-				if m.zone.Get(dotZoneID(i)).InBounds(msg) {
+				if zoneManager.Get(dotZoneID(i)).InBounds(msg) {
 					if i != cur && n > 1 {
 						result, cmd := m.GoToPage(i)
 						return result, cmd, true
@@ -182,7 +190,7 @@ func (m *Model) HandleMouse(msg tea.MouseMsg) (Model, tea.Cmd, bool) {
 			}
 		}
 	case tea.MouseClickMsg:
-		if m.zone != nil && m.zone.Get(frameZoneID).InBounds(msg) {
+		if zoneManager != nil && zoneManager.Get(frameZoneID).InBounds(msg) {
 			return *m, nil, true
 		}
 	}
@@ -191,6 +199,10 @@ func (m *Model) HandleMouse(msg tea.MouseMsg) (Model, tea.Cmd, bool) {
 
 func (m Model) BtnClicked(msg tea.MouseMsg) bool {
 	return m.zone != nil && m.zone.Get(btnZoneID).InBounds(msg)
+}
+
+func (m Model) BtnClickedInZone(msg tea.MouseMsg, zoneManager *zone.Manager) bool {
+	return zoneManager != nil && zoneManager.Get(btnZoneID).InBounds(msg)
 }
 
 func (m Model) IsDragging() bool { return false }
@@ -268,6 +280,14 @@ func (m Model) Next() (Model, tea.Cmd) {
 
 // View renders the carousel inline (screenshot + caption + dots).
 func (m Model) View(viewWidth int) string {
+	return m.view(viewWidth, m.zone)
+}
+
+func (m Model) ViewInZone(viewWidth int, zoneManager *zone.Manager) string {
+	return m.view(viewWidth, zoneManager)
+}
+
+func (m Model) view(viewWidth int, zoneManager *zone.Manager) string {
 	n := len(m.Screenshots)
 	if n == 0 {
 		return ""
@@ -325,8 +345,8 @@ func (m Model) View(viewWidth int) string {
 		frame = strings.Join(rows, "\n")
 	}
 
-	if m.zone != nil {
-		frame = m.zone.Mark(frameZoneID, frame)
+	if zoneManager != nil {
+		frame = zoneManager.Mark(frameZoneID, frame)
 	}
 
 	cur := m.currentPage()
@@ -335,16 +355,24 @@ func (m Model) View(viewWidth int) string {
 		parts = append(parts, m.Styles.Caption.Render(caption))
 	}
 	if n > 1 {
-		parts = append(parts, m.renderDots(n, cur))
+		parts = append(parts, m.renderDotsWithZone(n, cur, zoneManager))
 	}
 	return strings.Join(parts, "\n")
 }
 
 // ViewButton renders the clickable button shown when the carousel can't fit inline.
 func (m Model) ViewButton() string {
+	return m.viewButton(m.zone)
+}
+
+func (m Model) ViewButtonInZone(zoneManager *zone.Manager) string {
+	return m.viewButton(zoneManager)
+}
+
+func (m Model) viewButton(zoneManager *zone.Manager) string {
 	btn := m.Styles.Button.Render(fmt.Sprintf("▶ %s (%d)", m.Labels.Screenshots, len(m.Screenshots)))
-	if m.zone != nil {
-		btn = m.zone.Mark(btnZoneID, btn)
+	if zoneManager != nil {
+		btn = zoneManager.Mark(btnZoneID, btn)
 	}
 	return btn
 }
@@ -377,7 +405,7 @@ func (m *Model) SetLabels(labels Labels) {
 }
 
 func CanFitInline(width, height int) bool {
-	return width >= ScreenshotWidth && height >= MinInlineHeight
+	return width >= ScreenshotWidth
 }
 
 func CanFitModal(termW, termH int) bool {
@@ -429,6 +457,10 @@ func (m Model) maxScrollX(count int) float64 {
 }
 
 func (m Model) renderDots(count, currentPage int) string {
+	return m.renderDotsWithZone(count, currentPage, m.zone)
+}
+
+func (m Model) renderDotsWithZone(count, currentPage int, zoneManager *zone.Manager) string {
 	dots := make([]string, count)
 	for i := range dots {
 		var dot string
@@ -437,8 +469,8 @@ func (m Model) renderDots(count, currentPage int) string {
 		} else {
 			dot = m.Styles.DotInactive.Render("○")
 		}
-		if m.zone != nil {
-			dot = m.zone.Mark(dotZoneID(i), dot)
+		if zoneManager != nil {
+			dot = zoneManager.Mark(dotZoneID(i), dot)
 		}
 		dots[i] = dot
 	}
@@ -467,7 +499,6 @@ func padToScreenWidth(line string) string {
 	}
 	return line + strings.Repeat(" ", ScreenshotWidth-w)
 }
-
 
 func PlaceholderScreenshot(title, fg, bg string) string {
 	titleStyle := lipgloss.NewStyle().Foreground(lipgloss.Color(fg)).Background(lipgloss.Color(bg)).Bold(true)

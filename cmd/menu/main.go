@@ -127,6 +127,8 @@ func (m model) contextualKeyMap() helpKeyMap {
 		return m.games
 	case "profile":
 		return m.profile
+	case "about":
+		return m.about
 	}
 	return nil
 }
@@ -166,7 +168,7 @@ func main() {
 		help:        help.New(),
 		games:       newGamesModel(zoneManager),
 		profile:     newProfileModel(zoneManager),
-		about:       newAboutModel(),
+		about:       newAboutModel(zoneManager),
 	}
 	menuModel.applyMenuLocalization()
 
@@ -326,8 +328,14 @@ func (m *model) handleMouseMotion(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	case "games":
 		oldListHover := m.games.list.Hovered
 		wasDragging := m.games.carousel.IsDragging()
+		oldDetailsScroll := m.games.detailsViewport.scroll
+		oldDetailsDragging := m.games.detailsViewport.dragging
 		m.games, cmd = m.games.Update(msg)
-		if m.games.list.Hovered != oldListHover || m.games.carousel.IsDragging() || wasDragging {
+		if m.games.list.Hovered != oldListHover ||
+			m.games.carousel.IsDragging() ||
+			wasDragging ||
+			m.games.detailsViewport.scroll != oldDetailsScroll ||
+			m.games.detailsViewport.dragging != oldDetailsDragging {
 			m.dirty = true
 		}
 	case "profile":
@@ -337,7 +345,12 @@ func (m *model) handleMouseMotion(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			m.dirty = true
 		}
 	case "about":
+		oldScroll := m.about.viewport.scroll
+		oldDragging := m.about.viewport.dragging
 		m.about, cmd = m.about.Update(msg)
+		if m.about.viewport.scroll != oldScroll || m.about.viewport.dragging != oldDragging {
+			m.dirty = true
+		}
 	}
 	if m.tabs.Hovered != oldTabHover {
 		m.dirty = true

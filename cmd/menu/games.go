@@ -23,6 +23,7 @@ import (
 
 const (
 	playZoneID            = "games-play"
+	gameDetailsZoneID     = "games-details"
 	maxDetailsRenderBytes = 16 * 1024
 )
 
@@ -73,23 +74,25 @@ type gamesDataMsg struct {
 }
 
 type gamesModel struct {
-	zone      *zone.Manager
-	rawGames  []gameData
-	items     []gameItem
-	list      gamelist.Model
-	carousel  carousel.Model
-	styles    gamesDetailsStyles
-	termW     int
-	termH     int
-	tag       language.Tag
-	localizer localizer
-	loadErr   error
-	loaded    bool
-	playKey   key.Binding
-	playBusy  bool
-	spin      spinner.Model
-	playError string
-	preferred []language.Tag
+	zone            *zone.Manager
+	detailsZone     *zone.Manager
+	rawGames        []gameData
+	items           []gameItem
+	list            gamelist.Model
+	carousel        carousel.Model
+	styles          gamesDetailsStyles
+	termW           int
+	termH           int
+	tag             language.Tag
+	localizer       localizer
+	loadErr         error
+	loaded          bool
+	playKey         key.Binding
+	playBusy        bool
+	spin            spinner.Model
+	playError       string
+	preferred       []language.Tag
+	detailsViewport scrollViewport
 }
 
 type gamesDetailsStyles struct {
@@ -113,14 +116,17 @@ func defaultDetailsStyles() gamesDetailsStyles {
 }
 
 func newGamesModel(zoneManager *zone.Manager) gamesModel {
+	detailsZone := zone.New()
 	m := gamesModel{
-		zone:      zoneManager,
-		list:      gamelist.New("", nil, zoneManager, "games-item-"),
-		carousel:  carousel.New(zoneManager),
-		styles:    defaultDetailsStyles(),
-		tag:       language.English,
-		localizer: newLocalizer(),
-		preferred: []language.Tag{language.English},
+		zone:            zoneManager,
+		detailsZone:     detailsZone,
+		list:            gamelist.New("", nil, zoneManager, "games-item-"),
+		carousel:        carousel.New(zoneManager),
+		styles:          defaultDetailsStyles(),
+		detailsViewport: newScrollViewportWithContentZone(zoneManager, gameDetailsZoneID, detailsZone),
+		tag:             language.English,
+		localizer:       newLocalizer(),
+		preferred:       []language.Tag{language.English},
 	}
 	m.spin = spinner.New(spinner.WithSpinner(spinner.Dot))
 	m.applyLocalization(m.localizer, m.preferred)
@@ -129,6 +135,13 @@ func newGamesModel(zoneManager *zone.Manager) gamesModel {
 
 func (m gamesModel) ShortHelp() []key.Binding {
 	b := m.list.ShortHelp()
+	if !m.list.Filtering() && !m.playBusy && m.selectedItem().Shortname != "" && m.detailsViewport.CanScroll(m.detailsViewportLines) {
+		b = append(
+			b,
+			key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", "details up")),
+			key.NewBinding(key.WithKeys("pgdn"), key.WithHelp("pgdn", "details down")),
+		)
+	}
 	if !m.list.Filtering() && !m.playBusy && m.selectedItem().Shortname != "" {
 		b = append(b, m.playKey)
 	}
@@ -175,6 +188,7 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		if err != nil {
 			m.playBusy = false
 			m.playError = err.Error()
+			m.detailsViewport.Invalidate()
 			return m, nil
 		}
 		if ready {
@@ -200,9 +214,26 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		if key.Matches(msg, m.playKey) && !m.list.Filtering() {
 			return m.startPlaySelected()
 		}
+		if !m.list.Filtering() {
+			switch msg.String() {
+			case "pgup", "pageup":
+				m.detailsViewport.ScrollBy(-max(1, m.detailsViewport.height/2), m.detailsViewportLines)
+				return m, nil
+			case "pgdn", "pagedown":
+				m.detailsViewport.ScrollBy(max(1, m.detailsViewport.height/2), m.detailsViewportLines)
+				return m, nil
+			case "home":
+				m.detailsViewport.ScrollToTop()
+				return m, nil
+			case "end":
+				m.detailsViewport.ScrollToBottom(m.detailsViewportLines)
+				return m, nil
+			}
+		}
 		if msg.String() == "left" && !m.list.Filtering() {
 			var cmd tea.Cmd
 			m.carousel, cmd = m.carousel.Prev()
+			m.detailsViewport.Invalidate()
 			if cmd != nil {
 				return m, cmd
 			}
@@ -210,6 +241,7 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		if msg.String() == "right" && !m.list.Filtering() {
 			var cmd tea.Cmd
 			m.carousel, cmd = m.carousel.Next()
+			m.detailsViewport.Invalidate()
 			if cmd != nil {
 				return m, cmd
 			}
@@ -217,6 +249,7 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		if m.carousel.Modal {
 			if msg.String() == "esc" {
 				m.carousel.Modal = false
+				m.detailsViewport.Invalidate()
 			}
 			return m, nil
 		}
@@ -231,30 +264,62 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		if m.playBusy {
 			return m, nil
 		}
+		if m.detailsViewport.HandleMouse(msg, m.detailsViewportLines) {
+			return m, nil
+		}
+		if event, ok := msg.(tea.MouseWheelMsg); ok && m.detailsViewport.InBounds(msg) {
+			switch event.Button {
+			case tea.MouseWheelUp:
+				m.detailsViewport.ScrollBy(-1, m.detailsViewportLines)
+				return m, nil
+			case tea.MouseWheelDown:
+				m.detailsViewport.ScrollBy(1, m.detailsViewportLines)
+				return m, nil
+			}
+		}
 		_, isRelease := msg.(tea.MouseReleaseMsg)
 		_, isClick := msg.(tea.MouseClickMsg)
 		isSelectEvent := isRelease || isClick
-		if isSelectEvent && m.zone != nil && m.zone.Get(playZoneID).InBounds(msg) {
-			return m.startPlaySelected()
-		}
 		if m.carousel.Modal {
 			result, cmd, handled := m.carousel.HandleMouse(msg)
 			m.carousel = result
+			m.detailsViewport.Invalidate()
 			if handled {
 				return m, cmd
 			}
 			if isSelectEvent {
 				m.carousel.Modal = false
+				m.detailsViewport.Invalidate()
 			}
 			return m, nil
 		}
+		if isSelectEvent {
+			if localMsg, ok := m.detailsViewport.ContentMouse(msg); ok {
+				if m.detailsZone.Get(playZoneID).InBounds(localMsg) {
+					return m.startPlaySelected()
+				}
+				result, cc, handled := m.carousel.HandleMouseInZone(localMsg, m.detailsZone)
+				m.carousel = result
+				m.detailsViewport.Invalidate()
+				if handled {
+					return m, cc
+				}
+				if m.carousel.BtnClickedInZone(localMsg, m.detailsZone) {
+					m.carousel.Modal = true
+					m.detailsViewport.Invalidate()
+					return m, nil
+				}
+			}
+		}
 		result, cc, handled := m.carousel.HandleMouse(msg)
 		m.carousel = result
+		m.detailsViewport.Invalidate()
 		if handled {
 			return m, cc
 		}
 		if isSelectEvent && m.carousel.BtnClicked(msg) {
 			m.carousel.Modal = true
+			m.detailsViewport.Invalidate()
 			return m, nil
 		}
 		prev := m.list.SelectedIndex()
@@ -268,6 +333,7 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 	var lc, cc tea.Cmd
 	m.list, lc = m.list.Update(msg)
 	m.carousel, cc = m.carousel.Update(msg)
+	m.detailsViewport.Invalidate()
 	return m, tea.Batch(lc, cc)
 }
 
@@ -278,14 +344,18 @@ func (m gamesModel) startPlaySelected() (gamesModel, tea.Cmd) {
 	}
 	if err := app.Change(item.Shortname); err != nil {
 		m.playError = err.Error()
+		m.detailsViewport.Invalidate()
 		return m, nil
 	}
 	m.playError = ""
 	m.playBusy = true
+	m.detailsViewport.Invalidate()
 	return m, m.spin.Tick
 }
 
 func (m *gamesModel) syncCarouselToSelection() tea.Cmd {
+	m.detailsViewport.Reset()
+	m.detailsViewport.Invalidate()
 	idx := m.list.SelectedIndex()
 	if idx >= 0 && idx < len(m.items) {
 		m.carousel.Screenshots = m.items[idx].Screenshots
@@ -360,6 +430,7 @@ func resolveScreenshots(preferred []language.Tag, byLang map[string][]carousel.S
 }
 
 func (m *gamesModel) applyLocalization(localizer localizer, preferred []language.Tag) tea.Cmd {
+	m.detailsViewport.Invalidate()
 	m.localizer = localizer
 	m.tag = localizer.tag
 	if len(preferred) == 0 {
@@ -409,6 +480,7 @@ func (m *gamesModel) renderGamesTab(width, height int) string {
 	}
 	gap := 2
 	leftWidth := int(float64(width) * 0.3)
+	leftWidth -= 2
 	if leftWidth < 18 {
 		leftWidth = 18
 	}
@@ -440,18 +512,7 @@ func (m *gamesModel) renderGameDetails(width, height int) string {
 	if width <= 0 || height <= 0 {
 		return ""
 	}
-	if !m.loaded {
-		return lipgloss.NewStyle().Width(width).Height(height).Render(m.styles.Subtle.Render(m.localizer.Text(textProfileLoading)))
-	}
-	if m.loadErr != nil {
-		return lipgloss.NewStyle().Width(width).Height(height).Render(m.styles.Subtle.Render(m.loadErr.Error()))
-	}
-	item := m.selectedItem()
-	if item.Shortname == "" {
-		return lipgloss.NewStyle().Width(width).Height(height).Render(m.styles.Subtle.Render(m.localizer.Text(textGamesNoMatch)))
-	}
-	content := m.renderGameDetailsContent(width, height, true)
-	return lipgloss.NewStyle().Width(width).MaxHeight(height).Render(content)
+	return m.detailsViewport.View(width, height, m.detailsViewportLines)
 }
 
 func (m *gamesModel) renderGameDetailsContent(width, height int, allowInlineScreenshots bool) string {
@@ -459,6 +520,23 @@ func (m *gamesModel) renderGameDetailsContent(width, height int, allowInlineScre
 	showInlineScreenshots := allowInlineScreenshots && len(item.Screenshots) > 0 && carousel.CanFitInline(width, height)
 	parts := m.buildGameDetailsParts(item, width, showInlineScreenshots)
 	return strings.Join(parts, "\n")
+}
+
+func (m *gamesModel) detailsViewportLines(contentWidth int) []string {
+	if contentWidth <= 0 {
+		return []string{""}
+	}
+	if !m.loaded {
+		return viewportWrappedLines(m.styles.Subtle.Render(m.localizer.Text(textProfileLoading)), contentWidth)
+	}
+	if m.loadErr != nil {
+		return viewportWrappedLines(m.styles.Subtle.Render(m.loadErr.Error()), contentWidth)
+	}
+	item := m.selectedItem()
+	if item.Shortname == "" {
+		return viewportWrappedLines(m.styles.Subtle.Render(m.localizer.Text(textGamesNoMatch)), contentWidth)
+	}
+	return viewportWrappedLines(m.renderGameDetailsContent(contentWidth, m.detailsViewport.height, true), contentWidth)
 }
 
 func (m *gamesModel) buildGameDetailsParts(item gameItem, width int, inlineScreenshots bool) []string {
@@ -479,27 +557,27 @@ func (m *gamesModel) buildGameDetailsParts(item gameItem, width int, inlineScree
 	if len(item.Screenshots) > 0 {
 		switch {
 		case inlineScreenshots:
-			parts = append(parts, "\n"+m.carousel.View(width))
+			parts = append(parts, "\n"+m.carousel.ViewInZone(width, m.detailsZone))
 		case carousel.CanFitModal(m.termW, m.termH):
-			parts = append(parts, "", m.carousel.ViewButton())
+			parts = append(parts, "", m.carousel.ViewButtonInZone(m.detailsZone))
 		}
 	}
 
-	parts = append(parts, "", m.renderCurrentPlayButton(width))
+	parts = append(parts, "", m.renderCurrentPlayButton(width, m.detailsZone))
 	if m.playError != "" {
 		parts = append(parts, m.styles.Error.Render(m.playError))
 	}
 	return parts
 }
 
-func (m *gamesModel) renderCurrentPlayButton(width int) string {
+func (m *gamesModel) renderCurrentPlayButton(width int, zoneManager *zone.Manager) string {
 	label := m.localizer.Text(textPlayButton)
 	if m.playBusy {
 		label = m.spin.View() + " " + m.localizer.Text(textPlayLoading)
 	}
 	play := m.renderPlayButton(width, label)
-	if m.zone != nil {
-		return m.zone.Mark(playZoneID, play)
+	if zoneManager != nil {
+		return zoneManager.Mark(playZoneID, play)
 	}
 	return play
 }

@@ -11,14 +11,17 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	zone "github.com/lrstanley/bubblezone/v2"
 
 	"github.com/terminal-games/terminal-games/cmd/menu/tabs"
 	"github.com/terminal-games/terminal-games/cmd/menu/theme"
 )
 
 const (
+	aboutViewportZoneID  = "about-viewport"
 	aboutBlinkInterval   = 700 * time.Millisecond
 	aboutRefreshInterval = 5 * time.Second
 	aboutMaxMapHeight    = 24
@@ -68,6 +71,8 @@ func aboutTickCmd() tea.Cmd {
 
 type aboutModel struct {
 	localizer localizer
+	zone      *zone.Manager
+	viewport  scrollViewport
 	data      aboutHostPayload
 	lastFetch time.Time
 	loadErr   error
@@ -77,9 +82,11 @@ type aboutModel struct {
 	blinkOn   bool
 }
 
-func newAboutModel() aboutModel {
+func newAboutModel(zoneManager *zone.Manager) aboutModel {
 	return aboutModel{
 		localizer: newLocalizer(),
+		zone:      zoneManager,
+		viewport:  newScrollViewport(zoneManager, aboutViewportZoneID),
 		blinkOn:   true,
 	}
 }
@@ -88,7 +95,18 @@ func (m *aboutModel) applyLocalization(localizer localizer) {
 	m.localizer = localizer
 }
 
-func (m aboutModel) Init() tea.Cmd { return nil }
+func (m aboutModel) ShortHelp() []key.Binding {
+	if !m.viewport.CanScroll(m.viewportLines) {
+		return nil
+	}
+	return []key.Binding{
+		key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", "page up")),
+		key.NewBinding(key.WithKeys("pgdn"), key.WithHelp("pgdn", "page down")),
+	}
+}
+
+func (m aboutModel) FullHelp() [][]key.Binding { return [][]key.Binding{m.ShortHelp()} }
+func (m aboutModel) Init() tea.Cmd             { return nil }
 
 func (m aboutModel) fetchStatus() tea.Cmd {
 	return func() tea.Msg {
@@ -132,6 +150,7 @@ func (m aboutModel) Update(msg tea.Msg) (aboutModel, tea.Cmd) {
 			return m, nil
 		}
 		m.blinkOn = !m.blinkOn
+		m.viewport.Invalidate()
 		cmds := []tea.Cmd{aboutTickCmd()}
 		if !m.loading && (!m.loaded || time.Since(m.lastFetch) >= aboutRefreshInterval) {
 			var cmd tea.Cmd
@@ -150,13 +169,45 @@ func (m aboutModel) Update(msg tea.Msg) (aboutModel, tea.Cmd) {
 		if msg.err == nil {
 			m.data = msg.payload
 		}
+		m.viewport.Invalidate()
 		return m, nil
 
 	case localizationChangedMsg:
 		if m.localizer.SetPreferred(msg.preferred) {
 			m.applyLocalization(m.localizer)
+			m.viewport.Invalidate()
 		}
 		return m, nil
+
+	case tea.KeyPressMsg:
+		switch msg.String() {
+		case "pgup", "pageup":
+			m.viewport.ScrollBy(-max(1, m.viewport.height/2), m.viewportLines)
+			return m, nil
+		case "pgdn", "pagedown":
+			m.viewport.ScrollBy(max(1, m.viewport.height/2), m.viewportLines)
+			return m, nil
+		case "home":
+			m.viewport.ScrollToTop()
+			return m, nil
+		case "end":
+			m.viewport.ScrollToBottom(m.viewportLines)
+			return m, nil
+		}
+	case tea.MouseMsg:
+		if m.viewport.HandleMouse(msg, m.viewportLines) {
+			return m, nil
+		}
+		if event, ok := msg.(tea.MouseWheelMsg); ok && m.viewport.InBounds(msg) {
+			switch event.Button {
+			case tea.MouseWheelUp:
+				m.viewport.ScrollBy(-1, m.viewportLines)
+				return m, nil
+			case tea.MouseWheelDown:
+				m.viewport.ScrollBy(1, m.viewportLines)
+				return m, nil
+			}
+		}
 	}
 
 	return m, nil
@@ -544,20 +595,6 @@ func renderFramedPanel(width int, lines []string) string {
 	return strings.Join(out, "\n")
 }
 
-func fitHeight(text string, height int) string {
-	if height <= 0 {
-		return ""
-	}
-	lines := strings.Split(text, "\n")
-	if len(lines) > height {
-		lines = lines[:height]
-	}
-	if len(lines) < height {
-		lines = append(lines, make([]string, height-len(lines))...)
-	}
-	return strings.Join(lines, "\n")
-}
-
 func truncateVisible(s string, width int) string {
 	if width <= 0 {
 		return ""
@@ -600,12 +637,11 @@ func clampInt(v, low, high int) int {
 	return v
 }
 
-func (m aboutModel) renderAboutTab(width, height int) string {
+func (m *aboutModel) renderAboutContent(width, height int) string {
 	titleStyle := lipgloss.NewStyle().Foreground(theme.Text).Bold(true)
 	ledeStyle := lipgloss.NewStyle().Foreground(theme.TextMuted).Width(width)
 	topLinkStyle := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true)
 	errorStyle := lipgloss.NewStyle().Foreground(theme.Danger).Bold(true)
-	panelStyle := lipgloss.NewStyle().Width(width)
 
 	head := []string{
 		titleStyle.Render(m.localizer.Text(textAboutTitle)),
@@ -615,12 +651,12 @@ func (m aboutModel) renderAboutTab(width, height int) string {
 
 	if !m.loaded && m.loading {
 		content := strings.Join(append(head, "", m.localizer.Text(textProfileLoading)), "\n")
-		return panelStyle.Height(height).Render(fitHeight(content, height))
+		return content
 	}
 
 	if m.loadErr != nil && !m.loaded {
 		content := strings.Join(append(head, "", errorStyle.Render(m.loadErr.Error())), "\n")
-		return panelStyle.Height(height).Render(fitHeight(content, height))
+		return content
 	}
 
 	regions := summarizeRegions(m.data)
@@ -654,13 +690,7 @@ func (m aboutModel) renderAboutTab(width, height int) string {
 	footerPanel := renderFooterPanel(width, m.localizer)
 
 	headBlock := strings.Join(head, "\n")
-	mapChromeHeight := 4
-	nonMapHeight := lipgloss.Height(headBlock) +
-		lipgloss.Height(cardsPanel) +
-		lipgloss.Height(regionsPanel) +
-		lipgloss.Height(footerPanel) +
-		1 // blank row between the body copy and the panel stack
-	mapHeight := min(aboutMaxMapHeight, max(6, height-nonMapHeight-mapChromeHeight))
+	mapHeight := aboutMaxMapHeight
 	mapWidth := max(20, width-4)
 
 	mapPanel := renderMapPanel(
@@ -679,7 +709,18 @@ func (m aboutModel) renderAboutTab(width, height int) string {
 		regionsPanel,
 		footerPanel,
 	}, "\n")
-	return panelStyle.Height(height).Render(fitHeight(content, height))
+	return content
+}
+
+func (m *aboutModel) viewportLines(contentWidth int) []string {
+	if contentWidth <= 0 {
+		return []string{""}
+	}
+	return viewportPlainLines(m.renderAboutContent(contentWidth, m.viewport.height))
+}
+
+func (m *aboutModel) renderAboutTab(width, height int) string {
+	return m.viewport.View(width, height, m.viewportLines)
 }
 
 func (m *model) renderAboutTab(width, height int) string {
