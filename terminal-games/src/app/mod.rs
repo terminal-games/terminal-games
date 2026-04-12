@@ -103,6 +103,7 @@ const MENU_REQ_PROFILE_SET: i32 = 2;
 const MENU_REQ_REPLAYS_LIST: i32 = 3;
 const MENU_REQ_REPLAY_DELETE: i32 = 4;
 const MENU_REQ_ABOUT_STATUS: i32 = 5;
+const MENU_REQ_GAME_ACTIVITY: i32 = 6;
 
 const NEXT_APP_READY_READY: i32 = 1;
 const NEXT_APP_READY_NOT_READY: i32 = 0;
@@ -798,6 +799,10 @@ impl AppServer {
                                             let result = Self::load_menu_about_status(ctx).await;
                                             (result, MenuUpdate::default())
                                         }
+                                        MenuRequestKind::GameActivity => {
+                                            let result = Self::load_menu_game_activity(ctx).await;
+                                            (result, MenuUpdate::default())
+                                        }
                                     };
                                     let _ = menu_result_tx
                                         .send((request.request_id, result, update))
@@ -1468,6 +1473,7 @@ enum MenuRequestKind {
     ReplaysList { locale: String },
     ReplayDelete { created_at: i64 },
     AboutStatus,
+    GameActivity,
 }
 
 struct MenuRequestJob {

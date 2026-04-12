@@ -31,6 +31,7 @@ const (
 	menuReqReplaysList  = 3
 	menuReqReplayDelete = 4
 	menuReqAboutStatus  = 5
+	menuReqGameActivity = 6
 )
 
 //go:wasmimport terminal_games menu_request_v1
@@ -43,6 +44,16 @@ func menu_poll(requestID int32, dataPtr unsafe.Pointer, dataMaxLen uint32, dataL
 
 type menuGamesPayload struct {
 	Apps []gameData `json:"apps"`
+}
+
+type menuGameActivityPayload struct {
+	Apps          []menuGameActivity `json:"apps"`
+	SessionsKnown bool               `json:"sessions_known"`
+}
+
+type menuGameActivity struct {
+	AppID          int64 `json:"app_id"`
+	ActiveSessions int   `json:"active_sessions"`
 }
 
 type menuProfilePayload struct {
@@ -91,6 +102,25 @@ func menuFetchGames() ([]gameData, error) {
 		return nil, err
 	}
 	return payload.Apps, nil
+}
+
+func menuFetchGameActivity() (map[int64]gameActivity, error) {
+	data, err := menuWaitFor(menu_request(menuReqGameActivity, nil, 0, nil, 0, 0))
+	if err != nil {
+		return nil, err
+	}
+	var payload menuGameActivityPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, err
+	}
+	activityByID := make(map[int64]gameActivity, len(payload.Apps))
+	for _, app := range payload.Apps {
+		activityByID[app.AppID] = gameActivity{
+			ActiveSessions: app.ActiveSessions,
+			SessionsKnown:  payload.SessionsKnown,
+		}
+	}
+	return activityByID, nil
 }
 
 func menuFetchProfile() (string, string, error) {

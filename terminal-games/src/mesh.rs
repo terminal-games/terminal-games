@@ -113,10 +113,17 @@ trait MeshRpc {
     async fn node_status() -> MeshNodeStatus;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeshAppSessionCount {
+    pub app_id: u64,
+    pub active_sessions: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MeshNodeStatus {
     pub node_id: String,
     pub current_sessions: usize,
+    pub app_sessions: Vec<MeshAppSessionCount>,
     pub status_known: bool,
     pub region_code: Option<String>,
     pub region_name: Option<String>,
@@ -578,18 +585,29 @@ struct MeshInner {
 
 impl MeshInner {
     async fn local_node_status(&self) -> MeshNodeStatus {
-        let current_sessions = self
-            .peers
-            .lock()
-            .await
-            .values()
-            .map(|app_peers| app_peers.len())
-            .sum();
+        let (current_sessions, app_sessions) = {
+            let peers = self.peers.lock().await;
+            let current_sessions = peers.values().map(|app_peers| app_peers.len()).sum();
+            let mut app_sessions = HashMap::<u64, usize>::new();
+            for (app_id, app_peers) in peers.iter() {
+                *app_sessions.entry(app_id.app_id).or_default() += app_peers.len();
+            }
+            let mut app_sessions = app_sessions
+                .into_iter()
+                .map(|(app_id, active_sessions)| MeshAppSessionCount {
+                    app_id,
+                    active_sessions,
+                })
+                .collect::<Vec<_>>();
+            app_sessions.sort_by_key(|entry| entry.app_id);
+            (current_sessions, app_sessions)
+        };
         let location = self.node_location.clone();
 
         MeshNodeStatus {
             node_id: self.node.to_string(),
             current_sessions,
+            app_sessions,
             status_known: true,
             region_code: location.region_code,
             region_name: location.region_name,
@@ -838,6 +856,7 @@ impl Mesh {
             return MeshNodeStatus {
                 node_id: node.to_string(),
                 current_sessions: 0,
+                app_sessions: Vec::new(),
                 status_known: false,
                 region_code: None,
                 region_name: None,
@@ -853,6 +872,7 @@ impl Mesh {
                 MeshNodeStatus {
                     node_id: node.to_string(),
                     current_sessions: 0,
+                    app_sessions: Vec::new(),
                     status_known: false,
                     region_code: None,
                     region_name: None,

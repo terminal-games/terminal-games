@@ -5,6 +5,8 @@
 package main
 
 import (
+	"fmt"
+
 	tea "charm.land/bubbletea/v2"
 	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
 	"github.com/terminal-games/terminal-games/cmd/menu/gamelist"
@@ -375,6 +377,23 @@ func (l localizer) Text(key textKey) string {
 		return "Loading"
 	}
 	return string(key)
+}
+
+func (l localizer) ActiveSessionsText(count int, sessionsKnown bool) string {
+	prefix := ""
+	if !sessionsKnown && count > 0 {
+		prefix = "~"
+	}
+	if l.tag == language.German {
+		if count == 1 {
+			return prefix + "1 aktive Sitzung"
+		}
+		return fmt.Sprintf("%s%d aktive Sitzungen", prefix, count)
+	}
+	if count == 1 {
+		return prefix + "1 active session"
+	}
+	return fmt.Sprintf("%s%d active sessions", prefix, count)
 }
 
 func (l localizer) GameListLabels() gamelist.Labels {

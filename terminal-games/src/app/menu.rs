@@ -2,10 +2,10 @@ use super::{
     AppContext, AppServer, AppState, GameDetailsOut, MAX_MENU_REQUESTS,
     MENU_POLL_ERR_BUFFER_TOO_SMALL, MENU_POLL_ERR_INVALID_REQUEST_ID, MENU_POLL_ERR_REQUEST_FAILED,
     MENU_POLL_PENDING, MENU_REQ_ABOUT_STATUS, MENU_REQ_ERR_INVALID_INPUT,
-    MENU_REQ_ERR_NOT_MENU_APP, MENU_REQ_ERR_TOO_MANY_REQUESTS, MENU_REQ_GAMES_LIST,
-    MENU_REQ_PROFILE_GET, MENU_REQ_PROFILE_SET, MENU_REQ_REPLAY_DELETE, MENU_REQ_REPLAYS_LIST,
-    MenuRequestJob, MenuRequestKind, MenuRequestState, MenuSessionState, MenuUpdate,
-    PendingMenuRequest,
+    MENU_REQ_ERR_NOT_MENU_APP, MENU_REQ_ERR_TOO_MANY_REQUESTS, MENU_REQ_GAME_ACTIVITY,
+    MENU_REQ_GAMES_LIST, MENU_REQ_PROFILE_GET, MENU_REQ_PROFILE_SET, MENU_REQ_REPLAY_DELETE,
+    MENU_REQ_REPLAYS_LIST, MenuRequestJob, MenuRequestKind, MenuRequestState, MenuSessionState,
+    MenuUpdate, PendingMenuRequest,
 };
 use crate::wasm_abi::HostApiRegistration;
 
@@ -93,6 +93,10 @@ impl AppServer {
             MENU_REQ_ABOUT_STATUS => MenuRequestJob {
                 request_id: request_id_u,
                 kind: MenuRequestKind::AboutStatus,
+            },
+            MENU_REQ_GAME_ACTIVITY => MenuRequestJob {
+                request_id: request_id_u,
+                kind: MenuRequestKind::GameActivity,
             },
             _ => {
                 caller.data_mut().menu_requests[request_id_u] = None;
@@ -222,6 +226,55 @@ impl AppServer {
         }
 
         serde_json::to_vec(&AppsOut { apps }).map_err(|e| e.to_string())
+    }
+
+    pub(in crate::app) async fn load_menu_game_activity(
+        ctx: AppContext,
+    ) -> Result<Vec<u8>, String> {
+        #[derive(serde::Serialize)]
+        struct AppActivityOut {
+            app_id: u64,
+            active_sessions: usize,
+        }
+
+        #[derive(serde::Serialize)]
+        struct GameActivityOut {
+            apps: Vec<AppActivityOut>,
+            sessions_known: bool,
+        }
+
+        let current_node = ctx.mesh.node();
+        let (discovered_nodes, mut sessions_known) = match ctx.mesh.discover_nodes().await {
+            Ok(nodes) => (nodes, true),
+            Err(_) => (vec![current_node], false),
+        };
+
+        let mut app_sessions = std::collections::HashMap::<u64, usize>::new();
+        for node in discovered_nodes {
+            let status = ctx.mesh.get_node_status(node).await;
+            if !status.status_known {
+                sessions_known = false;
+                continue;
+            }
+            for app in status.app_sessions {
+                *app_sessions.entry(app.app_id).or_default() += app.active_sessions;
+            }
+        }
+
+        let mut apps = app_sessions
+            .into_iter()
+            .map(|(app_id, active_sessions)| AppActivityOut {
+                app_id,
+                active_sessions,
+            })
+            .collect::<Vec<_>>();
+        apps.sort_by_key(|app| app.app_id);
+
+        serde_json::to_vec(&GameActivityOut {
+            apps,
+            sessions_known,
+        })
+        .map_err(|e| e.to_string())
     }
 
     pub(in crate::app) async fn load_menu_profile(

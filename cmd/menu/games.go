@@ -6,6 +6,7 @@ package main
 
 import (
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"charm.land/bubbles/v2/key"
@@ -24,6 +25,7 @@ import (
 const (
 	playZoneID            = "games-play"
 	gameDetailsZoneID     = "games-details"
+	gamesRefreshInterval  = 5 * time.Second
 	maxDetailsRenderBytes = 16 * 1024
 )
 
@@ -58,19 +60,35 @@ type gameData struct {
 }
 
 type gameItem struct {
-	ID          int64
-	Shortname   string
-	Author      string
-	Version     string
-	Name        string
-	Description string
-	Details     string
-	Screenshots []carousel.Screenshot
+	ID             int64
+	Shortname      string
+	Author         string
+	Version        string
+	Name           string
+	Description    string
+	Details        string
+	Screenshots    []carousel.Screenshot
+	ActiveSessions int
+	SessionsKnown  bool
 }
 
 type gamesDataMsg struct {
 	games []gameData
 	err   error
+}
+
+type gameActivity struct {
+	ActiveSessions int
+	SessionsKnown  bool
+}
+
+type gamesActivityMsg struct {
+	activityByID map[int64]gameActivity
+	err          error
+}
+
+type gamesRefreshTickMsg struct {
+	gen int
 }
 
 type gamesModel struct {
@@ -87,11 +105,16 @@ type gamesModel struct {
 	localizer       localizer
 	loadErr         error
 	loaded          bool
+	active          bool
+	listReady       bool
 	playKey         key.Binding
 	playBusy        bool
 	spin            spinner.Model
 	playError       string
 	preferred       []language.Tag
+	activityByID    map[int64]gameActivity
+	activityPending bool
+	refreshGen      int
 	detailsViewport scrollViewport
 }
 
@@ -127,6 +150,9 @@ func newGamesModel(zoneManager *zone.Manager) gamesModel {
 		tag:             language.English,
 		localizer:       newLocalizer(),
 		preferred:       []language.Tag{language.English},
+		activityByID:    make(map[int64]gameActivity),
+		active:          true,
+		refreshGen:      1,
 	}
 	m.spin = spinner.New(spinner.WithSpinner(spinner.Dot))
 	m.applyLocalization(m.localizer, m.preferred)
@@ -152,7 +178,14 @@ func (m gamesModel) FullHelp() [][]key.Binding { return [][]key.Binding{m.ShortH
 func (m gamesModel) Capturing() bool {
 	return m.list.Filtering() || m.playBusy || m.carousel.Modal
 }
-func (m gamesModel) Init() tea.Cmd { return tea.Batch(m.carousel.Init(), m.fetchGamesData()) }
+func (m gamesModel) Init() tea.Cmd {
+	return tea.Batch(
+		m.carousel.Init(),
+		m.fetchGamesData(),
+		m.fetchGameActivity(),
+		m.scheduleRefresh(),
+	)
+}
 
 func (m gamesModel) fetchGamesData() tea.Cmd {
 	return func() tea.Msg {
@@ -164,6 +197,23 @@ func (m gamesModel) fetchGamesData() tea.Cmd {
 	}
 }
 
+func (m gamesModel) fetchGameActivity() tea.Cmd {
+	return func() tea.Msg {
+		activityByID, err := menuFetchGameActivity()
+		if err != nil {
+			return gamesActivityMsg{err: err}
+		}
+		return gamesActivityMsg{activityByID: activityByID}
+	}
+}
+
+func (m gamesModel) scheduleRefresh() tea.Cmd {
+	gen := m.refreshGen
+	return tea.Tick(gamesRefreshInterval, func(time.Time) tea.Msg {
+		return gamesRefreshTickMsg{gen: gen}
+	})
+}
+
 func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case gamesDataMsg:
@@ -173,6 +223,22 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 			m.rawGames = msg.games
 		}
 		return m, m.applyLocalization(m.localizer, m.preferred)
+	case gamesActivityMsg:
+		m.activityPending = false
+		if msg.err != nil {
+			return m, nil
+		}
+		m.activityByID = msg.activityByID
+		return m, m.rebuildItems(false)
+	case gamesRefreshTickMsg:
+		if !m.active || msg.gen != m.refreshGen {
+			return m, nil
+		}
+		if m.activityPending {
+			return m, m.scheduleRefresh()
+		}
+		m.activityPending = true
+		return m, tea.Batch(m.fetchGameActivity(), m.scheduleRefresh())
 	case localizationChangedMsg:
 		localizerChanged := m.localizer.SetPreferred(msg.preferred)
 		preferredChanged := !sameLanguageTags(m.preferred, msg.preferred)
@@ -199,7 +265,16 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		return m, cmd
 	case tabs.TabChangedMsg:
 		if msg.Tab.ID == "games" {
+			wasActive := m.active
+			m.active = true
+			if !wasActive {
+				m.refreshGen++
+			}
 			return m, m.onActivated()
+		}
+		if m.active {
+			m.active = false
+			m.refreshGen++
 		}
 		return m, nil
 	case tea.WindowSizeMsg:
@@ -366,7 +441,13 @@ func (m *gamesModel) syncCarouselToSelection() tea.Cmd {
 }
 
 func (m *gamesModel) onActivated() tea.Cmd {
-	return m.carousel.RestartAuto()
+	cmds := []tea.Cmd{m.carousel.RestartAuto()}
+	if !m.activityPending {
+		m.activityPending = true
+		cmds = append(cmds, m.fetchGameActivity())
+	}
+	cmds = append(cmds, m.scheduleRefresh())
+	return tea.Batch(cmds...)
 }
 
 func (m gamesModel) selectedItem() gameItem {
@@ -430,7 +511,6 @@ func resolveScreenshots(preferred []language.Tag, byLang map[string][]carousel.S
 }
 
 func (m *gamesModel) applyLocalization(localizer localizer, preferred []language.Tag) tea.Cmd {
-	m.detailsViewport.Invalidate()
 	m.localizer = localizer
 	m.tag = localizer.tag
 	if len(preferred) == 0 {
@@ -440,7 +520,10 @@ func (m *gamesModel) applyLocalization(localizer localizer, preferred []language
 	}
 	m.playKey = key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", localizer.Text(textHelpPlay)))
 	m.carousel.SetLabels(localizer.CarouselLabels())
+	return m.rebuildItems(true)
+}
 
+func (m *gamesModel) rebuildItems(syncCarousel bool) tea.Cmd {
 	selectedShortname := ""
 	if i := m.list.SelectedIndex(); i >= 0 && i < len(m.items) {
 		selectedShortname = m.items[i].Shortname
@@ -450,28 +533,74 @@ func (m *gamesModel) applyLocalization(localizer localizer, preferred []language
 	listItems := make([]gamelist.Item, len(m.rawGames))
 	for i := range m.rawGames {
 		d := m.rawGames[i].Details
+		activity := m.activityByID[m.rawGames[i].ID]
 		item := gameItem{
-			ID:          m.rawGames[i].ID,
-			Shortname:   m.rawGames[i].Shortname,
-			Author:      d.Author,
-			Version:     d.Version,
-			Name:        resolveLocalized(m.preferred, d.Name, m.rawGames[i].Shortname),
-			Description: resolveLocalized(m.preferred, d.Description, ""),
-			Details:     resolveLocalized(m.preferred, d.Details, ""),
-			Screenshots: resolveScreenshots(m.preferred, d.ScreenshotsBy),
+			ID:             m.rawGames[i].ID,
+			Shortname:      m.rawGames[i].Shortname,
+			Author:         d.Author,
+			Version:        d.Version,
+			Name:           resolveLocalized(m.preferred, d.Name, m.rawGames[i].Shortname),
+			Description:    resolveLocalized(m.preferred, d.Description, ""),
+			Details:        resolveLocalized(m.preferred, d.Details, ""),
+			Screenshots:    resolveScreenshots(m.preferred, d.ScreenshotsBy),
+			ActiveSessions: activity.ActiveSessions,
+			SessionsKnown:  activity.SessionsKnown,
 		}
 		m.items[i] = item
-		listItems[i] = gamelist.Item{Name: item.Name, Description: item.Description}
-	}
-	m.list = gamelist.New(localizer.Text(textGamesListTitle), listItems, m.zone, "games-item-")
-	m.list.SetLabels(localizer.GameListLabels())
-	for i := range m.items {
-		if m.items[i].Shortname == selectedShortname {
-			m.list.Selected = i
-			break
+		listItems[i] = gamelist.Item{
+			Name:        item.Name,
+			Description: item.Description,
 		}
 	}
-	return m.syncCarouselToSelection()
+
+	if !m.listReady {
+		m.list = gamelist.New(m.localizer.Text(textGamesListTitle), listItems, m.zone, "games-item-")
+		m.listReady = true
+	} else {
+		m.list.Title = m.localizer.Text(textGamesListTitle)
+		m.list.SetItems(listItems)
+	}
+	m.list.SetLabels(m.localizer.GameListLabels())
+	m.restoreSelection(selectedShortname)
+	m.detailsViewport.Invalidate()
+	if syncCarousel {
+		return m.syncCarouselToSelection()
+	}
+	return nil
+}
+
+func (m *gamesModel) restoreSelection(shortname string) {
+	if len(m.list.Filtered) == 0 {
+		m.list.Selected = -1
+		m.list.Hovered = -1
+		return
+	}
+
+	itemIndex := 0
+	if shortname != "" {
+		itemIndex = -1
+		for i := range m.items {
+			if m.items[i].Shortname == shortname {
+				itemIndex = i
+				break
+			}
+		}
+	}
+	if itemIndex < 0 {
+		m.list.Selected = 0
+		m.list.Hovered = -1
+		return
+	}
+
+	for i, filteredIndex := range m.list.Filtered {
+		if filteredIndex == itemIndex {
+			m.list.Selected = i
+			m.list.Hovered = -1
+			return
+		}
+	}
+	m.list.Selected = 0
+	m.list.Hovered = -1
 }
 
 func (m *gamesModel) renderGamesTab(width, height int) string {
@@ -549,6 +678,7 @@ func (m *gamesModel) buildGameDetailsLines(item gameItem, width int) []string {
 	if item.Author != "" {
 		lines = append(lines, viewportWrappedLines(m.styles.Subtle.Render("by "+item.Author), width)...)
 	}
+	lines = append(lines, viewportWrappedLines(m.styles.Subtle.Render(m.localizer.ActiveSessionsText(item.ActiveSessions, item.SessionsKnown)), width)...)
 	lines = append(lines, "")
 	lines = append(lines, viewportWrappedLines(m.styles.Body.Render(details), width)...)
 
