@@ -515,13 +515,6 @@ func (m *gamesModel) renderGameDetails(width, height int) string {
 	return m.detailsViewport.View(width, height, m.detailsViewportLines)
 }
 
-func (m *gamesModel) renderGameDetailsContent(width, height int, allowInlineScreenshots bool) string {
-	item := m.selectedItem()
-	showInlineScreenshots := allowInlineScreenshots && len(item.Screenshots) > 0 && carousel.CanFitInline(width, height)
-	parts := m.buildGameDetailsParts(item, width, showInlineScreenshots)
-	return strings.Join(parts, "\n")
-}
-
 func (m *gamesModel) detailsViewportLines(contentWidth int) []string {
 	if contentWidth <= 0 {
 		return []string{""}
@@ -536,38 +529,47 @@ func (m *gamesModel) detailsViewportLines(contentWidth int) []string {
 	if item.Shortname == "" {
 		return viewportWrappedLines(m.styles.Subtle.Render(m.localizer.Text(textGamesNoMatch)), contentWidth)
 	}
-	return viewportWrappedLines(m.renderGameDetailsContent(contentWidth, m.detailsViewport.height, true), contentWidth)
+	lines := m.buildGameDetailsLines(item, contentWidth)
+	if len(lines) == 0 {
+		return []string{""}
+	}
+	return lines
 }
 
-func (m *gamesModel) buildGameDetailsParts(item gameItem, width int, inlineScreenshots bool) []string {
+func (m *gamesModel) buildGameDetailsLines(item gameItem, width int) []string {
 	details := clampUTF8Bytes(item.Details, maxDetailsRenderBytes)
 	title := m.styles.Title.Render(item.Name)
 	if item.Version != "" {
 		title += m.styles.Subtle.Render(" " + item.Version)
 	}
-	parts := []string{title}
+	lines := viewportWrappedLines(title, width)
 	if item.Description != "" {
-		parts = append(parts, m.styles.Subtle.Render(item.Description))
+		lines = append(lines, viewportWrappedLines(m.styles.Subtle.Render(item.Description), width)...)
 	}
 	if item.Author != "" {
-		parts = append(parts, m.styles.Subtle.Render("by "+item.Author))
+		lines = append(lines, viewportWrappedLines(m.styles.Subtle.Render("by "+item.Author), width)...)
 	}
-	parts = append(parts, "", m.styles.Body.Render(details))
+	lines = append(lines, "")
+	lines = append(lines, viewportWrappedLines(m.styles.Body.Render(details), width)...)
 
 	if len(item.Screenshots) > 0 {
+		lines = append(lines, "")
 		switch {
-		case inlineScreenshots:
-			parts = append(parts, "\n"+m.carousel.ViewInZone(width, m.detailsZone))
+		case carousel.CanFitInline(width, m.detailsViewport.height):
+			lines = append(lines, viewportPlainLines(m.carousel.ViewInZone(width, m.detailsZone))...)
 		case carousel.CanFitModal(m.termW, m.termH):
-			parts = append(parts, "", m.carousel.ViewButtonInZone(m.detailsZone))
+			lines = append(lines, viewportPlainLines(m.carousel.ViewButtonInZone(m.detailsZone))...)
+		default:
+			lines = lines[:len(lines)-1]
 		}
 	}
 
-	parts = append(parts, "", m.renderCurrentPlayButton(width, m.detailsZone))
+	lines = append(lines, "")
+	lines = append(lines, viewportPlainLines(m.renderCurrentPlayButton(width, m.detailsZone))...)
 	if m.playError != "" {
-		parts = append(parts, m.styles.Error.Render(m.playError))
+		lines = append(lines, viewportWrappedLines(m.styles.Error.Render(m.playError), width)...)
 	}
-	return parts
+	return lines
 }
 
 func (m *gamesModel) renderCurrentPlayButton(width int, zoneManager *zone.Manager) string {
