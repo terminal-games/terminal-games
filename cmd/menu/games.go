@@ -165,8 +165,8 @@ func (m gamesModel) ShortHelp() []key.Binding {
 	if !m.list.Filtering() && !m.playBusy && m.selectedItem().Shortname != "" && m.detailsViewport.CanScroll(m.detailsViewportLines) {
 		b = append(
 			b,
-			key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", "details up")),
-			key.NewBinding(key.WithKeys("pgdn"), key.WithHelp("pgdn", "details down")),
+			key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", m.localizer.HelpDetailsUp())),
+			key.NewBinding(key.WithKeys("pgdn"), key.WithHelp("pgdn", m.localizer.HelpDetailsDown())),
 		)
 	}
 	if !m.list.Filtering() && !m.playBusy && m.selectedItem().Shortname != "" {
@@ -519,7 +519,7 @@ func (m *gamesModel) applyLocalization(localizer localizer, preferred []language
 	} else {
 		m.preferred = append([]language.Tag(nil), preferred...)
 	}
-	m.playKey = key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", localizer.Text(textHelpPlay)))
+	m.playKey = key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", localizer.HelpPlay()))
 	m.carousel.SetLabels(localizer.CarouselLabels())
 	return m.rebuildItems(true)
 }
@@ -555,10 +555,10 @@ func (m *gamesModel) rebuildItems(syncCarousel bool) tea.Cmd {
 	}
 
 	if !m.listReady {
-		m.list = gamelist.New(m.localizer.Text(textGamesListTitle), listItems, m.zone, "games-item-")
+		m.list = gamelist.New(m.localizer.GamesListTitle(), listItems, m.zone, "games-item-")
 		m.listReady = true
 	} else {
-		m.list.Title = m.localizer.Text(textGamesListTitle)
+		m.list.Title = m.localizer.GamesListTitle()
 		m.list.SetItems(listItems)
 	}
 	m.list.SetLabels(m.localizer.GameListLabels())
@@ -650,14 +650,14 @@ func (m *gamesModel) detailsViewportLines(contentWidth int) []string {
 		return []string{""}
 	}
 	if !m.loaded {
-		return viewportWrappedLines(m.styles.Subtle.Render(m.localizer.Text(textProfileLoading)), contentWidth)
+		return viewportWrappedLines(m.styles.Subtle.Render(m.localizer.ProfileLoading()), contentWidth)
 	}
 	if m.loadErr != nil {
 		return viewportWrappedLines(m.styles.Subtle.Render(m.loadErr.Error()), contentWidth)
 	}
 	item := m.selectedItem()
 	if item.Shortname == "" {
-		return viewportWrappedLines(m.styles.Subtle.Render(m.localizer.Text(textGamesNoMatch)), contentWidth)
+		return viewportWrappedLines(m.styles.Subtle.Render(m.localizer.GamesNoMatch()), contentWidth)
 	}
 	lines := m.buildGameDetailsLines(item, contentWidth)
 	if len(lines) == 0 {
@@ -677,9 +677,9 @@ func (m *gamesModel) buildGameDetailsLines(item gameItem, width int) []string {
 		lines = append(lines, viewportWrappedLines(m.styles.Subtle.Render(item.Description), width)...)
 	}
 	if item.Author != "" {
-		lines = append(lines, viewportWrappedLines(m.styles.Subtle.Render("by "+item.Author), width)...)
+		lines = append(lines, viewportWrappedLines(m.styles.Subtle.Render(m.localizer.GamesByAuthor(item.Author)), width)...)
 	}
-	lines = append(lines, viewportWrappedLines(m.styles.Subtle.Render(m.localizer.ActiveSessionsText(item.ActiveSessions, item.SessionsKnown)), width)...)
+	lines = append(lines, viewportWrappedLines(m.styles.Subtle.Render(m.localizer.GamesActiveSessions(item.ActiveSessions, item.SessionsKnown)), width)...)
 	lines = append(lines, "")
 	lines = append(lines, viewportWrappedLines(m.styles.Body.Render(details), width)...)
 
@@ -704,9 +704,9 @@ func (m *gamesModel) buildGameDetailsLines(item gameItem, width int) []string {
 }
 
 func (m *gamesModel) renderCurrentPlayButton(width int, zoneManager *zone.Manager) string {
-	label := m.localizer.Text(textPlayButton)
+	label := m.localizer.PlayButton()
 	if m.playBusy {
-		label = m.spin.View() + " " + m.localizer.Text(textPlayLoading)
+		label = m.spin.View() + " " + m.localizer.PlayLoading()
 	}
 	play := m.renderPlayButton(width, label)
 	if zoneManager != nil {

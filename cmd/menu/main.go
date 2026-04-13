@@ -100,15 +100,15 @@ func newKeyMap(localizer localizer) keyMap {
 	return keyMap{
 		Quit: key.NewBinding(
 			key.WithKeys("q", "ctrl+c"),
-			key.WithHelp("q", localizer.Text(textHelpQuit)),
+			key.WithHelp("q", localizer.HelpQuit()),
 		),
 		NextTab: key.NewBinding(
 			key.WithKeys("tab"),
-			key.WithHelp("tab", localizer.Text(textHelpNextTab)),
+			key.WithHelp("tab", localizer.HelpNextTab()),
 		),
 		PrevTab: key.NewBinding(
 			key.WithKeys("shift+tab"),
-			key.WithHelp("shift+tab", localizer.Text(textHelpPrevTab)),
+			key.WithHelp("shift+tab", localizer.HelpPrevTab()),
 		),
 	}
 }
@@ -387,12 +387,12 @@ func (m *model) renderView() string {
 
 	tabsView := m.tabs.View()
 	tabsWidth := m.tabs.TotalWidth()
-	title := m.titleStyle.Render(" " + m.localizer.Text(textHeaderTitle))
+	title := m.titleStyle.Render(" " + m.localizer.HeaderTitle())
 	titleWidth := lipgloss.Width(title)
 
 	viewportWidth := min(m.w, maxWidth)
 	if !m.canRenderViewport(viewportWidth, titleWidth, tabsWidth) {
-		return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Center, m.localizer.Text(textWindowTooSmall))
+		return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Center, m.localizer.WindowTooSmall())
 	}
 
 	centeredTabsView := m.renderCenteredTabsView(viewportWidth, tabsView, tabsWidth, title, titleWidth)
@@ -481,7 +481,7 @@ func (m *model) renderActiveTab(width, height int) string {
 	case "about":
 		return m.renderAboutTab(width, height)
 	default:
-		return m.localizer.Text(textUnknownTab)
+		return m.localizer.UnknownTab()
 	}
 }
 
@@ -496,7 +496,7 @@ func (m model) startupReady() bool {
 }
 
 func (m model) renderLoadingView() string {
-	loading := m.localizer.Text(textProfileLoading)
+	loading := m.localizer.ProfileLoading()
 	if m.w <= 0 || m.h <= 0 {
 		return loading
 	}
@@ -514,9 +514,9 @@ func (m *model) applyMenuLocalization() {
 	m.keys = newKeyMap(m.localizer)
 	m.about.applyLocalization(m.localizer)
 	m.tabs = tabs.NewWithActive([]tabs.Tab{
-		{ID: "games", Title: m.localizer.Text(textTabGames)},
-		{ID: "profile", Title: m.localizer.Text(textTabProfile)},
-		{ID: "about", Title: m.localizer.Text(textTabAbout)},
+		{ID: "games", Title: m.localizer.TabGames()},
+		{ID: "profile", Title: m.localizer.TabProfile()},
+		{ID: "about", Title: m.localizer.TabAbout()},
 	}, m.zone, "menu-tab-", activeID)
 }
 

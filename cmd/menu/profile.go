@@ -276,23 +276,23 @@ type profileKeyMap struct {
 
 func newProfileKeyMapWithLocalizer(localizer localizer) profileKeyMap {
 	return profileKeyMap{
-		Up:       key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", localizer.Text(textHelpUp))),
-		Down:     key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", localizer.Text(textHelpDown))),
-		Edit:     key.NewBinding(key.WithKeys("enter", "e"), key.WithHelp("enter", localizer.Text(textHelpEdit))),
-		Delete:   key.NewBinding(key.WithKeys("d", "x"), key.WithHelp("d", localizer.Text(textHelpDelete))),
-		MoveUp:   key.NewBinding(key.WithKeys("K"), key.WithHelp("shift+k", localizer.Text(textHelpMoveUp))),
-		MoveDown: key.NewBinding(key.WithKeys("J"), key.WithHelp("shift+j", localizer.Text(textHelpMoveDown))),
-		Save:     key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", localizer.Text(textHelpSave))),
-		Cancel:   key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", localizer.Text(textHelpCancel))),
-		Done:     key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", localizer.Text(textHelpDone))),
+		Up:       key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", localizer.HelpUp())),
+		Down:     key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", localizer.HelpDown())),
+		Edit:     key.NewBinding(key.WithKeys("enter", "e"), key.WithHelp("enter", localizer.HelpEdit())),
+		Delete:   key.NewBinding(key.WithKeys("d", "x"), key.WithHelp("d", localizer.HelpDelete())),
+		MoveUp:   key.NewBinding(key.WithKeys("K"), key.WithHelp("shift+k", localizer.HelpMoveUp())),
+		MoveDown: key.NewBinding(key.WithKeys("J"), key.WithHelp("shift+j", localizer.HelpMoveDown())),
+		Save:     key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", localizer.HelpSave())),
+		Cancel:   key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", localizer.HelpCancel())),
+		Done:     key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", localizer.HelpDone())),
 		DropdownNav: key.NewBinding(
 			key.WithKeys("up", "down"),
-			key.WithHelp("↑↓", localizer.Text(textHelpNavigate)),
+			key.WithHelp("↑↓", localizer.HelpNavigate()),
 		),
-		Select:  key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", localizer.Text(textHelpSelect))),
-		Back:    key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", localizer.Text(textHelpBack))),
-		Confirm: key.NewBinding(key.WithKeys("y"), key.WithHelp("y", localizer.Text(textHelpConfirm))),
-		Reject:  key.NewBinding(key.WithKeys("n", "esc"), key.WithHelp("n/esc", localizer.Text(textHelpCancel))),
+		Select:  key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", localizer.HelpSelect())),
+		Back:    key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", localizer.HelpBack())),
+		Confirm: key.NewBinding(key.WithKeys("y"), key.WithHelp("y", localizer.HelpConfirm())),
+		Reject:  key.NewBinding(key.WithKeys("n", "esc"), key.WithHelp("n/esc", localizer.HelpCancel())),
 	}
 }
 
@@ -302,14 +302,14 @@ func newProfileModel(zoneManager *zone.Manager) profileModel {
 		keys:   newProfileKeyMapWithLocalizer(newLocalizer()),
 		styles: defaultProfileStyles(),
 		tr:     newLocalizer(),
-		editor: inlineEditor{placeholder: newLocalizer().Text(textProfileNameHint), maxLen: 32},
+		editor: inlineEditor{placeholder: newLocalizer().ProfileNamePlaceholder(), maxLen: 32},
 	}
 }
 
 func (m *profileModel) applyLocalization(localizer localizer) {
 	m.tr = localizer
 	m.keys = newProfileKeyMapWithLocalizer(localizer)
-	m.editor.placeholder = localizer.Text(textProfileNameHint)
+	m.editor.placeholder = localizer.ProfileNamePlaceholder()
 }
 
 func (m profileModel) Capturing() bool { return m.state != stateNormal }
@@ -779,10 +779,10 @@ func cursor(selected bool) string {
 
 func (m profileModel) renderProfileTab(width, height int) string {
 	if !m.loaded {
-		return m.styles.Label.Render(m.tr.Text(textProfileLoading))
+		return m.styles.Label.Render(m.tr.ProfileLoading())
 	}
 	if m.loadErr != nil {
-		return m.styles.Label.Render(m.tr.Text(textProfileLoadFailed))
+		return m.styles.Label.Render(m.tr.ProfileLoadFailed())
 	}
 
 	const labelW = 15
@@ -791,7 +791,7 @@ func (m profileModel) renderProfileTab(width, height int) string {
 
 	// Username
 	active := m.state == stateEditName || (m.section == sectionUsername && m.state == stateNormal)
-	lbl := m.styledLabel(m.tr.Text(textProfileUsername), labelW, active)
+	lbl := m.styledLabel(m.tr.ProfileUsername(), labelW, active)
 	if m.state == stateEditName {
 		lines = append(lines, m.mark("pf-username", lbl+m.editor.View(m.styles.Value, m.styles.Hint)))
 	} else {
@@ -801,14 +801,14 @@ func (m profileModel) renderProfileTab(width, height int) string {
 		}
 		val := style.Render(m.username)
 		if active {
-			val += m.styles.Hint.Render(m.tr.Text(textProfileEnterToEdit))
+			val += m.styles.Hint.Render(m.tr.ProfileEnterToEditHint())
 		}
 		lines = append(lines, m.mark("pf-username", lbl+val))
 	}
 
 	// Languages
 	langExpanded := m.state == stateEditLangs || m.state == stateLangDropdown
-	lbl = m.styledLabel(m.tr.Text(textProfileLanguages), labelW, langExpanded || (m.section == sectionLanguages && m.state == stateNormal))
+	lbl = m.styledLabel(m.tr.ProfileLanguages(), labelW, langExpanded || (m.section == sectionLanguages && m.state == stateNormal))
 
 	if langExpanded {
 		for i, tag := range m.languages {
@@ -829,7 +829,7 @@ func (m profileModel) renderProfileTab(width, height int) string {
 
 		// Add/search row
 		if m.state == stateLangDropdown {
-			display := editorCursor.Render(" ") + m.styles.Hint.Render(m.tr.Text(textProfileSearch))
+			display := editorCursor.Render(" ") + m.styles.Hint.Render(m.tr.ProfileLanguageSearchPlaceholder())
 			if len(m.dropdown.searchBuf) > 0 {
 				display = m.styles.Value.Render(string(m.dropdown.searchBuf)) + editorCursor.Render(" ")
 			}
@@ -837,9 +837,9 @@ func (m profileModel) renderProfileTab(width, height int) string {
 		} else {
 			sel := m.langCursor == len(m.languages) && m.state == stateEditLangs
 			style := m.rowStyle("pf-lang-add", sel)
-			text := cursor(sel) + style.Render(m.tr.Text(textProfileAddLanguage))
+			text := cursor(sel) + style.Render(m.tr.ProfileAddLanguage())
 			if sel {
-				text += m.styles.Hint.Render(m.tr.Text(textProfileEnterToAdd))
+				text += m.styles.Hint.Render(m.tr.ProfileEnterToAddHint())
 			}
 			lines = append(lines, m.mark("pf-lang-add", indent+text))
 		}
@@ -847,7 +847,7 @@ func (m profileModel) renderProfileTab(width, height int) string {
 		// Dropdown results
 		if m.state == stateLangDropdown {
 			if len(m.dropdown.filtered) == 0 {
-				lines = append(lines, indent+"    "+m.styles.Hint.Render(m.tr.Text(textProfileNoMatches)))
+				lines = append(lines, indent+"    "+m.styles.Hint.Render(m.tr.ProfileNoLanguageMatches()))
 			} else {
 				end := min(m.dropdown.scroll+m.dropdown.maxVisible, len(m.dropdown.filtered))
 				for i := m.dropdown.scroll; i < end; i++ {
@@ -871,7 +871,7 @@ func (m profileModel) renderProfileTab(width, height int) string {
 		}
 		summary := style.Render(strings.Join(names, ", "))
 		if active {
-			summary += m.styles.Hint.Render(m.tr.Text(textProfileEnterToEdit))
+			summary += m.styles.Hint.Render(m.tr.ProfileEnterToEditHint())
 		}
 		lines = append(lines, m.mark("pf-languages", lbl+summary))
 	}
@@ -879,17 +879,14 @@ func (m profileModel) renderProfileTab(width, height int) string {
 	// Replays
 	lines = append(lines, "")
 	replaysActive := m.state == stateConfirmDelete || (m.section == sectionReplays && m.state == stateNormal)
-	title := m.tr.Text(textProfileReplays)
-	if len(m.replays) > 0 {
-		title = fmt.Sprintf(m.tr.Text(textProfileReplaysCount), len(m.replays))
-	}
+	title := m.tr.ProfileReplaysTitle(len(m.replays))
 	title = m.styledLabel(title, 0, replaysActive)
 	divW := max(0, width-lipgloss.Width(title)-1)
 	lines = append(lines, title+" "+m.styles.Divider.Render(strings.Repeat("─", divW)))
 
 	availRows := max(1, height-len(lines))
 	if len(m.replays) == 0 {
-		lines = append(lines, m.styles.Label.Render(m.tr.Text(textProfileNoReplays)))
+		lines = append(lines, m.styles.Label.Render(m.tr.ProfileNoReplays()))
 	} else {
 		offset := scrollOffset(m.replayCursor, len(m.replays), availRows)
 		end := min(offset+availRows, len(m.replays))
@@ -908,13 +905,13 @@ func (m profileModel) renderReplayRow(idx, width int) string {
 
 	name := r.gameTitle
 	if name == "" {
-		name = m.tr.Text(textProfileUnknownGame)
+		name = m.tr.ProfileUnknownGame()
 	}
 	const nameCol = 16
-	if len([]rune(name)) > nameCol-1 {
-		name = string([]rune(name)[:nameCol-2]) + "…"
+	if lipgloss.Width(name) > nameCol {
+		name = truncateVisible(name, nameCol)
 	}
-	pad := strings.Repeat(" ", max(0, nameCol-len([]rune(name))))
+	pad := strings.Repeat(" ", max(0, nameCol-lipgloss.Width(name)))
 	ts := time.Unix(r.createdAt, 0).UTC().Format(time.RFC3339)
 
 	nameStyle, timeStyle, urlStyle := m.styles.Row, m.styles.Label, m.styles.URL
@@ -926,7 +923,7 @@ func (m profileModel) renderReplayRow(idx, width int) string {
 
 	row := nameStyle.Render(cursor(selected)+name) + pad + timeStyle.Render(ts)
 	if m.state == stateConfirmDelete && selected {
-		return row + "  " + m.styles.Danger.Render(m.tr.Text(textProfileDeleteConfirm))
+		return row + "  " + m.styles.Danger.Render(m.tr.ProfileDeleteConfirm())
 	}
 	if r.asciinemaURL != "" {
 		row += "  " + urlStyle.Render(osc8Link(r.asciinemaURL, r.asciinemaURL))
@@ -945,11 +942,11 @@ func padRight(s string, w int) string {
 	if w <= 0 {
 		return s
 	}
-	r := []rune(s)
-	if len(r) >= w {
-		return string(r[:w])
+	visible := lipgloss.Width(s)
+	if visible > w {
+		return truncateVisible(s, w)
 	}
-	return s + strings.Repeat(" ", w-len(r))
+	return s + strings.Repeat(" ", w-visible)
 }
 
 func (m *model) renderProfileTab(width, height int) string {

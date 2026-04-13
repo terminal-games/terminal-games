@@ -100,8 +100,8 @@ func (m aboutModel) ShortHelp() []key.Binding {
 		return nil
 	}
 	return []key.Binding{
-		key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", "page up")),
-		key.NewBinding(key.WithKeys("pgdn"), key.WithHelp("pgdn", "page down")),
+		key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", m.localizer.HelpPageUp())),
+		key.NewBinding(key.WithKeys("pgdn"), key.WithHelp("pgdn", m.localizer.HelpPageDown())),
 	}
 }
 
@@ -484,7 +484,7 @@ func renderCardGrid(cards []statCardData, width int) string {
 	return strings.Join(rows, "\n")
 }
 
-func renderRegionTable(width int, regions []regionSummary) string {
+func renderRegionTable(width int, localizer localizer, regions []regionSummary) string {
 	headerStyle := lipgloss.NewStyle().Foreground(theme.TextSubtle).Bold(true)
 	valueStyle := lipgloss.NewStyle().Foreground(theme.Text)
 	mutedStyle := lipgloss.NewStyle().Foreground(theme.TextMuted)
@@ -496,8 +496,8 @@ func renderRegionTable(width int, regions []regionSummary) string {
 	const columnGap = 3
 	const minRegionW = 12
 	const minNodesW = 5
-	maxRegionW := lipgloss.Width("Region")
-	maxNodesW := lipgloss.Width("Nodes")
+	maxRegionW := lipgloss.Width(localizer.AboutRegionHeader())
+	maxNodesW := lipgloss.Width(localizer.AboutNodesHeader())
 	for _, region := range regions {
 		name := region.Code + "  " + region.Name
 		maxRegionW = max(maxRegionW, lipgloss.Width(name))
@@ -512,7 +512,7 @@ func renderRegionTable(width int, regions []regionSummary) string {
 		nodesW = max(minNodesW, innerWidth-fixedWidth-regionW)
 	}
 	lines := []string{
-		headerStyle.Render(padRight("Region", regionW) + " " + padRight("Latency", latW) + " " + padRight("Sessions", sessW) + " " + padRight("Nodes", nodesW)),
+		headerStyle.Render(padRight(localizer.AboutRegionHeader(), regionW) + " " + padRight(localizer.AboutLatencyHeader(), latW) + " " + padRight(localizer.AboutSessionsHeader(), sessW) + " " + padRight(localizer.AboutNodesHeader(), nodesW)),
 	}
 	for _, region := range regions {
 		latency := "--"
@@ -550,9 +550,9 @@ func renderFooterPanel(width int, localizer localizer) string {
 	linkStyle := lipgloss.NewStyle().Foreground(theme.Accent).Bold(true)
 
 	lines := []string{
-		labelStyle.Render(localizer.Text(textAboutSectionCredits)),
-		bodyStyle.Render(localizer.Text(textAboutDevelopedByPrefix) + linkStyle.Render(osc8Link("https://github.com/mbund", "Mark Bundschuh")) + localizer.Text(textAboutSentenceEnd)),
-		bodyStyle.Render(localizer.Text(textAboutOpenSourcePrefix) + linkStyle.Render(osc8Link("https://github.com/terminal-games/terminal-games", "https://github.com/terminal-games/terminal-games")) + localizer.Text(textAboutSentenceEnd)),
+		labelStyle.Render(localizer.AboutCreditsHeading()),
+		bodyStyle.Render(localizer.AboutDevelopedBy(linkStyle.Render(osc8Link("https://github.com/mbund", "Mark Bundschuh")))),
+		bodyStyle.Render(localizer.AboutOpenSource(linkStyle.Render(osc8Link("https://github.com/terminal-games/terminal-games", "https://github.com/terminal-games/terminal-games")))),
 	}
 	return renderFramedPanel(width, lines)
 }
@@ -644,13 +644,13 @@ func (m *aboutModel) renderAboutContent(width, height int) string {
 	errorStyle := lipgloss.NewStyle().Foreground(theme.Danger).Bold(true)
 
 	head := []string{
-		titleStyle.Render(m.localizer.Text(textAboutTitle)),
-		ledeStyle.Render(m.localizer.Text(textAboutBody)),
-		ledeStyle.Render(m.localizer.Text(textAboutDeveloperDocsPrefix) + topLinkStyle.Render(osc8Link("https://docs.terminalgames.net", "https://docs.terminalgames.net")) + m.localizer.Text(textAboutSentenceEnd)),
+		titleStyle.Render(m.localizer.AboutTitle()),
+		ledeStyle.Render(m.localizer.AboutBody()),
+		ledeStyle.Render(m.localizer.AboutDeveloperDocs(topLinkStyle.Render(osc8Link("https://docs.terminalgames.net", "https://docs.terminalgames.net")))),
 	}
 
 	if !m.loaded && m.loading {
-		content := strings.Join(append(head, "", m.localizer.Text(textProfileLoading)), "\n")
+		content := strings.Join(append(head, "", m.localizer.ProfileLoading()), "\n")
 		return content
 	}
 
@@ -667,26 +667,22 @@ func (m *aboutModel) renderAboutContent(width, height int) string {
 			knownSessions += region.Active
 		}
 	}
-	serverVersion := "local only"
+	serverVersion := m.localizer.AboutLocalOnly()
 	if m.data.ServerVersion != nil && strings.TrimSpace(*m.data.ServerVersion) != "" {
 		serverVersion = *m.data.ServerVersion
 	}
 	cards := []statCardData{
-		{label: "Server Version", value: serverVersion},
-		{label: "Menu Version", value: menuVersion()},
-		{label: "CLI API Version", value: m.data.CliAPIVersion},
-		{label: "Connected Region", value: current.Code + "  " + current.Name},
+		{label: m.localizer.AboutServerVersionLabel(), value: serverVersion},
+		{label: m.localizer.AboutMenuVersionLabel(), value: menuVersion()},
+		{label: m.localizer.AboutCLIAPIVersionLabel(), value: m.data.CliAPIVersion},
+		{label: m.localizer.AboutConnectedRegionLabel(), value: current.Code + "  " + current.Name},
 	}
 	cardsPanel := renderCardGrid(cards, width)
 
-	sessionLabel := "sessions"
-	if knownSessions == 1 {
-		sessionLabel = "session"
-	}
-	mapSummary := fmt.Sprintf("%d regions, %d current %s", len(regions), knownSessions, sessionLabel)
+	mapSummary := m.localizer.AboutNetworkSummary(len(regions), knownSessions)
 	mapCaption := ""
 
-	regionsPanel := renderRegionTable(width, regions)
+	regionsPanel := renderRegionTable(width, m.localizer, regions)
 	footerPanel := renderFooterPanel(width, m.localizer)
 
 	headBlock := strings.Join(head, "\n")
@@ -695,7 +691,7 @@ func (m *aboutModel) renderAboutContent(width, height int) string {
 
 	mapPanel := renderMapPanel(
 		width,
-		"Network Topology",
+		m.localizer.AboutNetworkTopologyTitle(),
 		mapSummary,
 		mapCaption,
 		renderWorldMap(mapWidth, mapHeight, regions, m.blinkOn),
