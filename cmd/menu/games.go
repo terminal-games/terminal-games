@@ -13,6 +13,7 @@ import (
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	zone "github.com/lrstanley/bubblezone/v2"
 	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
 	"github.com/terminal-games/terminal-games/cmd/menu/gamelist"
@@ -718,7 +719,9 @@ func (m *gamesModel) renderPlayButton(width int, label string) string {
 	if width <= 0 {
 		return ""
 	}
-	return m.styles.PlayBtn.Render(lipgloss.Place(width, 3, lipgloss.Center, lipgloss.Center, label))
+	label = ansi.Truncate(label, width, "")
+	line := lipgloss.NewStyle().Width(width).Align(lipgloss.Center).Render(label)
+	return m.styles.PlayBtn.Render(lipgloss.Place(width, 3, lipgloss.Center, lipgloss.Center, line))
 }
 
 func clampUTF8Bytes(s string, limit int) string {

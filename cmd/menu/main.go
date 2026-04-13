@@ -446,6 +446,9 @@ func (m *model) renderHelpView(viewportWidth int) string {
 	if keyMap := m.globalHelpKeyMap(); keyMap != nil {
 		helpLines = append(helpLines, lipgloss.NewStyle().Width(innerWidth).Render(m.help.View(keyMap)))
 	}
+	for len(helpLines) < 2 {
+		helpLines = append(helpLines, lipgloss.NewStyle().Width(innerWidth).Render(""))
+	}
 	return lipgloss.NewStyle().Padding(1, helpPaddingX).Render(strings.Join(helpLines, "\n"))
 }
 
