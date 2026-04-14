@@ -4,6 +4,7 @@
 
 use std::{
     fs,
+    future::Future,
     io::{Read, Write},
     path::{Path, PathBuf},
     pin::Pin,
@@ -26,10 +27,11 @@ use tracing_subscriber::{Layer, filter::LevelFilter, fmt::time::FormatTime, laye
 
 use terminal_games::{
     app::{
-        AppInstantiationParams, AppServer, SessionIdentity, SessionIo, SessionOutput, SessionUi,
+        AboutRuntimeInfo, AppInstantiationParams, AppServer, SessionIdentity, SessionIo,
+        SessionOutput, SessionUi,
     },
     app_env::{encrypt_app_env_blob, validate_app_envs},
-    control::{AppEnvVar, StatusBarState},
+    control::{AppEnvVar, CONTROL_API_VERSION, StatusBarState},
     input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker},
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
     manifest::{extract_manifest_from_wasm, sanitize_manifest},
@@ -658,7 +660,6 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         .expect("Failed to start mesh server");
     local_discovery
         .register(node, local_addr.port())
-        .await
         .expect("Failed to register with local discovery");
     mesh.start_discovery().await?;
 
@@ -779,7 +780,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     }
     if graceful_shutdown_token.is_cancelled() {
         restore_terminal(&mut stdout)?;
-        let _ = local_discovery.unregister().await;
+        let _ = local_discovery.unregister();
         mesh.graceful_shutdown().await;
         return Ok(());
     }
@@ -817,6 +818,11 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         user_id,
         locale,
         log_backend: guest_log_backend,
+        about_runtime: AboutRuntimeInfo {
+            host_kind: "cli".to_string(),
+            server_version: None,
+            cli_api_version: CONTROL_API_VERSION.to_string(),
+        },
     });
     let mut pending_input: Option<
         Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>,
@@ -959,7 +965,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
 
     restore_terminal(&mut stdout)?;
 
-    let _ = local_discovery.unregister().await;
+    let _ = local_discovery.unregister();
     mesh.graceful_shutdown().await;
 
     if let Some(error) = app_error {

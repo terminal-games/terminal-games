@@ -146,17 +146,17 @@ type Model struct {
 	Duration time.Duration
 	Labels   Labels
 
-	zone         *zone.Manager
-	zonePrefix   string
-	filterValue  string
-	filterDraft  string
-	filtering    bool
-	layout       listLayout
-	startTop     float64
-	startBottom  float64
-	targetTop    float64
-	targetBottom float64
-	animStart    time.Time
+	zone            *zone.Manager
+	zonePrefix      string
+	filterValue     string
+	filterDraft     string
+	filtering       bool
+	layout          listLayout
+	startTop        float64
+	startBottom     float64
+	targetTop       float64
+	targetBottom    float64
+	animStart       time.Time
 	animating       bool
 	initialized     bool
 	lastLayoutWidth int
@@ -365,6 +365,12 @@ func (m *Model) View(width, height int) string {
 func (m *Model) SetLabels(labels Labels) {
 	m.Labels = labels
 	m.Keys = KeyMapWithLabels(labels)
+}
+
+func (m *Model) SetItems(items []Item) {
+	m.Items = append(m.Items[:0], items...)
+	m.applyFilter()
+	m.lastLayoutWidth = 0
 }
 
 func (m Model) moveSelection(delta int) (Model, tea.Cmd) {

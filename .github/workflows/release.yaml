@@ -73,7 +73,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.1
+          toolchain: 1.92.0
           target: aarch64-apple-darwin
 
       - name: Cache Cargo (registry + git + target)

@@ -30,6 +30,8 @@ const (
 	menuReqProfileSet   = 2
 	menuReqReplaysList  = 3
 	menuReqReplayDelete = 4
+	menuReqAboutStatus  = 5
+	menuReqGameActivity = 6
 )
 
 //go:wasmimport terminal_games menu_request_v1
@@ -42,6 +44,16 @@ func menu_poll(requestID int32, dataPtr unsafe.Pointer, dataMaxLen uint32, dataL
 
 type menuGamesPayload struct {
 	Apps []gameData `json:"apps"`
+}
+
+type menuGameActivityPayload struct {
+	Apps          []menuGameActivity `json:"apps"`
+	SessionsKnown bool               `json:"sessions_known"`
+}
+
+type menuGameActivity struct {
+	AppID          int64 `json:"app_id"`
+	ActiveSessions int   `json:"active_sessions"`
 }
 
 type menuProfilePayload struct {
@@ -59,6 +71,27 @@ type menuReplay struct {
 	GameTitle    string `json:"game_title"`
 }
 
+type aboutHostPayload struct {
+	HostKind          string      `json:"host_kind"`
+	ServerVersion     *string     `json:"server_version"`
+	CliAPIVersion     string      `json:"cli_api_version"`
+	CurrentRegion     string      `json:"current_region"`
+	Nodes             []aboutNode `json:"nodes"`
+	RefreshedAtUnixMs int64       `json:"refreshed_at_unix_ms"`
+}
+
+type aboutNode struct {
+	NodeID         string   `json:"node_id"`
+	LatencyMS      int      `json:"latency_ms"`
+	ActiveSessions int      `json:"active_sessions"`
+	SessionsKnown  bool     `json:"sessions_known"`
+	IsCurrent      bool     `json:"is_current"`
+	RegionCode     *string  `json:"region_code"`
+	RegionName     *string  `json:"region_name"`
+	LatitudeDeg    *float64 `json:"latitude_deg"`
+	LongitudeDeg   *float64 `json:"longitude_deg"`
+}
+
 func menuFetchGames() ([]gameData, error) {
 	data, err := menuWaitFor(menu_request(menuReqGamesList, nil, 0, nil, 0, 0))
 	if err != nil {
@@ -69,6 +102,25 @@ func menuFetchGames() ([]gameData, error) {
 		return nil, err
 	}
 	return payload.Apps, nil
+}
+
+func menuFetchGameActivity() (map[int64]gameActivity, error) {
+	data, err := menuWaitFor(menu_request(menuReqGameActivity, nil, 0, nil, 0, 0))
+	if err != nil {
+		return nil, err
+	}
+	var payload menuGameActivityPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, err
+	}
+	activityByID := make(map[int64]gameActivity, len(payload.Apps))
+	for _, app := range payload.Apps {
+		activityByID[app.AppID] = gameActivity{
+			ActiveSessions: app.ActiveSessions,
+			SessionsKnown:  payload.SessionsKnown,
+		}
+	}
+	return activityByID, nil
 }
 
 func menuFetchProfile() (string, string, error) {
@@ -132,6 +184,18 @@ func menuFetchReplays(locale string) ([]replay, error) {
 func menuDeleteReplay(createdAt int64) error {
 	_, err := menuWaitFor(menu_request(menuReqReplayDelete, nil, 0, nil, 0, createdAt))
 	return err
+}
+
+func menuFetchAboutStatus() (aboutHostPayload, error) {
+	data, err := menuWaitFor(menu_request(menuReqAboutStatus, nil, 0, nil, 0, 0))
+	if err != nil {
+		return aboutHostPayload{}, err
+	}
+	var payload aboutHostPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return aboutHostPayload{}, err
+	}
+	return payload, nil
 }
 
 func menuWaitFor(requestID int32) ([]byte, error) {

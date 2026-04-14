@@ -49,9 +49,10 @@ use tokio_util::sync::CancellationToken;
 use tower::{Service, ServiceExt};
 
 use terminal_games::app::{
-    AppInstantiationParams, AppServer, SessionControl, SessionEndReason, SessionOutput,
-    clamp_window_size,
+    AboutRuntimeInfo, AppInstantiationParams, AppServer, SessionControl, SessionEndReason,
+    SessionOutput, clamp_window_size,
 };
+use terminal_games::control::CONTROL_API_VERSION;
 use terminal_games::input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker};
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::rate_limiting::{NetworkInformation, RateLimitedStream, TcpLatencyProvider};
@@ -595,6 +596,11 @@ async fn handle_socket(
         user_id: None,
         locale,
         log_backend: Arc::new(NoopLogBackend),
+        about_runtime: AboutRuntimeInfo {
+            host_kind: "server".to_string(),
+            server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            cli_api_version: CONTROL_API_VERSION.to_string(),
+        },
     });
     let mut pending_input: Option<
         Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>,

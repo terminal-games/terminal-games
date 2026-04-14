@@ -8,6 +8,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
 	"github.com/terminal-games/terminal-games/cmd/menu/gamelist"
+	"github.com/terminal-games/terminal-games/cmd/menu/translations"
 	"golang.org/x/text/language"
 )
 
@@ -34,79 +35,125 @@ func sameLanguageTags(a, b []language.Tag) bool {
 	return true
 }
 
-type textKey string
-
-const (
-	textHeaderTitle    textKey = "header.title"
-	textTabGames       textKey = "tab.games"
-	textTabProfile     textKey = "tab.profile"
-	textTabAbout       textKey = "tab.about"
-	textWindowTooSmall textKey = "window.tooSmall"
-	textUnknownTab     textKey = "tab.unknown"
-	textAboutBody      textKey = "about.body"
-
-	textHelpQuit    textKey = "help.quit"
-	textHelpNextTab textKey = "help.nextTab"
-	textHelpPrevTab textKey = "help.prevTab"
-
-	textGamesListTitle      textKey = "games.listTitle"
-	textGamesNoMatch        textKey = "games.noMatch"
-	textCarouselScreenshots textKey = "carousel.screenshots"
-	textCarouselEscToClose  textKey = "carousel.escToClose"
-
-	textProfileNotSignedIn   textKey = "profile.notSignedIn"
-	textProfileLoading       textKey = "profile.loading"
-	textProfileLoadFailed    textKey = "profile.loadFailed"
-	textProfileUsername      textKey = "profile.username"
-	textProfileLanguages     textKey = "profile.languages"
-	textProfileEnterToEdit   textKey = "profile.enterToEdit"
-	textProfileSearch        textKey = "profile.search"
-	textProfileAddLanguage   textKey = "profile.addLanguage"
-	textProfileEnterToAdd    textKey = "profile.enterToAdd"
-	textProfileNoMatches     textKey = "profile.noMatches"
-	textProfileReplays       textKey = "profile.replays"
-	textProfileReplaysCount  textKey = "profile.replaysCount"
-	textProfileNoReplays     textKey = "profile.noReplays"
-	textProfileDeleteConfirm textKey = "profile.deleteConfirm"
-	textProfileUnknownGame   textKey = "profile.unknownGame"
-	textProfileNameHint      textKey = "profile.nameHint"
-
-	textHelpUp          textKey = "help.up"
-	textHelpDown        textKey = "help.down"
-	textHelpEdit        textKey = "help.edit"
-	textHelpDelete      textKey = "help.delete"
-	textHelpMoveUp      textKey = "help.moveUp"
-	textHelpMoveDown    textKey = "help.moveDown"
-	textHelpSave        textKey = "help.save"
-	textHelpCancel      textKey = "help.cancel"
-	textHelpDone        textKey = "help.done"
-	textHelpNavigate    textKey = "help.navigate"
-	textHelpSelect      textKey = "help.select"
-	textHelpBack        textKey = "help.back"
-	textHelpConfirm     textKey = "help.confirm"
-	textHelpFilter      textKey = "help.filter"
-	textHelpClearFilter textKey = "help.clearFilter"
-	textHelpApplyFilter textKey = "help.applyFilter"
-	textHelpPlay        textKey = "help.play"
-	textCountOf         textKey = "count.of"
-	textPlayButton      textKey = "play.button"
-	textPlayLoading     textKey = "play.loading"
-)
-
 var supportedMenuLanguages = []language.Tag{
 	language.English,
 	language.German,
+	language.Spanish,
+	language.Chinese,
+	language.Japanese,
+}
+
+type menuTranslations interface {
+	HeaderTitle() string
+	TabGames() string
+	TabProfile() string
+	TabAbout() string
+	WindowTooSmall() string
+	UnknownTab() string
+
+	HelpQuit() string
+	HelpNextTab() string
+	HelpPrevTab() string
+	HelpAudio() string
+	HelpDismiss() string
+	HelpUp() string
+	HelpDown() string
+	HelpEdit() string
+	HelpDelete() string
+	HelpMoveUp() string
+	HelpMoveDown() string
+	HelpSave() string
+	HelpCancel() string
+	HelpDone() string
+	HelpNavigate() string
+	HelpSelect() string
+	HelpBack() string
+	HelpConfirm() string
+	HelpFilter() string
+	HelpClearFilter() string
+	HelpApplyFilter() string
+	HelpPlay() string
+	HelpPageUp() string
+	HelpPageDown() string
+	HelpDetailsUp() string
+	HelpDetailsDown() string
+
+	GamesListTitle() string
+	GamesNoMatch() string
+	GamesByAuthor(author string) string
+	GamesActiveSessions(count int, sessionsKnown bool) string
+	GameListLabels() gamelist.Labels
+	CarouselLabels() carousel.Labels
+	PlayButton() string
+	PlayLoading() string
+
+	AboutTitle() string
+	AboutBody() string
+	AboutDeveloperDocs(link string) string
+	AboutCreditsHeading() string
+	AboutDevelopedBy(name string) string
+	AboutOpenSource(link string) string
+	AboutServerVersionLabel() string
+	AboutMenuVersionLabel() string
+	AboutCLIAPIVersionLabel() string
+	AboutConnectedRegionLabel() string
+	AboutLocalOnly() string
+	AboutRegionHeader() string
+	AboutLatencyHeader() string
+	AboutSessionsHeader() string
+	AboutNodesHeader() string
+	AboutNetworkSummary(regionCount, sessionCount int) string
+	AboutNetworkTopologyTitle() string
+
+	SSHAudioCallout() string
+	SSHAudioDialogTitle() string
+	SSHAudioDialogInstall() string
+	SSHAudioDialogBody() string
+	SSHAudioDialogHint() string
+	SSHAudioDialogKeyboardHint() string
+	SSHAudioDialogBashLabel() string
+	SSHAudioDialogFishLabel() string
+	SSHAudioDialogCopy() string
+	SSHAudioDialogCopied() string
+	SSHAudioDialogCopyBashHelp() string
+	SSHAudioDialogCopyFishHelp() string
+	SSHAudioDialogClose() string
+	SSHAudioDialogCloseHelp() string
+
+	ProfileLoading() string
+	ProfileLoadFailed() string
+	ProfileUsername() string
+	ProfileLanguages() string
+	ProfileEnterToEditHint() string
+	ProfileLanguageSearchPlaceholder() string
+	ProfileAddLanguage() string
+	ProfileEnterToAddHint() string
+	ProfileNoLanguageMatches() string
+	ProfileReplaysTitle(count int) string
+	ProfileNoReplays() string
+	ProfileDeleteConfirm() string
+	ProfileUnknownGame() string
+	ProfileNamePlaceholder() string
 }
 
 type localizer struct {
+	menuTranslations
 	matcher language.Matcher
 	tag     language.Tag
 }
 
+var _ menuTranslations = translations.English{}
+var _ menuTranslations = translations.German{}
+var _ menuTranslations = translations.Spanish{}
+var _ menuTranslations = translations.Chinese{}
+var _ menuTranslations = translations.Japanese{}
+
 func newLocalizer() localizer {
+	tag := language.English
 	return localizer{
-		matcher: language.NewMatcher(supportedMenuLanguages),
-		tag:     language.English,
+		menuTranslations: translationsForTag(tag),
+		matcher:          language.NewMatcher(supportedMenuLanguages),
+		tag:              tag,
 	}
 }
 
@@ -119,236 +166,22 @@ func (l *localizer) SetPreferred(preferred []language.Tag) bool {
 		return false
 	}
 	l.tag = next
+	l.menuTranslations = translationsForTag(next)
 	return true
 }
 
-func (l localizer) Text(key textKey) string {
-	if l.tag == language.German {
-		switch key {
-		case textHeaderTitle:
-			return "Terminal Games"
-		case textTabGames:
-			return "Spiele"
-		case textTabProfile:
-			return "Profil"
-		case textTabAbout:
-			return "Info"
-		case textWindowTooSmall:
-			return "Fenster ist zu klein"
-		case textUnknownTab:
-			return "Unbekannter Tab"
-		case textAboutBody:
-			return "Info"
-		case textHelpQuit:
-			return "beenden"
-		case textHelpNextTab:
-			return "nächster Tab"
-		case textHelpPrevTab:
-			return "voriger Tab"
-		case textGamesListTitle:
-			return "Alle Spiele"
-		case textGamesNoMatch:
-			return "Keine Spiele entsprechen dem aktuellen Filter."
-		case textCarouselScreenshots:
-			return "Screenshots"
-		case textCarouselEscToClose:
-			return "ESC zum Schließen"
-		case textProfileNotSignedIn:
-			return "Du bist nicht angemeldet."
-		case textProfileLoading:
-			return "Wird geladen..."
-		case textProfileLoadFailed:
-			return "Profil konnte nicht geladen werden."
-		case textProfileUsername:
-			return "Benutzername"
-		case textProfileLanguages:
-			return "Sprachen"
-		case textProfileEnterToEdit:
-			return "  enter zum Bearbeiten"
-		case textProfileSearch:
-			return "suche..."
-		case textProfileAddLanguage:
-			return "+ Sprache hinzufügen"
-		case textProfileEnterToAdd:
-			return "  enter zum Hinzufügen"
-		case textProfileNoMatches:
-			return "keine Treffer"
-		case textProfileReplays:
-			return "Replays"
-		case textProfileReplaysCount:
-			return "Replays (%d)"
-		case textProfileNoReplays:
-			return "  Noch keine Replays."
-		case textProfileDeleteConfirm:
-			return "löschen? y/n"
-		case textProfileUnknownGame:
-			return "unbekannt"
-		case textProfileNameHint:
-			return "benutzernamen eingeben"
-		case textHelpUp:
-			return "hoch"
-		case textHelpDown:
-			return "runter"
-		case textHelpEdit:
-			return "bearbeiten"
-		case textHelpDelete:
-			return "löschen"
-		case textHelpMoveUp:
-			return "nach oben"
-		case textHelpMoveDown:
-			return "nach unten"
-		case textHelpSave:
-			return "speichern"
-		case textHelpCancel:
-			return "abbrechen"
-		case textHelpDone:
-			return "fertig"
-		case textHelpNavigate:
-			return "navigieren"
-		case textHelpSelect:
-			return "auswählen"
-		case textHelpBack:
-			return "zurück"
-		case textHelpConfirm:
-			return "bestätigen"
-		case textHelpFilter:
-			return "filtern"
-		case textHelpClearFilter:
-			return "filter löschen"
-		case textHelpApplyFilter:
-			return "filter anwenden"
-		case textHelpPlay:
-			return "spielen"
-		case textCountOf:
-			return "von"
-		case textPlayButton:
-			return "Spielen"
-		case textPlayLoading:
-			return "Lade"
-		}
+func translationsForTag(tag language.Tag) menuTranslations {
+	if tag == language.German {
+		return translations.German{}
 	}
-	switch key {
-	case textHeaderTitle:
-		return "Terminal Games"
-	case textTabGames:
-		return "Games"
-	case textTabProfile:
-		return "Profile"
-	case textTabAbout:
-		return "About"
-	case textWindowTooSmall:
-		return "Window must be larger"
-	case textUnknownTab:
-		return "Unknown tab"
-	case textAboutBody:
-		return "About"
-	case textHelpQuit:
-		return "quit"
-	case textHelpNextTab:
-		return "next tab"
-	case textHelpPrevTab:
-		return "prev tab"
-	case textGamesListTitle:
-		return "All Games"
-	case textGamesNoMatch:
-		return "No games match the current filter."
-	case textCarouselScreenshots:
-		return "Screenshots"
-	case textCarouselEscToClose:
-		return "ESC to close"
-	case textProfileNotSignedIn:
-		return "You are not signed in."
-	case textProfileLoading:
-		return "Loading..."
-	case textProfileLoadFailed:
-		return "Failed to load profile."
-	case textProfileUsername:
-		return "Username"
-	case textProfileLanguages:
-		return "Languages"
-	case textProfileEnterToEdit:
-		return "  enter to edit"
-	case textProfileSearch:
-		return "search..."
-	case textProfileAddLanguage:
-		return "+ add language"
-	case textProfileEnterToAdd:
-		return "  enter to add"
-	case textProfileNoMatches:
-		return "no matches"
-	case textProfileReplays:
-		return "Replays"
-	case textProfileReplaysCount:
-		return "Replays (%d)"
-	case textProfileNoReplays:
-		return "  No replays yet."
-	case textProfileDeleteConfirm:
-		return "delete? y/n"
-	case textProfileUnknownGame:
-		return "unknown"
-	case textProfileNameHint:
-		return "enter username"
-	case textHelpUp:
-		return "up"
-	case textHelpDown:
-		return "down"
-	case textHelpEdit:
-		return "edit"
-	case textHelpDelete:
-		return "delete"
-	case textHelpMoveUp:
-		return "move up"
-	case textHelpMoveDown:
-		return "move down"
-	case textHelpSave:
-		return "save"
-	case textHelpCancel:
-		return "cancel"
-	case textHelpDone:
-		return "done"
-	case textHelpNavigate:
-		return "navigate"
-	case textHelpSelect:
-		return "select"
-	case textHelpBack:
-		return "back"
-	case textHelpConfirm:
-		return "confirm"
-	case textHelpFilter:
-		return "filter"
-	case textHelpClearFilter:
-		return "clear filter"
-	case textHelpApplyFilter:
-		return "apply filter"
-	case textHelpPlay:
-		return "play"
-	case textCountOf:
-		return "of"
-	case textPlayButton:
-		return "Play"
-	case textPlayLoading:
-		return "Loading"
+	if tag == language.Spanish {
+		return translations.Spanish{}
 	}
-	return string(key)
-}
-
-func (l localizer) GameListLabels() gamelist.Labels {
-	return gamelist.Labels{
-		Up:          l.Text(textHelpUp),
-		Down:        l.Text(textHelpDown),
-		Filter:      l.Text(textHelpFilter),
-		ClearFilter: l.Text(textHelpClearFilter),
-		ApplyFilter: l.Text(textHelpApplyFilter),
-		Cancel:      l.Text(textHelpCancel),
-		Games:       l.Text(textTabGames),
-		Of:          l.Text(textCountOf),
-		FilterValue: l.Text(textHelpFilter),
+	if tag == language.Chinese {
+		return translations.Chinese{}
 	}
-}
-
-func (l localizer) CarouselLabels() carousel.Labels {
-	return carousel.Labels{
-		Screenshots: l.Text(textCarouselScreenshots),
-		EscToClose:  l.Text(textCarouselEscToClose),
+	if tag == language.Japanese {
+		return translations.Japanese{}
 	}
+	return translations.English{}
 }

@@ -12,6 +12,7 @@ mod terminal;
 
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
@@ -101,6 +102,8 @@ const MENU_REQ_PROFILE_GET: i32 = 1;
 const MENU_REQ_PROFILE_SET: i32 = 2;
 const MENU_REQ_REPLAYS_LIST: i32 = 3;
 const MENU_REQ_REPLAY_DELETE: i32 = 4;
+const MENU_REQ_ABOUT_STATUS: i32 = 5;
+const MENU_REQ_GAME_ACTIVITY: i32 = 6;
 
 const NEXT_APP_READY_READY: i32 = 1;
 const NEXT_APP_READY_NOT_READY: i32 = 0;
@@ -348,6 +351,14 @@ pub struct AppInstantiationParams {
     pub user_id: Option<u64>,
     pub locale: String,
     pub log_backend: Arc<dyn GuestLogBackend>,
+    pub about_runtime: AboutRuntimeInfo,
+}
+
+#[derive(Clone)]
+pub struct AboutRuntimeInfo {
+    pub host_kind: String,
+    pub server_version: Option<String>,
+    pub cli_api_version: String,
 }
 
 #[derive(Debug, Clone)]
@@ -426,6 +437,7 @@ impl AppServer {
                 user_id,
                 locale,
                 log_backend,
+                about_runtime,
             } = params;
             let startup_shortname = session_identity.shortname();
             let (notification_tx, notification_rx, status_bar_state_rx) = session_ui.into_parts();
@@ -474,6 +486,7 @@ impl AppServer {
                 db: db.clone(),
                 linker,
                 mesh,
+                about_runtime,
                 app_env_secret_key,
                 app_registry,
                 app_output_sender,
@@ -531,6 +544,7 @@ impl AppServer {
 
             loop {
                 let app_shortname = app.shortname.clone();
+                let ctx_for_requests = ctx.clone();
                 let state = AppState {
                     app,
                     ctx,
@@ -746,6 +760,7 @@ impl AppServer {
                             request = menu_request_rx.recv() => {
                                 let Some(request) = request else { continue };
                                 let db = db.clone();
+                                let ctx = ctx_for_requests.clone();
                                 let menu_result_tx = menu_result_tx.clone();
                                 let menu_session = menu_session.clone();
                                 let menu_username = session_identity.username();
@@ -779,6 +794,14 @@ impl AppServer {
                                         }
                                         MenuRequestKind::ReplayDelete { created_at } => {
                                             Self::delete_menu_replay(db, user_id, menu_session, created_at).await
+                                        }
+                                        MenuRequestKind::AboutStatus => {
+                                            let result = Self::load_menu_about_status(ctx).await;
+                                            (result, MenuUpdate::default())
+                                        }
+                                        MenuRequestKind::GameActivity => {
+                                            let result = Self::load_menu_game_activity(ctx).await;
+                                            (result, MenuUpdate::default())
                                         }
                                     };
                                     let _ = menu_result_tx
@@ -1083,6 +1106,7 @@ pub struct PreloadedAppState {
 pub struct AppContext {
     db: libsql::Connection,
     mesh: Mesh,
+    about_runtime: AboutRuntimeInfo,
     app_env_secret_key: Arc<str>,
     remote_sshid: String,
     audio_enabled: bool,
@@ -1448,6 +1472,8 @@ enum MenuRequestKind {
     ProfileSet { username: String, locale: String },
     ReplaysList { locale: String },
     ReplayDelete { created_at: i64 },
+    AboutStatus,
+    GameActivity,
 }
 
 struct MenuRequestJob {
@@ -1639,17 +1665,23 @@ impl EscapeSequenceBuffer {
 
 struct AsyncCallHook {}
 
-#[async_trait::async_trait]
 impl wasmtime::CallHookHandler<AppState> for AsyncCallHook {
-    async fn handle_call_event(
-        &self,
-        _: wasmtime::StoreContextMut<'_, AppState>,
+    fn handle_call_event<'life0, 'life1, 'async_trait>(
+        &'life0 self,
+        _: wasmtime::StoreContextMut<'life1, AppState>,
         ch: wasmtime::CallHook,
-    ) -> wasmtime::Result<()> {
-        if ch.entering_host() {
-            tokio::task::yield_now().await;
-        }
-        Ok(())
+    ) -> Pin<Box<dyn Future<Output = wasmtime::Result<()>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            if ch.entering_host() {
+                tokio::task::yield_now().await;
+            }
+            Ok(())
+        })
     }
 }
 

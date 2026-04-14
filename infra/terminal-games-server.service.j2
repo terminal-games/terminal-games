@@ -7,7 +7,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/terminal-games/games
+WorkingDirectory=/opt/terminal-games
 EnvironmentFile=/etc/terminal-games/terminal-games-server.env
 ExecStart=/opt/terminal-games/bin/terminal-games-server
 Restart=always

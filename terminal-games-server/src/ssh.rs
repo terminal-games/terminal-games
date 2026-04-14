@@ -17,9 +17,10 @@ use russh::{Channel, ChannelId, Pty};
 use tokio_util::sync::CancellationToken;
 
 use terminal_games::app::{
-    AppInstantiationParams, AppServer, SessionControl, SessionEndReason, SessionOutput,
-    clamp_window_size_u32,
+    AboutRuntimeInfo, AppInstantiationParams, AppServer, SessionControl, SessionEndReason,
+    SessionOutput, clamp_window_size_u32,
 };
+use terminal_games::control::CONTROL_API_VERSION;
 use terminal_games::input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker};
 use terminal_games::log_backend::NoopLogBackend;
 use terminal_games::palette;
@@ -485,6 +486,11 @@ impl SshServer {
                 user_id,
                 locale,
                 log_backend: Arc::new(NoopLogBackend),
+                about_runtime: AboutRuntimeInfo {
+                    host_kind: "server".to_string(),
+                    server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    cli_api_version: CONTROL_API_VERSION.to_string(),
+                },
             });
             let mut pending_input: Option<
                 Pin<Box<dyn Future<Output = Result<(), InputForwardError>> + Send>>,
