@@ -23,6 +23,8 @@ func (Chinese) UnknownTab() string     { return "未知标签页" }
 func (Chinese) HelpQuit() string        { return "退出" }
 func (Chinese) HelpNextTab() string     { return "下一个标签页" }
 func (Chinese) HelpPrevTab() string     { return "上一个标签页" }
+func (Chinese) HelpAudio() string       { return "音频帮助" }
+func (Chinese) HelpDismiss() string     { return "关闭音频帮助" }
 func (Chinese) HelpUp() string          { return "上" }
 func (Chinese) HelpDown() string        { return "下" }
 func (Chinese) HelpEdit() string        { return "编辑" }
@@ -115,6 +117,31 @@ func (Chinese) AboutLatencyHeader() string        { return "延迟" }
 func (Chinese) AboutSessionsHeader() string       { return "会话" }
 func (Chinese) AboutNodesHeader() string          { return "节点" }
 func (Chinese) AboutNetworkTopologyTitle() string { return "网络拓扑" }
+
+func (Chinese) SSHAudioCallout() string     { return "了解如何通过 SSH 启用音频" }
+func (Chinese) SSHAudioDialogTitle() string { return "通过 SSH 启用音频" }
+func (Chinese) SSHAudioDialogInstall() string {
+	return "如果你还没有安装 ffplay，请先在本机安装。"
+}
+func (Chinese) SSHAudioDialogBody() string {
+	return "退出当前会话，然后用以下任一命令重新连接："
+}
+func (Chinese) SSHAudioDialogHint() string { return "按 Esc 关闭" }
+func (Chinese) SSHAudioDialogKeyboardHint() string {
+	return "[b] 复制 bash  [f] 复制 fish  [esc] 关闭"
+}
+func (Chinese) SSHAudioDialogBashLabel() string { return "Bash / Zsh" }
+func (Chinese) SSHAudioDialogFishLabel() string { return "Fish" }
+func (Chinese) SSHAudioDialogCopy() string      { return "复制" }
+func (Chinese) SSHAudioDialogCopied() string    { return "已复制" }
+func (Chinese) SSHAudioDialogCopyBashHelp() string {
+	return "复制 bash"
+}
+func (Chinese) SSHAudioDialogCopyFishHelp() string {
+	return "复制 fish"
+}
+func (Chinese) SSHAudioDialogClose() string     { return "关闭" }
+func (Chinese) SSHAudioDialogCloseHelp() string { return "关闭" }
 
 func (Chinese) ProfileLoading() string         { return "加载中..." }
 func (Chinese) ProfileLoadFailed() string      { return "加载个人资料失败。" }

@@ -54,6 +54,8 @@ type menuTranslations interface {
 	HelpQuit() string
 	HelpNextTab() string
 	HelpPrevTab() string
+	HelpAudio() string
+	HelpDismiss() string
 	HelpUp() string
 	HelpDown() string
 	HelpEdit() string
@@ -102,6 +104,21 @@ type menuTranslations interface {
 	AboutNodesHeader() string
 	AboutNetworkSummary(regionCount, sessionCount int) string
 	AboutNetworkTopologyTitle() string
+
+	SSHAudioCallout() string
+	SSHAudioDialogTitle() string
+	SSHAudioDialogInstall() string
+	SSHAudioDialogBody() string
+	SSHAudioDialogHint() string
+	SSHAudioDialogKeyboardHint() string
+	SSHAudioDialogBashLabel() string
+	SSHAudioDialogFishLabel() string
+	SSHAudioDialogCopy() string
+	SSHAudioDialogCopied() string
+	SSHAudioDialogCopyBashHelp() string
+	SSHAudioDialogCopyFishHelp() string
+	SSHAudioDialogClose() string
+	SSHAudioDialogCloseHelp() string
 
 	ProfileLoading() string
 	ProfileLoadFailed() string

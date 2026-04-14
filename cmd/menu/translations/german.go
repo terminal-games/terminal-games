@@ -23,6 +23,8 @@ func (German) UnknownTab() string     { return "Unbekannter Tab" }
 func (German) HelpQuit() string        { return "beenden" }
 func (German) HelpNextTab() string     { return "nächster Tab" }
 func (German) HelpPrevTab() string     { return "vorheriger Tab" }
+func (German) HelpAudio() string       { return "Audiohilfe" }
+func (German) HelpDismiss() string     { return "Audiohilfe ausblenden" }
 func (German) HelpUp() string          { return "hoch" }
 func (German) HelpDown() string        { return "runter" }
 func (German) HelpEdit() string        { return "bearbeiten" }
@@ -120,6 +122,31 @@ func (German) AboutLatencyHeader() string        { return "Latenz" }
 func (German) AboutSessionsHeader() string       { return "Sitzungen" }
 func (German) AboutNodesHeader() string          { return "Knoten" }
 func (German) AboutNetworkTopologyTitle() string { return "Netzwerk-Topologie" }
+
+func (German) SSHAudioCallout() string     { return "So aktivierst du Audio über SSH" }
+func (German) SSHAudioDialogTitle() string { return "Audio über SSH aktivieren" }
+func (German) SSHAudioDialogInstall() string {
+	return "Wenn ffplay auf deinem Computer noch nicht installiert ist, installiere es zuerst."
+}
+func (German) SSHAudioDialogBody() string {
+	return "Beende diese Sitzung und verbinde dich dann mit einem dieser Befehle erneut:"
+}
+func (German) SSHAudioDialogHint() string { return "Zum Schließen Esc drücken" }
+func (German) SSHAudioDialogKeyboardHint() string {
+	return "[b] bash kopieren  [f] fish kopieren  [esc] schließen"
+}
+func (German) SSHAudioDialogBashLabel() string { return "Bash / Zsh" }
+func (German) SSHAudioDialogFishLabel() string { return "Fish" }
+func (German) SSHAudioDialogCopy() string      { return "Kopieren" }
+func (German) SSHAudioDialogCopied() string    { return "Kopiert" }
+func (German) SSHAudioDialogCopyBashHelp() string {
+	return "bash kopieren"
+}
+func (German) SSHAudioDialogCopyFishHelp() string {
+	return "fish kopieren"
+}
+func (German) SSHAudioDialogClose() string     { return "Schließen" }
+func (German) SSHAudioDialogCloseHelp() string { return "schließen" }
 
 func (German) ProfileLoading() string         { return "Wird geladen..." }
 func (German) ProfileLoadFailed() string      { return "Profil konnte nicht geladen werden." }

@@ -25,6 +25,8 @@ func (Japanese) UnknownTab() string { return "不明なタブです" }
 func (Japanese) HelpQuit() string        { return "終了" }
 func (Japanese) HelpNextTab() string     { return "次のタブ" }
 func (Japanese) HelpPrevTab() string     { return "前のタブ" }
+func (Japanese) HelpAudio() string       { return "音声ヘルプ" }
+func (Japanese) HelpDismiss() string     { return "音声ヘルプを閉じる" }
 func (Japanese) HelpUp() string          { return "上へ" }
 func (Japanese) HelpDown() string        { return "下へ" }
 func (Japanese) HelpEdit() string        { return "編集" }
@@ -119,6 +121,31 @@ func (Japanese) AboutLatencyHeader() string        { return "レイテンシ" }
 func (Japanese) AboutSessionsHeader() string       { return "セッション" }
 func (Japanese) AboutNodesHeader() string          { return "ノード" }
 func (Japanese) AboutNetworkTopologyTitle() string { return "ネットワークトポロジ" }
+
+func (Japanese) SSHAudioCallout() string     { return "SSH で音声を有効にする方法" }
+func (Japanese) SSHAudioDialogTitle() string { return "SSH で音声を有効にする" }
+func (Japanese) SSHAudioDialogInstall() string {
+	return "ffplay がまだインストールされていない場合は、先にお使いの環境へインストールしてください。"
+}
+func (Japanese) SSHAudioDialogBody() string {
+	return "このセッションを終了し、次のいずれかのコマンドで再接続してください:"
+}
+func (Japanese) SSHAudioDialogHint() string { return "Esc で閉じる" }
+func (Japanese) SSHAudioDialogKeyboardHint() string {
+	return "[b] bash をコピー  [f] fish をコピー  [esc] 閉じる"
+}
+func (Japanese) SSHAudioDialogBashLabel() string { return "Bash / Zsh" }
+func (Japanese) SSHAudioDialogFishLabel() string { return "Fish" }
+func (Japanese) SSHAudioDialogCopy() string      { return "コピー" }
+func (Japanese) SSHAudioDialogCopied() string    { return "コピー済み" }
+func (Japanese) SSHAudioDialogCopyBashHelp() string {
+	return "bash をコピー"
+}
+func (Japanese) SSHAudioDialogCopyFishHelp() string {
+	return "fish をコピー"
+}
+func (Japanese) SSHAudioDialogClose() string     { return "閉じる" }
+func (Japanese) SSHAudioDialogCloseHelp() string { return "閉じる" }
 
 func (Japanese) ProfileLoading() string { return "読み込み中..." }
 func (Japanese) ProfileLoadFailed() string {

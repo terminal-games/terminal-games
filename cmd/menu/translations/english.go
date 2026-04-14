@@ -23,6 +23,8 @@ func (English) UnknownTab() string     { return "Unknown tab" }
 func (English) HelpQuit() string        { return "quit" }
 func (English) HelpNextTab() string     { return "next tab" }
 func (English) HelpPrevTab() string     { return "prev tab" }
+func (English) HelpAudio() string       { return "audio help" }
+func (English) HelpDismiss() string     { return "dismiss audio help" }
 func (English) HelpUp() string          { return "up" }
 func (English) HelpDown() string        { return "down" }
 func (English) HelpEdit() string        { return "edit" }
@@ -118,6 +120,31 @@ func (English) AboutLatencyHeader() string        { return "Latency" }
 func (English) AboutSessionsHeader() string       { return "Sessions" }
 func (English) AboutNodesHeader() string          { return "Nodes" }
 func (English) AboutNetworkTopologyTitle() string { return "Network Topology" }
+
+func (English) SSHAudioCallout() string     { return "Learn how to enable audio over SSH" }
+func (English) SSHAudioDialogTitle() string { return "Enable audio over SSH" }
+func (English) SSHAudioDialogInstall() string {
+	return "If ffplay isn't installed on your computer yet, install it first."
+}
+func (English) SSHAudioDialogBody() string {
+	return "Exit this session, then reconnect with one of these commands:"
+}
+func (English) SSHAudioDialogHint() string { return "Press Esc to close" }
+func (English) SSHAudioDialogKeyboardHint() string {
+	return "[b] copy bash  [f] copy fish  [esc] close"
+}
+func (English) SSHAudioDialogBashLabel() string { return "Bash / Zsh" }
+func (English) SSHAudioDialogFishLabel() string { return "Fish" }
+func (English) SSHAudioDialogCopy() string      { return "Copy" }
+func (English) SSHAudioDialogCopied() string    { return "Copied" }
+func (English) SSHAudioDialogCopyBashHelp() string {
+	return "copy bash"
+}
+func (English) SSHAudioDialogCopyFishHelp() string {
+	return "copy fish"
+}
+func (English) SSHAudioDialogClose() string     { return "Close" }
+func (English) SSHAudioDialogCloseHelp() string { return "close" }
 
 func (English) ProfileLoading() string         { return "Loading..." }
 func (English) ProfileLoadFailed() string      { return "Failed to load profile." }
