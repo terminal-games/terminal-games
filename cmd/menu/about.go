@@ -127,13 +127,17 @@ func (m aboutModel) beginRefresh() (aboutModel, tea.Cmd) {
 	return m, m.fetchStatus()
 }
 
+func (m aboutModel) shouldRefresh() bool {
+	return m.lastFetch.IsZero() || time.Since(m.lastFetch) >= aboutRefreshInterval
+}
+
 func (m aboutModel) Update(msg tea.Msg) (aboutModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tabs.TabChangedMsg:
 		if msg.Tab.ID == "about" {
 			m.active = true
 			cmds := []tea.Cmd{aboutTickCmd()}
-			if !m.loaded || time.Since(m.lastFetch) >= aboutRefreshInterval {
+			if m.shouldRefresh() {
 				var cmd tea.Cmd
 				m, cmd = m.beginRefresh()
 				if cmd != nil {
@@ -152,7 +156,7 @@ func (m aboutModel) Update(msg tea.Msg) (aboutModel, tea.Cmd) {
 		m.blinkOn = !m.blinkOn
 		m.viewport.Invalidate()
 		cmds := []tea.Cmd{aboutTickCmd()}
-		if !m.loading && (!m.loaded || time.Since(m.lastFetch) >= aboutRefreshInterval) {
+		if !m.loading && m.shouldRefresh() {
 			var cmd tea.Cmd
 			m, cmd = m.beginRefresh()
 			if cmd != nil {
@@ -163,10 +167,10 @@ func (m aboutModel) Update(msg tea.Msg) (aboutModel, tea.Cmd) {
 
 	case aboutDataMsg:
 		m.loading = false
-		m.loaded = true
 		m.lastFetch = msg.fetchedAt
 		m.loadErr = msg.err
 		if msg.err == nil {
+			m.loaded = true
 			m.data = msg.payload
 		}
 		m.viewport.Invalidate()
