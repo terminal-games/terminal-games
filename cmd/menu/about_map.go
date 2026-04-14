@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	brailleCellWidth  = 2
-	brailleCellHeight = 4
+	brailleCellWidth   = 2
+	brailleCellHeight  = 4
+	brailleUnicodeBase = 0x2800
 )
 
 type geoPoint struct {
@@ -177,7 +178,7 @@ func (r *brailleRaster) toCanvas() worldCanvas {
 			if cell.mask == 0 {
 				continue
 			}
-			canvas.set(x, y, rune(0x2800)+rune(brailleUnicodeMask(cell.mask)), cell.style)
+			canvas.set(x, y, rune(brailleUnicodeBase)+rune(cell.mask), cell.style)
 		}
 	}
 	return canvas
@@ -198,35 +199,6 @@ func overlayCanvas(dst *worldCanvas, src worldCanvas) {
 func brailleMask(dotX, dotY int) byte {
 	rowMajor := dotX + brailleCellWidth*dotY
 	return [...]byte{0x01, 0x08, 0x02, 0x10, 0x04, 0x20, 0x40, 0x80}[rowMajor]
-}
-
-func brailleUnicodeMask(mask byte) byte {
-	var unicodeMask byte
-	if mask&0x01 != 0 {
-		unicodeMask |= 0x01
-	}
-	if mask&0x02 != 0 {
-		unicodeMask |= 0x02
-	}
-	if mask&0x04 != 0 {
-		unicodeMask |= 0x04
-	}
-	if mask&0x08 != 0 {
-		unicodeMask |= 0x08
-	}
-	if mask&0x10 != 0 {
-		unicodeMask |= 0x10
-	}
-	if mask&0x20 != 0 {
-		unicodeMask |= 0x20
-	}
-	if mask&0x40 != 0 {
-		unicodeMask |= 0x40
-	}
-	if mask&0x80 != 0 {
-		unicodeMask |= 0x80
-	}
-	return unicodeMask
 }
 
 func mapProjectDots(width, height int, lon, lat float64) (int, int) {
