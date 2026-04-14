@@ -377,8 +377,12 @@ func (m Model) viewButton(zoneManager *zone.Manager) string {
 	return btn
 }
 
-// ViewModal renders the fullscreen modal with the carousel centered.
-func (m Model) ViewModal(title string, width, height int) string {
+// ViewModal renders the modal content block.
+func (m Model) ViewModal(title string, width int, spinner string) string {
+	return m.viewModal(title, width, spinner, m.zone)
+}
+
+func (m Model) viewModal(title string, width int, spinner string, zoneManager *zone.Manager) string {
 	if len(m.Screenshots) == 0 {
 		return ""
 	}
@@ -388,7 +392,11 @@ func (m Model) ViewModal(title string, width, height int) string {
 		cw = width
 	}
 
-	titleStr := m.Styles.Title.Render(title)
+	titleLabel := title
+	if spinner != "" {
+		titleLabel = spinner + " " + title
+	}
+	titleStr := m.Styles.Title.Render(titleLabel)
 	hintStr := m.Styles.Hint.Render(m.Labels.EscToClose)
 	gap := cw - lipgloss.Width(titleStr) - lipgloss.Width(hintStr)
 	if gap < 1 {
@@ -396,8 +404,21 @@ func (m Model) ViewModal(title string, width, height int) string {
 	}
 	header := titleStr + strings.Repeat(" ", gap) + hintStr
 
-	content := header + "\n" + m.View(cw)
-	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, content)
+	content := header + "\n" + m.view(cw, zoneManager)
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(theme.Line).
+		Padding(1, 2).
+		Render(content)
+}
+
+func (m Model) CanFitModal(title string, termW, termH int) bool {
+	if len(m.Screenshots) == 0 || termW <= 0 || termH <= 0 {
+		return false
+	}
+	modalWidth := min(max(84, ScreenshotWidth+6), max(36, termW-4))
+	modal := m.viewModal(title, modalWidth, "⠋", nil)
+	return lipgloss.Width(modal) <= termW && lipgloss.Height(modal) <= termH
 }
 
 func (m *Model) SetLabels(labels Labels) {
@@ -408,12 +429,8 @@ func CanFitInline(width, height int) bool {
 	return width >= ScreenshotWidth
 }
 
-func CanFitModal(termW, termH int) bool {
-	return termW >= ScreenshotWidth && termH >= ModalMinHeight
-}
-
 func (m *Model) HandleWindowSize(termW, termH int) {
-	if m.Modal && !CanFitModal(termW, termH) {
+	if m.Modal && (termW < ScreenshotWidth+6 || termH < ModalMinHeight+4) {
 		m.Modal = false
 	}
 }

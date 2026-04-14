@@ -14,8 +14,10 @@ import (
 
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	zone "github.com/lrstanley/bubblezone/v2"
 
 	"github.com/terminal-games/terminal-games/cmd/menu/carousel"
@@ -77,6 +79,8 @@ type model struct {
 	sshAudioCopied      string
 	sshAudioCopyGen     int
 	sshAudioHovered     string
+	foregroundSpin      spinner.Model
+	foregroundSpinOn    bool
 	games               gamesModel
 	profile             profileModel
 	about               aboutModel
@@ -206,9 +210,13 @@ func main() {
 		showSSHAudioCallout: shouldShowSSHAudioHelp(),
 		keys:                newKeyMap(newLocalizer()),
 		help:                help.New(),
-		games:               newGamesModel(zoneManager),
-		profile:             newProfileModel(zoneManager),
-		about:               newAboutModel(zoneManager),
+		foregroundSpin: spinner.New(
+			spinner.WithSpinner(spinner.Jump),
+			spinner.WithStyle(lipgloss.NewStyle().Foreground(theme.Primary).Bold(true)),
+		),
+		games:   newGamesModel(zoneManager),
+		profile: newProfileModel(zoneManager),
+		about:   newAboutModel(zoneManager),
 	}
 	menuModel.applyMenuLocalization()
 
@@ -223,13 +231,13 @@ func main() {
 }
 
 func (m *model) Init() tea.Cmd {
-	return tea.Batch(
+	return m.ensureForegroundSpinner(tea.Batch(
 		m.tabs.Init(),
 		m.games.Init(),
 		m.profile.Init(),
 		m.about.Init(),
 		startupLoadingDelayCmd(),
-	)
+	))
 }
 
 func shouldShowSSHAudioHelp() bool {
@@ -259,7 +267,7 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.h = msg.Height
 		var cmd tea.Cmd
 		m.games, cmd = m.games.Update(message)
-		return m, cmd
+		return m, m.ensureForegroundSpinner(cmd)
 	case tea.BackgroundColorMsg:
 		m.dirty = true
 		theme.SetHasDarkBackground(msg.IsDark())
@@ -286,13 +294,25 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case startupLoadingDelayElapsedMsg:
 		m.dirty = true
 		m.showLoading = true
-		return m, nil
+		return m, m.ensureForegroundSpinner(nil)
 	case sshAudioCopyResetMsg:
 		if msg.gen == m.sshAudioCopyGen {
 			m.dirty = true
 			m.sshAudioCopied = ""
 		}
-		return m, nil
+		return m, m.ensureForegroundSpinner(nil)
+	case spinner.TickMsg:
+		var cmds []tea.Cmd
+		if m.foregroundSurfaceActive() {
+			var cmd tea.Cmd
+			m.foregroundSpin, cmd = m.foregroundSpin.Update(msg)
+			cmds = append(cmds, cmd)
+			m.dirty = true
+		}
+		var cmd tea.Cmd
+		m.games, cmd = m.games.Update(message)
+		cmds = append(cmds, cmd)
+		return m, m.ensureForegroundSpinner(tea.Batch(cmds...))
 	default:
 		m.dirty = true
 		var cmds []tea.Cmd
@@ -308,7 +328,7 @@ func (m *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.started && m.startupReady() {
 			m.started = true
 		}
-		return m, tea.Batch(cmds...)
+		return m, m.ensureForegroundSpinner(tea.Batch(cmds...))
 	}
 }
 
@@ -320,28 +340,28 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		if key.Matches(msg, m.keys.AudioHelp) {
 			m.showSSHAudioHelp = false
-			return m, nil
+			return m, m.ensureForegroundSpinner(nil)
 		}
 		switch {
 		case msg.String() == "b":
-			return m, m.copySSHAudioCommand(sshAudioCopyBashTarget, sshAudioBashCommand)
+			return m, m.ensureForegroundSpinner(m.copySSHAudioCommand(sshAudioCopyBashTarget, sshAudioBashCommand))
 		case msg.String() == "f":
-			return m, m.copySSHAudioCommand(sshAudioCopyFishTarget, sshAudioFishCommand)
+			return m, m.ensureForegroundSpinner(m.copySSHAudioCommand(sshAudioCopyFishTarget, sshAudioFishCommand))
 		}
 		switch msg.String() {
 		case "esc", "enter", " ", "q":
 			m.showSSHAudioHelp = false
 		}
-		return m, nil
+		return m, m.ensureForegroundSpinner(nil)
 	}
 	if m.showSSHAudioCallout && key.Matches(msg, m.keys.DismissAudioHelp) && !m.inputCaptured() {
 		m.showSSHAudioCallout = false
 		m.showSSHAudioHelp = false
-		return m, nil
+		return m, m.ensureForegroundSpinner(nil)
 	}
 	if m.showSSHAudioCallout && key.Matches(msg, m.keys.AudioHelp) && !m.inputCaptured() {
 		m.showSSHAudioHelp = true
-		return m, nil
+		return m, m.ensureForegroundSpinner(nil)
 	}
 	if key.Matches(msg, m.keys.Quit) {
 		if msg.String() != "q" || !m.inputCaptured() {
@@ -349,19 +369,19 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	} else if key.Matches(msg, m.keys.NextTab) {
 		if m.inputCaptured() {
-			return m, nil
+			return m, m.ensureForegroundSpinner(nil)
 		}
 		next := (m.tabs.Active + 1) % len(m.tabs.Tabs)
-		return m, m.setActiveTab(next)
+		return m, m.ensureForegroundSpinner(m.setActiveTab(next))
 	} else if key.Matches(msg, m.keys.PrevTab) {
 		if m.inputCaptured() {
-			return m, nil
+			return m, m.ensureForegroundSpinner(nil)
 		}
 		prev := m.tabs.Active - 1
 		if prev < 0 {
 			prev = len(m.tabs.Tabs) - 1
 		}
-		return m, m.setActiveTab(prev)
+		return m, m.ensureForegroundSpinner(m.setActiveTab(prev))
 	}
 	var cmd tea.Cmd
 	switch m.tabs.ActiveTab().ID {
@@ -372,7 +392,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "about":
 		m.about, cmd = m.about.Update(msg)
 	}
-	return m, cmd
+	return m, m.ensureForegroundSpinner(cmd)
 }
 
 func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -381,7 +401,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	}
 	m.dirty = true
 	if handled, cmd := m.handleSSHAudioMouse(msg); handled {
-		return m, cmd
+		return m, m.ensureForegroundSpinner(cmd)
 	}
 	var cmds []tea.Cmd
 	var cmd tea.Cmd
@@ -398,7 +418,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		m.about, cmd = m.about.Update(msg)
 		cmds = append(cmds, cmd)
 	}
-	return m, tea.Batch(cmds...)
+	return m, m.ensureForegroundSpinner(tea.Batch(cmds...))
 }
 
 func (m *model) handleSSHAudioMouse(msg tea.MouseMsg) (bool, tea.Cmd) {
@@ -466,6 +486,28 @@ func (m *model) copySSHAudioCommand(target string, command string) tea.Cmd {
 			return sshAudioCopyResetMsg{gen: gen}
 		}),
 	)
+}
+
+func (m *model) foregroundSurfaceActive() bool {
+	return m.showSSHAudioHelp || m.games.carousel.Modal
+}
+
+func (m *model) ensureForegroundSpinner(cmd tea.Cmd) tea.Cmd {
+	active := m.foregroundSurfaceActive()
+	switch {
+	case active && !m.foregroundSpinOn:
+		m.foregroundSpinOn = true
+		return tea.Batch(cmd, m.foregroundSpin.Tick)
+	case !active && m.foregroundSpinOn:
+		m.foregroundSpinOn = false
+		return cmd
+	default:
+		return cmd
+	}
+}
+
+func (m model) renderForegroundSpinner() string {
+	return m.foregroundSpin.View()
 }
 
 func (m *model) handleMouseMotion(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -537,11 +579,6 @@ func (m *model) renderView() string {
 		return m.renderLoadingView()
 	}
 
-	if m.games.carousel.Modal {
-		item := m.games.selectedItem()
-		return m.zone.Scan(m.games.carousel.ViewModal(item.Name, m.w, m.h))
-	}
-
 	tabsView := m.tabs.View()
 	tabsWidth := m.tabs.TotalWidth()
 	title := m.titleStyle.Render(" " + m.localizer.HeaderTitle())
@@ -576,6 +613,14 @@ func (m *model) renderView() string {
 	parts = append(parts, styledContent, helpView)
 	fullView := lipgloss.JoinVertical(lipgloss.Left, parts...)
 	placed := lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Top, fullView)
+	if m.games.carousel.Modal {
+		item := m.games.selectedItem()
+		modalWidth := min(max(84, carousel.ScreenshotWidth+6), max(36, m.w-4))
+		modal := m.games.carousel.ViewModal(item.Name, modalWidth, m.renderForegroundSpinner())
+		modalX := max(0, (m.w-lipgloss.Width(modal))/2)
+		modalY := max(0, (m.h-lipgloss.Height(modal))/2)
+		placed = overlayBlock(placed, modal, modalX, modalY, m.w, m.h)
+	}
 	if m.showSSHAudioHelp {
 		placed = m.renderSSHAudioDialog(placed)
 	}
@@ -654,7 +699,7 @@ func (m *model) renderSSHAudioCallout(viewportWidth int) string {
 	return m.zone.Mark(sshAudioCalloutZoneID, callout)
 }
 
-func (m *model) renderSSHAudioDialog(_ string) string {
+func (m *model) renderSSHAudioDialog(background string) string {
 	dialogWidth := min(sshAudioDialogMaxWidth, max(sshAudioDialogMinWidth, m.w-8))
 	dialogWidth = min(dialogWidth, max(36, m.w-4))
 	dialogStyle := lipgloss.NewStyle().
@@ -685,7 +730,11 @@ func (m *model) renderSSHAudioDialog(_ string) string {
 
 	dialog := dialogStyle.Render(lipgloss.JoinVertical(
 		lipgloss.Left,
-		renderPinnedRow(contentWidth, titleStyle.Render(m.localizer.SSHAudioDialogTitle()), closeButton),
+		renderPinnedRow(
+			contentWidth,
+			lipgloss.JoinHorizontal(lipgloss.Left, m.renderForegroundSpinner(), " ", titleStyle.Render(m.localizer.SSHAudioDialogTitle())),
+			closeButton,
+		),
 		"",
 		bodyStyle.Render(m.localizer.SSHAudioDialogInstall()),
 		"",
@@ -705,7 +754,13 @@ func (m *model) renderSSHAudioDialog(_ string) string {
 		),
 	))
 
-	return lipgloss.Place(m.w, m.h, lipgloss.Center, lipgloss.Center, m.zone.Mark(sshAudioDialogZoneID, dialog))
+	dialog = m.zone.Mark(sshAudioDialogZoneID, dialog)
+	dialogWidth = lipgloss.Width(dialog)
+	dialogHeight := lipgloss.Height(dialog)
+	dialogX := max(0, (m.w-dialogWidth)/2)
+	dialogY := max(0, (m.h-dialogHeight)/2)
+
+	return overlayBlock(background, dialog, dialogX, dialogY, m.w, m.h)
 }
 
 func (m *model) renderSSHAudioCommandBlock(width int, label string, command string, action string) string {
@@ -801,6 +856,56 @@ func renderPinnedRow(width int, left string, right string) string {
 	return left + strings.Repeat(" ", gap) + right
 }
 
+func overlayBlock(background string, overlay string, x int, y int, width int, height int) string {
+	bgLines := strings.Split(background, "\n")
+	overlayLines := strings.Split(overlay, "\n")
+
+	for len(bgLines) < height {
+		bgLines = append(bgLines, "")
+	}
+	for i := range bgLines {
+		bgLines[i] = padStyledLine(bgLines[i], width)
+	}
+
+	for row, overlayLine := range overlayLines {
+		targetRow := y + row
+		if targetRow < 0 || targetRow >= len(bgLines) {
+			continue
+		}
+		targetX := x
+		overlayWidth := ansi.StringWidth(overlayLine)
+		if overlayWidth <= 0 || targetX >= width {
+			continue
+		}
+		if targetX < 0 {
+			overlayLine = ansi.Cut(overlayLine, -targetX, overlayWidth)
+			overlayWidth = ansi.StringWidth(overlayLine)
+			targetX = 0
+		}
+		if targetX+overlayWidth > width {
+			overlayLine = ansi.Truncate(overlayLine, width-targetX, "")
+			overlayWidth = ansi.StringWidth(overlayLine)
+		}
+		bgLine := bgLines[targetRow]
+		left := ansi.Cut(bgLine, 0, targetX)
+		right := ansi.Cut(bgLine, targetX+overlayWidth, width)
+		bgLines[targetRow] = left + overlayLine + right
+	}
+
+	if len(bgLines) > height {
+		bgLines = bgLines[:height]
+	}
+	return strings.Join(bgLines, "\n")
+}
+
+func padStyledLine(line string, width int) string {
+	lineWidth := ansi.StringWidth(line)
+	if lineWidth >= width {
+		return ansi.Truncate(line, width, "")
+	}
+	return line + strings.Repeat(" ", width-lineWidth)
+}
+
 func (m *model) computeContentLayout(viewportWidth, headerHeight, helpHeight int) contentLayout {
 	height := max(0, m.h-headerHeight-helpHeight)
 	paddingY := 1
@@ -871,6 +976,7 @@ func (m *model) applyMenuLocalization() {
 
 func (m *model) applyThemeStyles() {
 	m.barStyle = lipgloss.NewStyle().Foreground(theme.Line)
+	m.foregroundSpin.Style = lipgloss.NewStyle().Foreground(theme.Primary).Bold(true)
 	m.games.styles = defaultDetailsStyles()
 	m.games.list.Styles = gamelist.DefaultStyles()
 	m.games.carousel.Styles = carousel.DefaultStyles()

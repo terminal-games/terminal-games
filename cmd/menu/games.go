@@ -282,6 +282,9 @@ func (m gamesModel) Update(msg tea.Msg) (gamesModel, tea.Cmd) {
 		m.termW = msg.Width
 		m.termH = msg.Height
 		m.carousel.HandleWindowSize(msg.Width, msg.Height)
+		if m.carousel.Modal && !m.carousel.CanFitModal(m.selectedItem().Name, msg.Width, msg.Height) {
+			m.carousel.Modal = false
+		}
 		return m, nil
 	case tea.KeyPressMsg:
 		if m.playBusy {
@@ -688,7 +691,7 @@ func (m *gamesModel) buildGameDetailsLines(item gameItem, width int) []string {
 		switch {
 		case carousel.CanFitInline(width, m.detailsViewport.height):
 			lines = append(lines, viewportPlainLines(m.carousel.ViewInZone(width, m.detailsZone))...)
-		case carousel.CanFitModal(m.termW, m.termH):
+		case m.carousel.CanFitModal(item.Name, m.termW, m.termH):
 			lines = append(lines, viewportPlainLines(m.carousel.ViewButtonInZone(m.detailsZone))...)
 		default:
 			lines = lines[:len(lines)-1]
