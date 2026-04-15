@@ -799,50 +799,52 @@ impl AdminControlRpc for AdminRpcServer {
         _: context::Context,
         request: TickerReorderRequest,
     ) -> Result<(), RpcError> {
-        let db = self.control.app_server.db.get().await?;
-        let tx = db.transaction().await?;
-        let mut rows = tx
-            .query(
-                "SELECT id FROM status_tickers ORDER BY sort_order ASC, id ASC",
-                (),
-            )
-            .await?;
-        let mut existing_ids = Vec::new();
-        while let Some(row) = rows.next().await? {
-            existing_ids.push(row.get::<u64>(0)?);
-        }
-        if existing_ids.is_empty() {
-            return Err("no tickers exist to reorder".into());
-        }
-        let mut expected_ids = existing_ids.clone();
-        expected_ids.sort_unstable();
-        let mut provided_ids = request.ticker_ids.clone();
-        provided_ids.sort_unstable();
-        if provided_ids != expected_ids {
-            return Err("ticker reorder must provide each ticker id exactly once".into());
-        }
-        let mut query = String::from("UPDATE status_tickers SET sort_order = CASE id");
-        let mut params = Vec::with_capacity(request.ticker_ids.len() * 3);
-        for (index, id) in request.ticker_ids.iter().copied().enumerate() {
-            let id = i64::try_from(id).map_err(|_| RpcError::from("ticker id out of range"))?;
-            query.push_str(" WHEN ? THEN ?");
-            params.push(libsql::Value::Integer(id));
-            params.push(libsql::Value::Integer((index as i64) + 1));
-        }
-        query.push_str(" END WHERE id IN (");
-        for index in 0..request.ticker_ids.len() {
-            if index > 0 {
-                query.push_str(", ");
+        {
+            let db = self.control.app_server.db.get().await?;
+            let tx = db.transaction().await?;
+            let mut rows = tx
+                .query(
+                    "SELECT id FROM status_tickers ORDER BY sort_order ASC, id ASC",
+                    (),
+                )
+                .await?;
+            let mut existing_ids = Vec::new();
+            while let Some(row) = rows.next().await? {
+                existing_ids.push(row.get::<u64>(0)?);
             }
-            query.push('?');
+            if existing_ids.is_empty() {
+                return Err("no tickers exist to reorder".into());
+            }
+            let mut expected_ids = existing_ids.clone();
+            expected_ids.sort_unstable();
+            let mut provided_ids = request.ticker_ids.clone();
+            provided_ids.sort_unstable();
+            if provided_ids != expected_ids {
+                return Err("ticker reorder must provide each ticker id exactly once".into());
+            }
+            let mut query = String::from("UPDATE status_tickers SET sort_order = CASE id");
+            let mut params = Vec::with_capacity(request.ticker_ids.len() * 3);
+            for (index, id) in request.ticker_ids.iter().copied().enumerate() {
+                let id = i64::try_from(id).map_err(|_| RpcError::from("ticker id out of range"))?;
+                query.push_str(" WHEN ? THEN ?");
+                params.push(libsql::Value::Integer(id));
+                params.push(libsql::Value::Integer((index as i64) + 1));
+            }
+            query.push_str(" END WHERE id IN (");
+            for index in 0..request.ticker_ids.len() {
+                if index > 0 {
+                    query.push_str(", ");
+                }
+                query.push('?');
+            }
+            query.push(')');
+            for id in request.ticker_ids.iter().copied() {
+                let id = i64::try_from(id).map_err(|_| RpcError::from("ticker id out of range"))?;
+                params.push(libsql::Value::Integer(id));
+            }
+            tx.execute(&query, libsql::params_from_iter(params)).await?;
+            tx.commit().await?;
         }
-        query.push(')');
-        for id in request.ticker_ids.iter().copied() {
-            let id = i64::try_from(id).map_err(|_| RpcError::from("ticker id out of range"))?;
-            params.push(libsql::Value::Integer(id));
-        }
-        tx.execute(&query, libsql::params_from_iter(params)).await?;
-        tx.commit().await?;
         self.control.refresh_status_bar_state().await?;
         Ok(())
     }
@@ -852,12 +854,14 @@ impl AdminControlRpc for AdminRpcServer {
         _: context::Context,
         request: TickerRemoveRequest,
     ) -> Result<(), RpcError> {
-        let db = self.control.app_server.db.get().await?;
-        db.execute(
-            "DELETE FROM status_tickers WHERE id = ?1",
-            libsql::params!(request.ticker_id),
-        )
-        .await?;
+        {
+            let db = self.control.app_server.db.get().await?;
+            db.execute(
+                "DELETE FROM status_tickers WHERE id = ?1",
+                libsql::params!(request.ticker_id),
+            )
+            .await?;
+        }
         self.control.refresh_status_bar_state().await?;
         Ok(())
     }

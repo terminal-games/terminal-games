@@ -26,7 +26,7 @@ impl LibsqlConnectionManager {
 
     async fn build_pool(manager: Self) -> Result<DbPool, libsql::Error> {
         Pool::builder()
-            .max_size(1)
+            .max_size(4)
             .test_on_check_out(true)
             .build(manager)
             .await
