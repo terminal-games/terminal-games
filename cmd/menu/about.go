@@ -106,7 +106,15 @@ func (m aboutModel) ShortHelp() []key.Binding {
 }
 
 func (m aboutModel) FullHelp() [][]key.Binding { return [][]key.Binding{m.ShortHelp()} }
-func (m aboutModel) Init() tea.Cmd             { return nil }
+
+func (m *aboutModel) Init() tea.Cmd {
+	if m.loading {
+		return nil
+	}
+	next, cmd := m.beginRefresh()
+	*m = next
+	return cmd
+}
 
 func (m aboutModel) fetchStatus() tea.Cmd {
 	return func() tea.Msg {
