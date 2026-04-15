@@ -24,6 +24,7 @@ use crate::admission::{AdmissionConfig, decode_cidr_blob};
 use terminal_games::{
     app::AppServer,
     app_env::APP_ENV_KEY_ENV,
+    db::{DbPool, LibsqlConnectionManager},
     mesh::{AppRuntimeUpdateMessage, BuildId, EnvDiscovery, Mesh},
 };
 
@@ -35,9 +36,8 @@ const APP_ENV_DEV_FALLBACK_KEY: &str = "terminal-games-dev-app-env-key";
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-async fn load_app_build_snapshot(
-    conn: &libsql::Connection,
-) -> Result<Vec<AppRuntimeUpdateMessage>> {
+async fn load_app_build_snapshot(db: &DbPool) -> Result<Vec<AppRuntimeUpdateMessage>> {
+    let conn = db.get().await?;
     let mut updates = Vec::new();
     let mut game_rows = conn
         .query(
@@ -55,21 +55,18 @@ async fn load_app_build_snapshot(
     Ok(updates)
 }
 
-async fn sync_app_build_snapshot(
-    conn: &libsql::Connection,
-    app_server: &AppServer,
-    mesh: &Mesh,
-) -> Result<()> {
-    let snapshot = load_app_build_snapshot(conn).await?;
+async fn sync_app_build_snapshot(db: &DbPool, app_server: &AppServer, mesh: &Mesh) -> Result<()> {
+    let snapshot = load_app_build_snapshot(db).await?;
     app_server.app_registry().sync_snapshot(snapshot.clone());
     mesh.replace_app_runtime_snapshot(snapshot).await;
     Ok(())
 }
 
 async fn load_ip_ban_updates(
-    conn: &libsql::Connection,
+    db: &DbPool,
     since: Option<i64>,
 ) -> Result<(Vec<(ipnet::IpNet, Option<String>, Option<i64>)>, i64)> {
+    let conn = db.get().await?;
     let mut rows = match since {
         Some(last_inserted_at) => {
             conn.query(
@@ -124,7 +121,7 @@ async fn load_ip_ban_updates(
 }
 
 fn spawn_ip_ban_sync_task(
-    conn: libsql::Connection,
+    db: DbPool,
     admission_controller: Arc<admission::AdmissionController>,
     mut last_inserted_at: i64,
 ) {
@@ -139,7 +136,7 @@ fn spawn_ip_ban_sync_task(
         );
         loop {
             interval.tick().await;
-            match load_ip_ban_updates(&conn, Some(last_inserted_at)).await {
+            match load_ip_ban_updates(&db, Some(last_inserted_at)).await {
                 Ok((updates, _)) if updates.is_empty() => {
                     tracing::trace!(last_inserted_at, "Checked IP bans; no changes detected");
                 }
@@ -163,10 +160,10 @@ fn spawn_ip_ban_sync_task(
     });
 }
 
-fn spawn_cluster_kicked_ip_retention_task(conn: libsql::Connection) {
+fn spawn_cluster_kicked_ip_retention_task(db: DbPool) {
     tokio::spawn(async move {
         let retention_days = cluster_kicked_ips::retention_days();
-        if let Err(error) = cluster_kicked_ips::purge_expired(&conn).await {
+        if let Err(error) = cluster_kicked_ips::purge_expired(&db).await {
             tracing::warn!(error = ?error, "failed to purge expired cluster-kicked ip data");
         }
 
@@ -180,7 +177,7 @@ fn spawn_cluster_kicked_ip_retention_task(conn: libsql::Connection) {
         );
         loop {
             interval.tick().await;
-            if let Err(error) = cluster_kicked_ips::purge_expired(&conn).await {
+            if let Err(error) = cluster_kicked_ips::purge_expired(&db).await {
                 tracing::warn!(error = ?error, "failed to purge expired cluster-kicked ip data");
             }
         }
@@ -205,29 +202,31 @@ async fn main() -> Result<()> {
     let db = if let Ok(libsql_url) = std::env::var("LIBSQL_URL") {
         let libsql_auth_token = std::env::var("LIBSQL_AUTH_TOKEN")
             .context("LIBSQL_AUTH_TOKEN must be set if LIBSQL_URL is set")?;
-        libsql::Builder::new_remote(libsql_url.clone(), libsql_auth_token.clone())
-            .build()
+        LibsqlConnectionManager::new_remote_pool(libsql_url.clone(), libsql_auth_token.clone())
             .await
-            .context("Failed to initialize remote libsql client")?
+            .context("Failed to initialize remote libsql pool")?
     } else {
         let db_path = std::env::var("TERMINAL_GAMES_DB_PATH")
             .unwrap_or_else(|_| "./terminal-games.db".to_string());
-        libsql::Builder::new_local(db_path).build().await?
+        LibsqlConnectionManager::new_local_pool(db_path)
+            .await
+            .context("Failed to initialize local libsql pool")?
     };
 
-    let conn = db.connect().context("Failed to connect to libsql")?;
-
-    let tx = conn
-        .transaction()
-        .await
-        .context("Failed to start migration transaction")?;
-    tx.execute_batch(include_str!("../../terminal-games/libsql/migrate-001.sql"))
-        .await
-        .context("Failed to run migrate-001.sql")?;
-    tx.commit()
-        .await
-        .context("Failed to commit migration transaction")?;
-    cluster_kicked_ips::purge_expired(&conn)
+    {
+        let conn = db.get().await.context("Failed to connect to libsql")?;
+        let tx = conn
+            .transaction()
+            .await
+            .context("Failed to start migration transaction")?;
+        tx.execute_batch(include_str!("../../terminal-games/libsql/migrate-001.sql"))
+            .await
+            .context("Failed to run migrate-001.sql")?;
+        tx.commit()
+            .await
+            .context("Failed to commit migration transaction")?;
+    }
+    cluster_kicked_ips::purge_expired(&db)
         .await
         .context("Failed to enforce cluster-kicked ip retention")?;
 
@@ -245,13 +244,13 @@ async fn main() -> Result<()> {
 
     let app_server = Arc::new(AppServer::new(
         mesh.clone(),
-        conn.clone(),
+        db.clone(),
         app_env_secret_key,
     )?);
-    sync_app_build_snapshot(&conn, &app_server, &mesh).await?;
+    sync_app_build_snapshot(&db, &app_server, &mesh).await?;
     {
         let app_server = app_server.clone();
-        let conn = conn.clone();
+        let db = db.clone();
         let mesh = mesh.clone();
         let mut updates = mesh.subscribe_app_runtime_updates();
         tokio::spawn(async move {
@@ -262,8 +261,7 @@ async fn main() -> Result<()> {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "lagged mesh app runtime updates");
-                        if let Err(error) = sync_app_build_snapshot(&conn, &app_server, &mesh).await
-                        {
+                        if let Err(error) = sync_app_build_snapshot(&db, &app_server, &mesh).await {
                             tracing::warn!(
                                 error = ?error,
                                 "failed to resync app runtime snapshot after lag"
@@ -292,14 +290,13 @@ async fn main() -> Result<()> {
         .unwrap_or(usize::MAX);
     let ssh_captcha_threshold =
         parse_ssh_captcha_threshold(std::env::var("SSH_CAPTCHA_THRESHOLD"))?;
-    let (banned_ips, last_ban_inserted_at) = load_ip_ban_updates(&conn, None).await?;
+    let (banned_ips, last_ban_inserted_at) = load_ip_ban_updates(&db, None).await?;
     tracing::debug!(
         active_ban_count = banned_ips.len(),
         last_inserted_at = last_ban_inserted_at,
         "Loaded initial IP ban snapshot"
     );
-    let metrics =
-        metrics::ServerMetrics::new(node_id.clone(), max_active_apps, conn.clone()).await?;
+    let metrics = metrics::ServerMetrics::new(node_id.clone(), max_active_apps, db.clone()).await?;
     let admission_controller = Arc::new(admission::AdmissionController::new(
         AdmissionConfig {
             max_running: max_active_apps,
@@ -309,15 +306,15 @@ async fn main() -> Result<()> {
         },
         banned_ips,
         metrics.clone(),
-        conn.clone(),
+        db.clone(),
         notifications.clone(),
     ));
     spawn_ip_ban_sync_task(
-        conn.clone(),
+        db.clone(),
         admission_controller.clone(),
         last_ban_inserted_at,
     );
-    spawn_cluster_kicked_ip_retention_task(conn.clone());
+    spawn_cluster_kicked_ip_retention_task(db.clone());
     tracing::info!(
         max_active_apps,
         max_active_apps_per_ip,
@@ -335,7 +332,7 @@ async fn main() -> Result<()> {
     let session_registry = sessions::SessionRegistry::new(node_id, notifications.clone());
     let shutdown =
         shutdown::ShutdownCoordinator::new(admission_controller.clone(), session_registry.clone());
-    let initial_status_bar_state = control::load_status_bar_state(&conn, None).await?;
+    let initial_status_bar_state = control::load_status_bar_state(&db, None).await?;
     session_registry.set_status_bar_state(initial_status_bar_state);
     let control_plane = control::ControlPlane::new(
         app_server.clone(),

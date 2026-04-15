@@ -23,6 +23,7 @@ use crate::notifications::{
     Notifications,
 };
 use terminal_games::app::{SessionAppState, SessionControl, SessionEndReason};
+use terminal_games::db::DbPool;
 
 pub(crate) const INPUT_WINDOW_MS: u64 = 8 * 60_000;
 pub(crate) const MAX_INPUT_SAMPLES: usize = 96;
@@ -364,7 +365,7 @@ struct ClusterSession {
 struct ClusterManager {
     max_running: usize,
     metrics: Arc<ServerMetrics>,
-    db: libsql::Connection,
+    db: DbPool,
     notifications: Arc<Notifications>,
     rx: mpsc::UnboundedReceiver<ClusterEvent>,
     live_sessions: HashMap<u64, ClusterSession>,
@@ -377,7 +378,7 @@ impl AdmissionController {
         config: AdmissionConfig,
         initial_banned_ips: Vec<(IpNet, Option<String>, Option<i64>)>,
         metrics: Arc<ServerMetrics>,
-        db: libsql::Connection,
+        db: DbPool,
         notifications: Arc<Notifications>,
     ) -> Self {
         let (ban_changes, _) = watch::channel(());
@@ -805,7 +806,7 @@ impl Drop for AdmissionTicket {
 fn spawn_cluster_manager(
     max_running: usize,
     metrics: Arc<ServerMetrics>,
-    db: libsql::Connection,
+    db: DbPool,
     notifications: Arc<Notifications>,
 ) -> mpsc::UnboundedSender<ClusterEvent> {
     let (tx, rx) = mpsc::unbounded_channel();

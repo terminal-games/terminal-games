@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result, bail};
 use terminal_games::control::{ClusterKickedIpEntry, ClusterKickedIpListResponse};
+use terminal_games::db::DbPool;
 
 use crate::admission::decode_cidr_blob;
 
@@ -60,7 +61,7 @@ pub fn display(ip: &[u8]) -> Result<String> {
 }
 
 pub async fn increment_for_enforcement(
-    db: &libsql::Connection,
+    db: &DbPool,
     ips: impl IntoIterator<Item = IpAddr>,
 ) -> Result<ClusterKickedIpReview> {
     let mut increments = HashMap::<Vec<u8>, u64>::new();
@@ -75,6 +76,7 @@ pub async fn increment_for_enforcement(
     let bucket_start = current_bucket_start();
     let cutoff_bucket_start = retained_bucket_cutoff(bucket_start, retention_days);
     purge_expired_before(db, cutoff_bucket_start).await?;
+    let db = db.get().await?;
 
     let mut entries = Vec::with_capacity(increments.len());
 
@@ -131,10 +133,11 @@ pub async fn increment_for_enforcement(
 }
 
 pub async fn load_entries_page(
-    db: &libsql::Connection,
+    db: &DbPool,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<ClusterKickedIpEntry>> {
+    let db = db.get().await?;
     let cutoff_bucket_start = retained_bucket_cutoff(current_bucket_start(), retention_days());
     let mut rows = db
         .query(
@@ -172,7 +175,7 @@ pub async fn load_entries_page(
 }
 
 pub async fn load_visible_page(
-    db: &libsql::Connection,
+    db: &DbPool,
     offset: usize,
     limit: usize,
     exclude_banned: bool,
@@ -217,12 +220,13 @@ pub async fn load_visible_page(
     Ok(ClusterKickedIpListResponse { entries, has_more })
 }
 
-pub(crate) async fn purge_expired(db: &libsql::Connection) -> Result<()> {
+pub(crate) async fn purge_expired(db: &DbPool) -> Result<()> {
     let cutoff_bucket_start = retained_bucket_cutoff(current_bucket_start(), retention_days());
     purge_expired_before(db, cutoff_bucket_start).await
 }
 
-async fn purge_expired_before(db: &libsql::Connection, cutoff_bucket_start: i64) -> Result<()> {
+async fn purge_expired_before(db: &DbPool, cutoff_bucket_start: i64) -> Result<()> {
+    let db = db.get().await?;
     db.execute(
         "DELETE FROM cluster_kicked_ip_buckets
          WHERE bucket_start < ?1",
@@ -233,7 +237,8 @@ async fn purge_expired_before(db: &libsql::Connection, cutoff_bucket_start: i64)
     Ok(())
 }
 
-async fn load_active_ban_cidrs(db: &libsql::Connection) -> Result<Vec<ipnet::IpNet>> {
+async fn load_active_ban_cidrs(db: &DbPool) -> Result<Vec<ipnet::IpNet>> {
+    let db = db.get().await?;
     let mut rows = db
         .query(
             "SELECT cidr, expires_at

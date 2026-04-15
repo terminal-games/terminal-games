@@ -50,6 +50,12 @@ impl From<libsql::Error> for RpcError {
     }
 }
 
+impl From<bb8::RunError<libsql::Error>> for RpcError {
+    fn from(error: bb8::RunError<libsql::Error>) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
 impl From<serde_json::Error> for RpcError {
     fn from(error: serde_json::Error) -> Self {
         Self::new(error.to_string())

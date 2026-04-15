@@ -216,17 +216,21 @@ impl SshServer {
             };
 
             let locale = if let Some(uid) = user_id {
-                match app_server
-                    .db
-                    .query(
-                        "SELECT locale FROM users WHERE id = ?1 LIMIT 1",
-                        libsql::params!(uid),
-                    )
-                    .await
-                {
-                    Ok(mut rows) => match rows.next().await {
-                        Ok(Some(row)) => row.get::<String>(0).unwrap_or_else(|_| "en".to_string()),
-                        _ => "en".to_string(),
+                match app_server.db.get().await {
+                    Ok(db) => match db
+                        .query(
+                            "SELECT locale FROM users WHERE id = ?1 LIMIT 1",
+                            libsql::params!(uid),
+                        )
+                        .await
+                    {
+                        Ok(mut rows) => match rows.next().await {
+                            Ok(Some(row)) => {
+                                row.get::<String>(0).unwrap_or_else(|_| "en".to_string())
+                            }
+                            _ => "en".to_string(),
+                        },
+                        Err(_) => "en".to_string(),
                     },
                     Err(_) => "en".to_string(),
                 }
@@ -264,17 +268,22 @@ impl SshServer {
                     _ => ("menu".into(), None, false),
                 };
 
-            let app_exists = match app_server
-                .db
-                .query(
-                    "SELECT 1 FROM apps WHERE shortname = ?1 LIMIT 1",
-                    libsql::params!(first_app_shortname.as_str()),
-                )
-                .await
-            {
-                Ok(mut rows) => matches!(rows.next().await, Ok(Some(_))),
+            let app_exists = match app_server.db.get().await {
+                Ok(db) => match db
+                    .query(
+                        "SELECT 1 FROM apps WHERE shortname = ?1 LIMIT 1",
+                        libsql::params!(first_app_shortname.as_str()),
+                    )
+                    .await
+                {
+                    Ok(mut rows) => matches!(rows.next().await, Ok(Some(_))),
+                    Err(err) => {
+                        tracing::warn!(error = ?err, "failed to validate requested app");
+                        false
+                    }
+                },
                 Err(err) => {
-                    tracing::warn!(error = ?err, "failed to validate requested app");
+                    tracing::warn!(error = %err, "failed to acquire database connection");
                     false
                 }
             };
@@ -1054,20 +1063,21 @@ impl Handler for SshSession {
         user: &str,
         pubkey: &PublicKey,
     ) -> Result<Auth, Self::Error> {
-        let user_id = if let Ok(mut rows) = self
-            .server
-            .app_server
-            .db
-            .query(
-                "INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (?1, ?2, 'en')
-                 ON CONFLICT(pubkey_fingerprint) DO UPDATE SET username = excluded.username
-                 RETURNING id",
-                libsql::params!(pubkey.fingerprint(Default::default()).as_bytes(), user),
-            )
-            .await
-        {
-            if let Ok(Some(row)) = rows.next().await {
-                row.get::<u64>(0).ok()
+        let user_id = if let Ok(db) = self.server.app_server.db.get().await {
+            if let Ok(mut rows) = db
+                .query(
+                    "INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (?1, ?2, 'en')
+                     ON CONFLICT(pubkey_fingerprint) DO UPDATE SET username = excluded.username
+                     RETURNING id",
+                    libsql::params!(pubkey.fingerprint(Default::default()).as_bytes(), user),
+                )
+                .await
+            {
+                if let Ok(Some(row)) = rows.next().await {
+                    row.get::<u64>(0).ok()
+                } else {
+                    None
+                }
             } else {
                 None
             }

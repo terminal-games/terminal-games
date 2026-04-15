@@ -55,6 +55,7 @@ use terminal_games::{
         TickerAddRequest, TickerEntry, TickerRemoveRequest, TickerReorderRequest, UploadAppRequest,
         UploadAppResponse, expiry_from_duration, parse_duration_string, parse_optional_expiry,
     },
+    db::DbPool,
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
     mesh::{AppRuntimeUpdateMessage, BuildId, ContentHash, Mesh, hash_app_envs, hash_bytes},
     wasm_abi,
@@ -221,6 +222,8 @@ impl ControlPlane {
         let token_hash = sha256_hex(&secret);
         self.app_server
             .db
+            .get()
+            .await?
             .execute(
                 "UPDATE app_tokens SET token_hash = ?2 WHERE id = ?1",
                 libsql::params!(app_id, token_hash),
@@ -668,6 +671,8 @@ impl AdminControlRpc for AdminRpcServer {
         self.control
             .app_server
             .db
+            .get()
+            .await?
             .execute(
                 "INSERT INTO ip_bans (cidr, reason, expires_at, inserted_at)
                  VALUES (?1, ?2, ?3, CAST(unixepoch('subsec') * 1000 AS INTEGER))
@@ -711,6 +716,8 @@ impl AdminControlRpc for AdminRpcServer {
         self.control
             .app_server
             .db
+            .get()
+            .await?
             .execute(
                 "DELETE FROM ip_bans WHERE cidr = ?1",
                 libsql::params!(encode_cidr_blob(cidr)),
@@ -774,6 +781,8 @@ impl AdminControlRpc for AdminRpcServer {
         self.control
             .app_server
             .db
+            .get()
+            .await?
             .execute(
                 "INSERT INTO status_tickers (sort_order, content, expires_at)
                  SELECT COALESCE(MAX(sort_order), 0) + 1, ?1, ?2
@@ -790,7 +799,8 @@ impl AdminControlRpc for AdminRpcServer {
         _: context::Context,
         request: TickerReorderRequest,
     ) -> Result<(), RpcError> {
-        let tx = self.control.app_server.db.transaction().await?;
+        let db = self.control.app_server.db.get().await?;
+        let tx = db.transaction().await?;
         let mut rows = tx
             .query(
                 "SELECT id FROM status_tickers ORDER BY sort_order ASC, id ASC",
@@ -842,14 +852,12 @@ impl AdminControlRpc for AdminRpcServer {
         _: context::Context,
         request: TickerRemoveRequest,
     ) -> Result<(), RpcError> {
-        self.control
-            .app_server
-            .db
-            .execute(
-                "DELETE FROM status_tickers WHERE id = ?1",
-                libsql::params!(request.ticker_id),
-            )
-            .await?;
+        let db = self.control.app_server.db.get().await?;
+        db.execute(
+            "DELETE FROM status_tickers WHERE id = ?1",
+            libsql::params!(request.ticker_id),
+        )
+        .await?;
         self.control.refresh_status_bar_state().await?;
         Ok(())
     }
@@ -897,10 +905,8 @@ impl AdminControlRpc for AdminRpcServer {
         validate_shortname(&request.shortname)?;
         let secret = random_token_secret();
         let token_hash = sha256_hex(&secret);
-        let mut rows = self
-            .control
-            .app_server
-            .db
+        let db = self.control.app_server.db.get().await?;
+        let mut rows = db
             .query(
                 "INSERT INTO app_tokens (shortname, token_hash)
                  VALUES (?1, ?2)
@@ -932,10 +938,8 @@ impl AdminControlRpc for AdminRpcServer {
     }
 
     async fn app_list(self, _: context::Context) -> Result<Vec<AppSummary>, RpcError> {
-        let mut rows = self
-            .control
-            .app_server
-            .db
+        let db = self.control.app_server.db.get().await?;
+        let mut rows = db
             .query(
                 "SELECT a.id,
                         COALESCE(json_extract(g.details, '$.author'), ''),
@@ -972,10 +976,8 @@ impl AdminControlRpc for AdminRpcServer {
     ) -> Result<RotateAppTokenResponse, RpcError> {
         let secret = random_token_secret();
         let token_hash = sha256_hex(&secret);
-        let mut rows = self
-            .control
-            .app_server
-            .db
+        let db = self.control.app_server.db.get().await?;
+        let mut rows = db
             .query(
                 "UPDATE app_tokens
                  SET token_hash = ?2
@@ -1204,7 +1206,8 @@ impl AppControlRpc for AppRpcServer {
             validate_app_envs(envs)?;
         }
         let details_json = serde_json::to_string(&manifest.details)?;
-        let tx = self.control.app_server.db.transaction().await?;
+        let db = self.control.app_server.db.get().await?;
+        let tx = db.transaction().await?;
         let wasm_hash = hash_bytes(&request.wasm);
         let env_blob = match request.envs.as_deref() {
             Some(envs) => Some((
@@ -1639,9 +1642,10 @@ async fn send_spy_event(
 }
 
 async fn load_app_token_record_by_shortname(
-    db: &libsql::Connection,
+    db: &DbPool,
     shortname: &str,
 ) -> anyhow::Result<Option<AppTokenRecord>> {
+    let db = db.get().await?;
     let mut rows = db
         .query(
             "SELECT id, shortname, token_hash FROM app_tokens WHERE shortname = ?1 LIMIT 1",
@@ -1697,7 +1701,7 @@ fn app_import_staleness(imports: &[String]) -> (bool, Vec<StaleImport>) {
 }
 
 async fn load_app_self_info_records_by_shortnames<'a>(
-    db: &libsql::Connection,
+    db: &DbPool,
     shortnames: impl IntoIterator<Item = &'a str>,
 ) -> anyhow::Result<HashMap<String, AppSelfInfoRecord>> {
     let shortnames = shortnames
@@ -1723,6 +1727,7 @@ async fn load_app_self_info_records_by_shortnames<'a>(
          WHERE app_tokens.shortname IN ({placeholders})"
     );
 
+    let db = db.get().await?;
     let mut rows = db
         .query(&query, libsql::params_from_iter(shortnames))
         .await?;
@@ -1772,9 +1777,10 @@ fn matching_app_token_count(token_hash: &str, claims: &[AppTokenClaims]) -> u32 
 }
 
 async fn load_app_env_blob(
-    db: &libsql::Connection,
+    db: &DbPool,
     shortname: &str,
 ) -> anyhow::Result<Option<(u64, Vec<u8>, Vec<u8>)>> {
+    let db = db.get().await?;
     let mut rows = db
         .query(
             "SELECT id, env_salt, env_blob FROM apps WHERE shortname = ?1 LIMIT 1",
@@ -1792,7 +1798,7 @@ async fn load_app_env_blob(
 }
 
 async fn store_app_envs(
-    db: &libsql::Connection,
+    db: &DbPool,
     app_id: u64,
     previous_env_hash: ContentHash,
     env_hash: ContentHash,
@@ -1802,6 +1808,7 @@ async fn store_app_envs(
         return Ok(None);
     }
     let updated_at_ns = current_unix_nanos();
+    let db = db.get().await?;
     let tx = db.transaction().await?;
     tx.execute(
         "UPDATE apps
@@ -1838,7 +1845,8 @@ async fn publish_app_build_update(
     Ok(())
 }
 
-async fn load_app_build_id(db: &libsql::Connection, app_id: u64) -> anyhow::Result<BuildId> {
+async fn load_app_build_id(db: &DbPool, app_id: u64) -> anyhow::Result<BuildId> {
+    let db = db.get().await?;
     let mut rows = db
         .query(
             "SELECT wasm_hash, env_hash FROM apps WHERE id = ?1 LIMIT 1",
@@ -1853,9 +1861,10 @@ async fn load_app_build_id(db: &libsql::Connection, app_id: u64) -> anyhow::Resu
 }
 
 async fn delete_app_token_and_app(
-    db: &libsql::Connection,
+    db: &DbPool,
     app_token_id: u64,
 ) -> anyhow::Result<Option<(Option<AppRuntimeUpdateMessage>, String)>> {
+    let db = db.get().await?;
     let tx = db.transaction().await?;
     let mut rows = tx
         .query(
@@ -1904,7 +1913,8 @@ async fn delete_app_token_and_app(
     Ok(Some((update, shortname)))
 }
 
-async fn load_ticker_entries(db: &libsql::Connection) -> anyhow::Result<Vec<TickerEntry>> {
+async fn load_ticker_entries(db: &DbPool) -> anyhow::Result<Vec<TickerEntry>> {
+    let db = db.get().await?;
     let mut rows = db
         .query(
             "SELECT id, content, expires_at, sort_order, created_at
@@ -1931,7 +1941,8 @@ async fn load_ticker_entries(db: &libsql::Connection) -> anyhow::Result<Vec<Tick
     Ok(entries)
 }
 
-async fn load_ban_entries(db: &libsql::Connection) -> anyhow::Result<Vec<BanEntry>> {
+async fn load_ban_entries(db: &DbPool) -> anyhow::Result<Vec<BanEntry>> {
+    let db = db.get().await?;
     let mut rows = db
         .query(
             "SELECT cidr, COALESCE(reason, ''), expires_at, inserted_at
@@ -1959,7 +1970,7 @@ async fn load_ban_entries(db: &libsql::Connection) -> anyhow::Result<Vec<BanEntr
 }
 
 pub async fn load_status_bar_state(
-    db: &libsql::Connection,
+    db: &DbPool,
     broadcast: Option<StatusBroadcast>,
 ) -> anyhow::Result<StatusBarState> {
     let tickers = load_ticker_entries(db).await?;

@@ -37,6 +37,7 @@ use crate::{
     app_registry::{AppRuntimeRegistry, AppRuntimeSession},
     audio::Mixer,
     control::StatusBarState,
+    db::DbPool,
     log_backend::GuestLogBackend,
     mesh::{AppId, BuildId, Mesh, PeerId, PeerMessageApp},
     rate_limiting::{NetworkInfo, TokenBucket},
@@ -323,7 +324,7 @@ impl SessionUi {
 pub struct AppServer {
     linker: Arc<wasmtime::Linker<AppState>>,
     engine: wasmtime::Engine,
-    pub db: libsql::Connection,
+    pub db: DbPool,
     mesh: Mesh,
     app_env_secret_key: Arc<str>,
     app_registry: AppRuntimeRegistry,
@@ -370,7 +371,7 @@ pub struct SessionOutput {
 impl AppServer {
     pub fn new(
         mesh: Mesh,
-        db: libsql::Connection,
+        db: DbPool,
         app_env_secret_key: impl Into<Arc<str>>,
     ) -> anyhow::Result<Self> {
         let mut config = wasmtime::Config::new();
@@ -936,8 +937,8 @@ impl AppServer {
         session_identity: &SessionIdentity,
         shortname: String,
     ) -> anyhow::Result<(PreloadedAppState, wasmtime::InstancePre<AppState>)> {
-        let mut app_rows = ctx
-            .db
+        let db = ctx.db.get().await?;
+        let mut app_rows = db
             .query(
                 "SELECT id, wasm, wasm_hash, env_hash, env_salt, env_blob, build_updated_at
                  FROM apps
@@ -989,8 +990,7 @@ impl AppServer {
             envs.push(("USER_ID".to_string(), user_id.to_string()));
         }
         if let Some(user_id) = ctx.user_id
-            && let Ok(mut rows) = ctx
-                .db
+            && let Ok(mut rows) = db
                 .query(
                     "SELECT locale FROM users WHERE id = ?1 LIMIT 1",
                     libsql::params!(user_id),
@@ -1033,7 +1033,7 @@ fn trigger_replay_upload(
     notification_tx: &SessionNotificationSender,
     replay_buffer: &ReplayBuffer,
     replay_last_at: &mut Duration,
-    db: libsql::Connection,
+    db: DbPool,
     menu_session: MenuSessionState,
     user_id: Option<u64>,
     username: String,
@@ -1104,7 +1104,7 @@ pub struct PreloadedAppState {
 
 #[derive(Clone)]
 pub struct AppContext {
-    db: libsql::Connection,
+    db: DbPool,
     mesh: Mesh,
     about_runtime: AboutRuntimeInfo,
     app_env_secret_key: Arc<str>,
@@ -1836,13 +1836,17 @@ fn get_install_id() -> &'static str {
 }
 
 async fn save_replay(
-    db: &libsql::Connection,
+    db: &DbPool,
     mut menu_session: MenuSessionState,
     user_id: Option<u64>,
     app_id: AppId,
     username: &str,
     asciicast: &[u8],
 ) -> (Result<String, String>, Option<MenuSessionState>) {
+    let db = match db.get().await {
+        Ok(db) => db,
+        Err(error) => return (Err(error.to_string()), None),
+    };
     let url = match upload_asciicast(username, asciicast).await {
         Ok(u) => u,
         Err(e) => return (Err(e), None),

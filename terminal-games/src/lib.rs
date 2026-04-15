@@ -7,6 +7,7 @@ pub mod app_env;
 pub mod app_registry;
 mod audio;
 pub mod control;
+pub mod db;
 pub mod input_guard;
 pub mod log_backend;
 pub mod manifest;

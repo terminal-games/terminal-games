@@ -13,7 +13,10 @@ use prometheus::{
     Encoder, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder, core::Collector,
 };
 use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-use terminal_games::app::{SessionAppState, SessionEndReason};
+use terminal_games::{
+    app::{SessionAppState, SessionEndReason},
+    db::DbPool,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Transport {
@@ -220,7 +223,7 @@ pub struct ServerMetrics {
     local_registry: Registry,
     global_registry: Registry,
     node: String,
-    db: libsql::Connection,
+    db: DbPool,
     duration_writer: tokio::sync::mpsc::UnboundedSender<DurationRecord>,
 
     admission_waiting_sessions: IntGaugeVec,
@@ -243,11 +246,7 @@ pub struct ServerMetrics {
 }
 
 impl ServerMetrics {
-    pub async fn new(
-        node: String,
-        admission_max_running: usize,
-        db: libsql::Connection,
-    ) -> Result<Arc<Self>> {
+    pub async fn new(node: String, admission_max_running: usize, db: DbPool) -> Result<Arc<Self>> {
         let local_registry = Registry::new();
         let global_registry = Registry::new();
 
@@ -671,10 +670,7 @@ impl ServerMetrics {
     }
 }
 
-fn spawn_duration_writer(
-    db: libsql::Connection,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<DurationRecord>,
-) {
+fn spawn_duration_writer(db: DbPool, mut rx: tokio::sync::mpsc::UnboundedReceiver<DurationRecord>) {
     tokio::spawn(async move {
         while let Some(record) = rx.recv().await {
             match persist_duration_record(&db, &record).await {
@@ -693,7 +689,8 @@ fn spawn_duration_writer(
     });
 }
 
-async fn persist_duration_record(db: &libsql::Connection, record: &DurationRecord) -> Result<()> {
+async fn persist_duration_record(db: &DbPool, record: &DurationRecord) -> Result<()> {
+    let db = db.get().await?;
     let tx = db
         .transaction()
         .await
@@ -743,7 +740,8 @@ async fn persist_duration_record(db: &libsql::Connection, record: &DurationRecor
     Ok(())
 }
 
-async fn load_persisted_shortname_durations(db: &libsql::Connection) -> Result<Vec<(String, f64)>> {
+async fn load_persisted_shortname_durations(db: &DbPool) -> Result<Vec<(String, f64)>> {
+    let db = db.get().await?;
     let mut rows = db
         .query(
             "SELECT shortname, CAST(duration_seconds AS REAL)
