@@ -1843,15 +1843,15 @@ async fn save_replay(
     username: &str,
     asciicast: &[u8],
 ) -> (Result<String, String>, Option<MenuSessionState>) {
-    let db = match db.get().await {
-        Ok(db) => db,
-        Err(error) => return (Err(error.to_string()), None),
-    };
     let url = match upload_asciicast(username, asciicast).await {
         Ok(u) => u,
         Err(e) => return (Err(e), None),
     };
     if let Some(uid) = user_id {
+        let db = match db.get().await {
+            Ok(db) => db,
+            Err(error) => return (Err(error.to_string()), None),
+        };
         let now = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
