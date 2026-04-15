@@ -32,6 +32,7 @@ use terminal_games::{
     },
     app_env::{encrypt_app_env_blob, validate_app_envs},
     control::{AppEnvVar, CONTROL_API_VERSION, StatusBarState},
+    db::{DbPool, LibsqlConnectionManager},
     input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker},
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
     manifest::{extract_manifest_from_wasm, sanitize_manifest},
@@ -461,9 +462,8 @@ async fn upsert_game(
     Ok((shortname, update))
 }
 
-async fn load_local_app_build_snapshot(
-    conn: &libsql::Connection,
-) -> Result<Vec<AppRuntimeUpdateMessage>> {
+async fn load_local_app_build_snapshot(db: &DbPool) -> Result<Vec<AppRuntimeUpdateMessage>> {
+    let conn = db.get().await?;
     let mut updates = Vec::new();
     let mut game_rows = conn
         .query(
@@ -491,11 +491,11 @@ fn current_unix_nanos() -> i64 {
 }
 
 async fn sync_local_app_build_snapshot(
-    conn: &libsql::Connection,
+    db: &DbPool,
     app_server: &AppServer,
     mesh: &Mesh,
 ) -> Result<()> {
-    let snapshot = load_local_app_build_snapshot(conn).await?;
+    let snapshot = load_local_app_build_snapshot(db).await?;
     app_server.app_registry().sync_snapshot(snapshot.clone());
     mesh.replace_app_runtime_snapshot(snapshot).await;
     Ok(())
@@ -537,25 +537,9 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let db_path = data_dir.join("terminal-games.db");
 
-    let db = libsql::Builder::new_local(&db_path)
-        .build()
+    let db = LibsqlConnectionManager::new_local_pool(&db_path)
         .await
-        .context("Failed to initialize local libsql client")?;
-
-    let conn = db
-        .connect()
-        .context("Failed to connect to local database")?;
-
-    let tx = conn
-        .transaction()
-        .await
-        .context("Failed to start migration transaction")?;
-    tx.execute_batch(include_str!("../../terminal-games/libsql/migrate-001.sql"))
-        .await
-        .context("Failed to run migrate-001.sql")?;
-    tx.commit()
-        .await
-        .context("Failed to commit migration transaction")?;
+        .context("Failed to initialize local libsql pool")?;
 
     let wasm_path = Path::new(wasm_file)
         .canonicalize()
@@ -563,61 +547,64 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         .display()
         .to_string();
 
-    let mut local_app_updates = Vec::new();
-    let (first_app_shortname, update) = upsert_game(
-        &conn,
-        &app_env_secret_key,
-        wasm_path.as_str(),
-        None,
-        &primary_envs,
-    )
-    .await?;
-    if let Some(update) = update {
-        local_app_updates.push(update);
-    }
+    let (first_app_shortname, local_app_updates, user_id, locale, username) = {
+        let conn = db
+            .get()
+            .await
+            .context("Failed to connect to local database")?;
 
-    for app in &args.apps {
-        if let Some((shortname, path)) = app.split_once('=') {
-            let path = Path::new(path)
-                .canonicalize()
-                .context("Failed to resolve app path")?
-                .display()
-                .to_string();
-            let (_, update) = upsert_game(
-                &conn,
-                &app_env_secret_key,
-                path.as_str(),
-                Some(shortname),
-                &[],
-            )
-            .await?;
-            if let Some(update) = update {
-                local_app_updates.push(update);
+        let tx = conn
+            .transaction()
+            .await
+            .context("Failed to start migration transaction")?;
+        tx.execute_batch(include_str!("../../terminal-games/libsql/migrate-001.sql"))
+            .await
+            .context("Failed to run migrate-001.sql")?;
+        tx.commit()
+            .await
+            .context("Failed to commit migration transaction")?;
+
+        let mut local_app_updates = Vec::new();
+        let (first_app_shortname, update) = upsert_game(
+            &conn,
+            &app_env_secret_key,
+            wasm_path.as_str(),
+            None,
+            &primary_envs,
+        )
+        .await?;
+        if let Some(update) = update {
+            local_app_updates.push(update);
+        }
+
+        for app in &args.apps {
+            if let Some((shortname, path)) = app.split_once('=') {
+                let path = Path::new(path)
+                    .canonicalize()
+                    .context("Failed to resolve app path")?
+                    .display()
+                    .to_string();
+                let (_, update) = upsert_game(
+                    &conn,
+                    &app_env_secret_key,
+                    path.as_str(),
+                    Some(shortname),
+                    &[],
+                )
+                .await?;
+                if let Some(update) = update {
+                    local_app_updates.push(update);
+                }
             }
         }
-    }
 
-    let username = args
-        .username
-        .clone()
-        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "cli".to_string()));
-    let user_id = match conn
-        .query(
-            "SELECT id FROM users WHERE username = ?1 AND pubkey_fingerprint IS NULL LIMIT 1",
-            libsql::params!(username.as_str()),
-        )
-        .await
-    {
-        Ok(mut rows) => match rows.next().await {
-            Ok(Some(row)) => row.get::<u64>(0).ok(),
-            _ => None,
-        },
-        Err(_) => None,
-    };
-    let user_id = if user_id.is_none() {
-        match conn
+        let username = args
+            .username
+            .clone()
+            .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "cli".to_string()));
+        let user_id = match conn
             .query(
-                "INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (NULL, ?1, 'en') RETURNING id",
+                "SELECT id FROM users WHERE username = ?1 AND pubkey_fingerprint IS NULL LIMIT 1",
                 libsql::params!(username.as_str()),
             )
             .await
@@ -627,26 +614,49 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
                 _ => None,
             },
             Err(_) => None,
-        }
-    } else {
-        user_id
-    };
-    let locale = if let Some(uid) = user_id {
-        match conn
-            .query(
-                "SELECT locale FROM users WHERE id = ?1 LIMIT 1",
-                libsql::params!(uid),
-            )
-            .await
-        {
-            Ok(mut rows) => match rows.next().await {
-                Ok(Some(row)) => row.get::<String>(0).unwrap_or_else(|_| "en".to_string()),
-                _ => "en".to_string(),
-            },
-            Err(_) => "en".to_string(),
-        }
-    } else {
-        "en".to_string()
+        };
+        let user_id = if user_id.is_none() {
+            match conn
+                .query(
+                    "INSERT INTO users (pubkey_fingerprint, username, locale) VALUES (NULL, ?1, 'en') RETURNING id",
+                    libsql::params!(username.as_str()),
+                )
+                .await
+            {
+                Ok(mut rows) => match rows.next().await {
+                    Ok(Some(row)) => row.get::<u64>(0).ok(),
+                    _ => None,
+                },
+                Err(_) => None,
+            }
+        } else {
+            user_id
+        };
+        let locale = if let Some(uid) = user_id {
+            match conn
+                .query(
+                    "SELECT locale FROM users WHERE id = ?1 LIMIT 1",
+                    libsql::params!(uid),
+                )
+                .await
+            {
+                Ok(mut rows) => match rows.next().await {
+                    Ok(Some(row)) => row.get::<String>(0).unwrap_or_else(|_| "en".to_string()),
+                    _ => "en".to_string(),
+                },
+                Err(_) => "en".to_string(),
+            }
+        } else {
+            "en".to_string()
+        };
+
+        (
+            first_app_shortname,
+            local_app_updates,
+            user_id,
+            locale,
+            username,
+        )
     };
 
     let local_discovery = Arc::new(LocalDiscovery::new());
@@ -665,7 +675,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
 
     let app_server = Arc::new(AppServer::new(
         mesh.clone(),
-        conn,
+        db.clone(),
         app_env_secret_key.clone(),
     )?);
     let graceful_shutdown_token = CancellationToken::new();

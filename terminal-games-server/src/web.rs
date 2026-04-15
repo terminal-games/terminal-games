@@ -449,18 +449,22 @@ async fn handle_socket(
 ) {
     let (mut sender, mut receiver) = socket.split();
 
-    let app_exists = match server
-        .app_server
-        .db
-        .query(
-            "SELECT 1 FROM apps WHERE shortname = ?1 LIMIT 1",
-            libsql::params!(first_app_shortname.as_str()),
-        )
-        .await
-    {
-        Ok(mut rows) => matches!(rows.next().await, Ok(Some(_))),
+    let app_exists = match server.app_server.db.get().await {
+        Ok(db) => match db
+            .query(
+                "SELECT 1 FROM apps WHERE shortname = ?1 LIMIT 1",
+                libsql::params!(first_app_shortname.as_str()),
+            )
+            .await
+        {
+            Ok(mut rows) => matches!(rows.next().await, Ok(Some(_))),
+            Err(err) => {
+                tracing::warn!(error = ?err, "failed to validate requested app");
+                false
+            }
+        },
         Err(err) => {
-            tracing::warn!(error = ?err, "failed to validate requested app");
+            tracing::warn!(error = %err, "failed to acquire database connection");
             false
         }
     };

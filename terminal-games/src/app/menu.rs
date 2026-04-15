@@ -7,6 +7,7 @@ use super::{
     MENU_REQ_REPLAYS_LIST, MenuRequestJob, MenuRequestKind, MenuRequestState, MenuSessionState,
     MenuUpdate, PendingMenuRequest,
 };
+use crate::db::DbPool;
 use crate::wasm_abi::HostApiRegistration;
 
 inventory::submit! { HostApiRegistration::new("menu_request", "menu_request_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::menu_request_v1)) }
@@ -187,7 +188,7 @@ impl AppServer {
     }
 
     pub(in crate::app) async fn load_menu_games(
-        db: libsql::Connection,
+        db: DbPool,
         current_shortname: String,
     ) -> Result<Vec<u8>, String> {
         #[derive(serde::Serialize)]
@@ -202,6 +203,7 @@ impl AppServer {
             apps: Vec<AppOut>,
         }
 
+        let db = db.get().await.map_err(|e| e.to_string())?;
         let mut rows = db
             .query(
                 "SELECT id, shortname, details FROM apps WHERE shortname != ?1 ORDER BY id",
@@ -278,7 +280,7 @@ impl AppServer {
     }
 
     pub(in crate::app) async fn load_menu_profile(
-        db: libsql::Connection,
+        db: DbPool,
         user_id: Option<u64>,
         menu_session: MenuSessionState,
         menu_username: String,
@@ -289,12 +291,16 @@ impl AppServer {
             locale: String,
         }
 
+        let mut update = MenuUpdate::default();
+        let db = match db.get().await {
+            Ok(db) => db,
+            Err(error) => return (Err(error.to_string()), update),
+        };
         let mut profile = ProfileOut {
             username: menu_username,
             locale: menu_session.locale.clone(),
         };
 
-        let mut update = MenuUpdate::default();
         let mut had_row = false;
         if let Some(user_id) = user_id {
             let rows = db
@@ -327,13 +333,17 @@ impl AppServer {
     }
 
     pub(in crate::app) async fn save_menu_profile(
-        db: libsql::Connection,
+        db: DbPool,
         user_id: Option<u64>,
         _menu_session: MenuSessionState,
         username: String,
         locale: String,
     ) -> (Result<Vec<u8>, String>, MenuUpdate) {
         let mut update = MenuUpdate::default();
+        let db = match db.get().await {
+            Ok(db) => db,
+            Err(error) => return (Err(error.to_string()), update),
+        };
         if let Some(user_id) = user_id {
             let result = db
                 .execute(
@@ -352,7 +362,7 @@ impl AppServer {
     }
 
     pub(in crate::app) async fn load_menu_replays(
-        db: libsql::Connection,
+        db: DbPool,
         user_id: Option<u64>,
         mut menu_session: MenuSessionState,
         locale: String,
@@ -369,6 +379,10 @@ impl AppServer {
             replays: Vec<ReplayOut>,
         }
 
+        let db = match db.get().await {
+            Ok(db) => db,
+            Err(error) => return (Err(error.to_string()), MenuUpdate::default()),
+        };
         let mut replays = Vec::<ReplayOut>::new();
 
         if let Some(user_id) = user_id {
@@ -442,12 +456,16 @@ impl AppServer {
     }
 
     pub(in crate::app) async fn delete_menu_replay(
-        db: libsql::Connection,
+        db: DbPool,
         user_id: Option<u64>,
         mut menu_session: MenuSessionState,
         created_at: i64,
     ) -> (Result<Vec<u8>, String>, MenuUpdate) {
         let mut update = MenuUpdate::default();
+        let db = match db.get().await {
+            Ok(db) => db,
+            Err(error) => return (Err(error.to_string()), update),
+        };
         if let Some(user_id) = user_id {
             let result = db
                 .execute(
