@@ -75,8 +75,8 @@ pub async fn increment_for_enforcement(
     let retention_days = retention_days();
     let bucket_start = current_bucket_start();
     let cutoff_bucket_start = retained_bucket_cutoff(bucket_start, retention_days);
-    purge_expired_before(db, cutoff_bucket_start).await?;
     let db = db.get().await?;
+    purge_expired_before(&db, cutoff_bucket_start).await?;
 
     let mut entries = Vec::with_capacity(increments.len());
 
@@ -132,12 +132,11 @@ pub async fn increment_for_enforcement(
     })
 }
 
-pub async fn load_entries_page(
-    db: &DbPool,
+async fn load_entries_page(
+    db: &libsql::Connection,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<ClusterKickedIpEntry>> {
-    let db = db.get().await?;
     let cutoff_bucket_start = retained_bucket_cutoff(current_bucket_start(), retention_days());
     let mut rows = db
         .query(
@@ -182,15 +181,17 @@ pub async fn load_visible_page(
 ) -> Result<ClusterKickedIpListResponse> {
     const PAGE_SIZE: usize = 64;
 
-    purge_expired(db).await?;
-    let active_bans = load_active_ban_cidrs(db).await?;
+    let db = db.get().await?;
+    let cutoff_bucket_start = retained_bucket_cutoff(current_bucket_start(), retention_days());
+    purge_expired_before(&db, cutoff_bucket_start).await?;
+    let active_bans = load_active_ban_cidrs(&db).await?;
     let mut entries = Vec::with_capacity(limit);
     let mut matched_offset = 0_usize;
     let mut sql_offset = 0_i64;
     let mut has_more = false;
 
     loop {
-        let page = load_entries_page(db, PAGE_SIZE as i64, sql_offset).await?;
+        let page = load_entries_page(&db, PAGE_SIZE as i64, sql_offset).await?;
         if page.is_empty() {
             break;
         }
@@ -222,11 +223,11 @@ pub async fn load_visible_page(
 
 pub(crate) async fn purge_expired(db: &DbPool) -> Result<()> {
     let cutoff_bucket_start = retained_bucket_cutoff(current_bucket_start(), retention_days());
-    purge_expired_before(db, cutoff_bucket_start).await
+    let db = db.get().await?;
+    purge_expired_before(&db, cutoff_bucket_start).await
 }
 
-async fn purge_expired_before(db: &DbPool, cutoff_bucket_start: i64) -> Result<()> {
-    let db = db.get().await?;
+async fn purge_expired_before(db: &libsql::Connection, cutoff_bucket_start: i64) -> Result<()> {
     db.execute(
         "DELETE FROM cluster_kicked_ip_buckets
          WHERE bucket_start < ?1",
@@ -237,8 +238,7 @@ async fn purge_expired_before(db: &DbPool, cutoff_bucket_start: i64) -> Result<(
     Ok(())
 }
 
-async fn load_active_ban_cidrs(db: &DbPool) -> Result<Vec<ipnet::IpNet>> {
-    let db = db.get().await?;
+async fn load_active_ban_cidrs(db: &libsql::Connection) -> Result<Vec<ipnet::IpNet>> {
     let mut rows = db
         .query(
             "SELECT cidr, expires_at
