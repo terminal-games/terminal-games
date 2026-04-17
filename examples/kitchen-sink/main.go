@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -497,28 +498,61 @@ func refreshKVState(status string) tea.Cmd {
 func incrementKV() tea.Cmd {
 	return func() tea.Msg {
 		key := currentDateKey()
+		nextValue, err := incrementKVWithCAS(key)
+		if err != nil {
+			return kvStateMsg{status: fmt.Sprintf("KV increment failed: %v", err), entries: "KV unavailable"}
+		}
+
+		return refreshKVState(fmt.Sprintf("committed %s=%d", currentDateString(), nextValue))()
+	}
+}
+
+func incrementKVWithCAS(key []any) (uint64, error) {
+	for attempt := 0; attempt < 8; attempt++ {
 		value, err := kv.Get(key...)
 		if err != nil {
-			return kvStateMsg{status: fmt.Sprintf("KV get failed: %v", err), entries: "KV unavailable"}
+			return 0, err
 		}
 
-		var current uint64
+		var builder *kv.AtomicBuilder
+		var nextValue uint64
 		switch value := value.(type) {
+		case nil:
+			nextValue = 1
+			builder = kv.Atomic().
+				CheckMissing(key...).
+				Set(nextValue, key...)
 		case uint64:
-			current = value
+			nextValue = value + 1
+			builder = kv.Atomic().
+				Check(value, key...).
+				Set(nextValue, key...)
 		case int64:
-			current = uint64(value)
+			if value < 0 {
+				return 0, fmt.Errorf("counter has unsupported negative value %d", value)
+			}
+			nextValue = uint64(value + 1)
+			builder = kv.Atomic().
+				Check(value, key...).
+				Set(value+1, key...)
+		default:
+			return 0, fmt.Errorf("counter has unsupported type %T", value)
 		}
 
-		err = kv.Atomic().
-			Set(current+1, key...).
-			Exec()
-		if err != nil {
-			return kvStateMsg{status: fmt.Sprintf("KV commit failed: %v", err), entries: "KV unavailable"}
+		if err := builder.Exec(); err != nil {
+			if isKVCheckFailed(err) {
+				continue
+			}
+			return 0, err
 		}
-
-		return refreshKVState(fmt.Sprintf("committed %s=%d", currentDateString(), current+1))()
+		return nextValue, nil
 	}
+
+	return 0, fmt.Errorf("counter update conflicted too many times")
+}
+
+func isKVCheckFailed(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "kv check failed:")
 }
 
 func currentDateKey() []any {

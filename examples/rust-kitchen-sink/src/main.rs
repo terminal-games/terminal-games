@@ -19,7 +19,7 @@ use tachyonfx::{Interpolation, Motion, fx};
 use terminal_games_sdk::{
     app,
     audio::{OggVorbisResource, Resource, mixer},
-    kv::{self, Value},
+    kv::{self, Error as KvError, Value},
     network::Conn,
     peer::{self, PeerId},
     terminal::{TerminalGamesBackend, TerminalReader},
@@ -247,20 +247,11 @@ async fn main() -> std::io::Result<()> {
                     }
                     terminput::key!(terminput::KeyCode::Char('v')) => {
                         let today_key = current_date_key();
-                        let current = kv::get(today_key.clone())
-                            .await
-                            .map_err(std::io::Error::other)?;
-                        let current_value = match current {
-                            Some(Value::U64(value)) => value,
-                            _ => 0,
-                        };
-                        kv::atomic()
-                            .set(current_value + 1, today_key)
-                            .exec()
+                        let current_value = increment_kv_with_cas(today_key)
                             .await
                             .map_err(std::io::Error::other)?;
                         kv_status =
-                            format!("committed {}={}", current_date_string(), current_value + 1);
+                            format!("committed {}={}", current_date_string(), current_value);
                         kv_entries_text =
                             refresh_kv_entries().await.map_err(std::io::Error::other)?;
                         last_kv_refresh = Instant::now();
@@ -491,6 +482,50 @@ async fn refresh_kv_entries() -> Result<String, terminal_games_sdk::kv::Error> {
 
 fn current_date_key() -> terminal_games_sdk::kv::Key {
     terminal_games_sdk::kv_key![current_date_string()]
+}
+
+async fn increment_kv_with_cas(key: terminal_games_sdk::kv::Key) -> Result<u64, String> {
+    for _ in 0..8 {
+        let current = kv::get(key.clone()).await.map_err(|err| err.to_string())?;
+        let (next_value, commit) = match current {
+            None => (
+                1,
+                kv::atomic()
+                    .check_missing(key.clone())
+                    .set(1_u64, key.clone()),
+            ),
+            Some(Value::U64(value)) => (
+                value + 1,
+                kv::atomic()
+                    .check(value, key.clone())
+                    .set(value + 1, key.clone()),
+            ),
+            Some(Value::I64(value)) if value >= 0 => (
+                (value as u64) + 1,
+                kv::atomic()
+                    .check(value, key.clone())
+                    .set(value + 1, key.clone()),
+            ),
+            Some(Value::I64(value)) => {
+                return Err(format!("counter has unsupported negative value {value}"));
+            }
+            Some(other) => {
+                return Err(format!("counter has unsupported value {other:?}"));
+            }
+        };
+
+        match commit.exec().await {
+            Ok(()) => return Ok(next_value),
+            Err(err) if is_kv_check_failed(&err) => continue,
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+
+    Err("counter update conflicted too many times".to_string())
+}
+
+fn is_kv_check_failed(err: &KvError) -> bool {
+    matches!(err, KvError::RequestFailed(message) if message.starts_with("kv check failed:"))
 }
 
 fn current_date_string() -> String {
