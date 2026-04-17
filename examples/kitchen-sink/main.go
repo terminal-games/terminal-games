@@ -14,6 +14,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/terminal-games/terminal-games/pkg/app"
 	"github.com/terminal-games/terminal-games/pkg/audio"
 	"github.com/terminal-games/terminal-games/pkg/bubblewrap"
+	"github.com/terminal-games/terminal-games/pkg/kv"
 	_ "github.com/terminal-games/terminal-games/pkg/log"
 	_ "github.com/terminal-games/terminal-games/pkg/net/http"
 	"github.com/terminal-games/terminal-games/pkg/peer"
@@ -49,6 +51,9 @@ type model struct {
 	newVersionAvailable bool
 	audioPlaying        bool
 	audioVolume         float32
+	kvStatus            string
+	kvEntries           string
+	isHoveringKVRefresh bool
 }
 
 type httpBodyMsg string
@@ -58,6 +63,11 @@ type tickMsg time.Time
 type peerListMsg []peer.ID
 
 type networkInfoMsg app.NetworkInfo
+type kvStateMsg struct {
+	status  string
+	entries string
+}
+type kvRefreshTickMsg time.Time
 
 type peerMessage struct {
 	From          peer.ID
@@ -124,6 +134,8 @@ func main() {
 		networkInfo:     app.NetworkInfo{},
 		audioPlaying:    audioPlaying,
 		audioVolume:     initialVolume,
+		kvStatus:        "press 'v' to bump today's counter",
+		kvEntries:       "No KV entries yet",
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -135,7 +147,15 @@ func main() {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(tea.RequestBackgroundColor, tick(), listenForPeerMessage(), refreshPeerList(), refreshNetworkInfo(m.networkInfo))
+	return tea.Batch(
+		tea.RequestBackgroundColor,
+		tick(),
+		kvRefreshTick(),
+		listenForPeerMessage(),
+		refreshPeerList(),
+		refreshNetworkInfo(m.networkInfo),
+		refreshKVState(""),
+	)
 }
 
 func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -151,7 +171,11 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.x = mouse.X
 		m.y = mouse.Y
 		m.isHoveringZone = zone.Get("myId").InBounds(msg)
+		m.isHoveringKVRefresh = zone.Get("kvRefresh").InBounds(msg)
 		isHoveringAudio.Store(m.isHoveringZone)
+		if click, ok := msg.(tea.MouseClickMsg); ok && click.Mouse().Button == tea.MouseLeft && m.isHoveringKVRefresh {
+			return m, refreshKVState("refreshed")
+		}
 		return m, nil
 	case tea.KeyPressMsg:
 		m.lastChar = msg.String()
@@ -237,6 +261,8 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				song.SetVolume(m.audioVolume)
 			}
 			return m, nil
+		case "v":
+			return m, incrementKV()
 		}
 	case tickMsg:
 		m.timeLeft--
@@ -245,6 +271,8 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		return m, tea.Batch(tick(), refreshPeerList(), refreshNetworkInfo(m.networkInfo))
+	case kvRefreshTickMsg:
+		return m, tea.Batch(kvRefreshTick(), refreshKVState("refreshed"))
 	case networkInfoMsg:
 		m.networkInfo = app.NetworkInfo(msg)
 		return m, nil
@@ -253,6 +281,10 @@ func (m model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if m.selectedPeerIdx >= len(m.peers) {
 			m.selectedPeerIdx = max(0, len(m.peers)-1)
 		}
+		return m, nil
+	case kvStateMsg:
+		m.kvStatus = msg.status
+		m.kvEntries = msg.entries
 		return m, nil
 	case httpBodyMsg:
 		m.httpBody = string(msg)
@@ -289,6 +321,11 @@ func (m model) View() tea.View {
 		hoverString = "[hello there]"
 	}
 	markedZone := zone.Mark("myId", hoverString)
+	refreshButtonText := "[ Refresh KV ]"
+	if m.isHoveringKVRefresh {
+		refreshButtonText = lipgloss.NewStyle().Bold(true).Underline(true).Render(refreshButtonText)
+	}
+	refreshButton := zone.Mark("kvRefresh", refreshButtonText)
 
 	peerListText := "No peers connected"
 	if len(m.peers) > 0 {
@@ -355,6 +392,8 @@ func (m model) View() tea.View {
 			"New Version Available: %v\n\n"+
 			"Audio: %s\n"+
 			"  [Space]=Play/Pause  [+/-]=Volume  [M]=Mute\n\n"+
+			"KV: %s\n"+
+			"  [V]=Bump today's counter  %s (auto refresh every 10s)\n%s\n\n"+
 			"Network: ↑%.0f B/s ↓%.0f B/s RTT %dms throttled: %s\n\n"+
 			"Peers (↑/↓ to select, Enter to send message):\n%s\n\n"+
 			"Recent Messages:\n%s\n\n"+
@@ -363,6 +402,9 @@ func (m model) View() tea.View {
 		m.peerID.String(),
 		m.newVersionAvailable,
 		audioStatus,
+		m.kvStatus,
+		refreshButton,
+		m.kvEntries,
 		m.networkInfo.BytesPerSecIn, m.networkInfo.BytesPerSecOut, m.networkInfo.LatencyMs, lastThrottledStr,
 		peerListText,
 		peerMessagesText,
@@ -383,6 +425,12 @@ func TerminalOSC8Link(link, text string) string {
 func tick() tea.Cmd {
 	return tea.Tick(time.Second, func(t time.Time) tea.Msg {
 		return tickMsg(t)
+	})
+}
+
+func kvRefreshTick() tea.Cmd {
+	return tea.Tick(10*time.Second, func(t time.Time) tea.Msg {
+		return kvRefreshTickMsg(t)
 	})
 }
 
@@ -423,6 +471,128 @@ func refreshNetworkInfo(prev app.NetworkInfo) tea.Cmd {
 			return networkInfoMsg(prev)
 		}
 		return networkInfoMsg(info)
+	}
+}
+
+func refreshKVState(status string) tea.Cmd {
+	return func() tea.Msg {
+		entries, err := loadRecentKVEntries()
+		if err != nil {
+			if status == "" {
+				status = fmt.Sprintf("KV error: %v", err)
+			}
+			return kvStateMsg{status: status, entries: "KV unavailable"}
+		}
+
+		if status == "" {
+			status = "KV ready"
+		}
+		return kvStateMsg{
+			status:  status,
+			entries: entries,
+		}
+	}
+}
+
+func incrementKV() tea.Cmd {
+	return func() tea.Msg {
+		key := currentDateKey()
+		value, err := kv.Get(key...)
+		if err != nil {
+			return kvStateMsg{status: fmt.Sprintf("KV get failed: %v", err), entries: "KV unavailable"}
+		}
+
+		var current uint64
+		switch value := value.(type) {
+		case uint64:
+			current = value
+		case int64:
+			current = uint64(value)
+		}
+
+		err = kv.Atomic().
+			Set(current+1, key...).
+			Exec()
+		if err != nil {
+			return kvStateMsg{status: fmt.Sprintf("KV commit failed: %v", err), entries: "KV unavailable"}
+		}
+
+		return refreshKVState(fmt.Sprintf("committed %s=%d", currentDateString(), current+1))()
+	}
+}
+
+func currentDateKey() []any {
+	return []any{currentDateString()}
+}
+
+func currentDateString() string {
+	return time.Now().UTC().Format("2006-01-02")
+}
+
+func dayString(offsetDays int) string {
+	return time.Now().UTC().AddDate(0, 0, offsetDays).Format("2006-01-02")
+}
+
+func loadRecentKVEntries() (string, error) {
+	start := kv.Tuple{dayString(-6)}
+	end := kv.Tuple{dayString(1)}
+	values := make(map[string]string, 7)
+	for entry, err := range kv.List(kv.Tuple{}, start, end) {
+		if err != nil {
+			return "", err
+		}
+		key := formatKVEntryKey(entry.Key)
+		values[key] = formatKVValue(entry.Value)
+	}
+
+	lines := make([]string, 0, 7)
+	for offset := -6; offset <= 0; offset++ {
+		key := dayString(offset)
+		value := values[key]
+		if value == "" {
+			value = "0"
+		}
+		lines = append(lines, fmt.Sprintf("%s = %s", key, value))
+	}
+	return fmt.Sprintf("Last 7 days:\n%s", joinLines(lines)), nil
+}
+
+func formatKVEntryKey(key kv.Tuple) string {
+	if len(key) == 1 {
+		if value, ok := key[0].(string); ok {
+			return value
+		}
+	}
+	return fmt.Sprint([]any(key))
+}
+
+func joinLines(lines []string) string {
+	result := ""
+	for i, line := range lines {
+		if i > 0 {
+			result += "\n"
+		}
+		result += line
+	}
+	return result
+}
+
+func formatKVValue(value any) string {
+	switch value := value.(type) {
+	case nil:
+		return "<missing>"
+	case string:
+		return value
+	case []byte:
+		return string(value)
+	case int64:
+		return strconv.FormatInt(value, 10)
+	case uint64:
+		return strconv.FormatUint(value, 10)
+	case bool:
+		return strconv.FormatBool(value)
+	default:
+		return fmt.Sprint(value)
 	}
 }
 

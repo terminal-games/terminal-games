@@ -25,9 +25,7 @@ impl LibsqlConnectionManager {
     }
 
     async fn build_pool(manager: Self) -> Result<DbPool, libsql::Error> {
-        Pool::builder()
-            .build(manager)
-            .await
+        Pool::builder().build(manager).await
     }
 
     async fn new_local(db_path: impl AsRef<Path>) -> libsql::Result<Self> {

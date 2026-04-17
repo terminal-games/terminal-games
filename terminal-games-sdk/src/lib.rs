@@ -5,6 +5,7 @@
 pub mod ansi_backend;
 pub mod app;
 pub mod audio;
+pub mod kv;
 pub mod log;
 pub mod peer;
 pub mod terminal;
@@ -149,5 +150,45 @@ mod internal {
     unsafe extern "C" {
         #[link_name = "log_v1"]
         pub(crate) fn log(level: u32, msg_ptr: *const u8, msg_len: u32) -> i32;
+    }
+
+    #[link(wasm_import_module = "terminal_games")]
+    unsafe extern "C" {
+        #[link_name = "kv_get_v1"]
+        pub(crate) fn kv_get(key_ptr: *const u8, key_len: u32) -> i32;
+        #[link_name = "kv_get_poll_v1"]
+        pub(crate) fn kv_get_poll(
+            request_id: i32,
+            value_ptr: *mut u8,
+            value_max_len: u32,
+            value_len_ptr: *mut u32,
+        ) -> i32;
+        #[link_name = "kv_exec_v1"]
+        pub(crate) fn kv_exec(commands_ptr: *const u8, commands_len: u32) -> i32;
+        #[link_name = "kv_exec_poll_v1"]
+        pub(crate) fn kv_exec_poll(
+            request_id: i32,
+            data_ptr: *mut u8,
+            data_max_len: u32,
+            data_len_ptr: *mut u32,
+        ) -> i32;
+        #[link_name = "kv_list_v1"]
+        pub(crate) fn kv_list(request_ptr: *const u8, request_len: u32) -> i32;
+        #[link_name = "kv_list_poll_v1"]
+        pub(crate) fn kv_list_poll(
+            request_id: i32,
+            data_ptr: *mut u8,
+            data_max_len: u32,
+            data_len_ptr: *mut u32,
+        ) -> i32;
+        #[link_name = "kv_storage_used_v1"]
+        pub(crate) fn kv_storage_used() -> i32;
+        #[link_name = "kv_storage_used_poll_v1"]
+        pub(crate) fn kv_storage_used_poll(
+            request_id: i32,
+            data_ptr: *mut u8,
+            data_max_len: u32,
+            data_len_ptr: *mut u32,
+        ) -> i32;
     }
 }

@@ -7,6 +7,7 @@ mod cluster_detection;
 mod cluster_kicked_ips;
 mod control;
 mod idle;
+mod kv;
 mod metrics;
 mod notifications;
 mod sessions;
@@ -25,7 +26,7 @@ use terminal_games::{
     app::AppServer,
     app_env::APP_ENV_KEY_ENV,
     db::{DbPool, LibsqlConnectionManager},
-    mesh::{AppRuntimeUpdateMessage, BuildId, EnvDiscovery, Mesh},
+    mesh::{AppRuntimeUpdateMessage, BuildId, EnvDiscovery, Mesh, NodeId},
 };
 
 const APP_ENV_DEV_FALLBACK_KEY: &str = "terminal-games-dev-app-env-key";
@@ -233,20 +234,34 @@ async fn main() -> Result<()> {
     let app_env_secret_key = load_app_env_secret_key();
 
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
+    let kv_leader_node = std::env::var("KV_LEADER_NODE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| mesh.node().to_string())
+        .parse::<NodeId>()
+        .map_err(|error| anyhow::anyhow!("invalid KV_LEADER_NODE_ID: {error}"))?;
+    let local_kv_backend = if mesh.node() == kv_leader_node {
+        Some(kv::load_backend_from_env().await?)
+    } else {
+        None
+    };
+    let kv_backend =
+        terminal_games::kv::load_mesh_backend(mesh.clone(), kv_leader_node, local_kv_backend)?;
+    let app_server = Arc::new(AppServer::new(
+        mesh.clone(),
+        db.clone(),
+        kv_backend,
+        app_env_secret_key,
+    )?);
     mesh.start_discovery().await?;
-    mesh.serve().await?;
+    mesh.serve(Some(app_server.kv_backend())).await?;
     let node_id = std::env::var("NODE_ID")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| mesh.node().to_string());
     let notifications = Arc::new(notifications::Notifications::from_env());
-
-    let app_server = Arc::new(AppServer::new(
-        mesh.clone(),
-        db.clone(),
-        app_env_secret_key,
-    )?);
     sync_app_build_snapshot(&db, &app_server, &mesh).await?;
     {
         let app_server = app_server.clone();

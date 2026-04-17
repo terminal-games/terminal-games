@@ -34,6 +34,7 @@ use terminal_games::{
     control::{AppEnvVar, CONTROL_API_VERSION, StatusBarState},
     db::{DbPool, LibsqlConnectionManager},
     input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker},
+    kv::{LibsqlKvBackendOptions, load_libsql_backend},
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
     manifest::{extract_manifest_from_wasm, sanitize_manifest},
     mesh::AppRuntimeUpdateMessage,
@@ -536,6 +537,7 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         .join("terminal-games-cli");
     std::fs::create_dir_all(&data_dir)?;
     let db_path = data_dir.join("terminal-games.db");
+    let kv_db_path = data_dir.join("kv.db");
 
     let db = LibsqlConnectionManager::new_local_pool(&db_path)
         .await
@@ -664,20 +666,24 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         .allocate_node()
         .expect("Failed to allocate node");
     let mesh = Mesh::with_node(local_discovery.clone(), node);
+    let local_kv_backend = load_libsql_backend(LibsqlKvBackendOptions::new(kv_db_path)).await?;
+    let kv_backend =
+        terminal_games::kv::load_mesh_backend(mesh.clone(), mesh.node(), Some(local_kv_backend))
+            .expect("Failed to initialize mesh KV backend");
+    let app_server = Arc::new(AppServer::new(
+        mesh.clone(),
+        db.clone(),
+        kv_backend,
+        app_env_secret_key.clone(),
+    )?);
     let local_addr = mesh
-        .serve_on(([127, 0, 0, 1], 0).into())
+        .serve_on(([127, 0, 0, 1], 0).into(), Some(app_server.kv_backend()))
         .await
         .expect("Failed to start mesh server");
     local_discovery
         .register(node, local_addr.port())
         .expect("Failed to register with local discovery");
     mesh.start_discovery().await?;
-
-    let app_server = Arc::new(AppServer::new(
-        mesh.clone(),
-        db.clone(),
-        app_env_secret_key.clone(),
-    )?);
     let graceful_shutdown_token = CancellationToken::new();
     {
         let app_server = app_server.clone();

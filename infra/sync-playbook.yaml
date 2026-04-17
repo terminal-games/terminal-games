@@ -23,7 +23,19 @@
           - METRICS_BEARER_TOKEN | length > 0
           - SSH_HOST_KEY_BASE64 is defined
           - SSH_HOST_KEY_BASE64 | length > 0
+          - hostvars[inventory_hostname].kv_leader_node_id is defined
+          - hostvars[inventory_hostname].kv_leader_node_id | length > 0
         fail_msg: "Set MESH_PINNED_PEM, LIBSQL_AUTH_TOKEN, LIBSQL_URL, ADMIN_SHARED_SECRET, AUTHOR_ENV_SECRET_KEY, METRICS_BEARER_TOKEN, and SSH_HOST_KEY_BASE64."
+      no_log: true
+
+    - name: Validate KV backend configuration on the leader
+      ansible.builtin.assert:
+        that:
+          - KV_BACKEND is defined
+          - KV_BACKEND | length > 0
+          - KV_BACKEND != "s3" or (KV_S3_BUCKET is defined and KV_S3_BUCKET | length > 0)
+        fail_msg: "Set KV_BACKEND in secrets.yml, and set KV_S3_BUCKET there when KV_BACKEND is s3."
+      when: hostvars[inventory_hostname].node_id == hostvars[inventory_hostname].kv_leader_node_id
       no_log: true
 
     - name: Verify local server binary exists
@@ -40,7 +52,7 @@
           - server_binary_stat.stat.isreg
         fail_msg: "Server binary missing at {{ server_binary_local_path }}. Build it first."
 
-    - name: Ensure runtime directories exist
+    - name: Ensure base runtime directories exist
       ansible.builtin.file:
         path: "{{ item }}"
         state: directory
@@ -50,6 +62,26 @@
       loop:
         - /opt/terminal-games/bin
         - /etc/terminal-games
+
+    - name: Ensure KV cache directory exists on the leader
+      ansible.builtin.file:
+        path: "{{ KV_CACHE_DIR | default('/opt/terminal-games/kv-cache') }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: hostvars[inventory_hostname].node_id == hostvars[inventory_hostname].kv_leader_node_id
+
+    - name: Ensure KV local libsql directory exists on the leader when local backend is enabled
+      ansible.builtin.file:
+        path: "{{ (KV_LIBSQL_PATH | default('/var/lib/terminal-games/kv/kv.db')) | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when:
+        - hostvars[inventory_hostname].node_id == hostvars[inventory_hostname].kv_leader_node_id
+        - (KV_BACKEND | default('libsql')) != "s3"
 
     - name: Deploy server binary
       ansible.builtin.copy:
