@@ -246,8 +246,11 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let kv_backend =
-        terminal_games::kv::load_mesh_backend(mesh.clone(), kv_leader_node, local_kv_backend)?;
+    let kv_backend = terminal_games::kv::load_mesh_backend(
+        mesh.clone(),
+        kv_leader_node,
+        local_kv_backend.clone(),
+    )?;
     let app_server = Arc::new(AppServer::new(
         mesh.clone(),
         db.clone(),
@@ -255,7 +258,7 @@ async fn main() -> Result<()> {
         app_env_secret_key,
     )?);
     mesh.start_discovery().await?;
-    mesh.serve(Some(app_server.kv_backend())).await?;
+    mesh.serve(local_kv_backend).await?;
     let node_id = std::env::var("NODE_ID")
         .ok()
         .map(|value| value.trim().to_string())
