@@ -17,8 +17,8 @@ use opendal::raw::{
 use opendal::{Buffer, EntryMode, ErrorKind as OpenDalErrorKind, Operator, services::S3};
 use serde::{Deserialize, Serialize};
 use terminal_games::kv::{
-    DEFAULT_KV_APP_MAX_BYTES, DEFAULT_KV_CHECKPOINT_INTERVAL_COMMITS, KvBackend, KvCommand,
-    KvEntry, KvKey, KvListPage, KvWrite, LibsqlKvBackendOptions, load_libsql_backend,
+    DEFAULT_KV_APP_MAX_BYTES, KvBackend, KvCommand, KvEntry, KvKey, KvListPage, KvWrite,
+    LibsqlKvBackendOptions, load_libsql_backend,
 };
 use tokio::sync::Mutex;
 
@@ -26,11 +26,12 @@ const DEFAULT_KV_S3_PREFIX: &str = "kv";
 const DEFAULT_KV_CACHE_DIR: &str = "/opt/terminal-games/kv-cache";
 const DEFAULT_KV_CACHE_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_KV_CACHE_DISK_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const DEFAULT_KV_S3_CHECKPOINT_INTERVAL_COMMITS: u64 = 256;
 
 pub async fn load_backend_from_env() -> anyhow::Result<Arc<dyn KvBackend>> {
     let max_app_bytes = read_env_u64("KV_APP_MAX_BYTES").unwrap_or(DEFAULT_KV_APP_MAX_BYTES);
     let checkpoint_interval_commits = read_env_u64("KV_CHECKPOINT_INTERVAL_COMMITS")
-        .unwrap_or(DEFAULT_KV_CHECKPOINT_INTERVAL_COMMITS)
+        .unwrap_or(DEFAULT_KV_S3_CHECKPOINT_INTERVAL_COMMITS)
         .max(1);
     let backend_kind = std::env::var("KV_BACKEND")
         .ok()
@@ -48,14 +49,13 @@ pub async fn load_backend_from_env() -> anyhow::Result<Arc<dyn KvBackend>> {
             return load_libsql_backend(LibsqlKvBackendOptions {
                 path,
                 max_app_bytes,
-                checkpoint_interval_commits,
             })
             .await;
         }
         other => anyhow::bail!("unsupported KV_BACKEND '{other}', expected 'libsql' or 's3'"),
     };
 
-    Ok(Arc::new(JournaledKvBackend {
+    Ok(Arc::new(S3KvBackend {
         store: Arc::new(store),
         max_app_bytes,
         checkpoint_interval_commits,
@@ -64,7 +64,7 @@ pub async fn load_backend_from_env() -> anyhow::Result<Arc<dyn KvBackend>> {
 }
 
 #[derive(Clone)]
-struct JournaledKvBackend {
+struct S3KvBackend {
     store: Arc<KvStore>,
     max_app_bytes: u64,
     checkpoint_interval_commits: u64,
@@ -93,7 +93,7 @@ struct JournalRecord {
     writes: Vec<KvWrite>,
 }
 
-impl JournaledKvBackend {
+impl S3KvBackend {
     async fn namespace(&self, app_id: u64) -> Arc<Mutex<AppState>> {
         let mut namespaces = self.namespaces.lock().await;
         namespaces
@@ -174,7 +174,7 @@ impl JournaledKvBackend {
 }
 
 #[async_trait]
-impl KvBackend for JournaledKvBackend {
+impl KvBackend for S3KvBackend {
     async fn get(&self, app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, String> {
         let namespace = self.namespace(app_id).await;
         let mut state = namespace.lock().await;
