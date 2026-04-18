@@ -48,11 +48,66 @@ pub enum KvWrite {
     Delete { key: KvKey },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvCheckFailedReason {
+    KeyMissing,
+    KeyExists,
+    ValueMismatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvError {
+    TooManyWritesInAtomicTransaction,
+    CheckFailed(KvCheckFailedReason),
+    QuotaExceeded {
+        app_id: u64,
+        used_bytes: u64,
+        limit_bytes: u64,
+    },
+    Unavailable,
+    Internal(String),
+}
+
+impl KvError {
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(message.into())
+    }
+}
+
+impl std::fmt::Display for KvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyWritesInAtomicTransaction => {
+                write!(f, "kv atomic transactions may contain at most one write")
+            }
+            Self::CheckFailed(reason) => match reason {
+                KvCheckFailedReason::KeyMissing => write!(f, "kv check failed: key missing"),
+                KvCheckFailedReason::KeyExists => write!(f, "kv check failed: key exists"),
+                KvCheckFailedReason::ValueMismatch => {
+                    write!(f, "kv check failed: value mismatch")
+                }
+            },
+            Self::QuotaExceeded {
+                app_id,
+                used_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "app {app_id} kv quota exceeded: {used_bytes} > {limit_bytes}"
+            ),
+            Self::Unavailable => write!(f, "kv unavailable"),
+            Self::Internal(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for KvError {}
+
 #[async_trait]
 pub trait KvBackend: Send + Sync {
-    async fn get(&self, app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, String>;
+    async fn get(&self, app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, KvError>;
 
-    async fn exec(&self, app_id: u64, commands: Vec<KvCommand>) -> Result<(), String>;
+    async fn exec(&self, app_id: u64, commands: Vec<KvCommand>) -> Result<(), KvError>;
 
     async fn list_page(
         &self,
@@ -61,9 +116,29 @@ pub trait KvBackend: Send + Sync {
         start: Option<KvKey>,
         end: Option<KvKey>,
         after: Option<KvKey>,
-    ) -> Result<KvListPage, String>;
+    ) -> Result<KvListPage, KvError>;
 
-    async fn storage_used(&self, app_id: u64) -> Result<u64, String>;
+    async fn storage_used(&self, app_id: u64) -> Result<u64, KvError>;
+}
+
+pub fn collect_kv_writes(commands: &[KvCommand]) -> Result<Vec<KvWrite>, KvError> {
+    let mut writes = Vec::new();
+    for command in commands {
+        match command {
+            KvCommand::Set { key, value } => writes.push(KvWrite::Set {
+                key: key.clone(),
+                value: value.clone(),
+            }),
+            KvCommand::Delete { key } => writes.push(KvWrite::Delete { key: key.clone() }),
+            KvCommand::CheckValue { .. }
+            | KvCommand::CheckExists { .. }
+            | KvCommand::CheckMissing { .. } => {}
+        }
+        if writes.len() > 1 {
+            return Err(KvError::TooManyWritesInAtomicTransaction);
+        }
+    }
+    Ok(writes)
 }
 
 #[derive(Debug, Clone)]
@@ -137,18 +212,17 @@ impl LibsqlKvBackend {
             .clone()
     }
 
-    async fn load_state(&self, app_id: u64, state: &mut AppState) -> Result<(), String> {
+    async fn load_state(&self, app_id: u64, state: &mut AppState) -> Result<(), KvError> {
         if state.loaded {
             return Ok(());
         }
 
-        state.records = self
-            .store
-            .load_records(app_id)
-            .await
-            .map_err(|error| format!("failed to load kv records: {error:#}"))?;
+        state.records =
+            self.store.load_records(app_id).await.map_err(|error| {
+                KvError::internal(format!("failed to load kv records: {error:#}"))
+            })?;
         state.total_bytes = total_bytes_for_records(&state.records)
-            .map_err(|error| format!("failed to measure kv state: {error:#}"))?;
+            .map_err(|error| KvError::internal(format!("failed to measure kv state: {error:#}")))?;
         state.loaded = true;
         Ok(())
     }
@@ -156,39 +230,38 @@ impl LibsqlKvBackend {
 
 #[async_trait]
 impl KvBackend for LibsqlKvBackend {
-    async fn get(&self, app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, String> {
+    async fn get(&self, app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, KvError> {
         let namespace = self.namespace(app_id).await;
         let mut state = namespace.lock().await;
         self.load_state(app_id, &mut state).await?;
         Ok(state.records.get(&key).cloned())
     }
 
-    async fn exec(&self, app_id: u64, commands: Vec<KvCommand>) -> Result<(), String> {
+    async fn exec(&self, app_id: u64, commands: Vec<KvCommand>) -> Result<(), KvError> {
         let namespace = self.namespace(app_id).await;
         let mut state = namespace.lock().await;
         self.load_state(app_id, &mut state).await?;
 
-        let mut writes = Vec::new();
-        for command in commands {
+        let writes = collect_kv_writes(&commands)?;
+        for command in &commands {
             match command {
-                KvCommand::Set { key, value } => writes.push(KvWrite::Set { key, value }),
-                KvCommand::Delete { key } => writes.push(KvWrite::Delete { key }),
+                KvCommand::Set { .. } | KvCommand::Delete { .. } => {}
                 KvCommand::CheckValue { key, value } => {
-                    let Some(existing) = state.records.get(&key) else {
-                        return Err("kv check failed: key missing".to_string());
+                    let Some(existing) = state.records.get(key) else {
+                        return Err(KvError::CheckFailed(KvCheckFailedReason::KeyMissing));
                     };
-                    if existing != &value {
-                        return Err("kv check failed: value mismatch".to_string());
+                    if existing != value {
+                        return Err(KvError::CheckFailed(KvCheckFailedReason::ValueMismatch));
                     }
                 }
                 KvCommand::CheckExists { key } => {
-                    if !state.records.contains_key(&key) {
-                        return Err("kv check failed: key missing".to_string());
+                    if !state.records.contains_key(key) {
+                        return Err(KvError::CheckFailed(KvCheckFailedReason::KeyMissing));
                     }
                 }
                 KvCommand::CheckMissing { key } => {
-                    if state.records.contains_key(&key) {
-                        return Err("kv check failed: key exists".to_string());
+                    if state.records.contains_key(key) {
+                        return Err(KvError::CheckFailed(KvCheckFailedReason::KeyExists));
                     }
                 }
             }
@@ -196,10 +269,11 @@ impl KvBackend for LibsqlKvBackend {
 
         let predicted_total_bytes = predicted_total_bytes(&state, &writes)?;
         if predicted_total_bytes > self.max_app_bytes {
-            return Err(format!(
-                "app {app_id} kv quota exceeded: {predicted_total_bytes} > {}",
-                self.max_app_bytes
-            ));
+            return Err(KvError::QuotaExceeded {
+                app_id,
+                used_bytes: predicted_total_bytes,
+                limit_bytes: self.max_app_bytes,
+            });
         }
         if writes.is_empty() {
             return Ok(());
@@ -208,7 +282,9 @@ impl KvBackend for LibsqlKvBackend {
         self.store
             .apply_writes(app_id, &writes)
             .await
-            .map_err(|error| format!("failed to persist kv writes: {error:#}"))?;
+            .map_err(|error| {
+                KvError::internal(format!("failed to persist kv writes: {error:#}"))
+            })?;
         apply_writes(&mut state, writes.into_iter())?;
         Ok(())
     }
@@ -220,38 +296,14 @@ impl KvBackend for LibsqlKvBackend {
         start: Option<KvKey>,
         end: Option<KvKey>,
         after: Option<KvKey>,
-    ) -> Result<KvListPage, String> {
-        let namespace = self.namespace(app_id).await;
-        let mut state = namespace.lock().await;
-        self.load_state(app_id, &mut state).await?;
-
-        let mut entries = state
-            .records
-            .iter()
-            .filter(|(key, _)| key.starts_with(&prefix))
-            .filter(|(key, _)| start.as_ref().is_none_or(|start| *key >= start))
-            .filter(|(key, _)| after.as_ref().is_none_or(|after| *key > after))
-            .filter(|(key, _)| end.as_ref().is_none_or(|end| *key < end))
-            .map(|(key, value)| KvEntry {
-                key: key.clone(),
-                value: value.clone(),
-            })
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-        let next_after = if entries.len() > KV_LIST_PAGE_SIZE {
-            let next_after = entries[KV_LIST_PAGE_SIZE - 1].key.clone();
-            entries.truncate(KV_LIST_PAGE_SIZE);
-            Some(next_after)
-        } else {
-            None
-        };
-        Ok(KvListPage {
-            entries,
-            next_after,
-        })
+    ) -> Result<KvListPage, KvError> {
+        self.store
+            .list_page(app_id, prefix, start, end, after)
+            .await
+            .map_err(|error| KvError::internal(format!("failed to list kv entries: {error:#}")))
     }
 
-    async fn storage_used(&self, app_id: u64) -> Result<u64, String> {
+    async fn storage_used(&self, app_id: u64) -> Result<u64, KvError> {
         let namespace = self.namespace(app_id).await;
         let mut state = namespace.lock().await;
         self.load_state(app_id, &mut state).await?;
@@ -261,12 +313,9 @@ impl KvBackend for LibsqlKvBackend {
 
 #[async_trait]
 impl KvBackend for MeshKvBackend {
-    async fn get(&self, app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, String> {
+    async fn get(&self, app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, KvError> {
         if self.mesh.node() == self.leader {
-            let backend = self
-                .local_backend
-                .as_ref()
-                .ok_or_else(|| "kv backend is not configured on KV leader".to_string())?;
+            let backend = self.local_backend.as_ref().ok_or(KvError::Unavailable)?;
             backend.get(app_id, key).await
         } else {
             self.mesh
@@ -275,12 +324,9 @@ impl KvBackend for MeshKvBackend {
         }
     }
 
-    async fn exec(&self, app_id: u64, commands: Vec<KvCommand>) -> Result<(), String> {
+    async fn exec(&self, app_id: u64, commands: Vec<KvCommand>) -> Result<(), KvError> {
         if self.mesh.node() == self.leader {
-            let backend = self
-                .local_backend
-                .as_ref()
-                .ok_or_else(|| "kv backend is not configured on KV leader".to_string())?;
+            let backend = self.local_backend.as_ref().ok_or(KvError::Unavailable)?;
             backend.exec(app_id, commands).await
         } else {
             self.mesh
@@ -296,12 +342,9 @@ impl KvBackend for MeshKvBackend {
         start: Option<KvKey>,
         end: Option<KvKey>,
         after: Option<KvKey>,
-    ) -> Result<KvListPage, String> {
+    ) -> Result<KvListPage, KvError> {
         if self.mesh.node() == self.leader {
-            let backend = self
-                .local_backend
-                .as_ref()
-                .ok_or_else(|| "kv backend is not configured on KV leader".to_string())?;
+            let backend = self.local_backend.as_ref().ok_or(KvError::Unavailable)?;
             backend.list_page(app_id, prefix, start, end, after).await
         } else {
             self.mesh
@@ -310,12 +353,9 @@ impl KvBackend for MeshKvBackend {
         }
     }
 
-    async fn storage_used(&self, app_id: u64) -> Result<u64, String> {
+    async fn storage_used(&self, app_id: u64) -> Result<u64, KvError> {
         if self.mesh.node() == self.leader {
-            let backend = self
-                .local_backend
-                .as_ref()
-                .ok_or_else(|| "kv backend is not configured on KV leader".to_string())?;
+            let backend = self.local_backend.as_ref().ok_or(KvError::Unavailable)?;
             backend.storage_used(app_id).await
         } else {
             self.mesh
@@ -328,18 +368,18 @@ impl KvBackend for MeshKvBackend {
 fn apply_writes(
     state: &mut AppState,
     writes: impl IntoIterator<Item = KvWrite>,
-) -> Result<(), String> {
+) -> Result<(), KvError> {
     for write in writes {
         match write {
             KvWrite::Set { key, value } => {
                 let new_size = logical_entry_size(key.len(), value.len())
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| KvError::internal(error.to_string()))?;
                 let old_size = state
                     .records
                     .get(&key)
                     .map(|existing| logical_entry_size(key.len(), existing.len()))
                     .transpose()
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| KvError::internal(error.to_string()))?
                     .unwrap_or(0);
                 state.total_bytes = state
                     .total_bytes
@@ -351,7 +391,7 @@ fn apply_writes(
                 if let Some(existing) = state.records.remove(&key) {
                     state.total_bytes = state.total_bytes.saturating_sub(
                         logical_entry_size(key.len(), existing.len())
-                            .map_err(|error| error.to_string())?,
+                            .map_err(|error| KvError::internal(error.to_string()))?,
                     );
                 }
             }
@@ -360,7 +400,7 @@ fn apply_writes(
     Ok(())
 }
 
-fn predicted_total_bytes(state: &AppState, writes: &[KvWrite]) -> Result<u64, String> {
+fn predicted_total_bytes(state: &AppState, writes: &[KvWrite]) -> Result<u64, KvError> {
     let mut predicted = state.clone();
     apply_writes(&mut predicted, writes.iter().cloned())?;
     Ok(predicted.total_bytes)
@@ -371,6 +411,33 @@ fn logical_entry_size(key_len: usize, value_len: usize) -> anyhow::Result<u64> {
         .checked_add(value_len)
         .context("entry size overflow")?;
     u64::try_from(total).context("entry size exceeds u64")
+}
+
+fn append_blob_filter(
+    query: &mut String,
+    params: &mut Vec<Value>,
+    param_index: &mut usize,
+    predicate: &str,
+    value: Vec<u8>,
+) {
+    query.push_str(" AND ");
+    query.push_str(predicate);
+    query.push('?');
+    query.push_str(&param_index.to_string());
+    params.push(Value::Blob(value));
+    *param_index += 1;
+}
+
+fn exclusive_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    for index in (0..upper.len()).rev() {
+        if upper[index] != u8::MAX {
+            upper[index] += 1;
+            upper.truncate(index + 1);
+            return Some(upper);
+        }
+    }
+    None
 }
 
 fn total_bytes_for_records(records: &HashMap<KvKey, Vec<u8>>) -> anyhow::Result<u64> {
@@ -469,6 +536,80 @@ impl LibsqlKvStore {
         }
         tx.commit().await.context("failed to commit kv write")?;
         Ok(())
+    }
+
+    async fn list_page(
+        &self,
+        app_id: u64,
+        prefix: KvKey,
+        start: Option<KvKey>,
+        end: Option<KvKey>,
+        after: Option<KvKey>,
+    ) -> anyhow::Result<KvListPage> {
+        let app_id = to_i64(app_id, "app_id")?;
+        let connection = self.connection.lock().await;
+
+        let mut query = "SELECT key, value FROM kv_entries WHERE app_id = ?1".to_string();
+        let mut params = vec![Value::Integer(app_id)];
+        let mut param_index = 2;
+
+        if !prefix.is_empty() {
+            append_blob_filter(
+                &mut query,
+                &mut params,
+                &mut param_index,
+                "key >= ",
+                prefix.clone(),
+            );
+            if let Some(prefix_end) = exclusive_upper_bound(&prefix) {
+                append_blob_filter(
+                    &mut query,
+                    &mut params,
+                    &mut param_index,
+                    "key < ",
+                    prefix_end,
+                );
+            }
+        }
+        if let Some(start) = start {
+            append_blob_filter(&mut query, &mut params, &mut param_index, "key >= ", start);
+        }
+        if let Some(after) = after {
+            append_blob_filter(&mut query, &mut params, &mut param_index, "key > ", after);
+        }
+        if let Some(end) = end {
+            append_blob_filter(&mut query, &mut params, &mut param_index, "key < ", end);
+        }
+
+        query.push_str(&format!(
+            " ORDER BY key ASC LIMIT {}",
+            KV_LIST_PAGE_SIZE + 1
+        ));
+
+        let mut rows = connection
+            .query(&query, libsql::params_from_iter(params))
+            .await
+            .context("failed to query kv page")?;
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().await.context("failed to read kv page row")? {
+            entries.push(KvEntry {
+                key: blob_from_value(row.get_value(0)?)?,
+                value: blob_from_value(row.get_value(1)?)?,
+            });
+        }
+
+        let next_after = if entries.len() > KV_LIST_PAGE_SIZE {
+            let next_after = entries[KV_LIST_PAGE_SIZE - 1].key.clone();
+            entries.truncate(KV_LIST_PAGE_SIZE);
+            Some(next_after)
+        } else {
+            None
+        };
+
+        Ok(KvListPage {
+            entries,
+            next_after,
+        })
     }
 }
 

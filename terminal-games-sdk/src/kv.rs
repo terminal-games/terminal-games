@@ -26,6 +26,13 @@ const KV_CMD_CHECK_MISSING: u32 = 5;
 const KV_LIST_REQUEST_HEADER_SIZE: usize = 16;
 const KV_LIST_RESPONSE_HEADER_SIZE: usize = 8;
 const KV_OPTIONAL_KEY_MISSING: u32 = u32::MAX;
+const KV_ERROR_UNAVAILABLE: u32 = 1;
+const KV_ERROR_TOO_MANY_WRITES: u32 = 2;
+const KV_ERROR_CHECK_FAILED: u32 = 3;
+const KV_ERROR_QUOTA_EXCEEDED: u32 = 4;
+const KV_CHECK_FAILED_KEY_MISSING: u32 = 1;
+const KV_CHECK_FAILED_KEY_EXISTS: u32 = 2;
+const KV_CHECK_FAILED_VALUE_MISMATCH: u32 = 3;
 
 pub type Key = Vec<KeyPart>;
 
@@ -75,11 +82,21 @@ pub enum Command {
 pub enum Error {
     VersionMismatch,
     InvalidInput,
+    TooManyWritesInAtomicTransaction,
     TooManyRequests,
     InvalidRequestId,
-    RequestFailed(String),
+    Unavailable,
+    CheckFailed(CheckFailedReason),
+    QuotaExceeded { used_bytes: u64, limit_bytes: u64 },
     Decode(String),
     Unknown(i32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckFailedReason {
+    KeyMissing,
+    KeyExists,
+    ValueMismatch,
 }
 
 impl std::fmt::Display for Error {
@@ -89,9 +106,22 @@ impl std::fmt::Display for Error {
                 write!(f, "terminal-games host version mismatch for terminal_games")
             }
             Self::InvalidInput => write!(f, "invalid kv request"),
+            Self::TooManyWritesInAtomicTransaction => {
+                write!(f, "kv atomic transactions may contain at most one write")
+            }
             Self::TooManyRequests => write!(f, "too many pending kv requests"),
             Self::InvalidRequestId => write!(f, "invalid kv request ID"),
-            Self::RequestFailed(error) | Self::Decode(error) => f.write_str(error),
+            Self::Unavailable => write!(f, "kv unavailable"),
+            Self::CheckFailed(reason) => match reason {
+                CheckFailedReason::KeyMissing => write!(f, "kv check failed: key missing"),
+                CheckFailedReason::KeyExists => write!(f, "kv check failed: key exists"),
+                CheckFailedReason::ValueMismatch => write!(f, "kv check failed: value mismatch"),
+            },
+            Self::QuotaExceeded {
+                used_bytes,
+                limit_bytes,
+            } => write!(f, "kv quota exceeded: {used_bytes} > {limit_bytes}"),
+            Self::Decode(error) => f.write_str(error),
             Self::Unknown(code) => write!(f, "unknown kv error: {code}"),
         }
     }
@@ -108,6 +138,35 @@ impl Error {
             KV_POLL_ERR_INVALID_REQUEST_ID => Self::InvalidRequestId,
             _ => Self::Unknown(code),
         }
+    }
+}
+
+fn decode_request_failed(bytes: Vec<u8>) -> Error {
+    let Some(tag_bytes) = bytes.get(..4) else {
+        return Error::Decode("invalid kv error payload".into());
+    };
+    let tag = u32::from_le_bytes(tag_bytes.try_into().unwrap());
+    match tag {
+        KV_ERROR_UNAVAILABLE if bytes.len() == 4 => Error::Unavailable,
+        KV_ERROR_TOO_MANY_WRITES if bytes.len() == 4 => Error::TooManyWritesInAtomicTransaction,
+        KV_ERROR_CHECK_FAILED if bytes.len() == 8 => {
+            let reason = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            Error::CheckFailed(match reason {
+                KV_CHECK_FAILED_KEY_MISSING => CheckFailedReason::KeyMissing,
+                KV_CHECK_FAILED_KEY_EXISTS => CheckFailedReason::KeyExists,
+                KV_CHECK_FAILED_VALUE_MISMATCH => CheckFailedReason::ValueMismatch,
+                _ => return Error::Decode("invalid kv check-failed payload".into()),
+            })
+        }
+        KV_ERROR_QUOTA_EXCEEDED if bytes.len() == 20 => {
+            let used_bytes = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+            let limit_bytes = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+            Error::QuotaExceeded {
+                used_bytes,
+                limit_bytes,
+            }
+        }
+        _ => Error::Decode("unknown kv error payload".into()),
     }
 }
 
@@ -264,6 +323,8 @@ pub fn atomic() -> Atomic {
 }
 
 pub async fn exec(commands: impl IntoIterator<Item = Command>) -> Result<(), Error> {
+    let commands = commands.into_iter().collect::<Vec<_>>();
+    validate_commands(&commands)?;
     let encoded = encode_commands(commands)?;
     let request_id = unsafe {
         crate::internal::kv_exec(
@@ -311,17 +372,21 @@ pub struct Atomic {
 }
 
 impl Atomic {
-    pub fn set(mut self, value: impl IntoValue, key: impl Into<Key>) -> Self {
+    pub fn set(mut self, value: impl IntoValue, key: impl Into<Key>) -> AtomicWrite {
         self.commands.push(Command::Set {
             key: key.into(),
             value: value.into_value(),
         });
-        self
+        AtomicWrite {
+            commands: self.commands,
+        }
     }
 
-    pub fn delete(mut self, key: impl Into<Key>) -> Self {
+    pub fn delete(mut self, key: impl Into<Key>) -> AtomicWrite {
         self.commands.push(Command::Delete { key: key.into() });
-        self
+        AtomicWrite {
+            commands: self.commands,
+        }
     }
 
     pub fn check(mut self, value: impl IntoValue, key: impl Into<Key>) -> Self {
@@ -343,8 +408,32 @@ impl Atomic {
         self
     }
 
-    pub fn extend(mut self, commands: impl IntoIterator<Item = Command>) -> Self {
-        self.commands.extend(commands);
+    pub async fn exec(self) -> Result<(), Error> {
+        exec(self.commands).await
+    }
+}
+
+pub struct AtomicWrite {
+    commands: Vec<Command>,
+}
+
+impl AtomicWrite {
+    pub fn check(mut self, value: impl IntoValue, key: impl Into<Key>) -> Self {
+        self.commands.push(Command::Check {
+            key: key.into(),
+            value: value.into_value(),
+        });
+        self
+    }
+
+    pub fn check_exists(mut self, key: impl Into<Key>) -> Self {
+        self.commands.push(Command::CheckExists { key: key.into() });
+        self
+    }
+
+    pub fn check_missing(mut self, key: impl Into<Key>) -> Self {
+        self.commands
+            .push(Command::CheckMissing { key: key.into() });
         self
     }
 
@@ -410,6 +499,17 @@ struct EncodedCommands {
     commands: Vec<GuestCommand>,
 }
 
+fn validate_commands(commands: &[Command]) -> Result<(), Error> {
+    let write_count = commands
+        .iter()
+        .filter(|command| matches!(command, Command::Set { .. } | Command::Delete { .. }))
+        .count();
+    if write_count > 1 {
+        return Err(Error::TooManyWritesInAtomicTransaction);
+    }
+    Ok(())
+}
+
 fn encode_commands(commands: impl IntoIterator<Item = Command>) -> Result<EncodedCommands, Error> {
     let mut keys = Vec::new();
     let mut values = Vec::new();
@@ -470,9 +570,7 @@ async fn poll_get(request_id: i32) -> Result<Option<Vec<u8>>, Error> {
             KV_POLL_ERR_BUFFER_TOO_SMALL => buffer.resize(len as usize, 0),
             KV_POLL_ERR_REQUEST_FAILED => {
                 buffer.truncate(len as usize);
-                return Err(Error::RequestFailed(
-                    String::from_utf8(buffer).unwrap_or_else(|_| "kv request failed".to_string()),
-                ));
+                return Err(decode_request_failed(buffer));
             }
             code => return Err(Error::from_code(code)),
         }
@@ -497,9 +595,7 @@ async fn poll_exec(request_id: i32) -> Result<(), Error> {
             KV_POLL_ERR_BUFFER_TOO_SMALL => buffer.resize(len as usize, 0),
             KV_POLL_ERR_REQUEST_FAILED => {
                 buffer.truncate(len as usize);
-                return Err(Error::RequestFailed(
-                    String::from_utf8(buffer).unwrap_or_else(|_| "kv request failed".to_string()),
-                ));
+                return Err(decode_request_failed(buffer));
             }
             code => return Err(Error::from_code(code)),
         }
@@ -527,9 +623,7 @@ async fn poll_list(request_id: i32) -> Result<Vec<u8>, Error> {
             KV_POLL_ERR_BUFFER_TOO_SMALL => buffer.resize(len as usize, 0),
             KV_POLL_ERR_REQUEST_FAILED => {
                 buffer.truncate(len as usize);
-                return Err(Error::RequestFailed(
-                    String::from_utf8(buffer).unwrap_or_else(|_| "kv request failed".to_string()),
-                ));
+                return Err(decode_request_failed(buffer));
             }
             code => return Err(Error::from_code(code)),
         }
@@ -557,9 +651,7 @@ async fn poll_storage_used(request_id: i32) -> Result<Vec<u8>, Error> {
             KV_POLL_ERR_BUFFER_TOO_SMALL => buffer.resize(len as usize, 0),
             KV_POLL_ERR_REQUEST_FAILED => {
                 buffer.truncate(len as usize);
-                return Err(Error::RequestFailed(
-                    String::from_utf8(buffer).unwrap_or_else(|_| "kv request failed".to_string()),
-                ));
+                return Err(decode_request_failed(buffer));
             }
             code => return Err(Error::from_code(code)),
         }

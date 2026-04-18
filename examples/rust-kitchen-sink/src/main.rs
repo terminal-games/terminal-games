@@ -525,7 +525,7 @@ async fn increment_kv_with_cas(key: terminal_games_sdk::kv::Key) -> Result<u64, 
 }
 
 fn is_kv_check_failed(err: &KvError) -> bool {
-    matches!(err, KvError::RequestFailed(message) if message.starts_with("kv check failed:"))
+    matches!(err, KvError::CheckFailed(_))
 }
 
 fn current_date_string() -> String {

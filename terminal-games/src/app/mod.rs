@@ -1430,8 +1430,8 @@ pub struct PendingKvRequest {
 }
 
 pub enum KvRequestState {
-    Pending(tokio::sync::oneshot::Receiver<Result<KvPendingResult, String>>),
-    Complete(Result<KvPendingResult, Box<str>>),
+    Pending(tokio::sync::oneshot::Receiver<Result<KvPendingResult, crate::kv::KvError>>),
+    Complete(Result<KvPendingResult, crate::kv::KvError>),
 }
 
 pub enum KvPendingResult {

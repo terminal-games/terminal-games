@@ -2,7 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -10,15 +15,16 @@ use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
     HybridCachePolicy::WriteOnInsertion, LruConfig,
 };
+use futures::TryStreamExt as _;
 use opendal::raw::oio::Read as _;
 use opendal::raw::{
     Access, Layer, LayeredAccess, OpList, OpRead, OpWrite, RpDelete, RpList, RpRead, RpWrite,
 };
 use opendal::{Buffer, EntryMode, ErrorKind as OpenDalErrorKind, Operator, services::S3};
-use serde::{Deserialize, Serialize};
 use terminal_games::kv::{
-    DEFAULT_KV_APP_MAX_BYTES, KvBackend, KvCommand, KvEntry, KvKey, KvListPage, KvWrite,
-    LibsqlKvBackendOptions, load_libsql_backend,
+    DEFAULT_KV_APP_MAX_BYTES, KV_LIST_PAGE_SIZE, KvBackend, KvCheckFailedReason, KvCommand,
+    KvEntry, KvError, KvKey, KvListPage, KvWrite, LibsqlKvBackendOptions, collect_kv_writes,
+    load_libsql_backend,
 };
 use tokio::sync::Mutex;
 
@@ -26,214 +32,142 @@ const DEFAULT_KV_S3_PREFIX: &str = "kv";
 const DEFAULT_KV_CACHE_DIR: &str = "/opt/terminal-games/kv-cache";
 const DEFAULT_KV_CACHE_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_KV_CACHE_DISK_BYTES: u64 = 32 * 1024 * 1024 * 1024;
-const DEFAULT_KV_S3_CHECKPOINT_INTERVAL_COMMITS: u64 = 256;
 
 pub async fn load_backend_from_env() -> anyhow::Result<Arc<dyn KvBackend>> {
     let max_app_bytes = read_env_u64("KV_APP_MAX_BYTES").unwrap_or(DEFAULT_KV_APP_MAX_BYTES);
-    let checkpoint_interval_commits = read_env_u64("KV_CHECKPOINT_INTERVAL_COMMITS")
-        .unwrap_or(DEFAULT_KV_S3_CHECKPOINT_INTERVAL_COMMITS)
-        .max(1);
     let backend_kind = std::env::var("KV_BACKEND")
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "libsql".to_string());
 
-    let store = match backend_kind.as_str() {
-        "s3" => KvStore::from_s3_env().await?,
-        "libsql" | "local" => {
+    match backend_kind.as_str() {
+        "s3" => Ok(Arc::new(S3KvBackend {
+            store: Arc::new(KvStore::from_s3_env().await?),
+            max_app_bytes,
+            namespaces: Arc::new(Mutex::new(HashMap::new())),
+        })),
+        "libsql" => {
             let path = std::env::var("KV_LIBSQL_PATH")
                 .ok()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("./kv-store/kv.db"));
-            return load_libsql_backend(LibsqlKvBackendOptions {
+            load_libsql_backend(LibsqlKvBackendOptions {
                 path,
                 max_app_bytes,
             })
-            .await;
+            .await
         }
         other => anyhow::bail!("unsupported KV_BACKEND '{other}', expected 'libsql' or 's3'"),
-    };
-
-    Ok(Arc::new(S3KvBackend {
-        store: Arc::new(store),
-        max_app_bytes,
-        checkpoint_interval_commits,
-        namespaces: Arc::new(Mutex::new(HashMap::new())),
-    }))
+    }
 }
 
 #[derive(Clone)]
 struct S3KvBackend {
     store: Arc<KvStore>,
     max_app_bytes: u64,
-    checkpoint_interval_commits: u64,
-    namespaces: Arc<Mutex<HashMap<u64, Arc<Mutex<AppState>>>>>,
-}
-
-#[derive(Default)]
-struct AppState {
-    loaded: bool,
-    last_seq: u64,
-    last_checkpoint_seq: u64,
-    total_bytes: u64,
-    records: HashMap<KvKey, Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CheckpointRecord {
-    last_seq: u64,
-    total_bytes: u64,
-    records: HashMap<KvKey, Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JournalRecord {
-    seq: u64,
-    writes: Vec<KvWrite>,
+    namespaces: Arc<Mutex<HashMap<u64, Arc<Mutex<()>>>>>,
 }
 
 impl S3KvBackend {
-    async fn namespace(&self, app_id: u64) -> Arc<Mutex<AppState>> {
+    async fn namespace(&self, app_id: u64) -> Arc<Mutex<()>> {
         let mut namespaces = self.namespaces.lock().await;
         namespaces
             .entry(app_id)
-            .or_insert_with(|| Arc::new(Mutex::new(AppState::default())))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
-    }
-
-    async fn load_state(&self, app_id: u64, state: &mut AppState) -> Result<(), String> {
-        if state.loaded {
-            return Ok(());
-        }
-
-        if let Some(bytes) = self
-            .store
-            .load_checkpoint(app_id)
-            .await
-            .map_err(|error| format!("failed to load kv checkpoint: {error:#}"))?
-        {
-            let checkpoint: CheckpointRecord = bincode::deserialize(&bytes)
-                .map_err(|error| format!("failed to decode kv checkpoint: {error}"))?;
-            state.last_seq = checkpoint.last_seq;
-            state.last_checkpoint_seq = checkpoint.last_seq;
-            state.total_bytes = checkpoint.total_bytes;
-            state.records = checkpoint.records;
-        }
-
-        for bytes in self
-            .store
-            .load_journal_since(app_id, state.last_seq)
-            .await
-            .map_err(|error| format!("failed to load kv journal: {error:#}"))?
-        {
-            let journal: JournalRecord = bincode::deserialize(&bytes)
-                .map_err(|error| format!("failed to decode kv journal entry: {error}"))?;
-            apply_journal_record(state, journal)?;
-        }
-
-        state.loaded = true;
-        Ok(())
-    }
-
-    async fn maybe_checkpoint(&self, app_id: u64, state: &mut AppState) {
-        let needs_checkpoint = state.last_seq.saturating_sub(state.last_checkpoint_seq)
-            >= self.checkpoint_interval_commits;
-        if !needs_checkpoint {
-            return;
-        }
-
-        let checkpoint = CheckpointRecord {
-            last_seq: state.last_seq,
-            total_bytes: state.total_bytes,
-            records: state.records.clone(),
-        };
-        let checkpoint_bytes = match bincode::serialize(&checkpoint) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                tracing::warn!(app_id, error = ?error, "failed to encode kv checkpoint");
-                return;
-            }
-        };
-
-        let checkpoint_seq = state.last_seq;
-        if let Err(error) = self
-            .store
-            .store_checkpoint(app_id, checkpoint_seq, &checkpoint_bytes)
-            .await
-        {
-            tracing::warn!(app_id, checkpoint_seq, error = ?error, "failed to store kv checkpoint");
-            return;
-        }
-
-        state.last_checkpoint_seq = checkpoint_seq;
-        if let Err(error) = self.store.prune_before(app_id, checkpoint_seq).await {
-            tracing::warn!(app_id, checkpoint_seq, error = ?error, "failed to prune kv journal");
-        }
     }
 }
 
 #[async_trait]
 impl KvBackend for S3KvBackend {
-    async fn get(&self, app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, String> {
+    async fn get(&self, app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, KvError> {
         let namespace = self.namespace(app_id).await;
-        let mut state = namespace.lock().await;
-        self.load_state(app_id, &mut state).await?;
-        Ok(state.records.get(&key).cloned())
+        let _guard = namespace.lock().await;
+        self.store
+            .get_entry(app_id, &key)
+            .await
+            .map_err(|error| KvError::internal(format!("failed to read kv entry: {error:#}")))
     }
 
-    async fn exec(&self, app_id: u64, commands: Vec<KvCommand>) -> Result<(), String> {
+    async fn exec(&self, app_id: u64, commands: Vec<KvCommand>) -> Result<(), KvError> {
         let namespace = self.namespace(app_id).await;
-        let mut state = namespace.lock().await;
-        self.load_state(app_id, &mut state).await?;
+        let _guard = namespace.lock().await;
+        let writes = collect_kv_writes(&commands)?;
 
-        let mut writes = Vec::new();
-        for command in commands {
+        let touched_keys = commands
+            .iter()
+            .map(|command| match command {
+                KvCommand::Set { key, .. }
+                | KvCommand::Delete { key }
+                | KvCommand::CheckValue { key, .. }
+                | KvCommand::CheckExists { key }
+                | KvCommand::CheckMissing { key } => key.clone(),
+            })
+            .collect::<HashSet<_>>();
+
+        let current_values = self
+            .store
+            .load_entries(app_id, touched_keys)
+            .await
+            .map_err(|error| KvError::internal(format!("failed to load kv entries: {error:#}")))?;
+        let current_total_bytes =
+            self.store.storage_used(app_id).await.map_err(|error| {
+                KvError::internal(format!("failed to measure kv usage: {error:#}"))
+            })?;
+
+        for command in &commands {
             match command {
-                KvCommand::Set { key, value } => writes.push(KvWrite::Set { key, value }),
-                KvCommand::Delete { key } => writes.push(KvWrite::Delete { key }),
+                KvCommand::Set { .. } | KvCommand::Delete { .. } => {}
                 KvCommand::CheckValue { key, value } => {
-                    let Some(existing) = state.records.get(&key) else {
-                        return Err("kv check failed: key missing".to_string());
+                    let Some(existing) = current_values.get(key).and_then(|value| value.as_ref())
+                    else {
+                        return Err(KvError::CheckFailed(KvCheckFailedReason::KeyMissing));
                     };
-                    if existing != &value {
-                        return Err("kv check failed: value mismatch".to_string());
+                    if existing != value {
+                        return Err(KvError::CheckFailed(KvCheckFailedReason::ValueMismatch));
                     }
                 }
                 KvCommand::CheckExists { key } => {
-                    if !state.records.contains_key(&key) {
-                        return Err("kv check failed: key missing".to_string());
+                    if current_values
+                        .get(key)
+                        .and_then(|value| value.as_ref())
+                        .is_none()
+                    {
+                        return Err(KvError::CheckFailed(KvCheckFailedReason::KeyMissing));
                     }
                 }
                 KvCommand::CheckMissing { key } => {
-                    if state.records.contains_key(&key) {
-                        return Err("kv check failed: key exists".to_string());
+                    if current_values
+                        .get(key)
+                        .and_then(|value| value.as_ref())
+                        .is_some()
+                    {
+                        return Err(KvError::CheckFailed(KvCheckFailedReason::KeyExists));
                     }
                 }
             }
         }
 
-        let predicted_total_bytes = predicted_total_bytes(&state, &writes)?;
+        let predicted_total_bytes =
+            predicted_total_bytes(current_total_bytes, &current_values, &writes)?;
         if predicted_total_bytes > self.max_app_bytes {
-            return Err(format!(
-                "app {app_id} kv quota exceeded: {predicted_total_bytes} > {}",
-                self.max_app_bytes
-            ));
+            return Err(KvError::QuotaExceeded {
+                app_id,
+                used_bytes: predicted_total_bytes,
+                limit_bytes: self.max_app_bytes,
+            });
         }
         if writes.is_empty() {
             return Ok(());
         }
 
-        let seq = state.last_seq.saturating_add(1);
-        let journal = JournalRecord { seq, writes };
-        let journal_bytes = bincode::serialize(&journal)
-            .map_err(|error| format!("failed to encode kv journal entry: {error}"))?;
         self.store
-            .append_journal(app_id, seq, &journal_bytes)
+            .apply_entry_writes(app_id, &writes)
             .await
-            .map_err(|error| format!("failed to append kv journal entry: {error:#}"))?;
-        apply_journal_record(&mut state, journal)?;
-        self.maybe_checkpoint(app_id, &mut state).await;
+            .map_err(|error| {
+                KvError::internal(format!("failed to persist kv entries: {error:#}"))
+            })?;
         Ok(())
     }
 
@@ -244,118 +178,60 @@ impl KvBackend for S3KvBackend {
         start: Option<KvKey>,
         end: Option<KvKey>,
         after: Option<KvKey>,
-    ) -> Result<KvListPage, String> {
+    ) -> Result<KvListPage, KvError> {
         let namespace = self.namespace(app_id).await;
-        let mut state = namespace.lock().await;
-        self.load_state(app_id, &mut state).await?;
-
-        let mut entries = state
-            .records
-            .iter()
-            .filter(|(key, _)| key.starts_with(&prefix))
-            .filter(|(key, _)| start.as_ref().is_none_or(|start| *key >= start))
-            .filter(|(key, _)| after.as_ref().is_none_or(|after| *key > after))
-            .filter(|(key, _)| end.as_ref().is_none_or(|end| *key < end))
-            .map(|(key, value)| KvEntry {
-                key: key.clone(),
-                value: value.clone(),
-            })
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-        let next_after = if entries.len() > terminal_games::kv::KV_LIST_PAGE_SIZE {
-            let next_after = entries[terminal_games::kv::KV_LIST_PAGE_SIZE - 1]
-                .key
-                .clone();
-            entries.truncate(terminal_games::kv::KV_LIST_PAGE_SIZE);
-            Some(next_after)
-        } else {
-            None
-        };
-        Ok(KvListPage {
-            entries,
-            next_after,
-        })
+        let _guard = namespace.lock().await;
+        self.store
+            .list_entries_page(app_id, prefix, start, end, after)
+            .await
+            .map_err(|error| KvError::internal(format!("failed to list kv entries: {error:#}")))
     }
 
-    async fn storage_used(&self, app_id: u64) -> Result<u64, String> {
+    async fn storage_used(&self, app_id: u64) -> Result<u64, KvError> {
         let namespace = self.namespace(app_id).await;
-        let mut state = namespace.lock().await;
-        self.load_state(app_id, &mut state).await?;
-        Ok(state.total_bytes)
+        let _guard = namespace.lock().await;
+        self.store
+            .storage_used(app_id)
+            .await
+            .map_err(|error| KvError::internal(format!("failed to measure kv usage: {error:#}")))
     }
 }
 
-fn apply_journal_record(state: &mut AppState, journal: JournalRecord) -> Result<(), String> {
-    if journal.seq <= state.last_seq {
-        return Ok(());
-    }
-    if journal.seq != state.last_seq.saturating_add(1) {
-        return Err(format!(
-            "kv journal sequence gap: expected {}, got {}",
-            state.last_seq.saturating_add(1),
-            journal.seq
-        ));
-    }
+fn predicted_total_bytes(
+    current_total_bytes: u64,
+    current_values: &HashMap<KvKey, Option<Vec<u8>>>,
+    writes: &[KvWrite],
+) -> Result<u64, KvError> {
+    let mut total = current_total_bytes;
+    let mut current_values = current_values.clone();
 
-    for write in journal.writes {
-        match write {
-            KvWrite::Set { key, value } => {
-                let new_size = logical_entry_size(key.len(), value.len())
-                    .map_err(|error| error.to_string())?;
-                let old_size = state
-                    .records
-                    .get(&key)
-                    .map(|existing| logical_entry_size(key.len(), existing.len()))
-                    .transpose()
-                    .map_err(|error| error.to_string())?
-                    .unwrap_or(0);
-                state.total_bytes = state
-                    .total_bytes
-                    .saturating_sub(old_size)
-                    .saturating_add(new_size);
-                state.records.insert(key, value);
-            }
-            KvWrite::Delete { key } => {
-                if let Some(existing) = state.records.remove(&key) {
-                    state.total_bytes = state.total_bytes.saturating_sub(
-                        logical_entry_size(key.len(), existing.len())
-                            .map_err(|error| error.to_string())?,
-                    );
-                }
-            }
-        }
-    }
-
-    state.last_seq = journal.seq;
-    Ok(())
-}
-
-fn predicted_total_bytes(state: &AppState, writes: &[KvWrite]) -> Result<u64, String> {
-    let mut total = state.total_bytes;
     for write in writes {
         match write {
             KvWrite::Set { key, value } => {
                 let new_size = logical_entry_size(key.len(), value.len())
-                    .map_err(|error| error.to_string())?;
-                let old_size = state
-                    .records
+                    .map_err(|error| KvError::internal(error.to_string()))?;
+                let old_size = current_values
                     .get(key)
+                    .and_then(|value| value.as_ref())
                     .map(|existing| logical_entry_size(key.len(), existing.len()))
                     .transpose()
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| KvError::internal(error.to_string()))?
                     .unwrap_or(0);
                 total = total.saturating_sub(old_size).saturating_add(new_size);
+                current_values.insert(key.clone(), Some(value.clone()));
             }
             KvWrite::Delete { key } => {
-                if let Some(existing) = state.records.get(key) {
+                if let Some(existing) = current_values.get(key).and_then(|value| value.as_ref()) {
                     total = total.saturating_sub(
                         logical_entry_size(key.len(), existing.len())
-                            .map_err(|error| error.to_string())?,
+                            .map_err(|error| KvError::internal(error.to_string()))?,
                     );
                 }
+                current_values.insert(key.clone(), None);
             }
         }
     }
+
     Ok(total)
 }
 
@@ -509,11 +385,9 @@ impl<A: Access> LayeredAccess for FoyerAccess<A> {
     }
 }
 
-enum KvStore {
-    S3 {
-        operator: Operator,
-        cache: Arc<KvCache>,
-    },
+struct KvStore {
+    operator: Operator,
+    cache: Arc<KvCache>,
 }
 
 impl KvStore {
@@ -539,118 +413,166 @@ impl KvStore {
             .layer(FoyerLayer::new(cache.clone()))
             .finish();
 
-        Ok(Self::S3 { operator, cache })
-    }
-    async fn load_checkpoint(&self, app_id: u64) -> anyhow::Result<Option<Vec<u8>>> {
-        match self {
-            Self::S3 { operator, .. } => {
-                let paths = list_s3_paths(operator, &checkpoint_prefix(app_id)).await?;
-                let Some(path) = paths.last() else {
-                    return Ok(None);
-                };
-                read_s3(operator, path, "read kv checkpoint").await
-            }
-        }
+        Ok(Self { operator, cache })
     }
 
-    async fn load_journal_since(
+    async fn get_entry(&self, app_id: u64, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        read_s3(&self.operator, &entry_path(app_id, key), "read kv entry").await
+    }
+
+    async fn load_entries(
         &self,
         app_id: u64,
-        after_seq: u64,
-    ) -> anyhow::Result<Vec<Vec<u8>>> {
-        match self {
-            Self::S3 { operator, .. } => {
-                let paths = list_s3_paths(operator, &journal_prefix(app_id)).await?;
-                let mut entries = Vec::new();
-                for path in paths {
-                    if parse_seq_from_path(&path).is_some_and(|seq| seq > after_seq)
-                        && let Some(bytes) = read_s3(operator, &path, "read kv journal").await?
-                    {
-                        entries.push(bytes);
-                    }
+        keys: impl IntoIterator<Item = KvKey>,
+    ) -> anyhow::Result<HashMap<KvKey, Option<Vec<u8>>>> {
+        let mut values = HashMap::new();
+        for key in keys {
+            values.insert(key.clone(), self.get_entry(app_id, &key).await?);
+        }
+        Ok(values)
+    }
+
+    async fn apply_entry_writes(&self, app_id: u64, writes: &[KvWrite]) -> anyhow::Result<()> {
+        for write in writes {
+            match write {
+                KvWrite::Set { key, value } => {
+                    write_s3(
+                        &self.operator,
+                        &self.cache,
+                        &entry_path(app_id, key),
+                        value,
+                        "write kv entry",
+                    )
+                    .await?;
                 }
-                Ok(entries)
-            }
-        }
-    }
-
-    async fn append_journal(&self, app_id: u64, seq: u64, bytes: &[u8]) -> anyhow::Result<()> {
-        match self {
-            Self::S3 { operator, cache } => {
-                write_s3(
-                    operator,
-                    cache,
-                    &journal_path(app_id, seq),
-                    bytes,
-                    "write kv journal",
-                )
-                .await
-            }
-        }
-    }
-
-    async fn store_checkpoint(&self, app_id: u64, seq: u64, bytes: &[u8]) -> anyhow::Result<()> {
-        match self {
-            Self::S3 { operator, cache } => {
-                write_s3(
-                    operator,
-                    cache,
-                    &checkpoint_path(app_id, seq),
-                    bytes,
-                    "write kv checkpoint",
-                )
-                .await
-            }
-        }
-    }
-
-    async fn prune_before(&self, app_id: u64, seq: u64) -> anyhow::Result<()> {
-        match self {
-            Self::S3 { operator, cache } => {
-                for path in list_s3_paths(operator, &journal_prefix(app_id)).await? {
-                    if parse_seq_from_path(&path).is_some_and(|entry_seq| entry_seq <= seq) {
-                        delete_s3(operator, cache, &path).await?;
-                    }
+                KvWrite::Delete { key } => {
+                    delete_s3(&self.operator, &self.cache, &entry_path(app_id, key)).await?;
                 }
-                for path in list_s3_paths(operator, &checkpoint_prefix(app_id)).await? {
-                    if parse_seq_from_path(&path).is_some_and(|entry_seq| entry_seq < seq) {
-                        delete_s3(operator, cache, &path).await?;
-                    }
-                }
-                Ok(())
             }
         }
+        Ok(())
+    }
+
+    async fn list_entries_page(
+        &self,
+        app_id: u64,
+        prefix: KvKey,
+        start: Option<KvKey>,
+        end: Option<KvKey>,
+        after: Option<KvKey>,
+    ) -> anyhow::Result<KvListPage> {
+        let mut request = self
+            .operator
+            .lister_with(&entry_prefix_for_key_prefix(app_id, &prefix))
+            .recursive(true)
+            .limit(KV_LIST_PAGE_SIZE + 1);
+        if let Some(after) = after.as_ref().filter(|after| after.starts_with(&prefix)) {
+            request = request.start_after(&entry_path(app_id, after));
+        }
+
+        let mut lister = request.await.context("failed to create kv entry lister")?;
+        let mut entries = Vec::new();
+
+        while let Some(entry) = lister
+            .try_next()
+            .await
+            .context("failed to list kv entries")?
+        {
+            if entry.metadata().mode() != EntryMode::FILE {
+                continue;
+            }
+
+            let path = entry.path().to_string();
+            let Some(key) = parse_entry_key_from_path(&path) else {
+                continue;
+            };
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            if start
+                .as_ref()
+                .is_some_and(|start| key.as_slice() < start.as_slice())
+            {
+                continue;
+            }
+            if after
+                .as_ref()
+                .is_some_and(|after| key.as_slice() <= after.as_slice())
+            {
+                continue;
+            }
+            if end
+                .as_ref()
+                .is_some_and(|end| key.as_slice() >= end.as_slice())
+            {
+                break;
+            }
+
+            if let Some(value) = read_s3(&self.operator, &path, "read kv entry").await? {
+                entries.push(KvEntry { key, value });
+            }
+            if entries.len() > KV_LIST_PAGE_SIZE {
+                break;
+            }
+        }
+
+        let next_after = if entries.len() > KV_LIST_PAGE_SIZE {
+            let next_after = entries[KV_LIST_PAGE_SIZE - 1].key.clone();
+            entries.truncate(KV_LIST_PAGE_SIZE);
+            Some(next_after)
+        } else {
+            None
+        };
+
+        Ok(KvListPage {
+            entries,
+            next_after,
+        })
+    }
+
+    async fn storage_used(&self, app_id: u64) -> anyhow::Result<u64> {
+        let mut lister = self
+            .operator
+            .lister_with(&entry_prefix(app_id))
+            .recursive(true)
+            .await
+            .context("failed to create kv usage lister")?;
+        let mut total = 0_u64;
+
+        while let Some(entry) = lister.try_next().await.context("failed to list kv usage")? {
+            if entry.metadata().mode() != EntryMode::FILE {
+                continue;
+            }
+            let Some(key) = parse_entry_key_from_path(entry.path()) else {
+                continue;
+            };
+            let value_len = usize::try_from(entry.metadata().content_length())
+                .context("kv entry value length exceeds usize")?;
+            total = total
+                .checked_add(logical_entry_size(key.len(), value_len)?)
+                .context("kv usage overflow")?;
+        }
+
+        Ok(total)
     }
 }
 
-fn checkpoint_path(app_id: u64, seq: u64) -> String {
-    format!("app-{app_id}/checkpoint/{seq:020}.bin")
+fn entry_path(app_id: u64, key: &[u8]) -> String {
+    format!("app/{app_id}/entries/{}.bin", hex::encode(key))
 }
 
-fn checkpoint_prefix(app_id: u64) -> String {
-    format!("app-{app_id}/checkpoint/")
+fn entry_prefix(app_id: u64) -> String {
+    format!("app/{app_id}/entries/")
 }
 
-fn journal_path(app_id: u64, seq: u64) -> String {
-    format!("app-{app_id}/journal/{seq:020}.bin")
+fn entry_prefix_for_key_prefix(app_id: u64, prefix: &[u8]) -> String {
+    format!("{}{}", entry_prefix(app_id), hex::encode(prefix))
 }
 
-fn journal_prefix(app_id: u64) -> String {
-    format!("app-{app_id}/journal/")
-}
-
-async fn list_s3_paths(operator: &Operator, prefix: &str) -> anyhow::Result<Vec<String>> {
-    let mut paths = operator
-        .list_with(prefix)
-        .recursive(true)
-        .await
-        .with_context(|| format!("failed to list kv objects under {prefix}"))?
-        .into_iter()
-        .filter(|entry| entry.metadata().mode() == EntryMode::FILE)
-        .map(|entry| entry.path().to_string())
-        .collect::<Vec<_>>();
-    paths.sort_unstable();
-    Ok(paths)
+fn parse_entry_key_from_path(path: &str) -> Option<Vec<u8>> {
+    let name = path.rsplit('/').next()?;
+    let encoded = name.strip_suffix(".bin")?;
+    hex::decode(encoded).ok()
 }
 
 async fn read_s3(
@@ -692,12 +614,6 @@ async fn delete_s3(operator: &Operator, cache: &KvCache, path: &str) -> anyhow::
         }
         Err(error) => Err(error).with_context(|| format!("failed to delete kv object {path}")),
     }
-}
-
-fn parse_seq_from_path(path: &str) -> Option<u64> {
-    let name = path.rsplit('/').next()?;
-    let seq = name.strip_suffix(".bin")?;
-    seq.parse::<u64>().ok()
 }
 
 fn read_env_u64(key: &str) -> Option<u64> {

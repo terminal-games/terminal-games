@@ -6,6 +6,7 @@ package main
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,7 +16,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -514,45 +514,54 @@ func incrementKVWithCAS(key []any) (uint64, error) {
 			return 0, err
 		}
 
-		var builder *kv.AtomicBuilder
-		var nextValue uint64
 		switch value := value.(type) {
 		case nil:
-			nextValue = 1
-			builder = kv.Atomic().
+			if err := kv.Atomic().
 				CheckMissing(key...).
-				Set(nextValue, key...)
+				Set(1, key...).
+				Exec(); err != nil {
+				var checkErr *kv.CheckFailedError
+				if errors.As(err, &checkErr) {
+					continue
+				}
+				return 0, err
+			}
+			return 1, nil
 		case uint64:
-			nextValue = value + 1
-			builder = kv.Atomic().
+			nextValue := value + 1
+			if err := kv.Atomic().
 				Check(value, key...).
-				Set(nextValue, key...)
+				Set(nextValue, key...).
+				Exec(); err != nil {
+				var checkErr *kv.CheckFailedError
+				if errors.As(err, &checkErr) {
+					continue
+				}
+				return 0, err
+			}
+			return nextValue, nil
 		case int64:
 			if value < 0 {
 				return 0, fmt.Errorf("counter has unsupported negative value %d", value)
 			}
-			nextValue = uint64(value + 1)
-			builder = kv.Atomic().
+			nextValue := uint64(value + 1)
+			if err := kv.Atomic().
 				Check(value, key...).
-				Set(value+1, key...)
+				Set(value+1, key...).
+				Exec(); err != nil {
+				var checkErr *kv.CheckFailedError
+				if errors.As(err, &checkErr) {
+					continue
+				}
+				return 0, err
+			}
+			return nextValue, nil
 		default:
 			return 0, fmt.Errorf("counter has unsupported type %T", value)
 		}
-
-		if err := builder.Exec(); err != nil {
-			if isKVCheckFailed(err) {
-				continue
-			}
-			return 0, err
-		}
-		return nextValue, nil
 	}
 
 	return 0, fmt.Errorf("counter update conflicted too many times")
-}
-
-func isKVCheckFailed(err error) bool {
-	return err != nil && strings.HasPrefix(err.Error(), "kv check failed:")
 }
 
 func currentDateKey() []any {

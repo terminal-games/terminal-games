@@ -5,7 +5,7 @@ use super::{
     MAX_KV_REQUESTS, PendingKvRequest,
 };
 use crate::{
-    kv::{KvCommand, KvListPage},
+    kv::{KvCheckFailedReason, KvCommand, KvError, KvListPage},
     wasm_abi::HostApiRegistration,
 };
 
@@ -18,7 +18,13 @@ const KV_CMD_SIZE: usize = 20;
 const KV_LIST_REQUEST_HEADER_SIZE: usize = 16;
 const KV_LIST_RESPONSE_HEADER_SIZE: usize = 8;
 const KV_OPTIONAL_KEY_MISSING: u32 = u32::MAX;
-const KV_GUEST_ERROR_MESSAGE: &str = "kv unavailable";
+const KV_ERROR_UNAVAILABLE: u32 = 1;
+const KV_ERROR_TOO_MANY_WRITES: u32 = 2;
+const KV_ERROR_CHECK_FAILED: u32 = 3;
+const KV_ERROR_QUOTA_EXCEEDED: u32 = 4;
+const KV_CHECK_FAILED_KEY_MISSING: u32 = 1;
+const KV_CHECK_FAILED_KEY_EXISTS: u32 = 2;
+const KV_CHECK_FAILED_VALUE_MISMATCH: u32 = 3;
 
 inventory::submit! { HostApiRegistration::new("kv_get", "kv_get_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::kv_get_v1)) }
 inventory::submit! { HostApiRegistration::new("kv_get_poll", "kv_get_poll_v1", 1, |linker, module, import| linker.func_wrap(module, import, AppServer::kv_get_poll_v1)) }
@@ -109,7 +115,7 @@ impl AppServer {
                     value_ptr,
                     value_max_len,
                     value_len_ptr,
-                    error.as_bytes(),
+                    &encode_kv_error(&error),
                 )? {
                     request.state = KvRequestState::Complete(Err(error));
                     caller.data_mut().kv_requests[request_id as usize] = Some(request);
@@ -182,7 +188,7 @@ impl AppServer {
                     error_ptr,
                     error_max_len,
                     error_len_ptr,
-                    error.as_bytes(),
+                    &encode_kv_error(&error),
                 )? {
                     request.state = KvRequestState::Complete(Err(error));
                     caller.data_mut().kv_requests[request_id as usize] = Some(request);
@@ -215,7 +221,10 @@ impl AppServer {
                 )
                 .await
                 .map_err(|error| sanitize_kv_error("list", app_id, error))?;
-            encode_list_page(&page)
+            encode_list_page(&page).map_err(|error| {
+                tracing::error!(app_id, error = %error, "failed to encode kv list page");
+                KvError::Unavailable
+            })
         }))
     }
 
@@ -276,7 +285,7 @@ impl AppServer {
                     data_ptr,
                     data_max_len,
                     data_len_ptr,
-                    error.as_bytes(),
+                    &encode_kv_error(&error),
                 )? {
                     request.state = KvRequestState::Complete(Err(error));
                     caller.data_mut().kv_requests[request_id as usize] = Some(request);
@@ -360,7 +369,7 @@ impl AppServer {
                     data_ptr,
                     data_max_len,
                     data_len_ptr,
-                    error.as_bytes(),
+                    &encode_kv_error(&error),
                 )? {
                     request.state = KvRequestState::Complete(Err(error));
                     caller.data_mut().kv_requests[request_id as usize] = Some(request);
@@ -428,7 +437,7 @@ impl AppServer {
 
     fn spawn_kv_get_request<F>(state: &mut AppState, future: F) -> i32
     where
-        F: std::future::Future<Output = Result<Option<Vec<u8>>, String>> + Send + 'static,
+        F: std::future::Future<Output = Result<Option<Vec<u8>>, KvError>> + Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -443,7 +452,7 @@ impl AppServer {
 
     fn spawn_kv_exec_request<F>(state: &mut AppState, future: F) -> i32
     where
-        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+        F: std::future::Future<Output = Result<(), KvError>> + Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -454,7 +463,7 @@ impl AppServer {
 
     fn spawn_kv_list_request<F>(state: &mut AppState, future: F) -> i32
     where
-        F: std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'static,
+        F: std::future::Future<Output = Result<Vec<u8>, KvError>> + Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -469,7 +478,7 @@ impl AppServer {
 
     fn spawn_kv_storage_used_request<F>(state: &mut AppState, future: F) -> i32
     where
-        F: std::future::Future<Output = Result<u64, String>> + Send + 'static,
+        F: std::future::Future<Output = Result<u64, KvError>> + Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -538,13 +547,11 @@ impl AppServer {
         if let KvRequestState::Pending(receiver) = &mut request.state {
             match receiver.try_recv() {
                 Ok(result) => {
-                    request.state =
-                        KvRequestState::Complete(result.map_err(String::into_boxed_str));
+                    request.state = KvRequestState::Complete(result);
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    request.state =
-                        KvRequestState::Complete(Err("kv task unexpectedly closed".into()));
+                    request.state = KvRequestState::Complete(Err(KvError::Unavailable));
                 }
             }
         }
@@ -560,7 +567,7 @@ impl AppServer {
 
     fn insert_kv_request_pending(
         state: &mut AppState,
-        receiver: tokio::sync::oneshot::Receiver<Result<KvPendingResult, String>>,
+        receiver: tokio::sync::oneshot::Receiver<Result<KvPendingResult, KvError>>,
     ) -> i32 {
         let pending = PendingKvRequest {
             state: KvRequestState::Pending(receiver),
@@ -580,9 +587,46 @@ impl AppServer {
     }
 }
 
-fn sanitize_kv_error(op: &'static str, app_id: u64, error: String) -> String {
+fn sanitize_kv_error(op: &'static str, app_id: u64, error: KvError) -> KvError {
     tracing::error!(app_id, op, error = %error, "kv request failed");
-    KV_GUEST_ERROR_MESSAGE.to_string()
+    match error {
+        KvError::TooManyWritesInAtomicTransaction
+        | KvError::CheckFailed(_)
+        | KvError::QuotaExceeded { .. }
+        | KvError::Unavailable => error,
+        KvError::Internal(_) => KvError::Unavailable,
+    }
+}
+
+fn encode_kv_error(error: &KvError) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(20);
+    match error {
+        KvError::Unavailable | KvError::Internal(_) => {
+            bytes.extend_from_slice(&KV_ERROR_UNAVAILABLE.to_le_bytes());
+        }
+        KvError::TooManyWritesInAtomicTransaction => {
+            bytes.extend_from_slice(&KV_ERROR_TOO_MANY_WRITES.to_le_bytes());
+        }
+        KvError::CheckFailed(reason) => {
+            bytes.extend_from_slice(&KV_ERROR_CHECK_FAILED.to_le_bytes());
+            let reason = match reason {
+                KvCheckFailedReason::KeyMissing => KV_CHECK_FAILED_KEY_MISSING,
+                KvCheckFailedReason::KeyExists => KV_CHECK_FAILED_KEY_EXISTS,
+                KvCheckFailedReason::ValueMismatch => KV_CHECK_FAILED_VALUE_MISMATCH,
+            };
+            bytes.extend_from_slice(&reason.to_le_bytes());
+        }
+        KvError::QuotaExceeded {
+            used_bytes,
+            limit_bytes,
+            ..
+        } => {
+            bytes.extend_from_slice(&KV_ERROR_QUOTA_EXCEEDED.to_le_bytes());
+            bytes.extend_from_slice(&used_bytes.to_le_bytes());
+            bytes.extend_from_slice(&limit_bytes.to_le_bytes());
+        }
+    }
+    bytes
 }
 
 struct ListRequest {
