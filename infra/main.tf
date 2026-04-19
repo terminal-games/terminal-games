@@ -80,6 +80,16 @@ variable "servers" {
   }
 }
 
+variable "kv_leader_node_id" {
+  description = "NODE_ID of the elected KV leader node"
+  type        = string
+
+  validation {
+    condition     = contains([for s in var.servers : s.node_id], var.kv_leader_node_id)
+    error_message = "kv_leader_node_id must match one of the configured server node_ids."
+  }
+}
+
 locals {
   server_configs = {
     for s in var.servers :
@@ -196,7 +206,8 @@ resource "bunnynet_dns_record" "servers_ipv6" {
 
 resource "local_file" "ansible_inventory" {
   content = templatefile("${path.module}/inventory.tftpl", {
-    servers = local.servers
+    servers           = local.servers
+    kv_leader_node_id = var.kv_leader_node_id
   })
   filename = "${path.module}/inventory.ini"
 }

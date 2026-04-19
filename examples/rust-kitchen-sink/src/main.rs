@@ -4,7 +4,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use http_body_util::{BodyExt, Empty};
@@ -19,6 +19,7 @@ use tachyonfx::{Interpolation, Motion, fx};
 use terminal_games_sdk::{
     app,
     audio::{OggVorbisResource, Resource, mixer},
+    kv::{self, Error as KvError, Value},
     network::Conn,
     peer::{self, PeerId},
     terminal::{TerminalGamesBackend, TerminalReader},
@@ -115,6 +116,9 @@ async fn main() -> std::io::Result<()> {
     let mut messages = vec![];
     let mut peers_list = Vec::<PeerId>::new();
     let mut last_peer_update = Instant::now();
+    let mut kv_status = "press 'v' to bump today's counter".to_string();
+    let mut kv_entries_text = refresh_kv_entries().await.map_err(std::io::Error::other)?;
+    let mut last_kv_refresh = Instant::now();
 
     let mut effects: tachyonfx::EffectManager<()> = tachyonfx::EffectManager::default();
 
@@ -241,6 +245,23 @@ async fn main() -> std::io::Result<()> {
                             });
                         }
                     }
+                    terminput::key!(terminput::KeyCode::Char('v')) => {
+                        let today_key = current_date_key();
+                        let current_value = increment_kv_with_cas(today_key)
+                            .await
+                            .map_err(std::io::Error::other)?;
+                        kv_status =
+                            format!("committed {}={}", current_date_string(), current_value);
+                        kv_entries_text =
+                            refresh_kv_entries().await.map_err(std::io::Error::other)?;
+                        last_kv_refresh = Instant::now();
+                    }
+                    terminput::key!(terminput::KeyCode::Char('g')) => {
+                        kv_status = "refreshed".to_string();
+                        kv_entries_text =
+                            refresh_kv_entries().await.map_err(std::io::Error::other)?;
+                        last_kv_refresh = Instant::now();
+                    }
                     _ => {}
                 }
             }
@@ -288,6 +309,20 @@ async fn main() -> std::io::Result<()> {
                 peers_list.sort();
             }
             last_peer_update = Instant::now();
+        }
+
+        if last_kv_refresh.elapsed() >= Duration::from_secs(10) {
+            match refresh_kv_entries().await {
+                Ok(entries) => {
+                    kv_status = "refreshed".to_string();
+                    kv_entries_text = entries;
+                }
+                Err(err) => {
+                    kv_status = format!("KV error: {}", err);
+                    kv_entries_text = "KV unavailable".to_string();
+                }
+            }
+            last_kv_refresh = Instant::now();
         }
 
         let peer_messages_text = {
@@ -384,7 +419,7 @@ async fn main() -> std::io::Result<()> {
             let area = frame.area();
             frame.render_widget(
                 Paragraph::new(format!(
-                    "Hello World!\ncounter={}\nlast_event={:#?}\n{}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}\n\nAudio: {}\n  [Space]=Play/Pause  [+/-]=Volume  [M]=Mute\n\nNetwork: {}\n\nPeer ID: {}\nPress 'p' to send a message to peer {}\n\nConnected Peers ({}):\n{}\n\nRecent Messages:\n{}",
+                    "Hello World!\ncounter={}\nlast_event={:#?}\n{}\nconn_done={:#?}\nfps={}\nevent_counter={}\n{}\n\nAudio: {}\n  [Space]=Play/Pause  [+/-]=Volume  [M]=Mute\n\nKV: {}\n  [V]=Bump today's counter  [G] Refresh (auto refresh every 10s)\n{}\n\nNetwork: {}\n\nPeer ID: {}\nPress 'p' to send a message to peer {}\n\nConnected Peers ({}):\n{}\n\nRecent Messages:\n{}",
                     frame_counter,
                     last_event,
                     http_status,
@@ -393,6 +428,8 @@ async fn main() -> std::io::Result<()> {
                     event_counter,
                     "hello there".red().on_red(),
                     audio_status,
+                    kv_status,
+                    kv_entries_text,
                     net_info_str,
                     peer_id,
                     target_peer_id.as_ref()
@@ -416,4 +453,122 @@ async fn main() -> std::io::Result<()> {
     }
     std::io::stdout().write(b"\x1b[?1003l")?;
     Ok(())
+}
+
+async fn refresh_kv_entries() -> Result<String, terminal_games_sdk::kv::Error> {
+    let today_days = days_since_epoch(SystemTime::now());
+    let start = date_string_from_days(today_days - 6);
+    let end = date_string_from_days(today_days + 1);
+    let mut entries = kv::list(
+        terminal_games_sdk::kv_key![],
+        Some(terminal_games_sdk::kv_key![start]),
+        Some(terminal_games_sdk::kv_key![end]),
+    )
+    .await?;
+
+    let mut values = std::collections::BTreeMap::<String, String>::new();
+    while let Some(entry) = entries.next().await? {
+        values.insert(format_key(&entry.key), format_value(Some(entry.value)));
+    }
+
+    let mut lines = Vec::with_capacity(7);
+    for offset in -6..=0 {
+        let key = date_string_from_days(today_days + offset);
+        let value = values.get(&key).cloned().unwrap_or_else(|| "0".to_string());
+        lines.push(format!("{key} = {value}"));
+    }
+    Ok(format!("Last 7 days:\n{}", lines.join("\n")))
+}
+
+fn current_date_key() -> terminal_games_sdk::kv::Key {
+    terminal_games_sdk::kv_key![current_date_string()]
+}
+
+async fn increment_kv_with_cas(key: terminal_games_sdk::kv::Key) -> Result<u64, String> {
+    for _ in 0..8 {
+        let current = kv::get(key.clone()).await.map_err(|err| err.to_string())?;
+        let (next_value, commit) = match current {
+            None => (
+                1,
+                kv::atomic()
+                    .check_missing(key.clone())
+                    .set(1_u64, key.clone()),
+            ),
+            Some(Value::U64(value)) => (
+                value + 1,
+                kv::atomic()
+                    .check(value, key.clone())
+                    .set(value + 1, key.clone()),
+            ),
+            Some(Value::I64(value)) if value >= 0 => (
+                (value as u64) + 1,
+                kv::atomic()
+                    .check(value, key.clone())
+                    .set(value + 1, key.clone()),
+            ),
+            Some(Value::I64(value)) => {
+                return Err(format!("counter has unsupported negative value {value}"));
+            }
+            Some(other) => {
+                return Err(format!("counter has unsupported value {other:?}"));
+            }
+        };
+
+        match commit.exec().await {
+            Ok(()) => return Ok(next_value),
+            Err(err) if is_kv_check_failed(&err) => continue,
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+
+    Err("counter update conflicted too many times".to_string())
+}
+
+fn is_kv_check_failed(err: &KvError) -> bool {
+    matches!(err, KvError::CheckFailed(_))
+}
+
+fn current_date_string() -> String {
+    date_string_from_days(days_since_epoch(SystemTime::now()))
+}
+
+fn days_since_epoch(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .div_euclid(86_400) as i64
+}
+
+fn date_string_from_days(days: i64) -> String {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn format_key(key: &[terminal_games_sdk::kv::KeyPart]) -> String {
+    match key {
+        [terminal_games_sdk::kv::KeyPart::String(value)] => value.clone(),
+        _ => format!("{key:?}"),
+    }
+}
+
+fn format_value(value: Option<Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value,
+        Some(Value::Bytes(value)) => format!("{value:?}"),
+        Some(Value::I64(value)) => value.to_string(),
+        Some(Value::U64(value)) => value.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        None => "<missing>".to_string(),
+    }
 }

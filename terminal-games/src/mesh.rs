@@ -32,7 +32,11 @@ use tokio_util::{
     task::TaskTracker,
 };
 
-use crate::{app_env::AppEnvVar, rate_limiting::get_tcp_rtt_from_fd};
+use crate::{
+    app_env::AppEnvVar,
+    kv::{KvBackend, KvCommand, KvError, KvKey, KvListPage},
+    rate_limiting::get_tcp_rtt_from_fd,
+};
 
 pub type ContentHash = [u8; 32];
 
@@ -111,6 +115,16 @@ trait MeshRpc {
     async fn peer_removed(msg: PeerChangeMessage);
     async fn app_runtime_updated(msg: AppRuntimeUpdateMessage);
     async fn node_status() -> MeshNodeStatus;
+    async fn kv_get(app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, KvError>;
+    async fn kv_exec(app_id: u64, commands: Vec<KvCommand>) -> Result<(), KvError>;
+    async fn kv_list_page(
+        app_id: u64,
+        prefix: KvKey,
+        start: Option<KvKey>,
+        end: Option<KvKey>,
+        after: Option<KvKey>,
+    ) -> Result<KvListPage, KvError>;
+    async fn kv_storage_used(app_id: u64) -> Result<u64, KvError>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -765,15 +779,22 @@ impl Mesh {
             .unwrap_or_default()
     }
 
-    pub async fn serve(&self) -> anyhow::Result<SocketAddr> {
+    pub async fn serve(
+        &self,
+        kv_backend: Option<Arc<dyn KvBackend>>,
+    ) -> anyhow::Result<SocketAddr> {
         let listen_addr: SocketAddr = std::env::var("PEER_LISTEN_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:3001".to_string())
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid PEER_LISTEN_ADDR: {}", e))?;
-        self.serve_on(listen_addr).await
+        self.serve_on(listen_addr, kv_backend).await
     }
 
-    pub async fn serve_on(&self, listen_addr: SocketAddr) -> anyhow::Result<SocketAddr> {
+    pub async fn serve_on(
+        &self,
+        listen_addr: SocketAddr,
+        kv_backend: Option<Arc<dyn KvBackend>>,
+    ) -> anyhow::Result<SocketAddr> {
         let listener = TcpListener::bind(listen_addr).await?;
         let local_addr = listener.local_addr()?;
 
@@ -787,8 +808,11 @@ impl Mesh {
                             Ok((stream, peer_addr)) => {
                                 tracing::trace!(peer = %peer_addr, "Incoming mesh connection");
                                 let inner2 = inner.clone();
+                                let kv_backend = kv_backend.clone();
                                 inner.tasks.spawn(async move {
-                                    inner2.handle_connection(stream, peer_addr, None).await;
+                                    inner2
+                                        .handle_connection(stream, peer_addr, None, kv_backend)
+                                        .await;
                                 });
                             }
                             Err(e) => {
@@ -881,6 +905,128 @@ impl Mesh {
                 }
             }
         }
+    }
+
+    pub async fn execute_kv_get_on_node(
+        &self,
+        node: NodeId,
+        app_id: u64,
+        key: KvKey,
+    ) -> Result<Option<Vec<u8>>, KvError> {
+        if node == self.inner.node {
+            return Err(KvError::Internal(
+                "local kv access should go through AppServer".to_string(),
+            ));
+        }
+
+        let rpc_client = {
+            let nodes = self.inner.nodes.lock().await;
+            nodes
+                .get(&node)
+                .and_then(|state| state.as_active())
+                .map(|conn| conn.rpc_client.clone())
+        };
+
+        let Some(rpc_client) = rpc_client else {
+            return Err(KvError::Unavailable);
+        };
+
+        rpc_client
+            .kv_get(context::current(), app_id, key)
+            .await
+            .map_err(|error| KvError::Internal(format!("kv RPC to node {node} failed: {error}")))?
+    }
+
+    pub async fn execute_kv_exec_on_node(
+        &self,
+        node: NodeId,
+        app_id: u64,
+        commands: Vec<KvCommand>,
+    ) -> Result<(), KvError> {
+        if node == self.inner.node {
+            return Err(KvError::Internal(
+                "local kv access should go through AppServer".to_string(),
+            ));
+        }
+
+        let rpc_client = {
+            let nodes = self.inner.nodes.lock().await;
+            nodes
+                .get(&node)
+                .and_then(|state| state.as_active())
+                .map(|conn| conn.rpc_client.clone())
+        };
+
+        let Some(rpc_client) = rpc_client else {
+            return Err(KvError::Unavailable);
+        };
+
+        rpc_client
+            .kv_exec(context::current(), app_id, commands)
+            .await
+            .map_err(|error| KvError::Internal(format!("kv RPC to node {node} failed: {error}")))?
+    }
+
+    pub async fn execute_kv_list_page_on_node(
+        &self,
+        node: NodeId,
+        app_id: u64,
+        prefix: KvKey,
+        start: Option<KvKey>,
+        end: Option<KvKey>,
+        after: Option<KvKey>,
+    ) -> Result<KvListPage, KvError> {
+        if node == self.inner.node {
+            return Err(KvError::Internal(
+                "local kv access should go through AppServer".to_string(),
+            ));
+        }
+
+        let rpc_client = {
+            let nodes = self.inner.nodes.lock().await;
+            nodes
+                .get(&node)
+                .and_then(|state| state.as_active())
+                .map(|conn| conn.rpc_client.clone())
+        };
+
+        let Some(rpc_client) = rpc_client else {
+            return Err(KvError::Unavailable);
+        };
+
+        rpc_client
+            .kv_list_page(context::current(), app_id, prefix, start, end, after)
+            .await
+            .map_err(|error| KvError::Internal(format!("kv RPC to node {node} failed: {error}")))?
+    }
+
+    pub async fn execute_kv_storage_used_on_node(
+        &self,
+        node: NodeId,
+        app_id: u64,
+    ) -> Result<u64, KvError> {
+        if node == self.inner.node {
+            return Err(KvError::Internal(
+                "local kv access should go through AppServer".to_string(),
+            ));
+        }
+
+        let rpc_client = {
+            let nodes = self.inner.nodes.lock().await;
+            nodes
+                .get(&node)
+                .and_then(|state| state.as_active())
+                .map(|conn| conn.rpc_client.clone())
+        };
+
+        let Some(rpc_client) = rpc_client else {
+            return Err(KvError::Unavailable);
+        };
+
+        rpc_client
+            .kv_storage_used(context::current(), app_id)
+            .await
+            .map_err(|error| KvError::Internal(format!("kv RPC to node {node} failed: {error}")))?
     }
 
     pub async fn discover_nodes(&self) -> anyhow::Result<Vec<NodeId>> {
@@ -1055,7 +1201,9 @@ impl MeshInner {
 
         let inner = self.clone();
         self.tasks.spawn(async move {
-            inner.handle_connection(stream, addr, Some(node)).await;
+            inner
+                .handle_connection(stream, addr, Some(node), None)
+                .await;
         });
 
         Ok(())
@@ -1111,10 +1259,11 @@ impl MeshInner {
         stream: TcpStream,
         addr: SocketAddr,
         expected_node: Option<NodeId>,
+        kv_backend: Option<Arc<dyn KvBackend>>,
     ) {
         let fd = stream.as_raw_fd();
         let result = self
-            .handle_connection_inner(stream, addr, expected_node)
+            .handle_connection_inner(stream, addr, expected_node, kv_backend)
             .await;
 
         if let Err(error) = &result {
@@ -1151,6 +1300,7 @@ impl MeshInner {
         stream: TcpStream,
         addr: SocketAddr,
         expected_node: Option<NodeId>,
+        kv_backend: Option<Arc<dyn KvBackend>>,
     ) -> anyhow::Result<NodeId> {
         let role = if expected_node.is_some() {
             ConnectionRole::Outgoing
@@ -1272,6 +1422,7 @@ impl MeshInner {
                     MeshRpcServer {
                         inner,
                         remote_node: remote_node_for_server,
+                        kv_backend,
                     }
                     .serve(),
                 )
@@ -1697,6 +1848,7 @@ impl rustls::server::danger::ClientCertVerifier for PinnedClientCertVerifier {
 struct MeshRpcServer {
     inner: Arc<MeshInner>,
     remote_node: Arc<Mutex<Option<NodeId>>>,
+    kv_backend: Option<Arc<dyn KvBackend>>,
 }
 
 impl MeshRpc for MeshRpcServer {
@@ -1724,5 +1876,43 @@ impl MeshRpc for MeshRpcServer {
 
     async fn node_status(self, _: context::Context) -> MeshNodeStatus {
         self.inner.local_node_status().await
+    }
+
+    async fn kv_get(
+        self,
+        _: context::Context,
+        app_id: u64,
+        key: KvKey,
+    ) -> Result<Option<Vec<u8>>, KvError> {
+        let backend = self.kv_backend.ok_or(KvError::Unavailable)?;
+        backend.get(app_id, key).await
+    }
+
+    async fn kv_exec(
+        self,
+        _: context::Context,
+        app_id: u64,
+        commands: Vec<KvCommand>,
+    ) -> Result<(), KvError> {
+        let backend = self.kv_backend.ok_or(KvError::Unavailable)?;
+        backend.exec(app_id, commands).await
+    }
+
+    async fn kv_list_page(
+        self,
+        _: context::Context,
+        app_id: u64,
+        prefix: KvKey,
+        start: Option<KvKey>,
+        end: Option<KvKey>,
+        after: Option<KvKey>,
+    ) -> Result<KvListPage, KvError> {
+        let backend = self.kv_backend.ok_or(KvError::Unavailable)?;
+        backend.list_page(app_id, prefix, start, end, after).await
+    }
+
+    async fn kv_storage_used(self, _: context::Context, app_id: u64) -> Result<u64, KvError> {
+        let backend = self.kv_backend.ok_or(KvError::Unavailable)?;
+        backend.storage_used(app_id).await
     }
 }

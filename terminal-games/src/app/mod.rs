@@ -4,6 +4,7 @@
 
 mod app;
 mod audio;
+mod kv;
 mod log;
 mod menu;
 mod net;
@@ -91,6 +92,8 @@ const MENU_REQ_ERR_INVALID_INPUT: i32 = -2;
 const MENU_REQ_ERR_TOO_MANY_REQUESTS: i32 = -3;
 
 const MAX_MENU_REQUESTS: usize = 4;
+const MAX_KV_REQUESTS: usize = 32;
+const MAX_KV_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const WASM_MEMORY_LIMIT_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
 const MENU_POLL_PENDING: i32 = -1;
@@ -105,6 +108,14 @@ const MENU_REQ_REPLAYS_LIST: i32 = 3;
 const MENU_REQ_REPLAY_DELETE: i32 = 4;
 const MENU_REQ_ABOUT_STATUS: i32 = 5;
 const MENU_REQ_GAME_ACTIVITY: i32 = 6;
+
+const KV_REQ_ERR_INVALID_INPUT: i32 = -1;
+const KV_REQ_ERR_TOO_MANY_REQUESTS: i32 = -2;
+
+const KV_POLL_PENDING: i32 = -1;
+const KV_POLL_ERR_INVALID_REQUEST_ID: i32 = -8;
+const KV_POLL_ERR_BUFFER_TOO_SMALL: i32 = -3;
+const KV_POLL_ERR_REQUEST_FAILED: i32 = -4;
 
 const NEXT_APP_READY_READY: i32 = 1;
 const NEXT_APP_READY_NOT_READY: i32 = 0;
@@ -326,6 +337,7 @@ pub struct AppServer {
     engine: wasmtime::Engine,
     pub db: DbPool,
     mesh: Mesh,
+    kv_backend: Arc<dyn crate::kv::KvBackend>,
     app_env_secret_key: Arc<str>,
     app_registry: AppRuntimeRegistry,
 }
@@ -372,6 +384,7 @@ impl AppServer {
     pub fn new(
         mesh: Mesh,
         db: DbPool,
+        kv_backend: Arc<dyn crate::kv::KvBackend>,
         app_env_secret_key: impl Into<Arc<str>>,
     ) -> anyhow::Result<Self> {
         let mut config = wasmtime::Config::new();
@@ -388,6 +401,7 @@ impl AppServer {
         Ok(Self {
             linker: Arc::new(linker),
             mesh,
+            kv_backend,
             db,
             app_env_secret_key: app_env_secret_key.into(),
             engine,
@@ -403,6 +417,10 @@ impl AppServer {
         &self.app_registry
     }
 
+    pub fn kv_backend(&self) -> Arc<dyn crate::kv::KvBackend> {
+        self.kv_backend.clone()
+    }
+
     /// Run an app with IO defined in [`params`] in the background
     pub fn instantiate_app(
         &self,
@@ -415,6 +433,7 @@ impl AppServer {
         let engine = self.engine.clone();
         let linker = self.linker.clone();
         let app_registry = self.app_registry.clone();
+        let kv_backend = self.kv_backend.clone();
         let app_env_secret_key = self.app_env_secret_key.clone();
 
         tokio::task::spawn(async move {
@@ -487,6 +506,7 @@ impl AppServer {
                 db: db.clone(),
                 linker,
                 mesh,
+                kv_backend,
                 about_runtime,
                 app_env_secret_key,
                 app_registry,
@@ -554,6 +574,7 @@ impl AppServer {
                     completed_menu_results: HashMap::new(),
                     menu_completed_rx,
                     menu_request_tx,
+                    kv_requests: Vec::with_capacity(MAX_KV_REQUESTS),
                     menu_session: menu_session.clone(),
                     session_identity: session_identity.clone(),
                     limits: AppLimiter::default(),
@@ -1106,6 +1127,7 @@ pub struct PreloadedAppState {
 pub struct AppContext {
     db: DbPool,
     mesh: Mesh,
+    kv_backend: Arc<dyn crate::kv::KvBackend>,
     about_runtime: AboutRuntimeInfo,
     app_env_secret_key: Arc<str>,
     remote_sshid: String,
@@ -1127,6 +1149,7 @@ pub struct AppState {
     completed_menu_results: HashMap<usize, Result<Vec<u8>, String>>,
     menu_completed_rx: mpsc::Receiver<(usize, Result<Vec<u8>, String>)>,
     menu_request_tx: mpsc::Sender<MenuRequestJob>,
+    kv_requests: Vec<Option<PendingKvRequest>>,
     menu_session: MenuSessionState,
     session_identity: SessionIdentity,
     limits: AppLimiter,
@@ -1400,6 +1423,22 @@ pub struct PendingMenuRequest {
 pub enum MenuRequestState {
     Pending,
     Complete(Result<Box<[u8]>, String>),
+}
+
+pub struct PendingKvRequest {
+    state: KvRequestState,
+}
+
+pub enum KvRequestState {
+    Pending(tokio::sync::oneshot::Receiver<Result<KvPendingResult, crate::kv::KvError>>),
+    Complete(Result<KvPendingResult, crate::kv::KvError>),
+}
+
+pub enum KvPendingResult {
+    Get(Option<Box<[u8]>>),
+    List(Box<[u8]>),
+    StorageUsed(u64),
+    Exec,
 }
 
 #[derive(Clone)]

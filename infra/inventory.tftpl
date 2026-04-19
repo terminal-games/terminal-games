@@ -1,4 +1,4 @@
 [all]
 %{ for node, server in servers ~}
-${node} ansible_host=${server.main_ip} ansible_user=root ansible_port=2222 max_active_apps=${server.max_active_apps} node_id=${server.node_id} node_region=${server.region_code} node_region_name="${server.region_name}" node_latitude=${server.geolocation_lat} node_longitude=${server.geolocation_long}
+${node} ansible_host=${server.main_ip} ansible_user=root ansible_port=2222 max_active_apps=${server.max_active_apps} node_id=${server.node_id} node_region=${server.region_code} node_region_name="${server.region_name}" node_latitude=${server.geolocation_lat} node_longitude=${server.geolocation_long} kv_leader_node_id=${kv_leader_node_id}
 %{ endfor ~}
