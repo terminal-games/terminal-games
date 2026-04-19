@@ -43,9 +43,8 @@ const (
 	optionalKeyMissing     = math.MaxUint32
 
 	errorUnavailable   = 1
-	errorTooManyWrites = 2
-	errorCheckFailed   = 3
-	errorQuotaExceeded = 4
+	errorCheckFailed   = 2
+	errorQuotaExceeded = 3
 
 	checkFailedKeyMissing    = 1
 	checkFailedKeyExists     = 2
@@ -94,12 +93,6 @@ type UnavailableError struct{}
 
 func (e *UnavailableError) Error() string {
 	return "kv unavailable"
-}
-
-type TooManyWritesInAtomicTransactionError struct{}
-
-func (e *TooManyWritesInAtomicTransactionError) Error() string {
-	return "kv atomic transactions may contain at most one write"
 }
 
 type CheckFailureReason uint8
@@ -167,12 +160,7 @@ type listPage struct {
 	nextAfter optionalBytes
 }
 
-type AtomicChecksBuilder struct {
-	commands []Command
-	err      error
-}
-
-type AtomicWriteBuilder struct {
+type AtomicBuilder struct {
 	commands []Command
 	err      error
 }
@@ -221,14 +209,11 @@ func SetTuple(value any, key Tuple) error {
 	return ExecList([]Command{{kind: cmdSet, key: key, value: value}})
 }
 
-func Atomic() *AtomicChecksBuilder { return &AtomicChecksBuilder{} }
+func Atomic() *AtomicBuilder { return &AtomicBuilder{} }
 
 func Exec(commands ...Command) error { return ExecList(commands) }
 
 func ExecList(commands []Command) error {
-	if err := validateCommands(commands); err != nil {
-		return err
-	}
 	encoded, err := encodeCommands(commands)
 	if err != nil {
 		return err
@@ -343,41 +328,45 @@ func Parts(values ...any) (Tuple, error) {
 	return normalizeTuple(values)
 }
 
-func (b *AtomicChecksBuilder) Set(value any, keyParts ...any) *AtomicWriteBuilder {
+func (b *AtomicBuilder) Set(value any, keyParts ...any) *AtomicBuilder {
 	if b.err != nil {
-		return &AtomicWriteBuilder{commands: append([]Command(nil), b.commands...), err: b.err}
+		return b
 	}
 	key, err := Parts(keyParts...)
 	if err != nil {
 		b.err = err
-		return &AtomicWriteBuilder{commands: append([]Command(nil), b.commands...), err: b.err}
+		return b
 	}
 	return b.SetTuple(value, key)
 }
 
-func (b *AtomicChecksBuilder) SetTuple(value any, key Tuple) *AtomicWriteBuilder {
-	commands := append(append([]Command(nil), b.commands...), Command{kind: cmdSet, key: key, value: value})
-	return &AtomicWriteBuilder{commands: commands, err: b.err}
+func (b *AtomicBuilder) SetTuple(value any, key Tuple) *AtomicBuilder {
+	if b.err == nil {
+		b.commands = append(b.commands, Command{kind: cmdSet, key: key, value: value})
+	}
+	return b
 }
 
-func (b *AtomicChecksBuilder) Delete(keyParts ...any) *AtomicWriteBuilder {
+func (b *AtomicBuilder) Delete(keyParts ...any) *AtomicBuilder {
 	if b.err != nil {
-		return &AtomicWriteBuilder{commands: append([]Command(nil), b.commands...), err: b.err}
+		return b
 	}
 	key, err := Parts(keyParts...)
 	if err != nil {
 		b.err = err
-		return &AtomicWriteBuilder{commands: append([]Command(nil), b.commands...), err: b.err}
+		return b
 	}
 	return b.DeleteTuple(key)
 }
 
-func (b *AtomicChecksBuilder) DeleteTuple(key Tuple) *AtomicWriteBuilder {
-	commands := append(append([]Command(nil), b.commands...), Command{kind: cmdDelete, key: key})
-	return &AtomicWriteBuilder{commands: commands, err: b.err}
+func (b *AtomicBuilder) DeleteTuple(key Tuple) *AtomicBuilder {
+	if b.err == nil {
+		b.commands = append(b.commands, Command{kind: cmdDelete, key: key})
+	}
+	return b
 }
 
-func (b *AtomicChecksBuilder) Check(value any, keyParts ...any) *AtomicChecksBuilder {
+func (b *AtomicBuilder) Check(value any, keyParts ...any) *AtomicBuilder {
 	if b.err != nil {
 		return b
 	}
@@ -389,14 +378,14 @@ func (b *AtomicChecksBuilder) Check(value any, keyParts ...any) *AtomicChecksBui
 	return b.CheckTuple(value, key)
 }
 
-func (b *AtomicChecksBuilder) CheckTuple(value any, key Tuple) *AtomicChecksBuilder {
+func (b *AtomicBuilder) CheckTuple(value any, key Tuple) *AtomicBuilder {
 	if b.err == nil {
 		b.commands = append(b.commands, Command{kind: cmdCheckValue, key: key, value: value})
 	}
 	return b
 }
 
-func (b *AtomicChecksBuilder) CheckExists(keyParts ...any) *AtomicChecksBuilder {
+func (b *AtomicBuilder) CheckExists(keyParts ...any) *AtomicBuilder {
 	if b.err != nil {
 		return b
 	}
@@ -408,14 +397,14 @@ func (b *AtomicChecksBuilder) CheckExists(keyParts ...any) *AtomicChecksBuilder 
 	return b.CheckExistsTuple(key)
 }
 
-func (b *AtomicChecksBuilder) CheckExistsTuple(key Tuple) *AtomicChecksBuilder {
+func (b *AtomicBuilder) CheckExistsTuple(key Tuple) *AtomicBuilder {
 	if b.err == nil {
 		b.commands = append(b.commands, Command{kind: cmdCheckExists, key: key})
 	}
 	return b
 }
 
-func (b *AtomicChecksBuilder) CheckMissing(keyParts ...any) *AtomicChecksBuilder {
+func (b *AtomicBuilder) CheckMissing(keyParts ...any) *AtomicBuilder {
 	if b.err != nil {
 		return b
 	}
@@ -427,96 +416,18 @@ func (b *AtomicChecksBuilder) CheckMissing(keyParts ...any) *AtomicChecksBuilder
 	return b.CheckMissingTuple(key)
 }
 
-func (b *AtomicChecksBuilder) CheckMissingTuple(key Tuple) *AtomicChecksBuilder {
+func (b *AtomicBuilder) CheckMissingTuple(key Tuple) *AtomicBuilder {
 	if b.err == nil {
 		b.commands = append(b.commands, Command{kind: cmdCheckMissing, key: key})
 	}
 	return b
 }
 
-func (b *AtomicChecksBuilder) Exec() error {
+func (b *AtomicBuilder) Exec() error {
 	if b.err != nil {
 		return b.err
 	}
 	return ExecList(b.commands)
-}
-
-func (b *AtomicWriteBuilder) Check(value any, keyParts ...any) *AtomicWriteBuilder {
-	if b.err != nil {
-		return b
-	}
-	key, err := Parts(keyParts...)
-	if err != nil {
-		b.err = err
-		return b
-	}
-	return b.CheckTuple(value, key)
-}
-
-func (b *AtomicWriteBuilder) CheckTuple(value any, key Tuple) *AtomicWriteBuilder {
-	if b.err == nil {
-		b.commands = append(b.commands, Command{kind: cmdCheckValue, key: key, value: value})
-	}
-	return b
-}
-
-func (b *AtomicWriteBuilder) CheckExists(keyParts ...any) *AtomicWriteBuilder {
-	if b.err != nil {
-		return b
-	}
-	key, err := Parts(keyParts...)
-	if err != nil {
-		b.err = err
-		return b
-	}
-	return b.CheckExistsTuple(key)
-}
-
-func (b *AtomicWriteBuilder) CheckExistsTuple(key Tuple) *AtomicWriteBuilder {
-	if b.err == nil {
-		b.commands = append(b.commands, Command{kind: cmdCheckExists, key: key})
-	}
-	return b
-}
-
-func (b *AtomicWriteBuilder) CheckMissing(keyParts ...any) *AtomicWriteBuilder {
-	if b.err != nil {
-		return b
-	}
-	key, err := Parts(keyParts...)
-	if err != nil {
-		b.err = err
-		return b
-	}
-	return b.CheckMissingTuple(key)
-}
-
-func (b *AtomicWriteBuilder) CheckMissingTuple(key Tuple) *AtomicWriteBuilder {
-	if b.err == nil {
-		b.commands = append(b.commands, Command{kind: cmdCheckMissing, key: key})
-	}
-	return b
-}
-
-func (b *AtomicWriteBuilder) Exec() error {
-	if b.err != nil {
-		return b.err
-	}
-	return ExecList(b.commands)
-}
-
-func validateCommands(commands []Command) error {
-	writeCount := 0
-	for _, command := range commands {
-		switch command.kind {
-		case cmdSet, cmdDelete:
-			writeCount++
-			if writeCount > 1 {
-				return &TooManyWritesInAtomicTransactionError{}
-			}
-		}
-	}
-	return nil
 }
 
 type encodedCommands struct {
@@ -989,8 +900,6 @@ func decodeRequestFailed(bytes []byte) error {
 	switch tag {
 	case errorUnavailable:
 		return &UnavailableError{}
-	case errorTooManyWrites:
-		return &TooManyWritesInAtomicTransactionError{}
 	case errorCheckFailed:
 		if len(bytes) != 8 {
 			return errors.New("invalid kv check-failed payload")

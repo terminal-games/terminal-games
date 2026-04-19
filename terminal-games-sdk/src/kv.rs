@@ -27,9 +27,8 @@ const KV_LIST_REQUEST_HEADER_SIZE: usize = 16;
 const KV_LIST_RESPONSE_HEADER_SIZE: usize = 8;
 const KV_OPTIONAL_KEY_MISSING: u32 = u32::MAX;
 const KV_ERROR_UNAVAILABLE: u32 = 1;
-const KV_ERROR_TOO_MANY_WRITES: u32 = 2;
-const KV_ERROR_CHECK_FAILED: u32 = 3;
-const KV_ERROR_QUOTA_EXCEEDED: u32 = 4;
+const KV_ERROR_CHECK_FAILED: u32 = 2;
+const KV_ERROR_QUOTA_EXCEEDED: u32 = 3;
 const KV_CHECK_FAILED_KEY_MISSING: u32 = 1;
 const KV_CHECK_FAILED_KEY_EXISTS: u32 = 2;
 const KV_CHECK_FAILED_VALUE_MISMATCH: u32 = 3;
@@ -82,7 +81,6 @@ pub enum Command {
 pub enum Error {
     VersionMismatch,
     InvalidInput,
-    TooManyWritesInAtomicTransaction,
     TooManyRequests,
     InvalidRequestId,
     Unavailable,
@@ -106,9 +104,6 @@ impl std::fmt::Display for Error {
                 write!(f, "terminal-games host version mismatch for terminal_games")
             }
             Self::InvalidInput => write!(f, "invalid kv request"),
-            Self::TooManyWritesInAtomicTransaction => {
-                write!(f, "kv atomic transactions may contain at most one write")
-            }
             Self::TooManyRequests => write!(f, "too many pending kv requests"),
             Self::InvalidRequestId => write!(f, "invalid kv request ID"),
             Self::Unavailable => write!(f, "kv unavailable"),
@@ -148,7 +143,6 @@ fn decode_request_failed(bytes: Vec<u8>) -> Error {
     let tag = u32::from_le_bytes(tag_bytes.try_into().unwrap());
     match tag {
         KV_ERROR_UNAVAILABLE if bytes.len() == 4 => Error::Unavailable,
-        KV_ERROR_TOO_MANY_WRITES if bytes.len() == 4 => Error::TooManyWritesInAtomicTransaction,
         KV_ERROR_CHECK_FAILED if bytes.len() == 8 => {
             let reason = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
             Error::CheckFailed(match reason {
@@ -324,7 +318,6 @@ pub fn atomic() -> Atomic {
 
 pub async fn exec(commands: impl IntoIterator<Item = Command>) -> Result<(), Error> {
     let commands = commands.into_iter().collect::<Vec<_>>();
-    validate_commands(&commands)?;
     let encoded = encode_commands(commands)?;
     let request_id = unsafe {
         crate::internal::kv_exec(
@@ -372,52 +365,19 @@ pub struct Atomic {
 }
 
 impl Atomic {
-    pub fn set(mut self, value: impl IntoValue, key: impl Into<Key>) -> AtomicWrite {
+    pub fn set(mut self, value: impl IntoValue, key: impl Into<Key>) -> Self {
         self.commands.push(Command::Set {
             key: key.into(),
             value: value.into_value(),
         });
-        AtomicWrite {
-            commands: self.commands,
-        }
+        self
     }
 
-    pub fn delete(mut self, key: impl Into<Key>) -> AtomicWrite {
+    pub fn delete(mut self, key: impl Into<Key>) -> Self {
         self.commands.push(Command::Delete { key: key.into() });
-        AtomicWrite {
-            commands: self.commands,
-        }
-    }
-
-    pub fn check(mut self, value: impl IntoValue, key: impl Into<Key>) -> Self {
-        self.commands.push(Command::Check {
-            key: key.into(),
-            value: value.into_value(),
-        });
         self
     }
 
-    pub fn check_exists(mut self, key: impl Into<Key>) -> Self {
-        self.commands.push(Command::CheckExists { key: key.into() });
-        self
-    }
-
-    pub fn check_missing(mut self, key: impl Into<Key>) -> Self {
-        self.commands
-            .push(Command::CheckMissing { key: key.into() });
-        self
-    }
-
-    pub async fn exec(self) -> Result<(), Error> {
-        exec(self.commands).await
-    }
-}
-
-pub struct AtomicWrite {
-    commands: Vec<Command>,
-}
-
-impl AtomicWrite {
     pub fn check(mut self, value: impl IntoValue, key: impl Into<Key>) -> Self {
         self.commands.push(Command::Check {
             key: key.into(),
@@ -497,17 +457,6 @@ struct EncodedCommands {
     _keys: Vec<Vec<u8>>,
     _values: Vec<Vec<u8>>,
     commands: Vec<GuestCommand>,
-}
-
-fn validate_commands(commands: &[Command]) -> Result<(), Error> {
-    let write_count = commands
-        .iter()
-        .filter(|command| matches!(command, Command::Set { .. } | Command::Delete { .. }))
-        .count();
-    if write_count > 1 {
-        return Err(Error::TooManyWritesInAtomicTransaction);
-    }
-    Ok(())
 }
 
 fn encode_commands(commands: impl IntoIterator<Item = Command>) -> Result<EncodedCommands, Error> {

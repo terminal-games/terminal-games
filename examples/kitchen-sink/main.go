@@ -497,71 +497,108 @@ func refreshKVState(status string) tea.Cmd {
 
 func incrementKV() tea.Cmd {
 	return func() tea.Msg {
-		key := currentDateKey()
-		nextValue, err := incrementKVWithCAS(key)
+		dailyCount, totalCount, err := incrementKVWithCAS()
 		if err != nil {
 			return kvStateMsg{status: fmt.Sprintf("KV increment failed: %v", err), entries: "KV unavailable"}
 		}
 
-		return refreshKVState(fmt.Sprintf("committed %s=%d", currentDateString(), nextValue))()
+		return refreshKVState(
+			fmt.Sprintf("committed %s=%d total=%d", currentDateString(), dailyCount, totalCount),
+		)()
 	}
 }
 
-func incrementKVWithCAS(key []any) (uint64, error) {
+func incrementKVWithCAS() (uint64, uint64, error) {
+	dailyKey := currentDateKey()
+	totalKey := []any{"meta", "total"}
+	lastUpdatedKey := []any{"meta", "last-updated-day"}
+	today := currentDateString()
+
 	for attempt := 0; attempt < 8; attempt++ {
-		value, err := kv.Get(key...)
+		dailyValue, err := kv.Get(dailyKey...)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
+		}
+		totalValue, err := kv.Get(totalKey...)
+		if err != nil {
+			return 0, 0, err
+		}
+		lastUpdatedValue, err := kv.Get(lastUpdatedKey...)
+		if err != nil {
+			return 0, 0, err
 		}
 
-		switch value := value.(type) {
+		var dailyCount uint64
+		switch value := dailyValue.(type) {
 		case nil:
-			if err := kv.Atomic().
-				CheckMissing(key...).
-				Set(1, key...).
-				Exec(); err != nil {
-				var checkErr *kv.CheckFailedError
-				if errors.As(err, &checkErr) {
-					continue
-				}
-				return 0, err
-			}
-			return 1, nil
+			dailyCount = 0
 		case uint64:
-			nextValue := value + 1
-			if err := kv.Atomic().
-				Check(value, key...).
-				Set(nextValue, key...).
-				Exec(); err != nil {
-				var checkErr *kv.CheckFailedError
-				if errors.As(err, &checkErr) {
-					continue
-				}
-				return 0, err
-			}
-			return nextValue, nil
+			dailyCount = value
 		case int64:
 			if value < 0 {
-				return 0, fmt.Errorf("counter has unsupported negative value %d", value)
+				return 0, 0, fmt.Errorf("daily counter has unsupported negative value %d", value)
 			}
-			nextValue := uint64(value + 1)
-			if err := kv.Atomic().
-				Check(value, key...).
-				Set(value+1, key...).
-				Exec(); err != nil {
-				var checkErr *kv.CheckFailedError
-				if errors.As(err, &checkErr) {
-					continue
-				}
-				return 0, err
-			}
-			return nextValue, nil
+			dailyCount = uint64(value)
 		default:
-			return 0, fmt.Errorf("counter has unsupported type %T", value)
+			return 0, 0, fmt.Errorf("daily counter has unsupported type %T", value)
 		}
+
+		var totalCount uint64
+		switch value := totalValue.(type) {
+		case nil:
+			totalCount = 0
+		case uint64:
+			totalCount = value
+		case int64:
+			if value < 0 {
+				return 0, 0, fmt.Errorf("total counter has unsupported negative value %d", value)
+			}
+			totalCount = uint64(value)
+		default:
+			return 0, 0, fmt.Errorf("total counter has unsupported type %T", value)
+		}
+
+		builder := kv.Atomic()
+		switch value := dailyValue.(type) {
+		case nil:
+			builder = builder.CheckMissing(dailyKey...)
+		case uint64, int64:
+			builder = builder.Check(value, dailyKey...)
+		}
+		switch value := totalValue.(type) {
+		case nil:
+			builder = builder.CheckMissing(totalKey...)
+		case uint64, int64:
+			builder = builder.Check(value, totalKey...)
+		}
+		switch value := lastUpdatedValue.(type) {
+		case nil:
+			builder = builder.CheckMissing(lastUpdatedKey...)
+		case string:
+			builder = builder.Check(value, lastUpdatedKey...)
+		default:
+			return 0, 0, fmt.Errorf("last updated day has unsupported type %T", value)
+		}
+
+		nextDailyCount := dailyCount + 1
+		nextTotalCount := totalCount + 1
+		err = builder.
+			Set(nextDailyCount, dailyKey...).
+			Set(nextTotalCount, totalKey...).
+			Set(today, lastUpdatedKey...).
+			Exec()
+		if err == nil {
+			return nextDailyCount, nextTotalCount, nil
+		}
+
+		var checkErr *kv.CheckFailedError
+		if errors.As(err, &checkErr) {
+			continue
+		}
+		return 0, 0, err
 	}
 
-	return 0, fmt.Errorf("counter update conflicted too many times")
+	return 0, 0, fmt.Errorf("counter update conflicted too many times")
 }
 
 func currentDateKey() []any {

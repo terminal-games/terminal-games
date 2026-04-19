@@ -3,10 +3,11 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
 };
 
 use anyhow::Context as _;
@@ -21,10 +22,11 @@ use opendal::raw::{
     Access, Layer, LayeredAccess, OpList, OpRead, OpWrite, RpDelete, RpList, RpRead, RpWrite,
 };
 use opendal::{Buffer, EntryMode, ErrorKind as OpenDalErrorKind, Operator, services::S3};
+use serde::{Deserialize, Serialize};
 use terminal_games::kv::{
-    DEFAULT_KV_APP_MAX_BYTES, KV_LIST_PAGE_SIZE, KvBackend, KvCheckFailedReason, KvCommand,
-    KvEntry, KvError, KvKey, KvListPage, KvWrite, LibsqlKvBackendOptions, collect_kv_writes,
-    load_libsql_backend,
+    DEFAULT_KV_APP_MAX_BYTES, KV_LIST_PAGE_SIZE, KvAccessPattern, KvBackend, KvCheckFailedReason,
+    KvCommand, KvEntry, KvError, KvKey, KvListPage, KvRangeLock, KvWrite, LibsqlKvBackendOptions,
+    collect_kv_writes, collect_touched_keys, load_libsql_backend,
 };
 use tokio::sync::Mutex;
 
@@ -32,6 +34,9 @@ const DEFAULT_KV_S3_PREFIX: &str = "kv";
 const DEFAULT_KV_CACHE_DIR: &str = "/opt/terminal-games/kv-cache";
 const DEFAULT_KV_CACHE_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_KV_CACHE_DISK_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const MAX_KV_WAL_BATCHES: usize = 8;
+const WAL_RETRY_BASE_DELAY_MS: u64 = 250;
+const WAL_RETRY_MAX_DELAY_MS: u64 = 30_000;
 
 pub async fn load_backend_from_env() -> anyhow::Result<Arc<dyn KvBackend>> {
     let max_app_bytes = read_env_u64("KV_APP_MAX_BYTES").unwrap_or(DEFAULT_KV_APP_MAX_BYTES);
@@ -42,11 +47,12 @@ pub async fn load_backend_from_env() -> anyhow::Result<Arc<dyn KvBackend>> {
         .unwrap_or_else(|| "libsql".to_string());
 
     match backend_kind.as_str() {
-        "s3" => Ok(Arc::new(S3KvBackend {
-            store: Arc::new(KvStore::from_s3_env().await?),
-            max_app_bytes,
-            namespaces: Arc::new(Mutex::new(HashMap::new())),
-        })),
+        "s3" => {
+            let backend =
+                S3KvBackend::new(Arc::new(KvStore::from_s3_env().await?), max_app_bytes, true);
+            backend.spawn_startup_checkpoint();
+            Ok(backend)
+        }
         "libsql" => {
             let path = std::env::var("KV_LIBSQL_PATH")
                 .ok()
@@ -66,108 +72,556 @@ pub async fn load_backend_from_env() -> anyhow::Result<Arc<dyn KvBackend>> {
 struct S3KvBackend {
     store: Arc<KvStore>,
     max_app_bytes: u64,
-    namespaces: Arc<Mutex<HashMap<u64, Arc<Mutex<()>>>>>,
+    namespaces: Arc<Mutex<HashMap<u64, Arc<S3AppNamespace>>>>,
+    background_checkpointing: bool,
 }
 
 impl S3KvBackend {
-    async fn namespace(&self, app_id: u64) -> Arc<Mutex<()>> {
+    fn new(store: Arc<KvStore>, max_app_bytes: u64, background_checkpointing: bool) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            max_app_bytes,
+            namespaces: Arc::new(Mutex::new(HashMap::new())),
+            background_checkpointing,
+        })
+    }
+
+    async fn namespace(&self, app_id: u64) -> Arc<S3AppNamespace> {
         let mut namespaces = self.namespaces.lock().await;
         namespaces
             .entry(app_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(S3AppNamespace::default()))
             .clone()
     }
+
+    fn spawn_startup_checkpoint(self: &Arc<Self>) {
+        if !self.background_checkpointing {
+            return;
+        }
+        let backend = self.clone();
+        tokio::spawn(async move {
+            let app_ids = match backend.store.list_wal_app_ids().await {
+                Ok(app_ids) => app_ids,
+                Err(error) => {
+                    tracing::error!(error = ?error, "failed to discover kv wal files on startup");
+                    return;
+                }
+            };
+            for app_id in app_ids {
+                let namespace = backend.namespace(app_id).await;
+                let load_result = {
+                    let _wal_guard = namespace.wal_io.lock().await;
+                    let mut state = namespace.state.lock().await;
+                    backend.ensure_namespace_loaded(app_id, &mut state).await
+                };
+                if let Err(error) = load_result {
+                    tracing::error!(app_id, error = ?error, "failed to load kv wal on startup");
+                    continue;
+                }
+                backend.maybe_spawn_checkpoint(app_id, namespace).await;
+            }
+        });
+    }
+
+    async fn maybe_spawn_checkpoint(&self, app_id: u64, namespace: Arc<S3AppNamespace>) {
+        if !self.background_checkpointing {
+            return;
+        }
+        let should_spawn = {
+            let mut state = namespace.state.lock().await;
+            if state.checkpointing || state.wal.is_empty() {
+                false
+            } else {
+                state.checkpointing = true;
+                true
+            }
+        };
+        if !should_spawn {
+            return;
+        }
+
+        let backend = self.clone();
+        tokio::spawn(async move {
+            backend.checkpoint_namespace(app_id, namespace).await;
+        });
+    }
+
+    async fn checkpoint_namespace(self, app_id: u64, namespace: Arc<S3AppNamespace>) {
+        let mut backoff = Duration::from_millis(WAL_RETRY_BASE_DELAY_MS);
+        loop {
+            match self.checkpoint_one_batch(app_id, &namespace).await {
+                Ok(true) => {
+                    backoff = Duration::from_millis(WAL_RETRY_BASE_DELAY_MS);
+                }
+                Ok(false) => return,
+                Err(error) => {
+                    tracing::error!(
+                        app_id,
+                        error = ?error,
+                        retry_ms = backoff.as_millis(),
+                        "failed to checkpoint kv wal"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff.saturating_mul(2))
+                        .min(Duration::from_millis(WAL_RETRY_MAX_DELAY_MS));
+                }
+            }
+        }
+    }
+
+    async fn checkpoint_one_batch(
+        &self,
+        app_id: u64,
+        namespace: &Arc<S3AppNamespace>,
+    ) -> anyhow::Result<bool> {
+        let batch = {
+            let state = namespace.state.lock().await;
+            if state.wal.is_empty() {
+                None
+            } else {
+                state.wal.front().cloned()
+            }
+        };
+        let Some(batch) = batch else {
+            let mut state = namespace.state.lock().await;
+            state.checkpointing = false;
+            return Ok(false);
+        };
+        let _range_guard = namespace
+            .locks
+            .acquire(KvAccessPattern::write_keys(batch.iter().map(
+                |write| match write {
+                    KvWrite::Set { key, .. } | KvWrite::Delete { key } => key.clone(),
+                },
+            )))
+            .await;
+        let _wal_guard = namespace.wal_io.lock().await;
+        let remaining = {
+            let state = namespace.state.lock().await;
+            if state.wal.front() != Some(&batch) {
+                return Ok(true);
+            }
+            let mut remaining = state.wal.clone();
+            remaining.pop_front();
+            remaining
+        };
+        self.store.apply_entry_writes(app_id, &batch).await?;
+        self.store.write_wal(app_id, &remaining).await?;
+        let mut state = namespace.state.lock().await;
+        state.wal = remaining;
+        state.rebuild_overlay();
+        self.store.apply_cache_overlay(app_id, &state.overlay);
+        Ok(true)
+    }
+
+    async fn ensure_namespace_loaded(
+        &self,
+        app_id: u64,
+        state: &mut S3AppState,
+    ) -> anyhow::Result<()> {
+        if state.loaded {
+            return Ok(());
+        }
+        let (entry_sizes, total_bytes) = self.store.list_entry_sizes(app_id).await?;
+        state.wal = self.store.read_wal(app_id).await?;
+        state.entry_sizes = entry_sizes;
+        state.total_bytes = total_bytes;
+        state.rebuild_overlay();
+        let wal_writes = state
+            .wal
+            .iter()
+            .flat_map(|batch| batch.iter().cloned())
+            .collect::<Vec<_>>();
+        state.apply_writes(&wal_writes)?;
+        self.store.apply_cache_overlay(app_id, &state.overlay);
+        state.loaded = true;
+        Ok(())
+    }
+
+    async fn ensure_namespace_ready(
+        &self,
+        app_id: u64,
+        namespace: &S3AppNamespace,
+    ) -> Result<(), KvError> {
+        {
+            let state = namespace.state.lock().await;
+            if state.loaded {
+                return Ok(());
+            }
+        }
+        let _wal_guard = namespace.wal_io.lock().await;
+        let mut state = namespace.state.lock().await;
+        self.ensure_namespace_loaded(app_id, &mut state)
+            .await
+            .map_err(|error| KvError::internal(format!("failed to load kv wal: {error:#}")))
+    }
+}
+
+#[cfg(test)]
+impl S3KvBackend {
+    async fn checkpoint_all_for_tests(&self, app_id: u64) -> anyhow::Result<()> {
+        let namespace = self.namespace(app_id).await;
+        loop {
+            if !self.checkpoint_one_batch(app_id, &namespace).await? {
+                return Ok(());
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct S3AppState {
+    loaded: bool,
+    wal: VecDeque<KvWalBatch>,
+    overlay: HashMap<KvKey, Option<Vec<u8>>>,
+    entry_sizes: HashMap<KvKey, u64>,
+    total_bytes: u64,
+    checkpointing: bool,
+}
+
+impl S3AppState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn rebuild_overlay(&mut self) {
+        self.overlay.clear();
+        for batch in &self.wal {
+            for write in batch {
+                match write {
+                    KvWrite::Set { key, value } => {
+                        self.overlay.insert(key.clone(), Some(value.clone()));
+                    }
+                    KvWrite::Delete { key } => {
+                        self.overlay.insert(key.clone(), None);
+                    }
+                }
+            }
+        }
+    }
+
+    fn predicted_total_after(&self, writes: &[KvWrite]) -> Result<u64, KvError> {
+        let mut entry_sizes = self.entry_sizes.clone();
+        let mut total_bytes = self.total_bytes;
+
+        for write in writes {
+            match write {
+                KvWrite::Set { key, value } => {
+                    let new_size = logical_entry_size(key.len(), value.len())
+                        .map_err(|error| KvError::internal(error.to_string()))?;
+                    let old_size = entry_sizes.insert(key.clone(), new_size).unwrap_or(0);
+                    total_bytes = total_bytes
+                        .saturating_sub(old_size)
+                        .saturating_add(new_size);
+                }
+                KvWrite::Delete { key } => {
+                    total_bytes = total_bytes.saturating_sub(entry_sizes.remove(key).unwrap_or(0));
+                }
+            }
+        }
+
+        Ok(total_bytes)
+    }
+
+    fn apply_writes(&mut self, writes: &[KvWrite]) -> Result<(), KvError> {
+        for write in writes {
+            match write {
+                KvWrite::Set { key, value } => {
+                    let new_size = logical_entry_size(key.len(), value.len())
+                        .map_err(|error| KvError::internal(error.to_string()))?;
+                    let old_size = self.entry_sizes.insert(key.clone(), new_size).unwrap_or(0);
+                    self.total_bytes = self
+                        .total_bytes
+                        .saturating_sub(old_size)
+                        .saturating_add(new_size);
+                }
+                KvWrite::Delete { key } => {
+                    self.total_bytes = self
+                        .total_bytes
+                        .saturating_sub(self.entry_sizes.remove(key).unwrap_or(0));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct S3AppNamespace {
+    state: Mutex<S3AppState>,
+    locks: KvRangeLock,
+    wal_io: Mutex<()>,
+}
+
+type KvWalBatch = Vec<KvWrite>;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct StoredWal {
+    batches: Vec<KvWalBatch>,
 }
 
 #[async_trait]
 impl KvBackend for S3KvBackend {
     async fn get(&self, app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, KvError> {
         let namespace = self.namespace(app_id).await;
-        let _guard = namespace.lock().await;
-        self.store
-            .get_entry(app_id, &key)
-            .await
-            .map_err(|error| KvError::internal(format!("failed to read kv entry: {error:#}")))
+        let _guard = namespace
+            .locks
+            .acquire(KvAccessPattern::read_key(key.clone()))
+            .await;
+        self.ensure_namespace_ready(app_id, &namespace).await?;
+        let overlay_value = {
+            let state = namespace.state.lock().await;
+            if state.overlay.contains_key(&key) {
+                Some(state.overlay.get(&key).cloned().unwrap_or(None))
+            } else {
+                None
+            }
+        };
+        let value = if let Some(value) = overlay_value {
+            value
+        } else {
+            self.store
+                .get_entry(app_id, &key)
+                .await
+                .map_err(|error| KvError::internal(format!("failed to read kv entry: {error:#}")))?
+        };
+        self.maybe_spawn_checkpoint(app_id, namespace).await;
+        Ok(value)
     }
 
     async fn exec(&self, app_id: u64, commands: Vec<KvCommand>) -> Result<(), KvError> {
         let namespace = self.namespace(app_id).await;
-        let _guard = namespace.lock().await;
         let writes = collect_kv_writes(&commands)?;
+        let touched_keys = collect_touched_keys(&commands);
+        let _range_guard = namespace
+            .locks
+            .acquire(KvAccessPattern::write_keys(touched_keys.clone()))
+            .await;
+        let should_spawn_checkpoint = {
+            let _wal_guard = namespace.wal_io.lock().await;
+            enum MutationPlan {
+                Direct(KvWrite),
+                CheckOnly {
+                    visible_values: HashMap<KvKey, Option<Vec<u8>>>,
+                    store_keys: Vec<KvKey>,
+                },
+                AppendWal {
+                    next_wal: VecDeque<KvWalBatch>,
+                    visible_values: HashMap<KvKey, Option<Vec<u8>>>,
+                    store_keys: Vec<KvKey>,
+                },
+            }
 
-        let touched_keys = commands
-            .iter()
-            .map(|command| match command {
-                KvCommand::Set { key, .. }
-                | KvCommand::Delete { key }
-                | KvCommand::CheckValue { key, .. }
-                | KvCommand::CheckExists { key }
-                | KvCommand::CheckMissing { key } => key.clone(),
-            })
-            .collect::<HashSet<_>>();
+            let plan = {
+                let mut state = namespace.state.lock().await;
+                self.ensure_namespace_loaded(app_id, &mut state)
+                    .await
+                    .map_err(|error| {
+                        KvError::internal(format!("failed to load kv wal: {error:#}"))
+                    })?;
 
-        let current_values = self
-            .store
-            .load_entries(app_id, touched_keys)
-            .await
-            .map_err(|error| KvError::internal(format!("failed to load kv entries: {error:#}")))?;
-        let current_total_bytes =
-            self.store.storage_used(app_id).await.map_err(|error| {
-                KvError::internal(format!("failed to measure kv usage: {error:#}"))
-            })?;
+                if let Some(single_write) = single_write_command(&commands)
+                    && state.wal.is_empty()
+                {
+                    let predicted_total_bytes =
+                        state.predicted_total_after(std::slice::from_ref(&single_write))?;
+                    if predicted_total_bytes > self.max_app_bytes {
+                        return Err(KvError::QuotaExceeded {
+                            app_id,
+                            used_bytes: predicted_total_bytes,
+                            limit_bytes: self.max_app_bytes,
+                        });
+                    }
+                    MutationPlan::Direct(single_write)
+                } else {
+                    let mut visible_values = HashMap::new();
+                    let mut store_keys = Vec::new();
+                    for key in touched_keys {
+                        if let Some(value) = state.overlay.get(&key) {
+                            visible_values.insert(key, value.clone());
+                        } else {
+                            store_keys.push(key);
+                        }
+                    }
+                    let predicted_total_bytes = state.predicted_total_after(&writes)?;
+                    if predicted_total_bytes > self.max_app_bytes {
+                        return Err(KvError::QuotaExceeded {
+                            app_id,
+                            used_bytes: predicted_total_bytes,
+                            limit_bytes: self.max_app_bytes,
+                        });
+                    }
+                    if writes.is_empty() {
+                        MutationPlan::CheckOnly {
+                            visible_values,
+                            store_keys,
+                        }
+                    } else if state.wal.len() >= MAX_KV_WAL_BATCHES {
+                        return Err(KvError::Unavailable);
+                    } else {
+                        let mut next_wal = state.wal.clone();
+                        next_wal.push_back(writes.clone());
+                        MutationPlan::AppendWal {
+                            next_wal,
+                            visible_values,
+                            store_keys,
+                        }
+                    }
+                }
+            };
 
-        for command in &commands {
-            match command {
-                KvCommand::Set { .. } | KvCommand::Delete { .. } => {}
-                KvCommand::CheckValue { key, value } => {
-                    let Some(existing) = current_values.get(key).and_then(|value| value.as_ref())
-                    else {
-                        return Err(KvError::CheckFailed(KvCheckFailedReason::KeyMissing));
+            match plan {
+                MutationPlan::Direct(single_write) => {
+                    let result = match &single_write {
+                        KvWrite::Set { key, value } => {
+                            self.store.write_entry(app_id, key, value).await
+                        }
+                        KvWrite::Delete { key } => self.store.delete_entry(app_id, key).await,
                     };
-                    if existing != value {
-                        return Err(KvError::CheckFailed(KvCheckFailedReason::ValueMismatch));
+                    let mut state = namespace.state.lock().await;
+                    if let Err(error) = result {
+                        state.reset();
+                        return Err(KvError::internal(format!(
+                            "failed to persist kv entry: {error:#}"
+                        )));
                     }
+                    state.apply_writes(std::slice::from_ref(&single_write))?;
+                    false
                 }
-                KvCommand::CheckExists { key } => {
-                    if current_values
-                        .get(key)
-                        .and_then(|value| value.as_ref())
-                        .is_none()
-                    {
-                        return Err(KvError::CheckFailed(KvCheckFailedReason::KeyMissing));
+                MutationPlan::CheckOnly {
+                    mut visible_values,
+                    store_keys,
+                } => {
+                    visible_values.extend(
+                        self.store
+                            .load_entries(app_id, store_keys)
+                            .await
+                            .map_err(|error| {
+                                KvError::internal(format!("failed to load kv entries: {error:#}"))
+                            })?,
+                    );
+
+                    for command in &commands {
+                        match command {
+                            KvCommand::Set { .. } | KvCommand::Delete { .. } => {}
+                            KvCommand::CheckValue { key, value } => {
+                                let Some(existing) =
+                                    visible_values.get(key).and_then(|value| value.as_ref())
+                                else {
+                                    return Err(KvError::CheckFailed(
+                                        KvCheckFailedReason::KeyMissing,
+                                    ));
+                                };
+                                if existing != value {
+                                    return Err(KvError::CheckFailed(
+                                        KvCheckFailedReason::ValueMismatch,
+                                    ));
+                                }
+                            }
+                            KvCommand::CheckExists { key } => {
+                                if visible_values
+                                    .get(key)
+                                    .and_then(|value| value.as_ref())
+                                    .is_none()
+                                {
+                                    return Err(KvError::CheckFailed(
+                                        KvCheckFailedReason::KeyMissing,
+                                    ));
+                                }
+                            }
+                            KvCommand::CheckMissing { key } => {
+                                if visible_values
+                                    .get(key)
+                                    .and_then(|value| value.as_ref())
+                                    .is_some()
+                                {
+                                    return Err(KvError::CheckFailed(
+                                        KvCheckFailedReason::KeyExists,
+                                    ));
+                                }
+                            }
+                        }
                     }
+
+                    return Ok(());
                 }
-                KvCommand::CheckMissing { key } => {
-                    if current_values
-                        .get(key)
-                        .and_then(|value| value.as_ref())
-                        .is_some()
-                    {
-                        return Err(KvError::CheckFailed(KvCheckFailedReason::KeyExists));
+                MutationPlan::AppendWal {
+                    mut visible_values,
+                    store_keys,
+                    next_wal,
+                } => {
+                    visible_values.extend(
+                        self.store
+                            .load_entries(app_id, store_keys)
+                            .await
+                            .map_err(|error| {
+                                KvError::internal(format!("failed to load kv entries: {error:#}"))
+                            })?,
+                    );
+
+                    for command in &commands {
+                        match command {
+                            KvCommand::Set { .. } | KvCommand::Delete { .. } => {}
+                            KvCommand::CheckValue { key, value } => {
+                                let Some(existing) =
+                                    visible_values.get(key).and_then(|value| value.as_ref())
+                                else {
+                                    return Err(KvError::CheckFailed(
+                                        KvCheckFailedReason::KeyMissing,
+                                    ));
+                                };
+                                if existing != value {
+                                    return Err(KvError::CheckFailed(
+                                        KvCheckFailedReason::ValueMismatch,
+                                    ));
+                                }
+                            }
+                            KvCommand::CheckExists { key } => {
+                                if visible_values
+                                    .get(key)
+                                    .and_then(|value| value.as_ref())
+                                    .is_none()
+                                {
+                                    return Err(KvError::CheckFailed(
+                                        KvCheckFailedReason::KeyMissing,
+                                    ));
+                                }
+                            }
+                            KvCommand::CheckMissing { key } => {
+                                if visible_values
+                                    .get(key)
+                                    .and_then(|value| value.as_ref())
+                                    .is_some()
+                                {
+                                    return Err(KvError::CheckFailed(
+                                        KvCheckFailedReason::KeyExists,
+                                    ));
+                                }
+                            }
+                        }
                     }
+
+                    let write_result = self.store.write_wal(app_id, &next_wal).await;
+                    let mut state = namespace.state.lock().await;
+                    if let Err(error) = write_result {
+                        state.reset();
+                        return Err(KvError::internal(format!(
+                            "failed to write kv wal: {error:#}"
+                        )));
+                    }
+                    state.wal = next_wal;
+                    state.rebuild_overlay();
+                    state.apply_writes(&writes)?;
+                    self.store.apply_cache_overlay(app_id, &state.overlay);
+                    true
                 }
             }
-        }
+        };
 
-        let predicted_total_bytes =
-            predicted_total_bytes(current_total_bytes, &current_values, &writes)?;
-        if predicted_total_bytes > self.max_app_bytes {
-            return Err(KvError::QuotaExceeded {
-                app_id,
-                used_bytes: predicted_total_bytes,
-                limit_bytes: self.max_app_bytes,
-            });
+        if should_spawn_checkpoint {
+            self.maybe_spawn_checkpoint(app_id, namespace).await;
         }
-        if writes.is_empty() {
-            return Ok(());
-        }
-
-        self.store
-            .apply_entry_writes(app_id, &writes)
-            .await
-            .map_err(|error| {
-                KvError::internal(format!("failed to persist kv entries: {error:#}"))
-            })?;
         Ok(())
     }
 
@@ -180,59 +634,153 @@ impl KvBackend for S3KvBackend {
         after: Option<KvKey>,
     ) -> Result<KvListPage, KvError> {
         let namespace = self.namespace(app_id).await;
-        let _guard = namespace.lock().await;
-        self.store
-            .list_entries_page(app_id, prefix, start, end, after)
-            .await
-            .map_err(|error| KvError::internal(format!("failed to list kv entries: {error:#}")))
+        let _guard = namespace
+            .locks
+            .acquire(KvAccessPattern::read_list(
+                &prefix,
+                start.as_deref(),
+                end.as_deref(),
+                after.as_deref(),
+            ))
+            .await;
+        self.ensure_namespace_ready(app_id, &namespace).await?;
+        let overlay = {
+            let state = namespace.state.lock().await;
+            state.overlay.clone()
+        };
+        let page = self
+            .list_visible_page(app_id, &overlay, prefix, start, end, after)
+            .await?;
+        self.maybe_spawn_checkpoint(app_id, namespace).await;
+        Ok(page)
     }
 
     async fn storage_used(&self, app_id: u64) -> Result<u64, KvError> {
         let namespace = self.namespace(app_id).await;
-        let _guard = namespace.lock().await;
-        self.store
-            .storage_used(app_id)
-            .await
-            .map_err(|error| KvError::internal(format!("failed to measure kv usage: {error:#}")))
+        let _guard = namespace.locks.acquire(KvAccessPattern::read_all()).await;
+        self.ensure_namespace_ready(app_id, &namespace).await?;
+        let total = {
+            let state = namespace.state.lock().await;
+            state.total_bytes
+        };
+        self.maybe_spawn_checkpoint(app_id, namespace).await;
+        Ok(total)
     }
 }
 
-fn predicted_total_bytes(
-    current_total_bytes: u64,
-    current_values: &HashMap<KvKey, Option<Vec<u8>>>,
-    writes: &[KvWrite],
-) -> Result<u64, KvError> {
-    let mut total = current_total_bytes;
-    let mut current_values = current_values.clone();
-
-    for write in writes {
-        match write {
-            KvWrite::Set { key, value } => {
-                let new_size = logical_entry_size(key.len(), value.len())
-                    .map_err(|error| KvError::internal(error.to_string()))?;
-                let old_size = current_values
-                    .get(key)
-                    .and_then(|value| value.as_ref())
-                    .map(|existing| logical_entry_size(key.len(), existing.len()))
-                    .transpose()
-                    .map_err(|error| KvError::internal(error.to_string()))?
-                    .unwrap_or(0);
-                total = total.saturating_sub(old_size).saturating_add(new_size);
-                current_values.insert(key.clone(), Some(value.clone()));
-            }
-            KvWrite::Delete { key } => {
-                if let Some(existing) = current_values.get(key).and_then(|value| value.as_ref()) {
-                    total = total.saturating_sub(
-                        logical_entry_size(key.len(), existing.len())
-                            .map_err(|error| KvError::internal(error.to_string()))?,
-                    );
+impl S3KvBackend {
+    async fn list_visible_page(
+        &self,
+        app_id: u64,
+        overlay: &HashMap<KvKey, Option<Vec<u8>>>,
+        prefix: KvKey,
+        start: Option<KvKey>,
+        end: Option<KvKey>,
+        after: Option<KvKey>,
+    ) -> Result<KvListPage, KvError> {
+        let overlay_keys = overlay
+            .iter()
+            .filter(|(key, _)| {
+                key_in_range(
+                    key,
+                    &prefix,
+                    start.as_deref(),
+                    end.as_deref(),
+                    after.as_deref(),
+                )
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<HashSet<_>>();
+        let mut overlay_entries = overlay
+            .iter()
+            .filter_map(|(key, entry)| {
+                if !key_in_range(
+                    key,
+                    &prefix,
+                    start.as_deref(),
+                    end.as_deref(),
+                    after.as_deref(),
+                ) {
+                    return None;
                 }
-                current_values.insert(key.clone(), None);
-            }
-        }
-    }
+                Some(KvEntry {
+                    key: key.clone(),
+                    value: entry.clone()?,
+                })
+            })
+            .collect::<Vec<_>>();
+        overlay_entries.sort_by(|left, right| left.key.cmp(&right.key));
 
-    Ok(total)
+        let target_s3_entries = KV_LIST_PAGE_SIZE + 1 + overlay_keys.len();
+        let mut s3_entries = Vec::new();
+        let mut cursor = after;
+        while s3_entries.len() < target_s3_entries {
+            let page = self
+                .store
+                .list_entries_page(
+                    app_id,
+                    prefix.clone(),
+                    start.clone(),
+                    end.clone(),
+                    cursor.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    KvError::internal(format!("failed to list kv entries: {error:#}"))
+                })?;
+
+            for entry in page.entries {
+                if !overlay_keys.contains(&entry.key) {
+                    s3_entries.push(entry);
+                }
+            }
+            let Some(next_after) = page.next_after else {
+                break;
+            };
+            cursor = Some(next_after);
+        }
+
+        let mut entries = overlay_entries;
+        entries.extend(s3_entries);
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
+
+        let next_after = if entries.len() > KV_LIST_PAGE_SIZE {
+            let next_after = entries[KV_LIST_PAGE_SIZE - 1].key.clone();
+            entries.truncate(KV_LIST_PAGE_SIZE);
+            Some(next_after)
+        } else {
+            None
+        };
+
+        Ok(KvListPage {
+            entries,
+            next_after,
+        })
+    }
+}
+
+fn single_write_command(commands: &[KvCommand]) -> Option<KvWrite> {
+    match commands {
+        [KvCommand::Set { key, value }] => Some(KvWrite::Set {
+            key: key.clone(),
+            value: value.clone(),
+        }),
+        [KvCommand::Delete { key }] => Some(KvWrite::Delete { key: key.clone() }),
+        _ => None,
+    }
+}
+
+fn key_in_range(
+    key: &[u8],
+    prefix: &[u8],
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    after: Option<&[u8]>,
+) -> bool {
+    key.starts_with(prefix)
+        && start.is_none_or(|start| key >= start)
+        && after.is_none_or(|after| key > after)
+        && end.is_none_or(|end| key < end)
 }
 
 fn logical_entry_size(key_len: usize, value_len: usize) -> anyhow::Result<u64> {
@@ -245,6 +793,7 @@ fn logical_entry_size(key_len: usize, value_len: usize) -> anyhow::Result<u64> {
 #[derive(Clone)]
 struct KvCache {
     inner: HybridCache<String, Vec<u8>>,
+    deleted: Arc<StdMutex<HashSet<String>>>,
 }
 
 impl KvCache {
@@ -258,6 +807,14 @@ impl KvCache {
         let cache_disk_bytes =
             read_env_u64("KV_CACHE_DISK_BYTES").unwrap_or(DEFAULT_KV_CACHE_DISK_BYTES);
 
+        Self::open(cache_dir, cache_memory_bytes, cache_disk_bytes).await
+    }
+
+    async fn open(
+        cache_dir: PathBuf,
+        cache_memory_bytes: u64,
+        cache_disk_bytes: u64,
+    ) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(&cache_dir)
             .await
             .with_context(|| format!("failed to create kv cache dir {}", cache_dir.display()))?;
@@ -290,10 +847,17 @@ impl KvCache {
             .await
             .context("failed to initialize kv cache")?;
 
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            deleted: Arc::new(StdMutex::new(HashSet::new())),
+        })
     }
 
+    #[cfg(test)]
     async fn get(&self, path: &str) -> Option<Vec<u8>> {
+        if self.deleted.lock().unwrap().contains(path) {
+            return None;
+        }
         match self.inner.get(&path.to_string()).await {
             Ok(Some(entry)) => Some(entry.value().clone()),
             Ok(None) => None,
@@ -304,11 +868,27 @@ impl KvCache {
         }
     }
 
+    async fn lookup(&self, path: &str) -> Option<Option<Vec<u8>>> {
+        if self.deleted.lock().unwrap().contains(path) {
+            return Some(None);
+        }
+        match self.inner.get(&path.to_string()).await {
+            Ok(Some(entry)) => Some(Some(entry.value().clone())),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(error = ?error, path, "failed to read kv cache");
+                None
+            }
+        }
+    }
+
     fn insert(&self, path: &str, bytes: Vec<u8>) {
+        self.deleted.lock().unwrap().remove(path);
         self.inner.insert(path.to_string(), bytes);
     }
 
     fn remove(&self, path: &str) {
+        self.deleted.lock().unwrap().insert(path.to_string());
         self.inner.remove(&path.to_string());
     }
 }
@@ -360,8 +940,14 @@ impl<A: Access> LayeredAccess for FoyerAccess<A> {
 
     async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
         let cacheable = args.range().is_full();
-        if cacheable && let Some(bytes) = self.cache.get(path).await {
-            return Ok((RpRead::new(), bytes.into()));
+        if cacheable && let Some(bytes) = self.cache.lookup(path).await {
+            return match bytes {
+                Some(bytes) => Ok((RpRead::new(), bytes.into())),
+                None => Err(opendal::Error::new(
+                    OpenDalErrorKind::NotFound,
+                    "kv cache tombstone",
+                )),
+            };
         }
 
         let (rp, mut reader) = self.inner.read(path, args).await?;
@@ -420,6 +1006,31 @@ impl KvStore {
         read_s3(&self.operator, &entry_path(app_id, key), "read kv entry").await
     }
 
+    async fn write_entry(&self, app_id: u64, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+        write_s3(
+            &self.operator,
+            &self.cache,
+            &entry_path(app_id, key),
+            value,
+            "write kv entry",
+        )
+        .await
+    }
+
+    async fn delete_entry(&self, app_id: u64, key: &[u8]) -> anyhow::Result<()> {
+        delete_s3(&self.operator, &self.cache, &entry_path(app_id, key)).await
+    }
+
+    fn apply_cache_overlay(&self, app_id: u64, overlay: &HashMap<KvKey, Option<Vec<u8>>>) {
+        for (key, value) in overlay {
+            let path = entry_path(app_id, key);
+            match value {
+                Some(value) => self.cache.insert(&path, value.clone()),
+                None => self.cache.remove(&path),
+            }
+        }
+    }
+
     async fn load_entries(
         &self,
         app_id: u64,
@@ -436,21 +1047,91 @@ impl KvStore {
         for write in writes {
             match write {
                 KvWrite::Set { key, value } => {
-                    write_s3(
-                        &self.operator,
-                        &self.cache,
-                        &entry_path(app_id, key),
-                        value,
-                        "write kv entry",
-                    )
-                    .await?;
+                    self.write_entry(app_id, key, value).await?;
                 }
                 KvWrite::Delete { key } => {
-                    delete_s3(&self.operator, &self.cache, &entry_path(app_id, key)).await?;
+                    self.delete_entry(app_id, key).await?;
                 }
             }
         }
         Ok(())
+    }
+
+    async fn list_wal_app_ids(&self) -> anyhow::Result<Vec<u64>> {
+        let mut lister = self
+            .operator
+            .lister_with("app/")
+            .recursive(true)
+            .await
+            .context("failed to create kv wal lister")?;
+        let mut app_ids = Vec::new();
+        let mut seen = HashSet::new();
+
+        while let Some(entry) = lister.try_next().await.context("failed to list kv wals")? {
+            if entry.metadata().mode() != EntryMode::FILE {
+                continue;
+            }
+            let Some(app_id) = parse_wal_app_id(entry.path()) else {
+                continue;
+            };
+            if seen.insert(app_id) {
+                app_ids.push(app_id);
+            }
+        }
+
+        Ok(app_ids)
+    }
+
+    async fn read_wal(&self, app_id: u64) -> anyhow::Result<VecDeque<KvWalBatch>> {
+        let bytes = read_s3(&self.operator, &wal_path(app_id), "read kv wal").await?;
+        let Some(bytes) = bytes else {
+            return Ok(VecDeque::new());
+        };
+        let wal = bincode::deserialize::<StoredWal>(&bytes).context("failed to decode kv wal")?;
+        Ok(wal.batches.into())
+    }
+
+    async fn write_wal(&self, app_id: u64, wal: &VecDeque<KvWalBatch>) -> anyhow::Result<()> {
+        let path = wal_path(app_id);
+        if wal.is_empty() {
+            delete_s3(&self.operator, &self.cache, &path).await?;
+            return Ok(());
+        }
+
+        let bytes = bincode::serialize(&StoredWal {
+            batches: wal.iter().cloned().collect(),
+        })
+        .context("failed to encode kv wal")?;
+        write_s3(&self.operator, &self.cache, &path, &bytes, "write kv wal").await
+    }
+
+    async fn list_entry_sizes(&self, app_id: u64) -> anyhow::Result<(HashMap<KvKey, u64>, u64)> {
+        let mut lister = self
+            .operator
+            .lister_with(&entry_prefix(app_id))
+            .recursive(true)
+            .await
+            .context("failed to create kv usage lister")?;
+        let mut entry_sizes = HashMap::new();
+        let mut total_bytes = 0_u64;
+
+        while let Some(entry) = lister.try_next().await.context("failed to list kv usage")? {
+            if entry.metadata().mode() != EntryMode::FILE {
+                continue;
+            }
+            let Some(key) = parse_entry_key_from_path(entry.path()) else {
+                continue;
+            };
+            let value_len = usize::try_from(entry.metadata().content_length())
+                .context("kv entry value length exceeds usize")?;
+            let entry_size = logical_entry_size(key.len(), value_len)?;
+            total_bytes = total_bytes
+                .checked_add(entry_size)
+                .context("kv usage overflow")?;
+            entry_sizes.insert(key, entry_size);
+        }
+
+        Ok((entry_sizes, total_bytes))
     }
 
     async fn list_entries_page(
@@ -529,36 +1210,14 @@ impl KvStore {
             next_after,
         })
     }
-
-    async fn storage_used(&self, app_id: u64) -> anyhow::Result<u64> {
-        let mut lister = self
-            .operator
-            .lister_with(&entry_prefix(app_id))
-            .recursive(true)
-            .await
-            .context("failed to create kv usage lister")?;
-        let mut total = 0_u64;
-
-        while let Some(entry) = lister.try_next().await.context("failed to list kv usage")? {
-            if entry.metadata().mode() != EntryMode::FILE {
-                continue;
-            }
-            let Some(key) = parse_entry_key_from_path(entry.path()) else {
-                continue;
-            };
-            let value_len = usize::try_from(entry.metadata().content_length())
-                .context("kv entry value length exceeds usize")?;
-            total = total
-                .checked_add(logical_entry_size(key.len(), value_len)?)
-                .context("kv usage overflow")?;
-        }
-
-        Ok(total)
-    }
 }
 
 fn entry_path(app_id: u64, key: &[u8]) -> String {
     format!("app/{app_id}/entries/{}.bin", hex::encode(key))
+}
+
+fn wal_path(app_id: u64) -> String {
+    format!("app/{app_id}/wal.bin")
 }
 
 fn entry_prefix(app_id: u64) -> String {
@@ -573,6 +1232,15 @@ fn parse_entry_key_from_path(path: &str) -> Option<Vec<u8>> {
     let name = path.rsplit('/').next()?;
     let encoded = name.strip_suffix(".bin")?;
     hex::decode(encoded).ok()
+}
+
+fn parse_wal_app_id(path: &str) -> Option<u64> {
+    let rest = path.strip_prefix("app/")?;
+    let (app_id, tail) = rest.split_once('/')?;
+    if tail != "wal.bin" {
+        return None;
+    }
+    app_id.parse().ok()
 }
 
 async fn read_s3(
@@ -629,4 +1297,655 @@ fn read_env_string(key: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{BTreeSet, VecDeque},
+        sync::{Arc, Mutex as StdMutex},
+    };
+
+    use opendal::raw::oio;
+    use opendal::raw::{
+        Access, Layer, LayeredAccess, OpDelete, OpList, OpRead, OpWrite, RpDelete, RpList, RpRead,
+        RpWrite,
+    };
+    use opendal::{
+        Error as OpenDalError, ErrorKind as OpenDalErrorKind, Operator, services::Memory,
+    };
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct MockBucketStats {
+        reads: usize,
+        writes: usize,
+        deletes: usize,
+        lists: usize,
+        entry_write_requests: usize,
+    }
+
+    #[derive(Default)]
+    struct MockBucketState {
+        stats: MockBucketStats,
+        fail_entry_write_requests: BTreeSet<usize>,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockBucket {
+        inner: Arc<StdMutex<MockBucketState>>,
+    }
+
+    impl MockBucket {
+        fn stats(&self) -> MockBucketStats {
+            self.inner.lock().unwrap().stats.clone()
+        }
+
+        fn fail_entry_write_requests(&self, requests: impl IntoIterator<Item = usize>) {
+            let mut state = self.inner.lock().unwrap();
+            state.fail_entry_write_requests = requests.into_iter().collect();
+        }
+
+        fn clear_failures(&self) {
+            self.inner.lock().unwrap().fail_entry_write_requests.clear();
+        }
+
+        fn record_read(&self) {
+            self.inner.lock().unwrap().stats.reads += 1;
+        }
+
+        fn record_write(&self, path: &str) -> opendal::Result<()> {
+            let mut state = self.inner.lock().unwrap();
+            state.stats.writes += 1;
+            if path.contains("/entries/") {
+                state.stats.entry_write_requests += 1;
+                if state
+                    .fail_entry_write_requests
+                    .contains(&state.stats.entry_write_requests)
+                {
+                    return Err(OpenDalError::new(
+                        OpenDalErrorKind::Unexpected,
+                        "injected entry write failure",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        fn record_delete(&self) {
+            self.inner.lock().unwrap().stats.deletes += 1;
+        }
+
+        fn record_list(&self) {
+            self.inner.lock().unwrap().stats.lists += 1;
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingLayer {
+        bucket: MockBucket,
+    }
+
+    impl CountingLayer {
+        fn new(bucket: MockBucket) -> Self {
+            Self { bucket }
+        }
+    }
+
+    impl<A: Access> Layer<A> for CountingLayer {
+        type LayeredAccess = CountingAccess<A>;
+
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            CountingAccess {
+                inner,
+                bucket: self.bucket.clone(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingAccess<A: Access> {
+        inner: A,
+        bucket: MockBucket,
+    }
+
+    impl<A: Access> fmt::Debug for CountingAccess<A> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("CountingAccess")
+        }
+    }
+
+    impl<A: Access> LayeredAccess for CountingAccess<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type Writer = A::Writer;
+        type Lister = A::Lister;
+        type Deleter = CountingDeleter<A::Deleter>;
+
+        fn inner(&self) -> &Self::Inner {
+            &self.inner
+        }
+
+        async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
+            self.bucket.record_read();
+            self.inner.read(path, args).await
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(RpWrite, Self::Writer)> {
+            self.bucket.record_write(path)?;
+            self.inner.write(path, args).await
+        }
+
+        async fn delete(&self) -> opendal::Result<(RpDelete, Self::Deleter)> {
+            let (rp, deleter) = self.inner.delete().await?;
+            Ok((
+                rp,
+                CountingDeleter {
+                    inner: deleter,
+                    bucket: self.bucket.clone(),
+                },
+            ))
+        }
+
+        async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
+            let _ = path;
+            self.bucket.record_list();
+            self.inner.list(path, args).await
+        }
+    }
+
+    struct CountingDeleter<D> {
+        inner: D,
+        bucket: MockBucket,
+    }
+
+    impl<D: oio::Delete> oio::Delete for CountingDeleter<D> {
+        fn delete(&mut self, path: &str, args: OpDelete) -> opendal::Result<()> {
+            let _ = path;
+            self.bucket.record_delete();
+            self.inner.delete(path, args)
+        }
+
+        async fn flush(&mut self) -> opendal::Result<usize> {
+            self.inner.flush().await
+        }
+    }
+
+    struct TestHarness {
+        backend: Arc<S3KvBackend>,
+        store: Arc<KvStore>,
+        bucket: MockBucket,
+        _cache_dir: TempDir,
+    }
+
+    impl TestHarness {
+        async fn new(background_checkpointing: bool) -> Self {
+            Self::with_max_app_bytes(background_checkpointing, DEFAULT_KV_APP_MAX_BYTES).await
+        }
+
+        async fn with_max_app_bytes(background_checkpointing: bool, max_app_bytes: u64) -> Self {
+            let cache_dir = TempDir::new().unwrap();
+            let cache = Arc::new(
+                KvCache::open(cache_dir.path().join("cache"), 1024 * 1024, 8 * 1024 * 1024)
+                    .await
+                    .unwrap(),
+            );
+            let bucket = MockBucket::default();
+            let operator = Operator::new(Memory::default())
+                .unwrap()
+                .layer(CountingLayer::new(bucket.clone()))
+                .layer(FoyerLayer::new(cache.clone()))
+                .finish();
+            let store = Arc::new(KvStore { operator, cache });
+            let backend = S3KvBackend::new(store.clone(), max_app_bytes, background_checkpointing);
+            Self {
+                backend,
+                store,
+                bucket,
+                _cache_dir: cache_dir,
+            }
+        }
+
+        async fn cache_value(&self, path: &str) -> Option<Vec<u8>> {
+            self.store.cache.get(path).await
+        }
+    }
+
+    fn set(key: &[u8], value: &[u8]) -> KvCommand {
+        KvCommand::Set {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        }
+    }
+
+    fn delete(key: &[u8]) -> KvCommand {
+        KvCommand::Delete { key: key.to_vec() }
+    }
+
+    #[tokio::test]
+    async fn s3_single_set_loads_once_updates_cache_and_immediate_read_is_cached() {
+        let harness = TestHarness::new(false).await;
+        let app_id = 1;
+        let key = b"a".to_vec();
+        let value = b"value".to_vec();
+
+        harness
+            .backend
+            .exec(app_id, vec![set(&key, &value)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness.bucket.stats(),
+            MockBucketStats {
+                reads: 1,
+                writes: 1,
+                deletes: 0,
+                lists: 1,
+                entry_write_requests: 1,
+            }
+        );
+        assert_eq!(
+            harness.cache_value(&entry_path(app_id, &key)).await,
+            Some(value.clone())
+        );
+
+        let before = harness.bucket.stats();
+        assert_eq!(harness.backend.get(app_id, key).await.unwrap(), Some(value));
+        assert_eq!(harness.bucket.stats(), before);
+    }
+
+    #[tokio::test]
+    async fn s3_subsequent_single_overwrite_is_one_put_and_usage_stays_exact() {
+        let harness = TestHarness::new(false).await;
+        let app_id = 2;
+
+        harness
+            .backend
+            .exec(app_id, vec![set(b"a", b"alpha")])
+            .await
+            .unwrap();
+        let before = harness.bucket.stats();
+
+        harness
+            .backend
+            .exec(app_id, vec![set(b"a", b"bet")])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness.bucket.stats(),
+            MockBucketStats {
+                reads: before.reads,
+                writes: before.writes + 1,
+                deletes: before.deletes,
+                lists: before.lists,
+                entry_write_requests: before.entry_write_requests + 1,
+            }
+        );
+        assert_eq!(
+            harness.backend.get(app_id, b"a".to_vec()).await.unwrap(),
+            Some(b"bet".to_vec())
+        );
+        assert_eq!(
+            harness.backend.storage_used(app_id).await.unwrap(),
+            logical_entry_size(1, 3).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_single_delete_is_one_delete_and_tombstones_the_cache() {
+        let harness = TestHarness::new(false).await;
+        let app_id = 3;
+        let key = b"gone".to_vec();
+        let path = entry_path(app_id, &key);
+
+        harness
+            .backend
+            .exec(app_id, vec![set(&key, b"value")])
+            .await
+            .unwrap();
+        let before = harness.bucket.stats();
+
+        harness
+            .backend
+            .exec(app_id, vec![delete(&key)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness.bucket.stats(),
+            MockBucketStats {
+                reads: before.reads,
+                writes: before.writes,
+                deletes: before.deletes + 1,
+                lists: before.lists,
+                entry_write_requests: before.entry_write_requests,
+            }
+        );
+        assert_eq!(harness.cache_value(&path).await, None);
+
+        let before = harness.bucket.stats();
+        assert_eq!(harness.backend.get(app_id, key).await.unwrap(), None);
+        assert_eq!(harness.bucket.stats(), before);
+    }
+
+    #[tokio::test]
+    async fn s3_failed_check_does_not_mutate_state_or_persist_anything() {
+        let harness = TestHarness::new(false).await;
+        let app_id = 4;
+
+        harness
+            .backend
+            .exec(app_id, vec![set(b"a", b"alpha")])
+            .await
+            .unwrap();
+        let before = harness.bucket.stats();
+
+        let error = harness
+            .backend
+            .exec(
+                app_id,
+                vec![
+                    KvCommand::CheckValue {
+                        key: b"a".to_vec(),
+                        value: b"wrong".to_vec(),
+                    },
+                    set(b"b", b"bravo"),
+                ],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            KvError::CheckFailed(KvCheckFailedReason::ValueMismatch)
+        );
+
+        assert_eq!(harness.bucket.stats().writes, before.writes);
+        assert_eq!(harness.bucket.stats().deletes, before.deletes);
+        assert_eq!(
+            harness.bucket.stats().entry_write_requests,
+            before.entry_write_requests
+        );
+        assert_eq!(
+            harness.backend.get(app_id, b"a".to_vec()).await.unwrap(),
+            Some(b"alpha".to_vec())
+        );
+        assert_eq!(
+            harness.backend.get(app_id, b"b".to_vec()).await.unwrap(),
+            None
+        );
+
+        let namespace = harness.backend.namespace(app_id).await;
+        let state = namespace.state.lock().await;
+        assert!(state.wal.is_empty());
+        assert!(state.overlay.is_empty());
+        assert_eq!(state.total_bytes, logical_entry_size(1, 5).unwrap());
+    }
+
+    #[tokio::test]
+    async fn s3_quota_exceeded_rejects_without_persisting() {
+        let harness = TestHarness::with_max_app_bytes(false, 5).await;
+        let app_id = 5;
+
+        let error = harness
+            .backend
+            .exec(app_id, vec![set(b"a", b"value!")])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            KvError::QuotaExceeded {
+                app_id,
+                used_bytes: 7,
+                limit_bytes: 5,
+            }
+        );
+        assert_eq!(
+            harness.bucket.stats(),
+            MockBucketStats {
+                reads: 1,
+                writes: 0,
+                deletes: 0,
+                lists: 1,
+                entry_write_requests: 0,
+            }
+        );
+        assert_eq!(harness.backend.storage_used(app_id).await.unwrap(), 0);
+        assert_eq!(
+            harness.backend.get(app_id, b"a".to_vec()).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_multi_write_batch_is_visible_immediately_and_checkpoint_persists_it() {
+        let harness = TestHarness::new(false).await;
+        let app_id = 6;
+
+        harness
+            .backend
+            .exec(app_id, vec![set(b"a", b"alpha"), set(b"b", b"bravo")])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            harness.bucket.stats(),
+            MockBucketStats {
+                reads: 3,
+                writes: 1,
+                deletes: 0,
+                lists: 1,
+                entry_write_requests: 0,
+            }
+        );
+
+        let before = harness.bucket.stats();
+        assert_eq!(
+            harness.backend.get(app_id, b"a".to_vec()).await.unwrap(),
+            Some(b"alpha".to_vec())
+        );
+        assert_eq!(
+            harness.backend.get(app_id, b"b".to_vec()).await.unwrap(),
+            Some(b"bravo".to_vec())
+        );
+        assert_eq!(harness.bucket.stats(), before);
+
+        let before = harness.bucket.stats();
+        harness
+            .backend
+            .checkpoint_all_for_tests(app_id)
+            .await
+            .unwrap();
+        assert_eq!(harness.bucket.stats().reads, before.reads);
+        assert_eq!(harness.bucket.stats().writes, before.writes + 2);
+        assert_eq!(harness.bucket.stats().deletes, before.deletes + 1);
+        assert_eq!(
+            harness.bucket.stats().entry_write_requests,
+            before.entry_write_requests + 2
+        );
+
+        let restarted = S3KvBackend::new(harness.store.clone(), DEFAULT_KV_APP_MAX_BYTES, false);
+        assert_eq!(
+            restarted.get(app_id, b"a".to_vec()).await.unwrap(),
+            Some(b"alpha".to_vec())
+        );
+        assert_eq!(
+            restarted.get(app_id, b"b".to_vec()).await.unwrap(),
+            Some(b"bravo".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_checkpoint_failure_keeps_wal_authoritative_across_restart() {
+        let harness = TestHarness::new(false).await;
+        let app_id = 7;
+        harness.bucket.fail_entry_write_requests([2]);
+
+        harness
+            .backend
+            .exec(app_id, vec![set(b"a", b"alpha"), set(b"b", b"bravo")])
+            .await
+            .unwrap();
+
+        let namespace = harness.backend.namespace(app_id).await;
+        let error = harness
+            .backend
+            .checkpoint_one_batch(app_id, &namespace)
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
+
+        assert_eq!(
+            harness.backend.get(app_id, b"a".to_vec()).await.unwrap(),
+            Some(b"alpha".to_vec())
+        );
+        assert_eq!(
+            harness.backend.get(app_id, b"b".to_vec()).await.unwrap(),
+            Some(b"bravo".to_vec())
+        );
+        assert_eq!(
+            harness.backend.storage_used(app_id).await.unwrap(),
+            logical_entry_size(1, 5).unwrap() + logical_entry_size(1, 5).unwrap()
+        );
+
+        let restarted = S3KvBackend::new(harness.store.clone(), DEFAULT_KV_APP_MAX_BYTES, false);
+        assert_eq!(
+            restarted.get(app_id, b"a".to_vec()).await.unwrap(),
+            Some(b"alpha".to_vec())
+        );
+        assert_eq!(
+            restarted.get(app_id, b"b".to_vec()).await.unwrap(),
+            Some(b"bravo".to_vec())
+        );
+        assert_eq!(
+            restarted.storage_used(app_id).await.unwrap(),
+            logical_entry_size(1, 5).unwrap() + logical_entry_size(1, 5).unwrap()
+        );
+
+        harness.bucket.clear_failures();
+        restarted.checkpoint_all_for_tests(app_id).await.unwrap();
+        let namespace = restarted.namespace(app_id).await;
+        let state = namespace.state.lock().await;
+        assert!(state.wal.is_empty());
+        assert!(state.overlay.is_empty());
+    }
+
+    #[tokio::test]
+    async fn s3_list_page_merges_base_entries_pending_wal_and_pagination() {
+        let harness = TestHarness::new(false).await;
+        let app_id = 8;
+
+        for index in 0..KV_LIST_PAGE_SIZE {
+            let key = format!("k{index:02}").into_bytes();
+            let value = format!("v{index:02}").into_bytes();
+            harness
+                .store
+                .write_entry(app_id, &key, &value)
+                .await
+                .unwrap();
+        }
+
+        let mut wal = VecDeque::new();
+        wal.push_back(vec![
+            KvWrite::Delete {
+                key: b"k00".to_vec(),
+            },
+            KvWrite::Set {
+                key: b"k64".to_vec(),
+                value: b"v64".to_vec(),
+            },
+            KvWrite::Set {
+                key: b"k65".to_vec(),
+                value: b"v65".to_vec(),
+            },
+        ]);
+        harness.store.write_wal(app_id, &wal).await.unwrap();
+
+        let first_page = harness
+            .backend
+            .list_page(app_id, Vec::new(), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(first_page.entries.len(), KV_LIST_PAGE_SIZE);
+        assert_eq!(first_page.entries.first().unwrap().key, b"k01".to_vec());
+        assert_eq!(first_page.entries.last().unwrap().key, b"k64".to_vec());
+        assert_eq!(first_page.next_after, Some(b"k64".to_vec()));
+
+        let second_page = harness
+            .backend
+            .list_page(app_id, Vec::new(), None, None, first_page.next_after)
+            .await
+            .unwrap();
+        assert_eq!(
+            second_page
+                .entries
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>(),
+            vec![b"k65".to_vec()]
+        );
+        assert_eq!(second_page.next_after, None);
+    }
+
+    #[tokio::test]
+    async fn s3_concurrent_non_overlapping_wal_batches_keep_usage_exact() {
+        let harness = TestHarness::new(false).await;
+        let app_id = 9;
+
+        let backend = harness.backend.clone();
+        let tx_a = tokio::spawn(async move {
+            backend
+                .exec(app_id, vec![set(b"a1", b"alpha"), set(b"a2", b"able")])
+                .await
+        });
+        let backend = harness.backend.clone();
+        let tx_b = tokio::spawn(async move {
+            backend
+                .exec(app_id, vec![set(b"b1", b"bravo"), set(b"b2", b"baker")])
+                .await
+        });
+
+        tx_a.await.unwrap().unwrap();
+        tx_b.await.unwrap().unwrap();
+
+        let expected = logical_entry_size(2, 5).unwrap()
+            + logical_entry_size(2, 4).unwrap()
+            + logical_entry_size(2, 5).unwrap()
+            + logical_entry_size(2, 5).unwrap();
+        let namespace = harness.backend.namespace(app_id).await;
+        {
+            let state = namespace.state.lock().await;
+            assert_eq!(state.wal.len(), 2);
+            assert_eq!(state.overlay.len(), 4);
+            assert_eq!(state.total_bytes, expected);
+        }
+
+        assert_eq!(
+            harness.backend.get(app_id, b"a1".to_vec()).await.unwrap(),
+            Some(b"alpha".to_vec())
+        );
+        assert_eq!(
+            harness.backend.get(app_id, b"a2".to_vec()).await.unwrap(),
+            Some(b"able".to_vec())
+        );
+        assert_eq!(
+            harness.backend.get(app_id, b"b1".to_vec()).await.unwrap(),
+            Some(b"bravo".to_vec())
+        );
+        assert_eq!(
+            harness.backend.get(app_id, b"b2".to_vec()).await.unwrap(),
+            Some(b"baker".to_vec())
+        );
+        assert_eq!(
+            harness.backend.storage_used(app_id).await.unwrap(),
+            expected
+        );
+    }
 }

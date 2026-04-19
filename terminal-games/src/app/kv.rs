@@ -19,9 +19,8 @@ const KV_LIST_REQUEST_HEADER_SIZE: usize = 16;
 const KV_LIST_RESPONSE_HEADER_SIZE: usize = 8;
 const KV_OPTIONAL_KEY_MISSING: u32 = u32::MAX;
 const KV_ERROR_UNAVAILABLE: u32 = 1;
-const KV_ERROR_TOO_MANY_WRITES: u32 = 2;
-const KV_ERROR_CHECK_FAILED: u32 = 3;
-const KV_ERROR_QUOTA_EXCEEDED: u32 = 4;
+const KV_ERROR_CHECK_FAILED: u32 = 2;
+const KV_ERROR_QUOTA_EXCEEDED: u32 = 3;
 const KV_CHECK_FAILED_KEY_MISSING: u32 = 1;
 const KV_CHECK_FAILED_KEY_EXISTS: u32 = 2;
 const KV_CHECK_FAILED_VALUE_MISMATCH: u32 = 3;
@@ -590,10 +589,7 @@ impl AppServer {
 fn sanitize_kv_error(op: &'static str, app_id: u64, error: KvError) -> KvError {
     tracing::error!(app_id, op, error = %error, "kv request failed");
     match error {
-        KvError::TooManyWritesInAtomicTransaction
-        | KvError::CheckFailed(_)
-        | KvError::QuotaExceeded { .. }
-        | KvError::Unavailable => error,
+        KvError::CheckFailed(_) | KvError::QuotaExceeded { .. } | KvError::Unavailable => error,
         KvError::Internal(_) => KvError::Unavailable,
     }
 }
@@ -603,9 +599,6 @@ fn encode_kv_error(error: &KvError) -> Vec<u8> {
     match error {
         KvError::Unavailable | KvError::Internal(_) => {
             bytes.extend_from_slice(&KV_ERROR_UNAVAILABLE.to_le_bytes());
-        }
-        KvError::TooManyWritesInAtomicTransaction => {
-            bytes.extend_from_slice(&KV_ERROR_TOO_MANY_WRITES.to_le_bytes());
         }
         KvError::CheckFailed(reason) => {
             bytes.extend_from_slice(&KV_ERROR_CHECK_FAILED.to_le_bytes());

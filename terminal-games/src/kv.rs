@@ -5,14 +5,14 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use anyhow::Context as _;
 use async_trait::async_trait;
 use libsql::{Builder, Connection, Value};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::mesh::{Mesh, NodeId};
 
@@ -57,7 +57,6 @@ pub enum KvCheckFailedReason {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum KvError {
-    TooManyWritesInAtomicTransaction,
     CheckFailed(KvCheckFailedReason),
     QuotaExceeded {
         app_id: u64,
@@ -77,9 +76,6 @@ impl KvError {
 impl std::fmt::Display for KvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooManyWritesInAtomicTransaction => {
-                write!(f, "kv atomic transactions may contain at most one write")
-            }
             Self::CheckFailed(reason) => match reason {
                 KvCheckFailedReason::KeyMissing => write!(f, "kv check failed: key missing"),
                 KvCheckFailedReason::KeyExists => write!(f, "kv check failed: key exists"),
@@ -134,11 +130,282 @@ pub fn collect_kv_writes(commands: &[KvCommand]) -> Result<Vec<KvWrite>, KvError
             | KvCommand::CheckExists { .. }
             | KvCommand::CheckMissing { .. } => {}
         }
-        if writes.len() > 1 {
-            return Err(KvError::TooManyWritesInAtomicTransaction);
-        }
     }
     Ok(writes)
+}
+
+pub fn collect_touched_keys(commands: &[KvCommand]) -> Vec<KvKey> {
+    commands
+        .iter()
+        .map(|command| match command {
+            KvCommand::Set { key, .. }
+            | KvCommand::Delete { key }
+            | KvCommand::CheckValue { key, .. }
+            | KvCommand::CheckExists { key }
+            | KvCommand::CheckMissing { key } => key.clone(),
+        })
+        .collect()
+}
+
+pub fn exclusive_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    for index in (0..upper.len()).rev() {
+        if upper[index] != u8::MAX {
+            upper[index] += 1;
+            upper.truncate(index + 1);
+            return Some(upper);
+        }
+    }
+    None
+}
+
+#[derive(Clone, Default)]
+pub struct KvRangeLock {
+    inner: Arc<KvRangeLockInner>,
+}
+
+#[derive(Default)]
+struct KvRangeLockInner {
+    state: StdMutex<KvRangeLockState>,
+    notify: Notify,
+}
+
+#[derive(Default)]
+struct KvRangeLockState {
+    next_id: u64,
+    active: Vec<KvRangeReservation>,
+}
+
+#[derive(Clone)]
+struct KvRangeReservation {
+    id: u64,
+    access: KvAccessPattern,
+}
+
+#[derive(Debug, Clone)]
+pub struct KvAccessPattern {
+    write: bool,
+    ranges: Vec<KvKeyRange>,
+}
+
+#[derive(Debug, Clone)]
+struct KvKeyRange {
+    start: Option<KvLowerBound>,
+    end: Option<KvUpperBound>,
+}
+
+#[derive(Debug, Clone)]
+struct KvLowerBound {
+    key: KvKey,
+    inclusive: bool,
+}
+
+#[derive(Debug, Clone)]
+struct KvUpperBound {
+    key: KvKey,
+    inclusive: bool,
+}
+
+impl KvAccessPattern {
+    pub fn read_key(key: KvKey) -> Self {
+        Self {
+            write: false,
+            ranges: vec![KvKeyRange::point(key)],
+        }
+    }
+
+    pub fn write_keys(keys: impl IntoIterator<Item = KvKey>) -> Self {
+        Self {
+            write: true,
+            ranges: keys.into_iter().map(KvKeyRange::point).collect(),
+        }
+    }
+
+    pub fn read_list(
+        prefix: &[u8],
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        after: Option<&[u8]>,
+    ) -> Self {
+        let mut range = KvKeyRange::full();
+        if !prefix.is_empty() {
+            range.start = Some(KvLowerBound {
+                key: prefix.to_vec(),
+                inclusive: true,
+            });
+            range.end = exclusive_upper_bound(prefix).map(|key| KvUpperBound {
+                key,
+                inclusive: false,
+            });
+        }
+        if let Some(start) = start {
+            range.start = max_lower_bound(
+                range.start,
+                Some(KvLowerBound {
+                    key: start.to_vec(),
+                    inclusive: true,
+                }),
+            );
+        }
+        if let Some(after) = after {
+            range.start = max_lower_bound(
+                range.start,
+                Some(KvLowerBound {
+                    key: after.to_vec(),
+                    inclusive: false,
+                }),
+            );
+        }
+        if let Some(end) = end {
+            range.end = min_upper_bound(
+                range.end,
+                Some(KvUpperBound {
+                    key: end.to_vec(),
+                    inclusive: false,
+                }),
+            );
+        }
+        Self {
+            write: false,
+            ranges: if range.is_empty() {
+                Vec::new()
+            } else {
+                vec![range]
+            },
+        }
+    }
+
+    pub fn read_all() -> Self {
+        Self {
+            write: false,
+            ranges: vec![KvKeyRange::full()],
+        }
+    }
+
+    fn conflicts_with(&self, other: &Self) -> bool {
+        (self.write || other.write)
+            && self
+                .ranges
+                .iter()
+                .any(|left| other.ranges.iter().any(|right| left.overlaps(right)))
+    }
+}
+
+impl KvRangeLock {
+    pub async fn acquire(&self, access: KvAccessPattern) -> KvRangeGuard {
+        loop {
+            let notified = {
+                let mut state = self.inner.state.lock().unwrap();
+                if !state
+                    .active
+                    .iter()
+                    .any(|reservation| reservation.access.conflicts_with(&access))
+                {
+                    let id = state.next_id;
+                    state.next_id = state.next_id.saturating_add(1);
+                    state.active.push(KvRangeReservation {
+                        id,
+                        access: access.clone(),
+                    });
+                    return KvRangeGuard {
+                        inner: self.inner.clone(),
+                        id,
+                    };
+                }
+                self.inner.notify.notified()
+            };
+            notified.await;
+        }
+    }
+}
+
+pub struct KvRangeGuard {
+    inner: Arc<KvRangeLockInner>,
+    id: u64,
+}
+
+impl Drop for KvRangeGuard {
+    fn drop(&mut self) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.active.retain(|reservation| reservation.id != self.id);
+        self.inner.notify.notify_waiters();
+    }
+}
+
+impl KvKeyRange {
+    fn point(key: KvKey) -> Self {
+        Self {
+            start: Some(KvLowerBound {
+                key: key.clone(),
+                inclusive: true,
+            }),
+            end: Some(KvUpperBound {
+                key,
+                inclusive: true,
+            }),
+        }
+    }
+
+    fn full() -> Self {
+        Self {
+            start: None,
+            end: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        end_before_start(self.end.as_ref(), self.start.as_ref())
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        !end_before_start(self.end.as_ref(), other.start.as_ref())
+            && !end_before_start(other.end.as_ref(), self.start.as_ref())
+    }
+}
+
+fn max_lower_bound(
+    left: Option<KvLowerBound>,
+    right: Option<KvLowerBound>,
+) -> Option<KvLowerBound> {
+    match (left, right) {
+        (None, other) | (other, None) => other,
+        (Some(left), Some(right)) => match left.key.cmp(&right.key) {
+            std::cmp::Ordering::Less => Some(right),
+            std::cmp::Ordering::Greater => Some(left),
+            std::cmp::Ordering::Equal => Some(KvLowerBound {
+                key: left.key,
+                inclusive: left.inclusive && right.inclusive,
+            }),
+        },
+    }
+}
+
+fn min_upper_bound(
+    left: Option<KvUpperBound>,
+    right: Option<KvUpperBound>,
+) -> Option<KvUpperBound> {
+    match (left, right) {
+        (None, other) | (other, None) => other,
+        (Some(left), Some(right)) => match left.key.cmp(&right.key) {
+            std::cmp::Ordering::Less => Some(left),
+            std::cmp::Ordering::Greater => Some(right),
+            std::cmp::Ordering::Equal => Some(KvUpperBound {
+                key: left.key,
+                inclusive: left.inclusive && right.inclusive,
+            }),
+        },
+    }
+}
+
+fn end_before_start(end: Option<&KvUpperBound>, start: Option<&KvLowerBound>) -> bool {
+    let (Some(end), Some(start)) = (end, start) else {
+        return false;
+    };
+    match end.key.cmp(&start.key) {
+        std::cmp::Ordering::Less => true,
+        std::cmp::Ordering::Greater => false,
+        std::cmp::Ordering::Equal => !(end.inclusive && start.inclusive),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -239,10 +506,10 @@ impl KvBackend for LibsqlKvBackend {
 
     async fn exec(&self, app_id: u64, commands: Vec<KvCommand>) -> Result<(), KvError> {
         let namespace = self.namespace(app_id).await;
+        let writes = collect_kv_writes(&commands)?;
         let mut state = namespace.lock().await;
         self.load_state(app_id, &mut state).await?;
 
-        let writes = collect_kv_writes(&commands)?;
         for command in &commands {
             match command {
                 KvCommand::Set { .. } | KvCommand::Delete { .. } => {}
@@ -371,30 +638,41 @@ fn apply_writes(
 ) -> Result<(), KvError> {
     for write in writes {
         match write {
-            KvWrite::Set { key, value } => {
-                let new_size = logical_entry_size(key.len(), value.len())
-                    .map_err(|error| KvError::internal(error.to_string()))?;
-                let old_size = state
-                    .records
-                    .get(&key)
-                    .map(|existing| logical_entry_size(key.len(), existing.len()))
-                    .transpose()
-                    .map_err(|error| KvError::internal(error.to_string()))?
-                    .unwrap_or(0);
-                state.total_bytes = state
-                    .total_bytes
-                    .saturating_sub(old_size)
-                    .saturating_add(new_size);
-                state.records.insert(key, value);
-            }
-            KvWrite::Delete { key } => {
-                if let Some(existing) = state.records.remove(&key) {
-                    state.total_bytes = state.total_bytes.saturating_sub(
-                        logical_entry_size(key.len(), existing.len())
-                            .map_err(|error| KvError::internal(error.to_string()))?,
-                    );
-                }
-            }
+            KvWrite::Set { key, value } => set_record_value(state, key, Some(value))?,
+            KvWrite::Delete { key } => set_record_value(state, key, None)?,
+        }
+    }
+    Ok(())
+}
+
+fn set_record_value(
+    state: &mut AppState,
+    key: KvKey,
+    value: Option<Vec<u8>>,
+) -> Result<(), KvError> {
+    let old_size = state
+        .records
+        .get(&key)
+        .map(|existing| logical_entry_size(key.len(), existing.len()))
+        .transpose()
+        .map_err(|error| KvError::internal(error.to_string()))?
+        .unwrap_or(0);
+    let new_size = value
+        .as_ref()
+        .map(|value| logical_entry_size(key.len(), value.len()))
+        .transpose()
+        .map_err(|error| KvError::internal(error.to_string()))?
+        .unwrap_or(0);
+    state.total_bytes = state
+        .total_bytes
+        .saturating_sub(old_size)
+        .saturating_add(new_size);
+    match value {
+        Some(value) => {
+            state.records.insert(key, value);
+        }
+        None => {
+            state.records.remove(&key);
         }
     }
     Ok(())
@@ -426,18 +704,6 @@ fn append_blob_filter(
     query.push_str(&param_index.to_string());
     params.push(Value::Blob(value));
     *param_index += 1;
-}
-
-fn exclusive_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut upper = prefix.to_vec();
-    for index in (0..upper.len()).rev() {
-        if upper[index] != u8::MAX {
-            upper[index] += 1;
-            upper.truncate(index + 1);
-            return Some(upper);
-        }
-    }
-    None
 }
 
 fn total_bytes_for_records(records: &HashMap<KvKey, Vec<u8>>) -> anyhow::Result<u64> {
