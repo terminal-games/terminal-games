@@ -474,13 +474,13 @@ fn encode_commands(commands: impl IntoIterator<Item = Command>) -> Result<Encode
         };
         keys.push(encode_key(&key)?);
         let key_bytes = keys.last().unwrap();
-        let value_ptr = if let Some(value) = value {
+        let (value_ptr, value_len) = if let Some(value) = value {
             values.push(encode_value(&value)?);
-            values.last().unwrap().as_ptr() as u32
+            let value_bytes = values.last().unwrap();
+            (value_bytes.as_ptr() as u32, value_bytes.len() as u32)
         } else {
-            0
+            (0, 0)
         };
-        let value_len = values.last().map_or(0, |value| value.len() as u32);
         guest.push(GuestCommand {
             tag,
             key_ptr: key_bytes.as_ptr() as u32,
