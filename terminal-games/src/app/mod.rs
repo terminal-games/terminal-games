@@ -39,6 +39,7 @@ use crate::{
     audio::Mixer,
     control::StatusBarState,
     db::DbPool,
+    kv::{KvBackend, KvError},
     log_backend::GuestLogBackend,
     mesh::{AppId, BuildId, Mesh, PeerId, PeerMessageApp},
     rate_limiting::{NetworkInfo, TokenBucket},
@@ -337,7 +338,7 @@ pub struct AppServer {
     engine: wasmtime::Engine,
     pub db: DbPool,
     mesh: Mesh,
-    kv_backend: Arc<dyn crate::kv::KvBackend>,
+    kv_backend: Arc<dyn KvBackend>,
     app_env_secret_key: Arc<str>,
     app_registry: AppRuntimeRegistry,
 }
@@ -384,7 +385,7 @@ impl AppServer {
     pub fn new(
         mesh: Mesh,
         db: DbPool,
-        kv_backend: Arc<dyn crate::kv::KvBackend>,
+        kv_backend: Arc<dyn KvBackend>,
         app_env_secret_key: impl Into<Arc<str>>,
     ) -> anyhow::Result<Self> {
         let mut config = wasmtime::Config::new();
@@ -417,7 +418,7 @@ impl AppServer {
         &self.app_registry
     }
 
-    pub fn kv_backend(&self) -> Arc<dyn crate::kv::KvBackend> {
+    pub fn kv_backend(&self) -> Arc<dyn KvBackend> {
         self.kv_backend.clone()
     }
 
@@ -1127,7 +1128,7 @@ pub struct PreloadedAppState {
 pub struct AppContext {
     db: DbPool,
     mesh: Mesh,
-    kv_backend: Arc<dyn crate::kv::KvBackend>,
+    kv_backend: Arc<dyn KvBackend>,
     about_runtime: AboutRuntimeInfo,
     app_env_secret_key: Arc<str>,
     remote_sshid: String,
@@ -1430,8 +1431,8 @@ pub struct PendingKvRequest {
 }
 
 pub enum KvRequestState {
-    Pending(tokio::sync::oneshot::Receiver<Result<KvPendingResult, crate::kv::KvError>>),
-    Complete(Result<KvPendingResult, crate::kv::KvError>),
+    Pending(tokio::sync::oneshot::Receiver<Result<KvPendingResult, KvError>>),
+    Complete(Result<KvPendingResult, KvError>),
 }
 
 pub enum KvPendingResult {

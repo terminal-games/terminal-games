@@ -2,9 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::kv::{KvBackend, KvCommand, KvError, KvKey, KvListPage};
 use crate::mesh::{Mesh, NodeId};
-
-use super::{KvBackend, KvError, KvKey, KvListPage};
 
 pub fn load_mesh_backend(
     mesh: Mesh,
@@ -44,7 +43,7 @@ impl KvBackend for MeshKvBackend {
         }
     }
 
-    async fn exec(&self, app_id: u64, commands: Vec<super::KvCommand>) -> Result<(), KvError> {
+    async fn exec(&self, app_id: u64, commands: Vec<KvCommand>) -> Result<(), KvError> {
         if self.mesh.node() == self.leader {
             self.local_backend
                 .as_ref()

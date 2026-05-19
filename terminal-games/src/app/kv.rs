@@ -4,10 +4,8 @@ use super::{
     KV_REQ_ERR_TOO_MANY_REQUESTS, KvPendingResult, KvRequestState, MAX_KV_REQUEST_BYTES,
     MAX_KV_REQUESTS, PendingKvRequest,
 };
-use crate::{
-    kv::{KvCheckFailedReason, KvCommand, KvError, KvListPage},
-    wasm_abi::HostApiRegistration,
-};
+use crate::kv::{KvCheckFailedReason, KvCommand, KvError, KvListPage};
+use crate::wasm_abi::HostApiRegistration;
 
 const KV_CMD_SET: u32 = 1;
 const KV_CMD_DELETE: u32 = 2;
@@ -390,6 +388,7 @@ impl AppServer {
         }
 
         let mut commands = Vec::with_capacity(bytes.len() / KV_CMD_SIZE);
+        let mut write_count = 0_usize;
         for chunk in bytes.chunks_exact(KV_CMD_SIZE) {
             let tag = Self::read_cmd_u32(chunk, 0)?;
             let key_ptr = Self::read_cmd_u32(chunk, 4)? as i32;
@@ -407,13 +406,22 @@ impl AppServer {
             };
 
             let command = match tag {
-                KV_CMD_SET => KvCommand::Set { key, value },
-                KV_CMD_DELETE => KvCommand::Delete { key },
+                KV_CMD_SET => {
+                    write_count += 1;
+                    KvCommand::Set { key, value }
+                }
+                KV_CMD_DELETE => {
+                    write_count += 1;
+                    KvCommand::Delete { key }
+                }
                 KV_CMD_CHECK_VALUE => KvCommand::CheckValue { key, value },
                 KV_CMD_CHECK_EXISTS => KvCommand::CheckExists { key },
                 KV_CMD_CHECK_MISSING => KvCommand::CheckMissing { key },
                 _ => return Err(KV_REQ_ERR_INVALID_INPUT),
             };
+            if write_count > 1 {
+                return Err(KV_REQ_ERR_INVALID_INPUT);
+            }
             commands.push(command);
         }
         Ok(commands)
@@ -439,6 +447,10 @@ impl AppServer {
         F: std::future::Future<Output = Result<Option<Vec<u8>>, KvError>> + Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = Self::insert_kv_request_pending(state, rx);
+        if request_id < 0 {
+            return request_id;
+        }
         tokio::spawn(async move {
             let _ = tx.send(
                 future
@@ -446,7 +458,7 @@ impl AppServer {
                     .map(|value| KvPendingResult::Get(value.map(Vec::into_boxed_slice))),
             );
         });
-        Self::insert_kv_request_pending(state, rx)
+        request_id
     }
 
     fn spawn_kv_exec_request<F>(state: &mut AppState, future: F) -> i32
@@ -454,10 +466,14 @@ impl AppServer {
         F: std::future::Future<Output = Result<(), KvError>> + Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = Self::insert_kv_request_pending(state, rx);
+        if request_id < 0 {
+            return request_id;
+        }
         tokio::spawn(async move {
             let _ = tx.send(future.await.map(|()| KvPendingResult::Exec));
         });
-        Self::insert_kv_request_pending(state, rx)
+        request_id
     }
 
     fn spawn_kv_list_request<F>(state: &mut AppState, future: F) -> i32
@@ -465,6 +481,10 @@ impl AppServer {
         F: std::future::Future<Output = Result<Vec<u8>, KvError>> + Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = Self::insert_kv_request_pending(state, rx);
+        if request_id < 0 {
+            return request_id;
+        }
         tokio::spawn(async move {
             let _ = tx.send(
                 future
@@ -472,7 +492,7 @@ impl AppServer {
                     .map(|value| KvPendingResult::List(value.into_boxed_slice())),
             );
         });
-        Self::insert_kv_request_pending(state, rx)
+        request_id
     }
 
     fn spawn_kv_storage_used_request<F>(state: &mut AppState, future: F) -> i32
@@ -480,10 +500,14 @@ impl AppServer {
         F: std::future::Future<Output = Result<u64, KvError>> + Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = Self::insert_kv_request_pending(state, rx);
+        if request_id < 0 {
+            return request_id;
+        }
         tokio::spawn(async move {
             let _ = tx.send(future.await.map(KvPendingResult::StorageUsed));
         });
-        Self::insert_kv_request_pending(state, rx)
+        request_id
     }
 
     fn read_guest_bytes(

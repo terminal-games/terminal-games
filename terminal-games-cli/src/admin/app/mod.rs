@@ -4,6 +4,7 @@
 
 mod create;
 mod delete;
+mod kv_limit;
 mod list;
 mod rotate_token;
 
@@ -15,6 +16,7 @@ pub(super) async fn run(command: AdminAppCommand, profile: Option<String>) -> Re
     match command {
         AdminAppCommand::Create(args) => create::run(args, profile).await,
         AdminAppCommand::List => list::run(profile).await,
+        AdminAppCommand::KvLimit(args) => kv_limit::run(args, profile).await,
         AdminAppCommand::RotateToken(args) => rotate_token::run(args, profile).await,
         AdminAppCommand::Delete(args) => delete::run(args, profile).await,
     }

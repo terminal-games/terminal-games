@@ -9,7 +9,9 @@ use terminal_games::control::{
     AppSelfInfoRequest, AppSelfInfoResponse, AppSelfInfoTokenStatus, AppTokenClaims,
 };
 
-use crate::config::{format_imports, format_seconds, load_app_tokens_for_listing, print_table};
+use crate::config::{
+    format_imports, format_seconds, format_storage_usage, load_app_tokens_for_listing, print_table,
+};
 use crate::control_client::{connect_app_rpc_fallback, is_unauthorized_error};
 
 type TokenGroups = BTreeMap<String, Vec<AppTokenClaims>>;
@@ -46,6 +48,11 @@ pub(super) async fn run() -> Result<()> {
                         url.clone(),
                         app.server,
                         format_seconds(app.playtime_seconds),
+                        format_storage_usage(
+                            app.kv_storage_bytes,
+                            app.kv_storage_limit_bytes,
+                            app.kv_storage_limit_override_bytes.is_some(),
+                        ),
                         if app.stale { "yes" } else { "no" }.to_string(),
                         format_imports(&app.imports, &app.stale_imports),
                     ]
@@ -66,6 +73,7 @@ pub(super) async fn run() -> Result<()> {
             "Profile",
             "Server",
             "Playtime",
+            "KV Storage",
             "Stale",
             "APIs",
         ],

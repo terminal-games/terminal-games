@@ -34,7 +34,7 @@ use terminal_games::{
     control::{AppEnvVar, CONTROL_API_VERSION, StatusBarState},
     db::{DbPool, LibsqlConnectionManager},
     input_guard::{InputForwardError, InputForwarder, TerminalBackgroundTracker},
-    kv::{LibsqlKvBackendOptions, load_libsql_backend},
+    kv::{SqliteKvBackendOptions, libsql_usage_store, load_sqlite_backend},
     log_backend::{GuestLogBackend, GuestLogRecord, LogLevel},
     manifest::{extract_manifest_from_wasm, sanitize_manifest},
     mesh::AppRuntimeUpdateMessage,
@@ -666,7 +666,9 @@ pub(crate) async fn run(args: RunArgs) -> Result<()> {
         .allocate_node()
         .expect("Failed to allocate node");
     let mesh = Mesh::with_node(local_discovery.clone(), node);
-    let local_kv_backend = load_libsql_backend(LibsqlKvBackendOptions::new(kv_db_path)).await?;
+    let mut kv_options = SqliteKvBackendOptions::new(kv_db_path);
+    kv_options.usage = libsql_usage_store(db.clone());
+    let local_kv_backend = load_sqlite_backend(kv_options).await?;
     let kv_backend =
         terminal_games::kv::load_mesh_backend(mesh.clone(), mesh.node(), Some(local_kv_backend))
             .expect("Failed to initialize mesh KV backend");

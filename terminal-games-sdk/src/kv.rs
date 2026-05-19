@@ -69,7 +69,7 @@ pub struct ListIterator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Command {
+enum Command {
     Set { key: Key, value: Value },
     Delete { key: Key },
     Check { key: Key, value: Value },
@@ -301,10 +301,12 @@ pub async fn get_parts(parts: &[KeyPart]) -> Result<Option<Value>, Error> {
 }
 
 pub async fn set(value: impl IntoValue, key: impl Into<Key>) -> Result<(), Error> {
-    exec([Command::Set {
-        key: key.into(),
-        value: value.into_value(),
-    }])
+    exec_one(AtomicCommands {
+        commands: vec![Command::Set {
+            key: key.into(),
+            value: value.into_value(),
+        }],
+    })
     .await
 }
 
@@ -312,13 +314,12 @@ pub async fn set_parts(value: impl IntoValue, parts: &[KeyPart]) -> Result<(), E
     set(value, parts.to_vec()).await
 }
 
-pub fn atomic() -> Atomic {
+pub fn atomic() -> Atomic<NoWrite> {
     Atomic::default()
 }
 
-pub async fn exec(commands: impl IntoIterator<Item = Command>) -> Result<(), Error> {
-    let commands = commands.into_iter().collect::<Vec<_>>();
-    let encoded = encode_commands(commands)?;
+async fn exec_one(commands: AtomicCommands) -> Result<(), Error> {
+    let encoded = encode_commands(commands.commands)?;
     let request_id = unsafe {
         crate::internal::kv_exec(
             encoded.commands.as_ptr() as *const u8,
@@ -359,25 +360,24 @@ pub async fn storage_used() -> Result<u64, Error> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-#[derive(Default)]
-pub struct Atomic {
+pub struct NoWrite;
+pub struct HasWrite;
+
+pub struct Atomic<State> {
     commands: Vec<Command>,
+    _state: std::marker::PhantomData<State>,
 }
 
-impl Atomic {
-    pub fn set(mut self, value: impl IntoValue, key: impl Into<Key>) -> Self {
-        self.commands.push(Command::Set {
-            key: key.into(),
-            value: value.into_value(),
-        });
-        self
+impl Default for Atomic<NoWrite> {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            _state: std::marker::PhantomData,
+        }
     }
+}
 
-    pub fn delete(mut self, key: impl Into<Key>) -> Self {
-        self.commands.push(Command::Delete { key: key.into() });
-        self
-    }
-
+impl<State> Atomic<State> {
     pub fn check(mut self, value: impl IntoValue, key: impl Into<Key>) -> Self {
         self.commands.push(Command::Check {
             key: key.into(),
@@ -398,8 +398,36 @@ impl Atomic {
     }
 
     pub async fn exec(self) -> Result<(), Error> {
-        exec(self.commands).await
+        exec_one(AtomicCommands {
+            commands: self.commands,
+        })
+        .await
     }
+}
+
+impl Atomic<NoWrite> {
+    pub fn set(mut self, value: impl IntoValue, key: impl Into<Key>) -> Atomic<HasWrite> {
+        self.commands.push(Command::Set {
+            key: key.into(),
+            value: value.into_value(),
+        });
+        Atomic {
+            commands: self.commands,
+            _state: std::marker::PhantomData,
+        }
+    }
+
+    pub fn delete(mut self, key: impl Into<Key>) -> Atomic<HasWrite> {
+        self.commands.push(Command::Delete { key: key.into() });
+        Atomic {
+            commands: self.commands,
+            _state: std::marker::PhantomData,
+        }
+    }
+}
+
+struct AtomicCommands {
+    commands: Vec<Command>,
 }
 
 impl ListIterator {

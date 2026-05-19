@@ -51,11 +51,13 @@ use terminal_games::{
         CreateAppRequest, CreateAppResponse, DeleteAppRequest, DeleteShortnameRequest,
         DeleteShortnameResponse, DrainStartRequest, KickSessionRequest, NodeDiscoveryResponse,
         NodeRuntimeStatus, RotateAppTokenRequest, RotateAppTokenResponse, RpcError, SessionSummary,
-        SpyClientMessage, SpyControlMessage, StaleImport, StatusBarState, StatusBroadcast,
-        TickerAddRequest, TickerEntry, TickerRemoveRequest, TickerReorderRequest, UploadAppRequest,
-        UploadAppResponse, expiry_from_duration, parse_duration_string, parse_optional_expiry,
+        SetAppKvStorageLimitRequest, SpyClientMessage, SpyControlMessage, StaleImport,
+        StatusBarState, StatusBroadcast, TickerAddRequest, TickerEntry, TickerRemoveRequest,
+        TickerReorderRequest, UploadAppRequest, UploadAppResponse, expiry_from_duration,
+        parse_duration_string, parse_optional_expiry,
     },
     db::DbPool,
+    kv::KvQuota,
     manifest::{extract_manifest_from_wasm, sanitize_manifest, validate_shortname},
     mesh::{AppRuntimeUpdateMessage, BuildId, ContentHash, Mesh, hash_app_envs, hash_bytes},
     wasm_abi,
@@ -88,6 +90,7 @@ pub struct ControlPlane {
     rate_limiter: Arc<ApiRateLimiter>,
     bandwidth: Arc<BandwidthTracker>,
     max_capacity: usize,
+    kv_quota: Arc<AppKvQuota>,
     node_id: String,
     shutdown: ShutdownCoordinator,
 }
@@ -99,6 +102,7 @@ impl ControlPlane {
         session_registry: Arc<SessionRegistry>,
         mesh: Mesh,
         max_capacity: usize,
+        kv_quota: Arc<AppKvQuota>,
         admin_shared_secret: Option<Arc<str>>,
         node_id: String,
         shutdown: ShutdownCoordinator,
@@ -113,6 +117,7 @@ impl ControlPlane {
             rate_limiter: Arc::new(ApiRateLimiter::new()),
             bandwidth: Arc::new(BandwidthTracker::default()),
             max_capacity,
+            kv_quota,
             node_id,
             shutdown,
         }
@@ -273,6 +278,44 @@ impl ControlPlane {
             bandwidth_bytes_per_second: self.bandwidth.bytes_per_second(),
             shutdown: self.shutdown.snapshot(),
         }
+    }
+}
+
+pub(crate) struct AppKvQuota {
+    db: DbPool,
+    default_max_bytes: u64,
+    overrides: Mutex<HashMap<u64, u64>>,
+}
+
+impl AppKvQuota {
+    pub(crate) fn new(db: DbPool, default_max_bytes: u64) -> Self {
+        Self {
+            db,
+            default_max_bytes,
+            overrides: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn default_max_bytes(&self) -> u64 {
+        self.default_max_bytes
+    }
+
+    pub(crate) async fn refresh_from_db(&self) -> anyhow::Result<()> {
+        let overrides = load_kv_limit_overrides(&self.db).await?;
+        *self.overrides.lock().unwrap() = overrides;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl KvQuota for AppKvQuota {
+    async fn max_bytes(&self, namespace_id: u64) -> u64 {
+        self.overrides
+            .lock()
+            .unwrap()
+            .get(&namespace_id)
+            .copied()
+            .unwrap_or(self.default_max_bytes)
     }
 }
 
@@ -931,6 +974,9 @@ impl AdminControlRpc for AdminRpcServer {
             author_name: String::new(),
             shortname: shortname.clone(),
             playtime_seconds: 0.0,
+            kv_storage_bytes: 0,
+            kv_storage_limit_bytes: self.control.kv_quota.default_max_bytes(),
+            kv_storage_limit_override_bytes: None,
             stale: false,
             stale_imports: Vec::new(),
             imports: Vec::new(),
@@ -942,35 +988,39 @@ impl AdminControlRpc for AdminRpcServer {
     }
 
     async fn app_list(self, _: context::Context) -> Result<Vec<AppSummary>, RpcError> {
+        load_app_summaries(&self.control, None)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn app_set_kv_storage_limit(
+        self,
+        _: context::Context,
+        request: SetAppKvStorageLimitRequest,
+    ) -> Result<AppSummary, RpcError> {
         let db = self.control.app_server.db.get().await?;
-        let mut rows = db
-            .query(
-                "SELECT a.id,
-                        COALESCE(json_extract(g.details, '$.author'), ''),
-                        a.shortname,
-                        COALESCE(g.duration_seconds, 0.0),
-                        COALESCE(g.imports, '[]')
-                 FROM app_tokens a
-                 LEFT JOIN apps g ON g.shortname = a.shortname
-                 ORDER BY a.id ASC",
-                (),
+        let limit_bytes = request
+            .limit_bytes
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| RpcError::from("limit exceeds i64"))?;
+        let updated = db
+            .execute(
+                "UPDATE app_tokens
+                 SET kv_storage_limit_bytes = ?1
+                 WHERE id = ?2",
+                libsql::params!(limit_bytes, request.app_id),
             )
             .await?;
-        let mut app_tokens = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let imports = serde_json::from_str::<Vec<String>>(&row.get::<String>(4)?)?;
-            let (stale, stale_imports) = app_import_staleness(&imports);
-            app_tokens.push(AppSummary {
-                app_id: row.get::<u64>(0)?,
-                author_name: row.get::<String>(1)?,
-                shortname: row.get::<String>(2)?,
-                playtime_seconds: row.get::<f64>(3)?,
-                stale,
-                stale_imports,
-                imports,
-            });
+        if updated == 0 {
+            return Err(RpcError::from("app not found"));
         }
-        Ok(app_tokens)
+        self.control.kv_quota.refresh_from_db().await?;
+        load_app_summaries(&self.control, Some(request.app_id))
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| RpcError::from("app not found"))
     }
 
     async fn app_rotate_token(
@@ -1034,7 +1084,7 @@ impl AppControlRpc for AppRpcServer {
             .consume_tokens_rpc(RateLimitGroup::Api, &self.app.record.token_hash, 1)?;
         let claims_by_shortname = group_app_self_info_claims(request.tokens);
         let records_by_shortname = load_app_self_info_records_by_shortnames(
-            &self.control.app_server.db,
+            &self.control,
             claims_by_shortname
                 .iter()
                 .map(|(shortname, _)| shortname.as_str()),
@@ -1324,6 +1374,7 @@ impl AppControlRpc for AppRpcServer {
             (app_id, build_id, updated_at_ns, true)
         };
         tx.commit().await?;
+        self.control.kv_quota.refresh_from_db().await?;
         let response = UploadAppResponse {
             shortname: self.app.record.shortname.clone(),
             build_id: build_id.id_string(),
@@ -1671,6 +1722,9 @@ struct AppSelfInfoRecord {
     app_token: AppTokenRecord,
     author_name: String,
     playtime_seconds: f64,
+    kv_storage_bytes: u64,
+    kv_storage_limit_bytes: u64,
+    kv_storage_limit_override_bytes: Option<u64>,
     imports: Vec<String>,
 }
 
@@ -1683,11 +1737,60 @@ impl AppSelfInfoRecord {
             shortname: self.app_token.shortname.clone(),
             server: node_id.to_string(),
             playtime_seconds: self.playtime_seconds,
+            kv_storage_bytes: self.kv_storage_bytes,
+            kv_storage_limit_bytes: self.kv_storage_limit_bytes,
+            kv_storage_limit_override_bytes: self.kv_storage_limit_override_bytes,
             stale,
             stale_imports,
             imports: self.imports.clone(),
         }
     }
+}
+
+async fn load_app_summaries(
+    control: &ControlPlane,
+    app_id_filter: Option<u64>,
+) -> anyhow::Result<Vec<AppSummary>> {
+    let db = control.app_server.db.get().await?;
+    let mut query = "SELECT a.id,
+                            g.id,
+                            COALESCE(json_extract(g.details, '$.author'), ''),
+                            a.shortname,
+                            COALESCE(g.duration_seconds, 0.0),
+                            COALESCE(g.imports, '[]'),
+                            a.kv_storage_limit_bytes,
+                            COALESCE(g.kv_storage_bytes, 0)
+                     FROM app_tokens a
+                     LEFT JOIN apps g ON g.shortname = a.shortname"
+        .to_string();
+    let mut params = Vec::new();
+    if let Some(app_id) = app_id_filter {
+        query.push_str(" WHERE a.id = ?1");
+        params.push(libsql::Value::Integer(i64::try_from(app_id)?));
+    }
+    query.push_str(" ORDER BY a.id ASC");
+
+    let mut rows = db.query(&query, libsql::params_from_iter(params)).await?;
+    let mut summaries = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let app_id = row.get::<u64>(0)?;
+        let imports = serde_json::from_str::<Vec<String>>(&row.get::<String>(5)?)?;
+        let limit_override = optional_u64_from_value(row.get_value(6)?)?;
+        let (stale, stale_imports) = app_import_staleness(&imports);
+        summaries.push(AppSummary {
+            app_id,
+            author_name: row.get::<String>(2)?,
+            shortname: row.get::<String>(3)?,
+            playtime_seconds: row.get::<f64>(4)?,
+            kv_storage_bytes: row.get::<u64>(7)?,
+            kv_storage_limit_bytes: limit_override.unwrap_or(control.kv_quota.default_max_bytes()),
+            kv_storage_limit_override_bytes: limit_override,
+            stale,
+            stale_imports,
+            imports,
+        });
+    }
+    Ok(summaries)
 }
 
 fn app_import_staleness(imports: &[String]) -> (bool, Vec<StaleImport>) {
@@ -1704,8 +1807,37 @@ fn app_import_staleness(imports: &[String]) -> (bool, Vec<StaleImport>) {
     (!stale_imports.is_empty(), stale_imports)
 }
 
+fn optional_u64_from_value(value: libsql::Value) -> anyhow::Result<Option<u64>> {
+    match value {
+        libsql::Value::Null => Ok(None),
+        libsql::Value::Integer(value) => Ok(Some(u64::try_from(value)?)),
+        other => anyhow::bail!("expected INTEGER or NULL, got {other:?}"),
+    }
+}
+
+async fn load_kv_limit_overrides(db: &DbPool) -> anyhow::Result<HashMap<u64, u64>> {
+    let db = db.get().await?;
+    let mut rows = db
+        .query(
+            "SELECT apps.id, app_tokens.kv_storage_limit_bytes
+             FROM apps
+             JOIN app_tokens ON app_tokens.shortname = apps.shortname
+             WHERE app_tokens.kv_storage_limit_bytes IS NOT NULL",
+            (),
+        )
+        .await?;
+    let mut overrides = HashMap::new();
+    while let Some(row) = rows.next().await? {
+        let limit = optional_u64_from_value(row.get_value(1)?)?.ok_or_else(|| {
+            anyhow::anyhow!("app_tokens.kv_storage_limit_bytes unexpectedly NULL")
+        })?;
+        overrides.insert(row.get::<u64>(0)?, limit);
+    }
+    Ok(overrides)
+}
+
 async fn load_app_self_info_records_by_shortnames<'a>(
-    db: &DbPool,
+    control: &ControlPlane,
     shortnames: impl IntoIterator<Item = &'a str>,
 ) -> anyhow::Result<HashMap<String, AppSelfInfoRecord>> {
     let shortnames = shortnames
@@ -1721,34 +1853,43 @@ async fn load_app_self_info_records_by_shortnames<'a>(
         .join(", ");
     let query = format!(
         "SELECT app_tokens.id,
+                apps.id,
                 app_tokens.shortname,
                 app_tokens.token_hash,
                 COALESCE(json_extract(apps.details, '$.author'), ''),
                 COALESCE(apps.duration_seconds, 0.0),
-                COALESCE(apps.imports, '[]')
+                COALESCE(apps.imports, '[]'),
+                app_tokens.kv_storage_limit_bytes,
+                COALESCE(apps.kv_storage_bytes, 0)
          FROM app_tokens
          LEFT JOIN apps ON apps.shortname = app_tokens.shortname
          WHERE app_tokens.shortname IN ({placeholders})"
     );
 
-    let db = db.get().await?;
+    let db = control.app_server.db.get().await?;
     let mut rows = db
         .query(&query, libsql::params_from_iter(shortnames))
         .await?;
     let mut records = HashMap::new();
     while let Some(row) = rows.next().await? {
-        let shortname = row.get::<String>(1)?;
+        let app_id = row.get::<u64>(0)?;
+        let shortname = row.get::<String>(2)?;
+        let limit_override = optional_u64_from_value(row.get_value(7)?)?;
         records.insert(
             shortname.clone(),
             AppSelfInfoRecord {
                 app_token: AppTokenRecord {
-                    id: row.get::<u64>(0)?,
+                    id: app_id,
                     shortname,
-                    token_hash: row.get::<String>(2)?,
+                    token_hash: row.get::<String>(3)?,
                 },
-                author_name: row.get::<String>(3).unwrap_or_default(),
-                playtime_seconds: row.get::<f64>(4)?,
-                imports: serde_json::from_str(&row.get::<String>(5)?)?,
+                author_name: row.get::<String>(4).unwrap_or_default(),
+                playtime_seconds: row.get::<f64>(5)?,
+                kv_storage_bytes: row.get::<u64>(8)?,
+                kv_storage_limit_bytes: limit_override
+                    .unwrap_or(control.kv_quota.default_max_bytes()),
+                kv_storage_limit_override_bytes: limit_override,
+                imports: serde_json::from_str(&row.get::<String>(6)?)?,
             },
         );
     }

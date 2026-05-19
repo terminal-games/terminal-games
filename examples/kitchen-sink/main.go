@@ -510,20 +510,9 @@ func incrementKV() tea.Cmd {
 
 func incrementKVWithCAS() (uint64, uint64, error) {
 	dailyKey := currentDateKey()
-	totalKey := []any{"meta", "total"}
-	lastUpdatedKey := []any{"meta", "last-updated-day"}
-	today := currentDateString()
 
 	for attempt := 0; attempt < 8; attempt++ {
 		dailyValue, err := kv.Get(dailyKey...)
-		if err != nil {
-			return 0, 0, err
-		}
-		totalValue, err := kv.Get(totalKey...)
-		if err != nil {
-			return 0, 0, err
-		}
-		lastUpdatedValue, err := kv.Get(lastUpdatedKey...)
 		if err != nil {
 			return 0, 0, err
 		}
@@ -543,21 +532,6 @@ func incrementKVWithCAS() (uint64, uint64, error) {
 			return 0, 0, fmt.Errorf("daily counter has unsupported type %T", value)
 		}
 
-		var totalCount uint64
-		switch value := totalValue.(type) {
-		case nil:
-			totalCount = 0
-		case uint64:
-			totalCount = value
-		case int64:
-			if value < 0 {
-				return 0, 0, fmt.Errorf("total counter has unsupported negative value %d", value)
-			}
-			totalCount = uint64(value)
-		default:
-			return 0, 0, fmt.Errorf("total counter has unsupported type %T", value)
-		}
-
 		builder := kv.Atomic()
 		switch value := dailyValue.(type) {
 		case nil:
@@ -565,30 +539,13 @@ func incrementKVWithCAS() (uint64, uint64, error) {
 		case uint64, int64:
 			builder = builder.Check(value, dailyKey...)
 		}
-		switch value := totalValue.(type) {
-		case nil:
-			builder = builder.CheckMissing(totalKey...)
-		case uint64, int64:
-			builder = builder.Check(value, totalKey...)
-		}
-		switch value := lastUpdatedValue.(type) {
-		case nil:
-			builder = builder.CheckMissing(lastUpdatedKey...)
-		case string:
-			builder = builder.Check(value, lastUpdatedKey...)
-		default:
-			return 0, 0, fmt.Errorf("last updated day has unsupported type %T", value)
-		}
 
 		nextDailyCount := dailyCount + 1
-		nextTotalCount := totalCount + 1
 		err = builder.
 			Set(nextDailyCount, dailyKey...).
-			Set(nextTotalCount, totalKey...).
-			Set(today, lastUpdatedKey...).
 			Exec()
 		if err == nil {
-			return nextDailyCount, nextTotalCount, nil
+			return nextDailyCount, nextDailyCount, nil
 		}
 
 		var checkErr *kv.CheckFailedError

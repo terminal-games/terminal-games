@@ -17,13 +17,15 @@ CREATE TABLE IF NOT EXISTS apps (
     env_salt BLOB NOT NULL,
     env_blob BLOB NOT NULL,
     build_updated_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec') * 1000000000 AS INTEGER)),
-    duration_seconds REAL NOT NULL DEFAULT(0)
+    duration_seconds REAL NOT NULL DEFAULT(0),
+    kv_storage_bytes INTEGER NOT NULL DEFAULT(0) CHECK(kv_storage_bytes >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS app_tokens (
     id INTEGER PRIMARY KEY,
     shortname TEXT NOT NULL UNIQUE,
     token_hash TEXT NOT NULL UNIQUE,
+    kv_storage_limit_bytes INTEGER CHECK(kv_storage_limit_bytes IS NULL OR kv_storage_limit_bytes >= 0),
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 

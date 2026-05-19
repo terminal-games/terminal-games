@@ -3,7 +3,7 @@
   vars_files:
     - "{{ playbook_dir }}/secrets.yml"
   vars:
-    server_binary_local_path: "{{ playbook_dir }}/../terminal-games-server-docker-binary"
+    server_binary_local_path: "{{ playbook_dir }}/../target/x86_64-unknown-linux-musl/release/terminal-games-server"
     server_binary_remote_path: /opt/terminal-games/bin/terminal-games-server
   tasks:
     - name: Ensure required secret variables are provided
@@ -63,25 +63,16 @@
         - /opt/terminal-games/bin
         - /etc/terminal-games
 
-    - name: Ensure KV cache directory exists on the leader
+    - name: Ensure KV sqlite directory exists on the leader when sqlite backend is enabled
       ansible.builtin.file:
-        path: "{{ KV_CACHE_DIR | default('/opt/terminal-games/kv-cache') }}"
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-      when: hostvars[inventory_hostname].node_id == hostvars[inventory_hostname].kv_leader_node_id
-
-    - name: Ensure KV local libsql directory exists on the leader when local backend is enabled
-      ansible.builtin.file:
-        path: "{{ (KV_LIBSQL_PATH | default('/var/lib/terminal-games/kv/kv.db')) | dirname }}"
+        path: "{{ (KV_SQLITE_PATH | default('/var/lib/terminal-games/kv/kv.db')) | dirname }}"
         state: directory
         owner: root
         group: root
         mode: "0755"
       when:
         - hostvars[inventory_hostname].node_id == hostvars[inventory_hostname].kv_leader_node_id
-        - (KV_BACKEND | default('libsql')) != "s3"
+        - (KV_BACKEND | default('s3')) != "s3"
 
     - name: Deploy server binary
       ansible.builtin.copy:

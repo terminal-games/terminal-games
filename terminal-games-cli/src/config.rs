@@ -333,6 +333,35 @@ pub fn format_seconds(seconds: f64) -> String {
     format_duration(seconds.max(0.0) as u64)
 }
 
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+pub fn format_storage_usage(used_bytes: u64, limit_bytes: u64, is_override: bool) -> String {
+    let percent = if limit_bytes == 0 {
+        if used_bytes == 0 { 0.0 } else { 100.0 }
+    } else {
+        (used_bytes as f64 / limit_bytes as f64 * 100.0).min(999.9)
+    };
+    format!(
+        "{} / {} ({percent:.1}%){}",
+        format_bytes(used_bytes),
+        format_bytes(limit_bytes),
+        if is_override { " override" } else { "" }
+    )
+}
+
 pub fn format_bytes_per_second(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B/s", "KiB/s", "MiB/s", "GiB/s"];
     let mut value = bytes as f64;
