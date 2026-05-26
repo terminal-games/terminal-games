@@ -6,7 +6,7 @@ use anyhow::Result;
 use terminal_games::control::AppSummary;
 
 use super::super::load_api;
-use crate::config::{format_imports, format_seconds, print_table};
+use crate::config::{format_imports, format_seconds, format_storage_usage, print_table};
 
 pub(super) async fn run(profile: Option<String>) -> Result<()> {
     let api = load_api(profile.as_deref())?;
@@ -23,13 +23,26 @@ pub(super) async fn run(profile: Option<String>) -> Result<()> {
                 },
                 app.shortname,
                 format_seconds(app.playtime_seconds),
+                format_storage_usage(
+                    app.kv_storage_bytes,
+                    app.kv_storage_limit_bytes,
+                    app.kv_storage_limit_override_bytes.is_some(),
+                ),
                 if app.stale { "yes" } else { "no" }.to_string(),
                 format_imports(&app.imports, &app.stale_imports),
             ]
         })
         .collect::<Vec<_>>();
     print_table(
-        &["App ID", "App", "Shortname", "Playtime", "Stale", "APIs"],
+        &[
+            "App ID",
+            "App",
+            "Shortname",
+            "Playtime",
+            "KV Storage",
+            "Stale",
+            "APIs",
+        ],
         &rows,
     );
     Ok(())

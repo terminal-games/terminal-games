@@ -3,7 +3,7 @@
   vars_files:
     - "{{ playbook_dir }}/secrets.yml"
   vars:
-    server_binary_local_path: "{{ playbook_dir }}/../terminal-games-server-docker-binary"
+    server_binary_local_path: "{{ playbook_dir }}/../target/x86_64-unknown-linux-musl/release/terminal-games-server"
     server_binary_remote_path: /opt/terminal-games/bin/terminal-games-server
   tasks:
     - name: Ensure required secret variables are provided
@@ -23,6 +23,8 @@
           - METRICS_BEARER_TOKEN | length > 0
           - SSH_HOST_KEY_BASE64 is defined
           - SSH_HOST_KEY_BASE64 | length > 0
+          - hostvars[inventory_hostname].kv_leader_node_id is defined
+          - hostvars[inventory_hostname].kv_leader_node_id | length > 0
         fail_msg: "Set MESH_PINNED_PEM, LIBSQL_AUTH_TOKEN, LIBSQL_URL, ADMIN_SHARED_SECRET, AUTHOR_ENV_SECRET_KEY, METRICS_BEARER_TOKEN, and SSH_HOST_KEY_BASE64."
       no_log: true
 
@@ -40,7 +42,16 @@
           - server_binary_stat.stat.isreg
         fail_msg: "Server binary missing at {{ server_binary_local_path }}. Build it first."
 
-    - name: Ensure runtime directories exist
+    - name: Validate KV backend configuration on the leader
+      ansible.builtin.assert:
+        that:
+          - KV_S3_BUCKET is defined
+          - KV_S3_BUCKET | length > 0
+        fail_msg: "Set KV_S3_BUCKET in secrets.yml."
+      when: hostvars[inventory_hostname].node_id == hostvars[inventory_hostname].kv_leader_node_id
+      no_log: true
+
+    - name: Ensure base runtime directories exist
       ansible.builtin.file:
         path: "{{ item }}"
         state: directory

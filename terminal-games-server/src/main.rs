@@ -14,7 +14,7 @@ mod shutdown;
 mod ssh;
 mod web;
 
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use rustls::crypto::aws_lc_rs;
@@ -25,10 +25,15 @@ use terminal_games::{
     app::AppServer,
     app_env::APP_ENV_KEY_ENV,
     db::{DbPool, LibsqlConnectionManager},
-    mesh::{AppRuntimeUpdateMessage, BuildId, EnvDiscovery, Mesh},
+    kv::{
+        DEFAULT_NAMESPACE_MAX_BYTES, KvBackend, OpenDalKvBackendOptions, OpenDalS3Options,
+        libsql_usage_store, load_opendal_backend, opendal_fs_operator, opendal_s3_operator,
+    },
+    mesh::{AppRuntimeUpdateMessage, BuildId, EnvDiscovery, Mesh, NodeId},
 };
 
 const APP_ENV_DEV_FALLBACK_KEY: &str = "terminal-games-dev-app-env-key";
+const KV_QUOTA_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 // Avoid musl's default allocator due to lackluster performance
 // https://nickb.dev/blog/default-musl-allocator-considered-harmful-to-performance
@@ -184,6 +189,20 @@ fn spawn_cluster_kicked_ip_retention_task(db: DbPool) {
     });
 }
 
+fn spawn_kv_quota_refresh_task(quota: Arc<control::AppKvQuota>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(KV_QUOTA_REFRESH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = quota.refresh_from_db().await {
+                tracing::warn!(error = ?error, "failed to refresh kv quota overrides");
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = aws_lc_rs::default_provider().install_default();
@@ -233,20 +252,46 @@ async fn main() -> Result<()> {
     let app_env_secret_key = load_app_env_secret_key();
 
     let mesh = Mesh::new(Arc::new(EnvDiscovery::new()));
+    let kv_leader_node = std::env::var("KV_LEADER_NODE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| mesh.node().to_string())
+        .parse::<NodeId>()
+        .map_err(|error| anyhow::anyhow!("invalid KV_LEADER_NODE_ID: {error}"))?;
+    let kv_default_max_bytes = read_env_u64("KV_APP_MAX_BYTES")
+        .or_else(|| read_env_u64("KV_NAMESPACE_MAX_BYTES"))
+        .unwrap_or(DEFAULT_NAMESPACE_MAX_BYTES);
+    let kv_quota = Arc::new(control::AppKvQuota::new(db.clone(), kv_default_max_bytes));
+    kv_quota
+        .refresh_from_db()
+        .await
+        .context("Failed to load KV quota overrides")?;
+    let is_kv_leader = mesh.node() == kv_leader_node;
+    let local_kv_backend = if is_kv_leader {
+        Some(load_kv_backend_from_env(kv_quota.clone(), db.clone()).await?)
+    } else {
+        None
+    };
+    let kv_backend = terminal_games::kv::load_mesh_backend(
+        mesh.clone(),
+        kv_leader_node,
+        local_kv_backend.clone(),
+    )?;
+    let app_server = Arc::new(AppServer::new(
+        mesh.clone(),
+        db.clone(),
+        kv_backend,
+        app_env_secret_key,
+    )?);
     mesh.start_discovery().await?;
-    mesh.serve().await?;
+    mesh.serve(local_kv_backend).await?;
     let node_id = std::env::var("NODE_ID")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| mesh.node().to_string());
     let notifications = Arc::new(notifications::Notifications::from_env());
-
-    let app_server = Arc::new(AppServer::new(
-        mesh.clone(),
-        db.clone(),
-        app_env_secret_key,
-    )?);
     sync_app_build_snapshot(&db, &app_server, &mesh).await?;
     {
         let app_server = app_server.clone();
@@ -315,6 +360,9 @@ async fn main() -> Result<()> {
         last_ban_inserted_at,
     );
     spawn_cluster_kicked_ip_retention_task(db.clone());
+    if is_kv_leader {
+        spawn_kv_quota_refresh_task(kv_quota.clone());
+    }
     tracing::info!(
         max_active_apps,
         max_active_apps_per_ip,
@@ -340,6 +388,7 @@ async fn main() -> Result<()> {
         session_registry.clone(),
         mesh.clone(),
         max_active_apps,
+        kv_quota,
         admin_shared_secret,
         session_registry.node_id().to_string(),
         shutdown.clone(),
@@ -423,6 +472,54 @@ fn load_app_env_secret_key() -> String {
             APP_ENV_DEV_FALLBACK_KEY.to_string()
         }
     }
+}
+
+async fn load_kv_backend_from_env(
+    quota: Arc<control::AppKvQuota>,
+    db: DbPool,
+) -> Result<Arc<dyn KvBackend>> {
+    match read_env_string("KV_BACKEND")
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+        .unwrap_or("s3")
+    {
+        "s3" => {
+            let bucket = read_env_string("KV_S3_BUCKET")
+                .context("KV_S3_BUCKET must be set when KV_BACKEND=s3")?;
+            let mut s3_options = OpenDalS3Options::new(bucket);
+            if let Some(prefix) = read_env_string("KV_S3_PREFIX") {
+                s3_options.prefix = prefix;
+            }
+            s3_options.region = read_env_string("KV_S3_REGION");
+            s3_options.endpoint = read_env_string("KV_S3_ENDPOINT_URL");
+
+            let mut options = OpenDalKvBackendOptions::new(opendal_s3_operator(s3_options).await?);
+            options.quota = quota;
+            options.usage = libsql_usage_store(db);
+            load_opendal_backend(options).await
+        }
+        "fs" | "filesystem" => {
+            let root = read_env_string("KV_FS_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/var/lib/terminal-games/kv"));
+            let mut options = OpenDalKvBackendOptions::new(opendal_fs_operator(root).await?);
+            options.quota = quota;
+            options.usage = libsql_usage_store(db);
+            load_opendal_backend(options).await
+        }
+        other => anyhow::bail!("unsupported KV_BACKEND '{other}', expected 's3' or 'fs'"),
+    }
+}
+
+fn read_env_string(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_env_u64(key: &str) -> Option<u64> {
+    read_env_string(key).and_then(|value| value.parse::<u64>().ok())
 }
 
 fn parse_ssh_captcha_threshold(raw: Result<String, std::env::VarError>) -> Result<Option<f64>> {

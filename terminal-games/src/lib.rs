@@ -9,6 +9,7 @@ mod audio;
 pub mod control;
 pub mod db;
 pub mod input_guard;
+pub mod kv;
 pub mod log_backend;
 pub mod manifest;
 pub mod mesh;

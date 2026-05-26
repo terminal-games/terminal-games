@@ -2,7 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-use std::fs;
+use std::{
+    fs,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use terminal_games::{
@@ -12,6 +15,8 @@ use terminal_games::{
 
 use super::{AppUploadArgs, load_upload_envs};
 use crate::control_client::AppClient;
+
+const APP_UPLOAD_RPC_DEADLINE: Duration = Duration::from_secs(5 * 60);
 
 pub(super) async fn run(args: AppUploadArgs, profile: Option<String>) -> Result<()> {
     let wasm = fs::read(&args.path_to_wasm_file)
@@ -29,11 +34,13 @@ pub(super) async fn run(args: AppUploadArgs, profile: Option<String>) -> Result<
 
     let client = AppClient::from_target(target_shortname, profile.as_deref())?;
     let envs = load_upload_envs(&args.env, args.env_file.as_deref())?;
+    let mut context = terminal_games::control::rpc_context();
+    context.deadline = Instant::now() + APP_UPLOAD_RPC_DEADLINE;
     let response: UploadAppResponse = client
         .rpc()
         .await?
         .upload(
-            terminal_games::control::rpc_context(),
+            context,
             terminal_games::control::UploadAppRequest { wasm, envs },
         )
         .await?

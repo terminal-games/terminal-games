@@ -300,6 +300,9 @@ pub struct AppSummary {
     pub author_name: String,
     pub shortname: String,
     pub playtime_seconds: f64,
+    pub kv_storage_bytes: u64,
+    pub kv_storage_limit_bytes: u64,
+    pub kv_storage_limit_override_bytes: Option<u64>,
     pub stale: bool,
     pub stale_imports: Vec<StaleImport>,
     pub imports: Vec<String>,
@@ -327,6 +330,12 @@ pub struct RotateAppTokenResponse {
     pub app_id: u64,
     pub shortname: String,
     pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetAppKvStorageLimitRequest {
+    pub app_id: u64,
+    pub limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,6 +386,9 @@ pub struct AppSelfResponse {
     pub shortname: String,
     pub server: String,
     pub playtime_seconds: f64,
+    pub kv_storage_bytes: u64,
+    pub kv_storage_limit_bytes: u64,
+    pub kv_storage_limit_override_bytes: Option<u64>,
     pub stale: bool,
     pub stale_imports: Vec<StaleImport>,
     pub imports: Vec<String>,
@@ -531,6 +543,9 @@ pub trait AdminControlRpc {
     async fn app_rotate_token(
         request: RotateAppTokenRequest,
     ) -> Result<RotateAppTokenResponse, RpcError>;
+    async fn app_set_kv_storage_limit(
+        request: SetAppKvStorageLimitRequest,
+    ) -> Result<AppSummary, RpcError>;
     async fn app_delete(
         request: DeleteAppRequest,
     ) -> Result<Option<DeleteShortnameResponse>, RpcError>;

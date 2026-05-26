@@ -17,7 +17,7 @@ tasks:
     deps:
       - build
     cmds:
-      - mold -run cargo run --release -p terminal-games-server
+      - cargo run --release -p terminal-games-server
 
   kitchen-sink:
     cmds:

@@ -260,6 +260,8 @@ pub(super) enum AdminAppCommand {
     /// List all reserved app shortnames and their playtime.
     #[command(visible_alias = "ls")]
     List,
+    /// Override an app's KV storage limit in bytes, or clear the override.
+    KvLimit(AdminAppKvLimitArgs),
     /// Rotate an app token and print the new value.
     RotateToken(AdminAppRotateTokenArgs),
     /// Delete an app reservation and its shortname permanently.
@@ -283,6 +285,16 @@ pub(super) struct AdminAppDeleteArgs {
 pub(super) struct AdminAppRotateTokenArgs {
     #[arg(add = ArgValueCandidates::new(complete_app_id_candidates))]
     app_id: u64,
+}
+
+#[derive(Args)]
+pub(super) struct AdminAppKvLimitArgs {
+    #[arg(add = ArgValueCandidates::new(complete_app_id_candidates))]
+    app_id: u64,
+    #[arg(required_unless_present = "default")]
+    limit_bytes: Option<u64>,
+    #[arg(long, conflicts_with = "limit_bytes")]
+    default: bool,
 }
 
 pub async fn run(cli: AdminCli, profile: Option<String>) -> Result<()> {
