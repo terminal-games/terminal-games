@@ -26,8 +26,8 @@ use terminal_games::{
     app_env::APP_ENV_KEY_ENV,
     db::{DbPool, LibsqlConnectionManager},
     kv::{
-        DEFAULT_NAMESPACE_MAX_BYTES, KvBackend, S3KvBackendOptions, SqliteKvBackendOptions,
-        libsql_usage_store, load_s3_backend, load_sqlite_backend,
+        DEFAULT_NAMESPACE_MAX_BYTES, KvBackend, OpenDalKvBackendOptions, OpenDalS3Options,
+        libsql_usage_store, load_opendal_backend, opendal_fs_operator, opendal_s3_operator,
     },
     mesh::{AppRuntimeUpdateMessage, BuildId, EnvDiscovery, Mesh, NodeId},
 };
@@ -259,8 +259,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| mesh.node().to_string())
         .parse::<NodeId>()
         .map_err(|error| anyhow::anyhow!("invalid KV_LEADER_NODE_ID: {error}"))?;
-    let kv_default_max_bytes =
-        read_env_u64("KV_NAMESPACE_MAX_BYTES").unwrap_or(DEFAULT_NAMESPACE_MAX_BYTES);
+    let kv_default_max_bytes = read_env_u64("KV_APP_MAX_BYTES")
+        .or_else(|| read_env_u64("KV_NAMESPACE_MAX_BYTES"))
+        .unwrap_or(DEFAULT_NAMESPACE_MAX_BYTES);
     let kv_quota = Arc::new(control::AppKvQuota::new(db.clone(), kv_default_max_bytes));
     kv_quota
         .refresh_from_db()
@@ -485,28 +486,28 @@ async fn load_kv_backend_from_env(
         "s3" => {
             let bucket = read_env_string("KV_S3_BUCKET")
                 .context("KV_S3_BUCKET must be set when KV_BACKEND=s3")?;
-            let mut options = S3KvBackendOptions::new(bucket);
+            let mut s3_options = OpenDalS3Options::new(bucket);
             if let Some(prefix) = read_env_string("KV_S3_PREFIX") {
-                options.prefix = prefix;
+                s3_options.prefix = prefix;
             }
-            options.region = read_env_string("KV_S3_REGION");
-            options.endpoint = read_env_string("KV_S3_ENDPOINT_URL");
+            s3_options.region = read_env_string("KV_S3_REGION");
+            s3_options.endpoint = read_env_string("KV_S3_ENDPOINT_URL");
+
+            let mut options = OpenDalKvBackendOptions::new(opendal_s3_operator(s3_options).await?);
             options.quota = quota;
             options.usage = libsql_usage_store(db);
-            load_s3_backend(options).await
+            load_opendal_backend(options).await
         }
-        "sqlite" => {
-            let path = read_env_string("KV_SQLITE_PATH")
+        "fs" | "filesystem" => {
+            let root = read_env_string("KV_FS_ROOT")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("./kv-store/kv.db"));
-            load_sqlite_backend(SqliteKvBackendOptions {
-                path,
-                quota,
-                usage: libsql_usage_store(db),
-            })
-            .await
+                .unwrap_or_else(|| PathBuf::from("/var/lib/terminal-games/kv"));
+            let mut options = OpenDalKvBackendOptions::new(opendal_fs_operator(root).await?);
+            options.quota = quota;
+            options.usage = libsql_usage_store(db);
+            load_opendal_backend(options).await
         }
-        other => anyhow::bail!("unsupported KV_BACKEND '{other}', expected 's3' or 'sqlite'"),
+        other => anyhow::bail!("unsupported KV_BACKEND '{other}', expected 's3' or 'fs'"),
     }
 }
 

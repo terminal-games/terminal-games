@@ -34,7 +34,7 @@ use tokio_util::{
 
 use crate::{
     app_env::AppEnvVar,
-    kv::{KvBackend, KvCommand, KvError, KvKey, KvListPage},
+    kv::{KvBackend, KvCommand, KvError, KvKey, KvListPage, KvValue},
     rate_limiting::get_tcp_rtt_from_fd,
 };
 
@@ -115,7 +115,7 @@ trait MeshRpc {
     async fn peer_removed(msg: PeerChangeMessage);
     async fn app_runtime_updated(msg: AppRuntimeUpdateMessage);
     async fn node_status() -> MeshNodeStatus;
-    async fn kv_get(app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, KvError>;
+    async fn kv_get(app_id: u64, key: KvKey) -> Result<Option<KvValue>, KvError>;
     async fn kv_exec(app_id: u64, commands: Vec<KvCommand>) -> Result<(), KvError>;
     async fn kv_list_page(
         app_id: u64,
@@ -912,7 +912,7 @@ impl Mesh {
         node: NodeId,
         app_id: u64,
         key: KvKey,
-    ) -> Result<Option<Vec<u8>>, KvError> {
+    ) -> Result<Option<KvValue>, KvError> {
         if node == self.inner.node {
             return Err(KvError::Internal(
                 "local kv access should go through AppServer".to_string(),
@@ -1883,7 +1883,7 @@ impl MeshRpc for MeshRpcServer {
         _: context::Context,
         app_id: u64,
         key: KvKey,
-    ) -> Result<Option<Vec<u8>>, KvError> {
+    ) -> Result<Option<KvValue>, KvError> {
         let backend = self.kv_backend.ok_or(KvError::Unavailable)?;
         backend.get(app_id, key).await
     }

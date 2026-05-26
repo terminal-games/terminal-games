@@ -6,6 +6,7 @@ use super::{
 };
 use crate::kv::{KvCheckFailedReason, KvCommand, KvError, KvListPage};
 use crate::wasm_abi::HostApiRegistration;
+use bytes::Bytes;
 
 const KV_CMD_SET: u32 = 1;
 const KV_CMD_DELETE: u32 = 2;
@@ -59,18 +60,18 @@ impl AppServer {
         value_max_len: u32,
         value_len_ptr: i32,
     ) -> wasmtime::Result<i32> {
-        let Some(mut request) = Self::take_kv_request(caller.data_mut(), request_id) else {
-            return Ok(KV_POLL_ERR_INVALID_REQUEST_ID);
-        };
-        Self::advance_kv_request(&mut request);
-
-        match request.state {
-            KvRequestState::Pending(receiver) => {
-                request.state = KvRequestState::Pending(receiver);
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_PENDING)
-            }
-            KvRequestState::Complete(Ok(KvPendingResult::Get(value))) => match value {
+        let polled =
+            match Self::poll_kv_request(caller.data_mut(), request_id, |result| match result {
+                KvPendingResult::Get(value) => Ok(value),
+                other => Err(other),
+            }) {
+                Ok(polled) => polled,
+                Err(code) => return Ok(code),
+            };
+        match polled {
+            PolledKvRequest::Pending => Ok(KV_POLL_PENDING),
+            PolledKvRequest::WrongType => Ok(KV_POLL_ERR_REQUEST_FAILED),
+            PolledKvRequest::Ready(value) => match value {
                 Some(value) => {
                     let mut memory = Self::memory(&mut caller, "kv_get_poll")?;
                     if let Some(code) = Self::write_guest_bytes(
@@ -81,30 +82,18 @@ impl AppServer {
                         value_len_ptr,
                         &value,
                     )? {
-                        request.state =
-                            KvRequestState::Complete(Ok(KvPendingResult::Get(Some(value))));
-                        caller.data_mut().kv_requests[request_id as usize] = Some(request);
+                        Self::store_kv_result(
+                            caller.data_mut(),
+                            request_id,
+                            Ok(KvPendingResult::Get(Some(value))),
+                        );
                         return Ok(code);
                     }
                     Ok(1)
                 }
                 None => Ok(0),
             },
-            KvRequestState::Complete(Ok(KvPendingResult::List(value))) => {
-                request.state = KvRequestState::Complete(Ok(KvPendingResult::List(value)));
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_ERR_REQUEST_FAILED)
-            }
-            KvRequestState::Complete(Ok(KvPendingResult::StorageUsed(value))) => {
-                request.state = KvRequestState::Complete(Ok(KvPendingResult::StorageUsed(value)));
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_ERR_REQUEST_FAILED)
-            }
-            KvRequestState::Complete(Ok(KvPendingResult::Exec)) => {
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_ERR_REQUEST_FAILED)
-            }
-            KvRequestState::Complete(Err(error)) => {
+            PolledKvRequest::Failed(error) => {
                 let mut memory = Self::memory(&mut caller, "kv_get_poll")?;
                 if let Some(code) = Self::write_guest_bytes(
                     &mut caller,
@@ -114,8 +103,7 @@ impl AppServer {
                     value_len_ptr,
                     &encode_kv_error(&error),
                 )? {
-                    request.state = KvRequestState::Complete(Err(error));
-                    caller.data_mut().kv_requests[request_id as usize] = Some(request);
+                    Self::store_kv_result(caller.data_mut(), request_id, Err(error));
                     return Ok(code);
                 }
                 Ok(KV_POLL_ERR_REQUEST_FAILED)
@@ -150,34 +138,19 @@ impl AppServer {
         error_max_len: u32,
         error_len_ptr: i32,
     ) -> wasmtime::Result<i32> {
-        let Some(mut request) = Self::take_kv_request(caller.data_mut(), request_id) else {
-            return Ok(KV_POLL_ERR_INVALID_REQUEST_ID);
-        };
-        Self::advance_kv_request(&mut request);
-
-        match request.state {
-            KvRequestState::Pending(receiver) => {
-                request.state = KvRequestState::Pending(receiver);
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_PENDING)
-            }
-            KvRequestState::Complete(Ok(KvPendingResult::Exec)) => Ok(1),
-            KvRequestState::Complete(Ok(KvPendingResult::Get(value))) => {
-                request.state = KvRequestState::Complete(Ok(KvPendingResult::Get(value)));
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_ERR_REQUEST_FAILED)
-            }
-            KvRequestState::Complete(Ok(KvPendingResult::List(value))) => {
-                request.state = KvRequestState::Complete(Ok(KvPendingResult::List(value)));
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_ERR_REQUEST_FAILED)
-            }
-            KvRequestState::Complete(Ok(KvPendingResult::StorageUsed(value))) => {
-                request.state = KvRequestState::Complete(Ok(KvPendingResult::StorageUsed(value)));
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_ERR_REQUEST_FAILED)
-            }
-            KvRequestState::Complete(Err(error)) => {
+        let polled =
+            match Self::poll_kv_request(caller.data_mut(), request_id, |result| match result {
+                KvPendingResult::Exec => Ok(()),
+                other => Err(other),
+            }) {
+                Ok(polled) => polled,
+                Err(code) => return Ok(code),
+            };
+        match polled {
+            PolledKvRequest::Pending => Ok(KV_POLL_PENDING),
+            PolledKvRequest::WrongType => Ok(KV_POLL_ERR_REQUEST_FAILED),
+            PolledKvRequest::Ready(()) => Ok(1),
+            PolledKvRequest::Failed(error) => {
                 let mut memory = Self::memory(&mut caller, "kv_exec_poll")?;
                 if let Some(code) = Self::write_guest_bytes(
                     &mut caller,
@@ -187,8 +160,7 @@ impl AppServer {
                     error_len_ptr,
                     &encode_kv_error(&error),
                 )? {
-                    request.state = KvRequestState::Complete(Err(error));
-                    caller.data_mut().kv_requests[request_id as usize] = Some(request);
+                    Self::store_kv_result(caller.data_mut(), request_id, Err(error));
                     return Ok(code);
                 }
                 Ok(KV_POLL_ERR_REQUEST_FAILED)
@@ -232,18 +204,18 @@ impl AppServer {
         data_max_len: u32,
         data_len_ptr: i32,
     ) -> wasmtime::Result<i32> {
-        let Some(mut request) = Self::take_kv_request(caller.data_mut(), request_id) else {
-            return Ok(KV_POLL_ERR_INVALID_REQUEST_ID);
-        };
-        Self::advance_kv_request(&mut request);
-
-        match request.state {
-            KvRequestState::Pending(receiver) => {
-                request.state = KvRequestState::Pending(receiver);
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_PENDING)
-            }
-            KvRequestState::Complete(Ok(KvPendingResult::List(value))) => {
+        let polled =
+            match Self::poll_kv_request(caller.data_mut(), request_id, |result| match result {
+                KvPendingResult::List(value) => Ok(value),
+                other => Err(other),
+            }) {
+                Ok(polled) => polled,
+                Err(code) => return Ok(code),
+            };
+        match polled {
+            PolledKvRequest::Pending => Ok(KV_POLL_PENDING),
+            PolledKvRequest::WrongType => Ok(KV_POLL_ERR_REQUEST_FAILED),
+            PolledKvRequest::Ready(value) => {
                 let mut memory = Self::memory(&mut caller, "kv_list_poll")?;
                 if let Some(code) = Self::write_guest_bytes(
                     &mut caller,
@@ -253,28 +225,16 @@ impl AppServer {
                     data_len_ptr,
                     &value,
                 )? {
-                    request.state = KvRequestState::Complete(Ok(KvPendingResult::List(value)));
-                    caller.data_mut().kv_requests[request_id as usize] = Some(request);
+                    Self::store_kv_result(
+                        caller.data_mut(),
+                        request_id,
+                        Ok(KvPendingResult::List(value)),
+                    );
                     return Ok(code);
                 }
                 Ok(1)
             }
-            KvRequestState::Complete(Ok(KvPendingResult::Get(value))) => {
-                request.state = KvRequestState::Complete(Ok(KvPendingResult::Get(value)));
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_ERR_REQUEST_FAILED)
-            }
-            KvRequestState::Complete(Ok(KvPendingResult::StorageUsed(value))) => {
-                request.state = KvRequestState::Complete(Ok(KvPendingResult::StorageUsed(value)));
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_ERR_REQUEST_FAILED)
-            }
-            KvRequestState::Complete(Ok(KvPendingResult::Exec)) => {
-                request.state = KvRequestState::Complete(Ok(KvPendingResult::Exec));
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_ERR_REQUEST_FAILED)
-            }
-            KvRequestState::Complete(Err(error)) => {
+            PolledKvRequest::Failed(error) => {
                 let mut memory = Self::memory(&mut caller, "kv_list_poll")?;
                 if let Some(code) = Self::write_guest_bytes(
                     &mut caller,
@@ -284,8 +244,7 @@ impl AppServer {
                     data_len_ptr,
                     &encode_kv_error(&error),
                 )? {
-                    request.state = KvRequestState::Complete(Err(error));
-                    caller.data_mut().kv_requests[request_id as usize] = Some(request);
+                    Self::store_kv_result(caller.data_mut(), request_id, Err(error));
                     return Ok(code);
                 }
                 Ok(KV_POLL_ERR_REQUEST_FAILED)
@@ -296,7 +255,7 @@ impl AppServer {
     fn kv_storage_used_v1(mut caller: wasmtime::Caller<'_, AppState>) -> wasmtime::Result<i32> {
         let kv_backend = caller.data().ctx.kv_backend.clone();
         let app_id = caller.data().app.app_id.app_id;
-        Ok(Self::spawn_kv_storage_used_request(
+        Ok(Self::spawn_kv_request(
             caller.data_mut(),
             async move {
                 kv_backend
@@ -304,6 +263,7 @@ impl AppServer {
                     .await
                     .map_err(|error| sanitize_kv_error("storage_used", app_id, error))
             },
+            KvPendingResult::StorageUsed,
         ))
     }
 
@@ -314,18 +274,18 @@ impl AppServer {
         data_max_len: u32,
         data_len_ptr: i32,
     ) -> wasmtime::Result<i32> {
-        let Some(mut request) = Self::take_kv_request(caller.data_mut(), request_id) else {
-            return Ok(KV_POLL_ERR_INVALID_REQUEST_ID);
-        };
-        Self::advance_kv_request(&mut request);
-
-        match request.state {
-            KvRequestState::Pending(receiver) => {
-                request.state = KvRequestState::Pending(receiver);
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_PENDING)
-            }
-            KvRequestState::Complete(Ok(KvPendingResult::StorageUsed(value))) => {
+        let polled =
+            match Self::poll_kv_request(caller.data_mut(), request_id, |result| match result {
+                KvPendingResult::StorageUsed(value) => Ok(value),
+                other => Err(other),
+            }) {
+                Ok(polled) => polled,
+                Err(code) => return Ok(code),
+            };
+        match polled {
+            PolledKvRequest::Pending => Ok(KV_POLL_PENDING),
+            PolledKvRequest::WrongType => Ok(KV_POLL_ERR_REQUEST_FAILED),
+            PolledKvRequest::Ready(value) => {
                 let mut memory = Self::memory(&mut caller, "kv_storage_used_poll")?;
                 let bytes = value.to_le_bytes();
                 if let Some(code) = Self::write_guest_bytes(
@@ -336,29 +296,16 @@ impl AppServer {
                     data_len_ptr,
                     &bytes,
                 )? {
-                    request.state =
-                        KvRequestState::Complete(Ok(KvPendingResult::StorageUsed(value)));
-                    caller.data_mut().kv_requests[request_id as usize] = Some(request);
+                    Self::store_kv_result(
+                        caller.data_mut(),
+                        request_id,
+                        Ok(KvPendingResult::StorageUsed(value)),
+                    );
                     return Ok(code);
                 }
                 Ok(1)
             }
-            KvRequestState::Complete(Ok(KvPendingResult::Get(value))) => {
-                request.state = KvRequestState::Complete(Ok(KvPendingResult::Get(value)));
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_ERR_REQUEST_FAILED)
-            }
-            KvRequestState::Complete(Ok(KvPendingResult::List(value))) => {
-                request.state = KvRequestState::Complete(Ok(KvPendingResult::List(value)));
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_ERR_REQUEST_FAILED)
-            }
-            KvRequestState::Complete(Ok(KvPendingResult::Exec)) => {
-                request.state = KvRequestState::Complete(Ok(KvPendingResult::Exec));
-                caller.data_mut().kv_requests[request_id as usize] = Some(request);
-                Ok(KV_POLL_ERR_REQUEST_FAILED)
-            }
-            KvRequestState::Complete(Err(error)) => {
+            PolledKvRequest::Failed(error) => {
                 let mut memory = Self::memory(&mut caller, "kv_storage_used_poll")?;
                 if let Some(code) = Self::write_guest_bytes(
                     &mut caller,
@@ -368,8 +315,7 @@ impl AppServer {
                     data_len_ptr,
                     &encode_kv_error(&error),
                 )? {
-                    request.state = KvRequestState::Complete(Err(error));
-                    caller.data_mut().kv_requests[request_id as usize] = Some(request);
+                    Self::store_kv_result(caller.data_mut(), request_id, Err(error));
                     return Ok(code);
                 }
                 Ok(KV_POLL_ERR_REQUEST_FAILED)
@@ -401,7 +347,7 @@ impl AppServer {
                 KV_CMD_SET | KV_CMD_CHECK_VALUE => {
                     Self::read_guest_bytes(caller, value_ptr, value_len)?
                 }
-                _ if value_len == 0 => Vec::new(),
+                _ if value_len == 0 => Bytes::new(),
                 _ => return Err(KV_REQ_ERR_INVALID_INPUT),
             };
 
@@ -439,65 +385,34 @@ impl AppServer {
         len: u32,
     ) -> Result<ListRequest, i32> {
         let bytes = Self::read_guest_bytes(caller, ptr, len)?;
-        decode_list_request(&bytes).map_err(|_| KV_REQ_ERR_INVALID_INPUT)
+        decode_list_request(bytes).map_err(|_| KV_REQ_ERR_INVALID_INPUT)
     }
 
     fn spawn_kv_get_request<F>(state: &mut AppState, future: F) -> i32
     where
-        F: std::future::Future<Output = Result<Option<Vec<u8>>, KvError>> + Send + 'static,
+        F: std::future::Future<Output = Result<Option<Bytes>, KvError>> + Send + 'static,
     {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let request_id = Self::insert_kv_request_pending(state, rx);
-        if request_id < 0 {
-            return request_id;
-        }
-        tokio::spawn(async move {
-            let _ = tx.send(
-                future
-                    .await
-                    .map(|value| KvPendingResult::Get(value.map(Vec::into_boxed_slice))),
-            );
-        });
-        request_id
+        Self::spawn_kv_request(state, future, KvPendingResult::Get)
     }
 
     fn spawn_kv_exec_request<F>(state: &mut AppState, future: F) -> i32
     where
         F: std::future::Future<Output = Result<(), KvError>> + Send + 'static,
     {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let request_id = Self::insert_kv_request_pending(state, rx);
-        if request_id < 0 {
-            return request_id;
-        }
-        tokio::spawn(async move {
-            let _ = tx.send(future.await.map(|()| KvPendingResult::Exec));
-        });
-        request_id
+        Self::spawn_kv_request(state, future, |()| KvPendingResult::Exec)
     }
 
     fn spawn_kv_list_request<F>(state: &mut AppState, future: F) -> i32
     where
-        F: std::future::Future<Output = Result<Vec<u8>, KvError>> + Send + 'static,
+        F: std::future::Future<Output = Result<Bytes, KvError>> + Send + 'static,
     {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let request_id = Self::insert_kv_request_pending(state, rx);
-        if request_id < 0 {
-            return request_id;
-        }
-        tokio::spawn(async move {
-            let _ = tx.send(
-                future
-                    .await
-                    .map(|value| KvPendingResult::List(value.into_boxed_slice())),
-            );
-        });
-        request_id
+        Self::spawn_kv_request(state, future, KvPendingResult::List)
     }
 
-    fn spawn_kv_storage_used_request<F>(state: &mut AppState, future: F) -> i32
+    fn spawn_kv_request<F, T, Map>(state: &mut AppState, future: F, map: Map) -> i32
     where
-        F: std::future::Future<Output = Result<u64, KvError>> + Send + 'static,
+        F: std::future::Future<Output = Result<T, KvError>> + Send + 'static,
+        Map: FnOnce(T) -> KvPendingResult + Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let request_id = Self::insert_kv_request_pending(state, rx);
@@ -505,7 +420,7 @@ impl AppServer {
             return request_id;
         }
         tokio::spawn(async move {
-            let _ = tx.send(future.await.map(KvPendingResult::StorageUsed));
+            let _ = tx.send(future.await.map(map));
         });
         request_id
     }
@@ -514,7 +429,7 @@ impl AppServer {
         caller: &mut wasmtime::Caller<'_, AppState>,
         ptr: i32,
         len: u32,
-    ) -> Result<Vec<u8>, i32> {
+    ) -> Result<Bytes, i32> {
         let len = len as usize;
         if len > MAX_KV_REQUEST_BYTES {
             return Err(KV_REQ_ERR_INVALID_INPUT);
@@ -525,7 +440,7 @@ impl AppServer {
         let mut bytes = vec![0u8; len];
         mem.read(caller, ptr as usize, &mut bytes)
             .map_err(|_| KV_REQ_ERR_INVALID_INPUT)?;
-        Ok(bytes)
+        Ok(Bytes::from(bytes))
     }
 
     fn memory(
@@ -588,6 +503,55 @@ impl AppServer {
         state.kv_requests[request_id].take()
     }
 
+    fn poll_kv_request<T>(
+        state: &mut AppState,
+        request_id: i32,
+        take_value: impl FnOnce(KvPendingResult) -> Result<T, KvPendingResult>,
+    ) -> Result<PolledKvRequest<T>, i32> {
+        let Some(mut request) = Self::take_kv_request(state, request_id) else {
+            return Err(KV_POLL_ERR_INVALID_REQUEST_ID);
+        };
+        Self::advance_kv_request(&mut request);
+
+        match request.state {
+            KvRequestState::Pending(receiver) => {
+                request.state = KvRequestState::Pending(receiver);
+                Self::put_kv_request(state, request_id, request);
+                Ok(PolledKvRequest::Pending)
+            }
+            KvRequestState::Complete(Ok(result)) => match take_value(result) {
+                Ok(value) => Ok(PolledKvRequest::Ready(value)),
+                Err(result) => {
+                    Self::store_kv_result(state, request_id, Ok(result));
+                    Ok(PolledKvRequest::WrongType)
+                }
+            },
+            KvRequestState::Complete(Err(error)) => Ok(PolledKvRequest::Failed(error)),
+        }
+    }
+
+    fn store_kv_result(
+        state: &mut AppState,
+        request_id: i32,
+        result: Result<KvPendingResult, KvError>,
+    ) {
+        Self::put_kv_request(
+            state,
+            request_id,
+            PendingKvRequest {
+                state: KvRequestState::Complete(result),
+            },
+        );
+    }
+
+    fn put_kv_request(state: &mut AppState, request_id: i32, request: PendingKvRequest) {
+        if let Ok(request_id) = usize::try_from(request_id) {
+            if let Some(slot) = state.kv_requests.get_mut(request_id) {
+                *slot = Some(request);
+            }
+        }
+    }
+
     fn insert_kv_request_pending(
         state: &mut AppState,
         receiver: tokio::sync::oneshot::Receiver<Result<KvPendingResult, KvError>>,
@@ -608,6 +572,13 @@ impl AppServer {
         state.kv_requests.push(Some(pending));
         request_id
     }
+}
+
+enum PolledKvRequest<T> {
+    Pending,
+    Ready(T),
+    Failed(KvError),
+    WrongType,
 }
 
 fn sanitize_kv_error(op: &'static str, app_id: u64, error: KvError) -> KvError {
@@ -647,13 +618,13 @@ fn encode_kv_error(error: &KvError) -> Vec<u8> {
 }
 
 struct ListRequest {
-    prefix: Vec<u8>,
-    start: Option<Vec<u8>>,
-    end: Option<Vec<u8>>,
-    after: Option<Vec<u8>>,
+    prefix: Bytes,
+    start: Option<Bytes>,
+    end: Option<Bytes>,
+    after: Option<Bytes>,
 }
 
-fn decode_list_request(bytes: &[u8]) -> anyhow::Result<ListRequest> {
+fn decode_list_request(bytes: Bytes) -> anyhow::Result<ListRequest> {
     if bytes.len() < KV_LIST_REQUEST_HEADER_SIZE {
         anyhow::bail!("kv list request too short");
     }
@@ -664,12 +635,12 @@ fn decode_list_request(bytes: &[u8]) -> anyhow::Result<ListRequest> {
     let after_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
 
     let mut offset = KV_LIST_REQUEST_HEADER_SIZE;
-    let prefix = read_list_request_part(bytes, &mut offset, prefix_len)?;
+    let prefix = read_list_request_part(&bytes, &mut offset, prefix_len)?;
     let start = if start_len == KV_OPTIONAL_KEY_MISSING {
         None
     } else {
         Some(read_list_request_part(
-            bytes,
+            &bytes,
             &mut offset,
             start_len as usize,
         )?)
@@ -678,7 +649,7 @@ fn decode_list_request(bytes: &[u8]) -> anyhow::Result<ListRequest> {
         None
     } else {
         Some(read_list_request_part(
-            bytes,
+            &bytes,
             &mut offset,
             end_len as usize,
         )?)
@@ -687,7 +658,7 @@ fn decode_list_request(bytes: &[u8]) -> anyhow::Result<ListRequest> {
         None
     } else {
         Some(read_list_request_part(
-            bytes,
+            &bytes,
             &mut offset,
             after_len as usize,
         )?)
@@ -705,21 +676,22 @@ fn decode_list_request(bytes: &[u8]) -> anyhow::Result<ListRequest> {
     })
 }
 
-fn read_list_request_part(bytes: &[u8], offset: &mut usize, len: usize) -> anyhow::Result<Vec<u8>> {
+fn read_list_request_part(bytes: &Bytes, offset: &mut usize, len: usize) -> anyhow::Result<Bytes> {
     let end = offset
         .checked_add(len)
         .ok_or_else(|| anyhow::anyhow!("kv list request length overflow"))?;
-    let part = bytes
-        .get(*offset..end)
-        .ok_or_else(|| anyhow::anyhow!("unexpected end of kv list request"))?;
+    if end > bytes.len() {
+        anyhow::bail!("unexpected end of kv list request");
+    }
+    let part = bytes.slice(*offset..end);
     *offset = end;
-    Ok(part.to_vec())
+    Ok(part)
 }
 
-fn encode_list_page(page: &KvListPage) -> Result<Vec<u8>, String> {
+fn encode_list_page(page: &KvListPage) -> Result<Bytes, String> {
     let mut out = Vec::with_capacity(
         KV_LIST_RESPONSE_HEADER_SIZE
-            + page.next_after.as_ref().map_or(0, Vec::len)
+            + page.next_after.as_ref().map_or(0, Bytes::len)
             + page
                 .entries
                 .iter()
@@ -750,5 +722,5 @@ fn encode_list_page(page: &KvListPage) -> Result<Vec<u8>, String> {
         out.extend_from_slice(&entry.key);
         out.extend_from_slice(&entry.value);
     }
-    Ok(out)
+    Ok(Bytes::from(out))
 }

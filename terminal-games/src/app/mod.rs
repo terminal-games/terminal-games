@@ -1436,8 +1436,8 @@ pub enum KvRequestState {
 }
 
 pub enum KvPendingResult {
-    Get(Option<Box<[u8]>>),
-    List(Box<[u8]>),
+    Get(Option<Bytes>),
+    List(Bytes),
     StorageUsed(u64),
     Exec,
 }

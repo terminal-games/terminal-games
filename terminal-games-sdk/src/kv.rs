@@ -314,7 +314,7 @@ pub async fn set_parts(value: impl IntoValue, parts: &[KeyPart]) -> Result<(), E
     set(value, parts.to_vec()).await
 }
 
-pub fn atomic() -> Atomic<NoWrite> {
+pub fn atomic() -> Atomic {
     Atomic::default()
 }
 
@@ -352,32 +352,22 @@ pub async fn storage_used() -> Result<u64, Error> {
     if request_id < 0 {
         return Err(Error::from_code(request_id));
     }
-    let bytes = poll_storage_used(request_id).await?;
-    let bytes: [u8; 8] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| Error::Decode("invalid kv storage-used payload length".into()))?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-pub struct NoWrite;
-pub struct HasWrite;
-
-pub struct Atomic<State> {
-    commands: Vec<Command>,
-    _state: std::marker::PhantomData<State>,
-}
-
-impl Default for Atomic<NoWrite> {
-    fn default() -> Self {
-        Self {
-            commands: Vec::new(),
-            _state: std::marker::PhantomData,
-        }
+    match poll_host(request_id, 8, false, crate::internal::kv_storage_used_poll).await? {
+        PollBytes::Found(bytes) => bytes
+            .as_slice()
+            .try_into()
+            .map(u64::from_le_bytes)
+            .map_err(|_| Error::Decode("invalid kv storage-used payload length".into())),
+        PollBytes::Missing => unreachable!(),
     }
 }
 
-impl<State> Atomic<State> {
+#[derive(Default)]
+pub struct Atomic {
+    commands: Vec<Command>,
+}
+
+impl Atomic {
     pub fn check(mut self, value: impl IntoValue, key: impl Into<Key>) -> Self {
         self.commands.push(Command::Check {
             key: key.into(),
@@ -403,26 +393,18 @@ impl<State> Atomic<State> {
         })
         .await
     }
-}
 
-impl Atomic<NoWrite> {
-    pub fn set(mut self, value: impl IntoValue, key: impl Into<Key>) -> Atomic<HasWrite> {
+    pub fn set(mut self, value: impl IntoValue, key: impl Into<Key>) -> Self {
         self.commands.push(Command::Set {
             key: key.into(),
             value: value.into_value(),
         });
-        Atomic {
-            commands: self.commands,
-            _state: std::marker::PhantomData,
-        }
+        self
     }
 
-    pub fn delete(mut self, key: impl Into<Key>) -> Atomic<HasWrite> {
+    pub fn delete(mut self, key: impl Into<Key>) -> Self {
         self.commands.push(Command::Delete { key: key.into() });
-        Atomic {
-            commands: self.commands,
-            _state: std::marker::PhantomData,
-        }
+        self
     }
 }
 
@@ -525,24 +507,36 @@ fn encode_commands(commands: impl IntoIterator<Item = Command>) -> Result<Encode
     })
 }
 
-async fn poll_get(request_id: i32) -> Result<Option<Vec<u8>>, Error> {
-    let mut buffer = vec![0u8; 256];
+type PollFn = unsafe extern "C" fn(i32, *mut u8, u32, *mut u32) -> i32;
+
+enum PollBytes {
+    Found(Vec<u8>),
+    Missing,
+}
+
+async fn poll_host(
+    request_id: i32,
+    initial_size: usize,
+    missing_is_ok: bool,
+    poll: PollFn,
+) -> Result<PollBytes, Error> {
+    let mut buffer = vec![0u8; initial_size];
     loop {
         let mut len = 0_u32;
         let result = unsafe {
-            crate::internal::kv_get_poll(
+            poll(
                 request_id,
                 buffer.as_mut_ptr(),
                 buffer.len() as u32,
-                &mut len as *mut u32,
+                &mut len,
             )
         };
         match result {
             1 => {
                 buffer.truncate(len as usize);
-                return Ok(Some(buffer));
+                return Ok(PollBytes::Found(buffer));
             }
-            0 => return Ok(None),
+            0 if missing_is_ok => return Ok(PollBytes::Missing),
             KV_POLL_PENDING => tokio::time::sleep(Duration::from_millis(10)).await,
             KV_POLL_ERR_BUFFER_TOO_SMALL => buffer.resize(len as usize, 0),
             KV_POLL_ERR_REQUEST_FAILED => {
@@ -551,87 +545,25 @@ async fn poll_get(request_id: i32) -> Result<Option<Vec<u8>>, Error> {
             }
             code => return Err(Error::from_code(code)),
         }
+    }
+}
+
+async fn poll_get(request_id: i32) -> Result<Option<Vec<u8>>, Error> {
+    match poll_host(request_id, 256, true, crate::internal::kv_get_poll).await? {
+        PollBytes::Found(bytes) => Ok(Some(bytes)),
+        PollBytes::Missing => Ok(None),
     }
 }
 
 async fn poll_exec(request_id: i32) -> Result<(), Error> {
-    let mut buffer = vec![0u8; 256];
-    loop {
-        let mut len = 0_u32;
-        let result = unsafe {
-            crate::internal::kv_exec_poll(
-                request_id,
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                &mut len as *mut u32,
-            )
-        };
-        match result {
-            1 => return Ok(()),
-            KV_POLL_PENDING => tokio::time::sleep(Duration::from_millis(10)).await,
-            KV_POLL_ERR_BUFFER_TOO_SMALL => buffer.resize(len as usize, 0),
-            KV_POLL_ERR_REQUEST_FAILED => {
-                buffer.truncate(len as usize);
-                return Err(decode_request_failed(buffer));
-            }
-            code => return Err(Error::from_code(code)),
-        }
-    }
+    let _ = poll_host(request_id, 256, false, crate::internal::kv_exec_poll).await?;
+    Ok(())
 }
 
 async fn poll_list(request_id: i32) -> Result<Vec<u8>, Error> {
-    let mut buffer = vec![0u8; 256];
-    loop {
-        let mut len = 0_u32;
-        let result = unsafe {
-            crate::internal::kv_list_poll(
-                request_id,
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                &mut len as *mut u32,
-            )
-        };
-        match result {
-            1 => {
-                buffer.truncate(len as usize);
-                return Ok(buffer);
-            }
-            KV_POLL_PENDING => tokio::time::sleep(Duration::from_millis(10)).await,
-            KV_POLL_ERR_BUFFER_TOO_SMALL => buffer.resize(len as usize, 0),
-            KV_POLL_ERR_REQUEST_FAILED => {
-                buffer.truncate(len as usize);
-                return Err(decode_request_failed(buffer));
-            }
-            code => return Err(Error::from_code(code)),
-        }
-    }
-}
-
-async fn poll_storage_used(request_id: i32) -> Result<Vec<u8>, Error> {
-    let mut buffer = vec![0u8; 8];
-    loop {
-        let mut len = 0_u32;
-        let result = unsafe {
-            crate::internal::kv_storage_used_poll(
-                request_id,
-                buffer.as_mut_ptr(),
-                buffer.len() as u32,
-                &mut len as *mut u32,
-            )
-        };
-        match result {
-            1 => {
-                buffer.truncate(len as usize);
-                return Ok(buffer);
-            }
-            KV_POLL_PENDING => tokio::time::sleep(Duration::from_millis(10)).await,
-            KV_POLL_ERR_BUFFER_TOO_SMALL => buffer.resize(len as usize, 0),
-            KV_POLL_ERR_REQUEST_FAILED => {
-                buffer.truncate(len as usize);
-                return Err(decode_request_failed(buffer));
-            }
-            code => return Err(Error::from_code(code)),
-        }
+    match poll_host(request_id, 256, false, crate::internal::kv_list_poll).await? {
+        PollBytes::Found(bytes) => Ok(bytes),
+        PollBytes::Missing => unreachable!(),
     }
 }
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::kv::{KvBackend, KvCommand, KvError, KvKey, KvListPage};
+use crate::kv::{KvBackend, KvCommand, KvError, KvKey, KvListPage, KvValue};
 use crate::mesh::{Mesh, NodeId};
 
 pub fn load_mesh_backend(
@@ -29,7 +29,7 @@ struct MeshKvBackend {
 
 #[async_trait]
 impl KvBackend for MeshKvBackend {
-    async fn get(&self, app_id: u64, key: KvKey) -> Result<Option<Vec<u8>>, KvError> {
+    async fn get(&self, app_id: u64, key: KvKey) -> Result<Option<KvValue>, KvError> {
         if self.mesh.node() == self.leader {
             self.local_backend
                 .as_ref()

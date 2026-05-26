@@ -165,10 +165,7 @@ type AtomicBuilder struct {
 	err      error
 }
 
-type AtomicWriteBuilder struct {
-	commands []Command
-	err      error
-}
+type AtomicWriteBuilder = AtomicBuilder
 
 type guestCommand struct {
 	Tag      uint32
@@ -284,7 +281,14 @@ func StorageUsed() (uint64, error) {
 	if requestID < 0 {
 		return 0, hostCodeError(requestID)
 	}
-	return pollStorageUsed(requestID)
+	bytes, _, err := pollHost(requestID, 8, false, kv_storage_used_poll)
+	if err != nil {
+		return 0, err
+	}
+	if len(bytes) != 8 {
+		return 0, errors.New("invalid kv storage-used payload length")
+	}
+	return binary.LittleEndian.Uint64(bytes), nil
 }
 
 func Parts(values ...any) (Tuple, error) {
@@ -391,70 +395,6 @@ func (b *AtomicBuilder) Exec() error {
 	return execList(b.commands)
 }
 
-func (b *AtomicWriteBuilder) Check(value any, keyParts ...any) *AtomicWriteBuilder {
-	if b.err != nil {
-		return b
-	}
-	key, err := Parts(keyParts...)
-	if err != nil {
-		b.err = err
-		return b
-	}
-	return b.CheckTuple(value, key)
-}
-
-func (b *AtomicWriteBuilder) CheckTuple(value any, key Tuple) *AtomicWriteBuilder {
-	if b.err == nil {
-		b.commands = append(b.commands, Command{kind: cmdCheckValue, key: key, value: value})
-	}
-	return b
-}
-
-func (b *AtomicWriteBuilder) CheckExists(keyParts ...any) *AtomicWriteBuilder {
-	if b.err != nil {
-		return b
-	}
-	key, err := Parts(keyParts...)
-	if err != nil {
-		b.err = err
-		return b
-	}
-	return b.CheckExistsTuple(key)
-}
-
-func (b *AtomicWriteBuilder) CheckExistsTuple(key Tuple) *AtomicWriteBuilder {
-	if b.err == nil {
-		b.commands = append(b.commands, Command{kind: cmdCheckExists, key: key})
-	}
-	return b
-}
-
-func (b *AtomicWriteBuilder) CheckMissing(keyParts ...any) *AtomicWriteBuilder {
-	if b.err != nil {
-		return b
-	}
-	key, err := Parts(keyParts...)
-	if err != nil {
-		b.err = err
-		return b
-	}
-	return b.CheckMissingTuple(key)
-}
-
-func (b *AtomicWriteBuilder) CheckMissingTuple(key Tuple) *AtomicWriteBuilder {
-	if b.err == nil {
-		b.commands = append(b.commands, Command{kind: cmdCheckMissing, key: key})
-	}
-	return b
-}
-
-func (b *AtomicWriteBuilder) Exec() error {
-	if b.err != nil {
-		return b.err
-	}
-	return execList(b.commands)
-}
-
 type encodedCommands struct {
 	keys     [][]byte
 	values   [][]byte
@@ -500,94 +440,48 @@ func encodeCommands(commands []Command) (encodedCommands, error) {
 	return encoded, nil
 }
 
-func pollGet(requestID int32) ([]byte, bool, error) {
-	buffer := make([]byte, 256)
+type pollFunc func(int32, unsafe.Pointer, uint32, unsafe.Pointer) int32
+
+func pollHost(requestID int32, size int, missingOK bool, poll pollFunc) ([]byte, bool, error) {
+	buffer := make([]byte, size)
 	for {
-		var valueLen uint32
-		result := kv_get_poll(
-			requestID,
-			bufferPointer(buffer),
-			uint32(len(buffer)),
-			unsafe.Pointer(&valueLen),
-		)
+		var length uint32
+		result := poll(requestID, bufferPointer(buffer), uint32(len(buffer)), unsafe.Pointer(&length))
 		switch result {
 		case 1:
-			return append([]byte(nil), buffer[:valueLen]...), true, nil
+			return append([]byte(nil), buffer[:length]...), true, nil
 		case 0:
-			return nil, false, nil
+			if missingOK {
+				return nil, false, nil
+			}
+			return nil, false, hostCodeError(result)
 		case pollPending:
 			time.Sleep(10 * time.Millisecond)
 		case pollErrBufferTooSmall:
-			buffer = make([]byte, valueLen)
+			buffer = make([]byte, length)
 		case pollErrRequestFailed:
-			return nil, false, decodeRequestFailed(buffer[:valueLen])
+			return nil, false, decodeRequestFailed(buffer[:length])
 		default:
 			return nil, false, hostCodeError(result)
 		}
 	}
 }
 
+func pollGet(requestID int32) ([]byte, bool, error) {
+	return pollHost(requestID, 256, true, kv_get_poll)
+}
+
 func pollExec(requestID int32) error {
-	buffer := make([]byte, 256)
-	for {
-		var length uint32
-		result := kv_exec_poll(requestID, bufferPointer(buffer), uint32(len(buffer)), unsafe.Pointer(&length))
-		switch result {
-		case 1:
-			return nil
-		case pollPending:
-			time.Sleep(10 * time.Millisecond)
-		case pollErrBufferTooSmall:
-			buffer = make([]byte, length)
-		case pollErrRequestFailed:
-			return decodeRequestFailed(buffer[:length])
-		default:
-			return hostCodeError(result)
-		}
-	}
+	_, _, err := pollHost(requestID, 256, false, kv_exec_poll)
+	return err
 }
 
 func pollListPage(requestID int32) (listPage, error) {
-	buffer := make([]byte, 256)
-	for {
-		var length uint32
-		result := kv_list_poll(requestID, bufferPointer(buffer), uint32(len(buffer)), unsafe.Pointer(&length))
-		switch result {
-		case 1:
-			return decodeListPage(buffer[:length])
-		case pollPending:
-			time.Sleep(10 * time.Millisecond)
-		case pollErrBufferTooSmall:
-			buffer = make([]byte, length)
-		case pollErrRequestFailed:
-			return listPage{}, decodeRequestFailed(buffer[:length])
-		default:
-			return listPage{}, hostCodeError(result)
-		}
+	bytes, _, err := pollHost(requestID, 256, false, kv_list_poll)
+	if err != nil {
+		return listPage{}, err
 	}
-}
-
-func pollStorageUsed(requestID int32) (uint64, error) {
-	buffer := make([]byte, 8)
-	for {
-		var length uint32
-		result := kv_storage_used_poll(requestID, bufferPointer(buffer), uint32(len(buffer)), unsafe.Pointer(&length))
-		switch result {
-		case 1:
-			if length != 8 {
-				return 0, errors.New("invalid kv storage-used payload length")
-			}
-			return binary.LittleEndian.Uint64(buffer[:8]), nil
-		case pollPending:
-			time.Sleep(10 * time.Millisecond)
-		case pollErrBufferTooSmall:
-			buffer = make([]byte, length)
-		case pollErrRequestFailed:
-			return 0, decodeRequestFailed(buffer[:length])
-		default:
-			return 0, hostCodeError(result)
-		}
-	}
+	return decodeListPage(bytes)
 }
 
 func encodeKey(tuple Tuple) ([]byte, error) {

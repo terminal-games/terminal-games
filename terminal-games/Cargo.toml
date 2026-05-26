@@ -8,11 +8,11 @@ anyhow = "1"
 async-trait = "0.1"
 audiopus_sys = { version = "0.2", features = ["static"] }
 avt = "0.17"
-aws-sdk-s3 = { version = "1.132.0", default-features = false, features = ["default-https-client", "http-1x", "rt-tokio", "rustls"] }
 base64 = "0.22"
 bb8 = "0.9"
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 chacha20poly1305 = "0.10"
+foyer = "0.22"
 futures = "0.3"
 headless-terminal = { path = "../headless-terminal" }
 hex = "0.4"
@@ -22,6 +22,7 @@ ipnet = "2"
 libc = "0.2"
 libsql = "0.9"
 ogg = "0.9"
+opendal = { version = "0.56.0", default-features = false, features = ["executors-tokio", "reqwest-rustls-tls", "services-fs", "services-s3"] }
 opus = "0.3"
 rand_core = "0.6"
 reqwest = { version = "0.13", features = ["multipart", "json"] }
