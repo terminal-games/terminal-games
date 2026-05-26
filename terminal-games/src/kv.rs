@@ -2,10 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-mod mesh;
-
-pub use mesh::load_mesh_backend;
-
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -21,7 +17,10 @@ use opendal::{ErrorKind, Operator, services};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use crate::db::DbPool;
+use crate::{
+    db::DbPool,
+    mesh::{Mesh, NodeId},
+};
 
 pub const DEFAULT_NAMESPACE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const LIST_PAGE_SIZE: usize = 64;
@@ -256,6 +255,94 @@ pub trait KvBackend: Send + Sync {
     ) -> Result<KvListPage, KvError>;
 
     async fn storage_used(&self, namespace_id: u64) -> Result<u64, KvError>;
+}
+
+pub fn load_mesh_backend(
+    mesh: Mesh,
+    leader: NodeId,
+    local_backend: Option<Arc<dyn KvBackend>>,
+) -> anyhow::Result<Arc<dyn KvBackend>> {
+    if mesh.node() == leader && local_backend.is_none() {
+        anyhow::bail!("kv leader node requires a local KV backend");
+    }
+    Ok(Arc::new(MeshKvBackend {
+        mesh,
+        leader,
+        local_backend,
+    }))
+}
+
+#[derive(Clone)]
+struct MeshKvBackend {
+    mesh: Mesh,
+    leader: NodeId,
+    local_backend: Option<Arc<dyn KvBackend>>,
+}
+
+#[async_trait]
+impl KvBackend for MeshKvBackend {
+    async fn get(&self, namespace_id: u64, key: KvKey) -> Result<Option<KvValue>, KvError> {
+        if self.mesh.node() == self.leader {
+            self.local_backend
+                .as_ref()
+                .ok_or(KvError::Unavailable)?
+                .get(namespace_id, key)
+                .await
+        } else {
+            self.mesh
+                .execute_kv_get_on_node(self.leader, namespace_id, key)
+                .await
+        }
+    }
+
+    async fn exec(&self, namespace_id: u64, commands: Vec<KvCommand>) -> Result<(), KvError> {
+        if self.mesh.node() == self.leader {
+            self.local_backend
+                .as_ref()
+                .ok_or(KvError::Unavailable)?
+                .exec(namespace_id, commands)
+                .await
+        } else {
+            self.mesh
+                .execute_kv_exec_on_node(self.leader, namespace_id, commands)
+                .await
+        }
+    }
+
+    async fn list_page(
+        &self,
+        namespace_id: u64,
+        prefix: KvKey,
+        start: Option<KvKey>,
+        end: Option<KvKey>,
+        after: Option<KvKey>,
+    ) -> Result<KvListPage, KvError> {
+        if self.mesh.node() == self.leader {
+            self.local_backend
+                .as_ref()
+                .ok_or(KvError::Unavailable)?
+                .list_page(namespace_id, prefix, start, end, after)
+                .await
+        } else {
+            self.mesh
+                .execute_kv_list_page_on_node(self.leader, namespace_id, prefix, start, end, after)
+                .await
+        }
+    }
+
+    async fn storage_used(&self, namespace_id: u64) -> Result<u64, KvError> {
+        if self.mesh.node() == self.leader {
+            self.local_backend
+                .as_ref()
+                .ok_or(KvError::Unavailable)?
+                .storage_used(namespace_id)
+                .await
+        } else {
+            self.mesh
+                .execute_kv_storage_used_on_node(self.leader, namespace_id)
+                .await
+        }
+    }
 }
 
 #[derive(Clone)]
